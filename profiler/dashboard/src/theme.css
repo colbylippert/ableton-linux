@@ -462,7 +462,48 @@ table.data tbody tr:hover {
   line-height: 1;
 }
 
-/* ---------- empty states & placeholders ---------- */
+/* ---------- load warnings (parser complaints from src/data/load.ts) ---------- */
+
+.load-warnings {
+  margin: 0 0 12px;
+  padding: 8px 12px;
+  border: 1px solid var(--status-warning);
+  border-radius: var(--radius);
+  background: var(--surface-1);
+  font-size: 13px;
+}
+
+.load-warnings summary {
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.load-warnings .icon {
+  color: var(--status-warning);
+}
+
+.load-warnings ul {
+  margin: 8px 0 0;
+  padding-left: 20px;
+  color: var(--text-secondary);
+}
+
+.load-warnings code {
+  font-family: var(--mono);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+/* ---------- view-level layout hooks ---------- */
+
+/* Trials table: one chip per Set in the "per-set delta" cell */
+.trials-chips {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+/* ---------- empty states ---------- */
 
 .empty {
   padding: 24px;
@@ -472,29 +513,12 @@ table.data tbody tr:hover {
   text-align: center;
 }
 
-.empty code,
-.view-scaffold code {
+.empty code {
   font-family: var(--mono);
   font-size: 12px;
   background: var(--surface-2);
   padding: 1px 4px;
   border-radius: 3px;
-}
-
-.view-scaffold h2 {
-  margin: 0 0 4px;
-  font-size: 18px;
-}
-
-.view-scaffold .lead {
-  margin: 0 0 16px;
-  color: var(--text-secondary);
-}
-
-.view-scaffold ul {
-  margin: 8px 0 0;
-  padding-left: 20px;
-  color: var(--text-secondary);
 }
 
 @media (max-width: 480px) {

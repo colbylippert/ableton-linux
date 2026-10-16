@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useState, type ComponentType, type KeyboardEvent } from 'react';
 import { DEFAULT_FILTER, type DashboardData, type FilterState } from './data/types';
-import { applyFilter, filterOptions } from './data';
-import FilterBar from './components/FilterBar';
+import { applyFilter, filterOptions, type FilterOptions } from './data';
+import FilterBar, { isDefaultFilter } from './components/FilterBar';
 import type { ViewProps } from './views/ViewProps';
 import OverviewView from './views/Overview';
 import TrendsView from './views/Trends';
@@ -30,7 +30,10 @@ export const TABS: readonly TabDef[] = [
 
 export type ThemeChoice = 'system' | 'light' | 'dark';
 
+/** localStorage: the viewer's theme (also read by the pre-paint script in index.html). */
 const THEME_KEY = 'profiler-dashboard.theme';
+/** sessionStorage: the viewer's filter, so it survives the reload a new history file triggers. */
+export const FILTER_STORAGE_KEY = 'profiler-dashboard.filter';
 
 function isTabId(value: string): value is TabId {
   return TABS.some((t) => t.id === value);
@@ -63,6 +66,48 @@ function applyTheme(choice: ThemeChoice) {
   }
 }
 
+function pick<T extends string>(value: unknown, allowed: readonly T[]): T | null {
+  return typeof value === 'string' && (allowed as readonly string[]).includes(value) ? (value as T) : null;
+}
+
+/**
+ * The filter the viewer last set in this browser tab, or the default. Every value is
+ * checked against what the current data offers (a machine or Set that is gone falls back to
+ * "all"), so a stale filter can never leave a `<select>` blank or hide every run silently.
+ */
+export function readStoredFilter(options: FilterOptions): FilterState {
+  let raw: unknown = null;
+  try {
+    const text = sessionStorage.getItem(FILTER_STORAGE_KEY);
+    raw = text ? JSON.parse(text) : null;
+  } catch {
+    return DEFAULT_FILTER;
+  }
+  if (typeof raw !== 'object' || raw === null) return DEFAULT_FILTER;
+  const r = raw as Record<string, unknown>;
+  return {
+    machine: pick(
+      r.machine,
+      options.machines.map((m) => m.id),
+    ),
+    environment: pick(r.environment, ['bare-metal', 'virtualised'] as const) ?? 'all',
+    structure: pick(r.structure, options.structures),
+    scenario: pick(r.scenario, options.scenarios),
+    traceMode: pick(r.traceMode, options.traceModes),
+    set: pick(r.set, options.sets),
+    switch: pick(r.switch, ['none', ...options.switches]),
+  };
+}
+
+function storeFilter(filter: FilterState) {
+  try {
+    if (isDefaultFilter(filter)) sessionStorage.removeItem(FILTER_STORAGE_KEY);
+    else sessionStorage.setItem(FILTER_STORAGE_KEY, JSON.stringify(filter));
+  } catch {
+    /* per-viewer convenience only; storage may be unavailable */
+  }
+}
+
 export interface AppProps {
   data: DashboardData;
 }
@@ -73,9 +118,17 @@ export interface AppProps {
  * which scopes every view. Data is injected so tests can render the shell with fixtures.
  */
 export default function App({ data }: AppProps) {
+  const options = useMemo(() => filterOptions(data.runs), [data.runs]);
   const [tab, setTab] = useState<TabId>(readHashTab);
   const [theme, setTheme] = useState<ThemeChoice>(readStoredTheme);
-  const [filter, setFilter] = useState<FilterState>(DEFAULT_FILTER);
+  const [filter, setFilterState] = useState<FilterState>(() => readStoredFilter(options));
+
+  const setFilter = useCallback((next: FilterState) => {
+    setFilterState(next);
+    storeFilter(next);
+  }, []);
+
+  const slice = useMemo(() => applyFilter(data.runs, filter), [data.runs, filter]);
 
   useEffect(() => {
     applyTheme(theme);
@@ -115,6 +168,7 @@ export default function App({ data }: AppProps) {
 
   const runs = data.runs.length;
   const trials = data.trials.length;
+  const warnings = data.loadErrors.length;
 
   return (
     <div className="app">
@@ -122,7 +176,7 @@ export default function App({ data }: AppProps) {
         <h1 className="app-title">Profiler gains</h1>
         <span className="app-meta" aria-live="polite">
           {runs} run{runs === 1 ? '' : 's'} · {trials} trial{trials === 1 ? '' : 's'}
-          {data.loadErrors.length > 0 ? ` · ${data.loadErrors.length} load warning${data.loadErrors.length === 1 ? '' : 's'}` : ''}
+          {warnings > 0 ? ` · ${warnings} load warning${warnings === 1 ? '' : 's'}` : ''}
         </span>
         <span className="spacer" />
         <div className="theme-toggle" role="group" aria-label="Theme">
@@ -133,6 +187,24 @@ export default function App({ data }: AppProps) {
           ))}
         </div>
       </header>
+
+      {warnings > 0 ? (
+        <details className="load-warnings">
+          <summary>
+            <span className="icon" aria-hidden="true">
+              ⚠
+            </span>{' '}
+            {warnings} load warning{warnings === 1 ? '' : 's'}: history files or ledger lines that were skipped or given defaults
+          </summary>
+          <ul>
+            {data.loadErrors.map((message, i) => (
+              <li key={`${i}-${message}`}>
+                <code>{message}</code>
+              </li>
+            ))}
+          </ul>
+        </details>
+      ) : null}
 
       <div className="tablist" role="tablist" aria-label="Dashboard views" onKeyDown={onTabKeyDown}>
         {TABS.map((t) => (
@@ -154,7 +226,7 @@ export default function App({ data }: AppProps) {
 
       {/* One row above the panel; it scopes every view. */}
       <div className="filterbar-slot">
-        <FilterBar filter={filter} options={filterOptions(data.runs)} onChange={setFilter} runsInSlice={applyFilter(data.runs, filter).length} />
+        <FilterBar filter={filter} options={options} onChange={setFilter} runsInSlice={slice.length} />
       </div>
 
       <main id={`panel-${active.id}`} className="tabpanel" role="tabpanel" aria-labelledby={`tab-${active.id}`}>
