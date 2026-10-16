@@ -1,0 +1,8 @@
+{
+  "m1-studio": {
+    "benchmark/-": "20261010T100000Z-baseline"
+  },
+  "m2-vm": {
+    "benchmark/-": "20261009T100000Z-vm-baseline"
+  }
+}

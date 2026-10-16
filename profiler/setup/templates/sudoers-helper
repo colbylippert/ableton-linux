@@ -1,0 +1,5 @@
+# /etc/sudoers.d/91-profiler-helper — written by profiler/setup (phase 01 "sudo")
+# from profiler/setup/templates/sudoers-helper; validated with visudo -cf first.
+# Lets the profiler run its allowlisted root helper without a password on every
+# profile (bare metal included). The helper validates every argument itself.
+@@USER@@ ALL=(root) NOPASSWD: /usr/local/sbin/profiler-root-helper

@@ -1,0 +1,905 @@
+#!/usr/bin/env bash
+# profiler-root-helper — the allowlisted root entry point of the Wine interface
+# profiler. Source: profiler/setup/root-helper/profiler-root-helper. Installed by
+# profiler/setup/phases/01-sudo.sh as /usr/local/sbin/profiler-root-helper
+# (root:root 0755) together with /etc/sudoers.d/91-profiler-helper
+# (profiler/setup/templates/sudoers-helper):
+#     <user> ALL=(root) NOPASSWD: /usr/local/sbin/profiler-root-helper
+#
+# Always invoked as   sudo -n profiler-root-helper VERB …   by the setup phases,
+# profiler/bin/bench (through scripts/bench-suite.sh) and the agent loop. On the
+# dev VM, where the user also holds a NOPASSWD ALL rule, it is a guard-rail and a
+# portable interface; on bare metal it is the only root route the profiler uses.
+#
+# VERBS
+#   version                       print version and installation facts (works without root)
+#   snapshot [--force]            record the host knobs → /var/lib/profiler/baseline.env
+#                                 (first call only; --force retakes it)
+#   reset                         restore every knob recorded in baseline.env; idempotent
+#   knob get KEY | knob set KEY VALUE
+#       thp                       always | madvise | never
+#       governor                  a cpufreq governor name, applied to every CPU
+#       epp                       an energy_performance_preference, applied to every CPU
+#       ananicy                   on | off  (ananicy-cpp.service enable+start / disable+stop)
+#       sysctl.<key>              key ∈ kernel.perf_event_paranoid kernel.kptr_restrict
+#                                 kernel.sched_rt_runtime_us kernel.sched_autogroup_enabled
+#                                 kernel.timer_migration vm.swappiness vm.max_map_count
+#       irq-affinity.<N>          hex CPU mask, the format of /proc/irq/N/smp_affinity
+#       irq-prio.<N>              1..98, SCHED_FIFO priority of the irq/N-* thread
+#       rt-prio.<pid>             fifo:N | rr:N | other, applied to that pid/tid only —
+#                                 accepted only for a process of the invoking user whose
+#                                 /proc/<pid>/exe is under <home>/.local/opt/wine-*/
+#   trace start --tool NAME --run-dir DIR [--id ID] [--tool-dir DIR] [--pid N]…
+#               [--duration S] [-- ARGS…]
+#   trace stop  ID [--signal SIG] [--timeout S]
+#   trace stop  --tool NAME --run-dir DIR [--id ID] [--tool-dir DIR] [--timeout S] [-- ARGS…]
+#   trace status
+#   trace logs  ID [--lines N]
+#   install-tracer SRC_DIR        copy a tracer directory to /usr/local/lib/profiler/tracer
+#                                 (root-owned; MANIFEST.sha256 + INSTALLED.txt recorded)
+#
+# TRACE CONTRACT (shared with profiler/bin/wine-trace, see the plan §7)
+#   `trace start` runs   TOOL start [--pid N]… [--duration S] ARGS…   as root, in its
+#   own session (setsid), cwd RUN_DIR, stdin /dev/null, stdout/stderr appended to
+#   RUN_DIR/trace/NAME.out and RUN_DIR/trace/NAME.err, and records
+#   /run/profiler/<ID>.pid. A tool may daemonise (the recorded pid then exits 0;
+#   the session is still tracked by its session id). The suite form of
+#   `trace stop` runs   TOOL stop ARGS…   in the foreground (this is how the tool
+#   flushes and reduces its data), then signals whatever is left of the session,
+#   and finally `chown -R` RUN_DIR back to the invoking user. The ID form only
+#   signals (default INT, SIGKILL after --timeout, default 30 s) and chowns.
+#   Tools resolve to /usr/local/lib/profiler/tracer/NAME (or tracer/bin/NAME);
+#   when /etc/profiler/allow-user-tools exists (vm profile), also to
+#   <root>/bin/NAME and <root>/tracer/NAME for every profiler directory listed in
+#   that file (default <home>/Projects/ableton-linux/profiler), or to
+#   --tool-dir DIR/NAME when DIR lies under such a root. User tools must belong to
+#   the invoking user (or root) and must not be world-writable. RUN_DIR must
+#   resolve under <home>/.local/share/profiler/runs/ of the invoking user.
+#   Every --pid must be a live process of the invoking user.
+#
+# EXIT CODES
+#   0 ok · 1 the operation failed · 2 usage or an argument the allowlist/regexes
+#   refuse · 3 the knob is unavailable on this host (no cpufreq, no unit, …) ·
+#   4 refused to run (not root, or the helper / its library dir is writable by
+#   someone other than root)
+#
+# FILES
+#   /var/lib/profiler/baseline.env       host knobs before the profiler touched them
+#   /run/profiler/<ID>.pid               one per trace session (tmpfs: gone after a reboot)
+#   /var/log/profiler-root-helper.log    every invocation and its result (root 0640)
+#   /usr/local/lib/profiler/tracer/      root-owned tracer tools (install-tracer)
+#   /etc/profiler/allow-user-tools       present → tools from the user's checkout are allowed
+#
+# Every argument is validated against an anchored regular expression before it
+# is used; anything else is refused with exit 2 and logged.
+
+set -euo pipefail
+umask 022
+export LC_ALL=C
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+unset CDPATH
+
+readonly HELPER_VERSION=1.0.0
+readonly LIB_DIR=/usr/local/lib/profiler
+readonly TRACER_LIB="$LIB_DIR/tracer"
+readonly STATE_DIR=/var/lib/profiler
+readonly BASELINE="$STATE_DIR/baseline.env"
+readonly PIDFILE_DIR=/run/profiler
+readonly LOG=/var/log/profiler-root-helper.log
+readonly ALLOW_USER_TOOLS=/etc/profiler/allow-user-tools
+readonly ANANICY_UNIT=ananicy-cpp.service
+readonly THP_FILE=/sys/kernel/mm/transparent_hugepage/enabled
+readonly CPU_ROOT=/sys/devices/system/cpu
+readonly -a SYSCTL_ALLOW=(
+    kernel.perf_event_paranoid
+    kernel.kptr_restrict
+    kernel.sched_rt_runtime_us
+    kernel.sched_autogroup_enabled
+    kernel.timer_migration
+    vm.swappiness
+    vm.max_map_count
+)
+
+# ------------------------------------------------------------ validation ----
+readonly RE_NAME='^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$'            # tool names
+readonly RE_ID='^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$'              # trace session ids
+readonly RE_PATH='^/[A-Za-z0-9_./+-]{1,1023}$'                  # absolute paths, no spaces
+readonly RE_INT='^-?[0-9]{1,12}$'                               # sysctl values
+readonly RE_UINT='^[0-9]{1,12}$'
+readonly RE_PID='^[1-9][0-9]{0,7}$'
+readonly RE_IRQ='^[0-9]{1,5}$'
+readonly RE_PRIO='^([1-9]|[1-8][0-9]|9[0-8])$'                  # 1..98
+readonly RE_HEXMASK='^[0-9a-fA-F]{1,8}(,[0-9a-fA-F]{1,8})*$'
+readonly RE_ARG='^[A-Za-z0-9 _./:=,@+%~-]{1,1024}$'             # pass-through tool arguments
+readonly RE_SIG='^(INT|TERM|HUP|USR1|USR2|KILL|[0-9]{1,2})$'
+readonly RE_WORD='^[a-z][a-z0-9_-]{0,31}$'                      # governor / epp names
+readonly RE_SECS='^[0-9]{1,6}$'
+readonly RE_USER='^[a-z_][a-z0-9_-]{0,31}$'
+readonly RE_KEY='^[a-z][a-z0-9_.-]{0,80}$'
+
+INVOKER="${SUDO_USER:-}"
+INVOKER_UID="${SUDO_UID:-}"
+INVOKER_GID="${SUDO_GID:-}"
+INVOKER_HOME=""
+
+usage() {
+    cat <<'EOF'
+usage: sudo -n profiler-root-helper VERB …
+
+  version
+  snapshot [--force]
+  reset
+  knob get KEY
+  knob set KEY VALUE
+      KEY: thp | governor | epp | ananicy | sysctl.<allowlisted key> |
+           irq-affinity.<N> | irq-prio.<N> | rt-prio.<pid>
+  trace start --tool NAME --run-dir DIR [--id ID] [--tool-dir DIR] [--pid N]…
+              [--duration S] [-- ARGS…]
+  trace stop  ID [--signal SIG] [--timeout S]
+  trace stop  --tool NAME --run-dir DIR [--id ID] [--tool-dir DIR] [--timeout S] [-- ARGS…]
+  trace status
+  trace logs  ID [--lines N]
+  install-tracer SRC_DIR
+
+Exit codes: 0 ok · 1 failed · 2 refused argument/usage · 3 unavailable on this
+host · 4 refused to run (not root, or an unsafe installation).
+The header of this file documents every verb; the log is
+/var/log/profiler-root-helper.log.
+EOF
+}
+
+msg() { printf '%s\n' "$*"; }
+err() { printf 'profiler-root-helper: %s\n' "$*" >&2; }
+
+_log() {
+    if [ ! -e "$LOG" ]; then
+        { : > "$LOG"; } 2>/dev/null && chmod 0640 "$LOG" 2>/dev/null || return 0
+    fi
+    printf '%s pid=%s user=%s(%s) %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$$" \
+        "${INVOKER:-?}" "${INVOKER_UID:-?}" "$*" >> "$LOG" 2>/dev/null || true
+}
+
+die() {              # die MSG [CODE]
+    local code="${2:-1}"
+    err "$1"
+    _log "result=failed($code) $1"
+    exit "$code"
+}
+refuse() {           # refuse MSG  → exit 2
+    err "refused: $1"
+    _log "result=refused $1"
+    exit 2
+}
+unavailable() {      # unavailable MSG → exit 3
+    err "unavailable: $1"
+    _log "result=unavailable $1"
+    exit 3
+}
+quoted() { local out=""; local a; for a in "$@"; do out+="$(printf '%q' "$a") "; done; printf '%s' "${out% }"; }
+
+# ------------------------------------------------------------- integrity ----
+# owner root and no group/world write bit (pattern of scripts/setup-realtime.sh)
+_safe_root_path() {
+    local target="$1" owner mode
+    owner="$(stat -c %u -- "$target" 2>/dev/null)" || return 1
+    mode="$(stat -c %a -- "$target" 2>/dev/null)" || return 1
+    [ "$owner" = 0 ] || return 1
+    (( (8#$mode & 0022) == 0 )) || return 1
+    return 0
+}
+
+integrity_check() {
+    local self d
+    self="$(readlink -f -- "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")"
+    for d in "$(dirname -- "$self")" "$self"; do
+        _safe_root_path "$d" || {
+            err "refusing to run: $d must be owned by root and not be group/world-writable"
+            err "(run the installed copy: sudo -n /usr/local/sbin/profiler-root-helper …)"
+            exit 4
+        }
+    done
+    for d in "$LIB_DIR" "$TRACER_LIB"; do
+        [ -e "$d" ] || continue
+        _safe_root_path "$d" || { err "refusing to run: $d must be owned by root and not be group/world-writable"; exit 4; }
+    done
+}
+
+resolve_invoker() {
+    local entry
+    if [ -z "$INVOKER" ] || [ "$INVOKER" = root ]; then
+        INVOKER=root INVOKER_UID=0 INVOKER_GID=0 INVOKER_HOME=/root
+        return 0
+    fi
+    [[ "$INVOKER" =~ $RE_USER ]] || refuse "SUDO_USER '$INVOKER' has an unexpected form"
+    [[ "$INVOKER_UID" =~ ^[0-9]{1,10}$ ]] || refuse "SUDO_UID is missing or malformed"
+    [[ "$INVOKER_GID" =~ ^[0-9]{1,10}$ ]] || refuse "SUDO_GID is missing or malformed"
+    entry="$(getent passwd "$INVOKER" 2>/dev/null)" || refuse "no passwd entry for $INVOKER"
+    [ "$(printf '%s' "$entry" | cut -d: -f3)" = "$INVOKER_UID" ] || refuse "SUDO_UID $INVOKER_UID does not belong to $INVOKER"
+    INVOKER_HOME="$(printf '%s' "$entry" | cut -d: -f6)"
+    [[ "$INVOKER_HOME" =~ $RE_PATH ]] || refuse "home directory of $INVOKER has an unexpected form"
+    INVOKER_HOME="${INVOKER_HOME%/}"
+}
+
+need_invoker() {
+    [ "$INVOKER" != root ] || refuse "this verb needs the invoking user: run it as  sudo -n profiler-root-helper …  from your own account"
+}
+
+# ------------------------------------------------------------------ knobs ----
+thp_get() {
+    local s
+    s="$(cat "$THP_FILE" 2>/dev/null)" || { printf 'unavailable\n'; return 0; }
+    s="${s#*[}"; printf '%s\n' "${s%%]*}"
+}
+thp_set() {
+    [[ "$1" =~ ^(always|madvise|never)$ ]] || refuse "thp must be always, madvise or never (got '$1')"
+    [ -w "$THP_FILE" ] || unavailable "transparent hugepages ($THP_FILE)"
+    printf '%s' "$1" > "$THP_FILE" || die "cannot write $THP_FILE"
+}
+
+cpufreq_cpus() {     # prints the cpu directories that have a cpufreq policy
+    local d
+    for d in "$CPU_ROOT"/cpu[0-9]*; do [ -d "$d/cpufreq" ] && printf '%s\n' "$d"; done
+    return 0
+}
+cpu_attr_get() {     # cpu_attr_get ATTR → distinct values over all cpus, comma-joined; "unavailable"
+    local attr="$1" d v out=""
+    while IFS= read -r d; do
+        [ -n "$d" ] || continue
+        v="$(cat "$d/cpufreq/$attr" 2>/dev/null)" || continue
+        case ",$out," in *",$v,"*) ;; *) out="${out:+$out,}$v" ;; esac
+    done < <(cpufreq_cpus)
+    printf '%s\n' "${out:-unavailable}"
+}
+cpu_attr_set() {     # cpu_attr_set ATTR AVAIL_ATTR VALUE
+    local attr="$1" avail_attr="$2" value="$3" d avail n=0
+    [[ "$value" =~ $RE_WORD ]] || refuse "'$value' is not a valid $attr name"
+    [ -n "$(cpufreq_cpus)" ] || unavailable "cpufreq (no $CPU_ROOT/cpu*/cpufreq on this host)"
+    avail="$(cat "$CPU_ROOT/cpu0/cpufreq/$avail_attr" 2>/dev/null || true)"
+    [ -n "$avail" ] || unavailable "$attr ($CPU_ROOT/cpu0/cpufreq/$avail_attr is missing)"
+    case " $avail " in *" $value "*) ;; *) refuse "$attr '$value' is not offered by the driver (available: $avail)" ;; esac
+    while IFS= read -r d; do
+        [ -n "$d" ] || continue
+        printf '%s' "$value" > "$d/cpufreq/$attr" || die "cannot write $d/cpufreq/$attr"
+        n=$((n + 1))
+    done < <(cpufreq_cpus)
+    msg "applied to $n cpu(s)"
+}
+
+ananicy_present() { systemctl cat "$ANANICY_UNIT" >/dev/null 2>&1; }
+ananicy_enabled() { systemctl is-enabled "$ANANICY_UNIT" 2>/dev/null || true; }
+ananicy_active()  { systemctl is-active "$ANANICY_UNIT" 2>/dev/null || true; }
+ananicy_get() {
+    local en act
+    ananicy_present || { printf 'absent\n'; return 0; }
+    en="$(ananicy_enabled)"; act="$(ananicy_active)"
+    if [ "$en" = enabled ] || [ "$act" = active ] || [ "$act" = activating ]; then printf 'on\n'; else printf 'off\n'; fi
+}
+ananicy_set() {
+    ananicy_present || unavailable "$ANANICY_UNIT is not installed"
+    case "$1" in
+        on)  systemctl -q enable --now "$ANANICY_UNIT" || die "systemctl enable --now $ANANICY_UNIT failed" ;;
+        off) systemctl -q disable --now "$ANANICY_UNIT" || die "systemctl disable --now $ANANICY_UNIT failed" ;;
+        *)   refuse "ananicy must be on or off (got '$1')" ;;
+    esac
+}
+
+sysctl_allowed() { local k; for k in "${SYSCTL_ALLOW[@]}"; do [ "$1" = "$k" ] && return 0; done; return 1; }
+sysctl_get() { sysctl -n -- "$1" 2>/dev/null || printf 'unavailable\n'; }
+sysctl_set() {
+    [[ "$2" =~ $RE_INT ]] || refuse "sysctl value must be an integer (got '$2')"
+    sysctl -q -w -- "$1=$2" || die "sysctl -w $1=$2 failed"
+}
+
+irq_affinity_file() { printf '/proc/irq/%s/smp_affinity\n' "$1"; }
+irq_affinity_get() { cat "$(irq_affinity_file "$1")" 2>/dev/null || printf 'unavailable\n'; }
+irq_affinity_set() {
+    local f
+    [[ "$2" =~ $RE_HEXMASK ]] || refuse "irq affinity must be a hex CPU mask like ff or ffffffff,ffffffff (got '$2')"
+    f="$(irq_affinity_file "$1")"
+    [ -w "$f" ] || unavailable "IRQ $1 ($f)"
+    printf '%s' "$2" > "$f" 2>/dev/null || die "the kernel refused the affinity $2 for IRQ $1 (not movable, or no online CPU in the mask)"
+}
+
+irq_thread_tids() {  # irq_thread_tids N → tids of the irq/N-* kernel threads
+    ps -eo pid=,comm= 2>/dev/null | awk -v p="irq/$1-" 'index($2, p) == 1 { print $1 }'
+    return 0
+}
+irq_prio_get() {
+    local tid
+    tid="$(irq_thread_tids "$1" | head -n1)"
+    [ -n "$tid" ] || { printf 'unavailable\n'; return 0; }
+    ps -o rtprio= -p "$tid" 2>/dev/null | tr -d ' ' || printf 'unavailable\n'
+}
+irq_prio_set() {
+    local tid n=0
+    [[ "$2" =~ $RE_PRIO ]] || refuse "irq priority must be 1..98 (got '$2')"
+    while IFS= read -r tid; do
+        [ -n "$tid" ] || continue
+        chrt -f -p "$2" "$tid" || die "chrt -f -p $2 $tid failed"
+        n=$((n + 1))
+    done < <(irq_thread_tids "$1")
+    [ "$n" -gt 0 ] || unavailable "IRQ $1 has no irq/$1-* thread (threadirqs off, or no such IRQ)"
+}
+
+rt_prio_target() {   # rt_prio_target PID → validates ownership and the exe location
+    local pid="$1" uid exe
+    [[ "$pid" =~ $RE_PID ]] || refuse "bad pid '$pid'"
+    [ -d "/proc/$pid" ] || refuse "pid $pid does not exist"
+    need_invoker
+    uid="$(stat -c %u "/proc/$pid" 2>/dev/null || echo ?)"
+    [ "$uid" = "$INVOKER_UID" ] || refuse "pid $pid is not a process of $INVOKER (uid $uid)"
+    exe="$(readlink -f "/proc/$pid/exe" 2>/dev/null || true)"
+    case "$exe" in
+        "$INVOKER_HOME"/.local/opt/wine-*/*) ;;
+        *) refuse "pid $pid runs '${exe:-?}', which is not under $INVOKER_HOME/.local/opt/wine-*/" ;;
+    esac
+}
+rt_prio_get() {
+    local cls prio
+    read -r cls prio < <(ps -o cls=,rtprio= -p "$1" 2>/dev/null | head -n1 || true)
+    case "${cls:-}" in
+        FF) printf 'fifo:%s\n' "${prio:--}" ;;
+        RR) printf 'rr:%s\n' "${prio:--}" ;;
+        TS) printf 'other\n' ;;
+        "") printf 'unavailable\n' ;;
+        *)  printf '%s\n' "${cls,,}" ;;
+    esac
+}
+rt_prio_set() {
+    local pid="$1" value="$2" n
+    case "$value" in
+        fifo:*) n="${value#fifo:}"; [[ "$n" =~ ^([1-9]|[1-8][0-9]|9[0-9])$ ]] || refuse "fifo priority must be 1..99"
+                chrt -f -p "$n" "$pid" || die "chrt -f -p $n $pid failed" ;;
+        rr:*)   n="${value#rr:}"; [[ "$n" =~ ^([1-9]|[1-8][0-9]|9[0-9])$ ]] || refuse "rr priority must be 1..99"
+                chrt -r -p "$n" "$pid" || die "chrt -r -p $n $pid failed" ;;
+        other)  chrt -o -p 0 "$pid" || die "chrt -o -p 0 $pid failed" ;;
+        *)      refuse "rt-prio value must be fifo:N, rr:N or other (got '$value')" ;;
+    esac
+}
+
+do_knob() {
+    local op="${1:-}" key="${2:-}" value="${3:-}" cur sub
+    case "$op" in
+        get) [ $# -eq 2 ] || refuse "usage: knob get KEY" ;;
+        set) [ $# -eq 3 ] || refuse "usage: knob set KEY VALUE" ;;
+        *)   refuse "usage: knob get KEY | knob set KEY VALUE" ;;
+    esac
+    [[ "$key" =~ $RE_KEY ]] || refuse "bad knob key '$key'"
+    case "$key" in
+        thp)
+            cur="$(thp_get)"
+            if [ "$op" = get ]; then msg "$cur"; return 0; fi
+            thp_set "$value"; msg "thp: $cur -> $value" ;;
+        governor)
+            cur="$(cpu_attr_get scaling_governor)"
+            if [ "$op" = get ]; then msg "$cur"; [ "$cur" != unavailable ] || return 3; return 0; fi
+            cpu_attr_set scaling_governor scaling_available_governors "$value"; msg "governor: $cur -> $value" ;;
+        epp)
+            cur="$(cpu_attr_get energy_performance_preference)"
+            if [ "$op" = get ]; then msg "$cur"; [ "$cur" != unavailable ] || return 3; return 0; fi
+            cpu_attr_set energy_performance_preference energy_performance_available_preferences "$value"; msg "epp: $cur -> $value" ;;
+        ananicy)
+            cur="$(ananicy_get)"
+            if [ "$op" = get ]; then msg "$cur"; [ "$cur" != absent ] || return 3; return 0; fi
+            ananicy_set "$value"; msg "ananicy: $cur -> $value (enabled=$(ananicy_enabled) active=$(ananicy_active))" ;;
+        sysctl.*)
+            sub="${key#sysctl.}"
+            sysctl_allowed "$sub" || refuse "sysctl key '$sub' is not in the allowlist (${SYSCTL_ALLOW[*]})"
+            cur="$(sysctl_get "$sub")"
+            if [ "$op" = get ]; then msg "$cur"; return 0; fi
+            sysctl_set "$sub" "$value"; msg "sysctl.$sub: $cur -> $value" ;;
+        irq-affinity.*)
+            sub="${key#irq-affinity.}"
+            [[ "$sub" =~ $RE_IRQ ]] && [ -d "/proc/irq/$sub" ] || refuse "no such IRQ '$sub'"
+            cur="$(irq_affinity_get "$sub")"
+            if [ "$op" = get ]; then msg "$cur"; return 0; fi
+            irq_affinity_set "$sub" "$value"; msg "irq-affinity.$sub: $cur -> $(irq_affinity_get "$sub")" ;;
+        irq-prio.*)
+            sub="${key#irq-prio.}"
+            [[ "$sub" =~ $RE_IRQ ]] && [ -d "/proc/irq/$sub" ] || refuse "no such IRQ '$sub'"
+            cur="$(irq_prio_get "$sub")"
+            if [ "$op" = get ]; then msg "$cur"; [ "$cur" != unavailable ] || return 3; return 0; fi
+            irq_prio_set "$sub" "$value"; msg "irq-prio.$sub: $cur -> $value" ;;
+        rt-prio.*)
+            sub="${key#rt-prio.}"
+            rt_prio_target "$sub"
+            cur="$(rt_prio_get "$sub")"
+            if [ "$op" = get ]; then msg "$cur"; return 0; fi
+            rt_prio_set "$sub" "$value"; msg "rt-prio.$sub: $cur -> $(rt_prio_get "$sub")" ;;
+        *)
+            refuse "unknown knob '$key' (thp governor epp ananicy sysctl.<key> irq-affinity.<N> irq-prio.<N> rt-prio.<pid>)" ;;
+    esac
+    _log "result=ok knob $op $key${value:+ $value}"
+}
+
+# --------------------------------------------------------------- snapshot ----
+do_snapshot() {
+    local force=0 tmp d n cpu v ts k
+    while [ $# -gt 0 ]; do
+        case "$1" in --force) force=1 ;; *) refuse "snapshot takes only --force (got '$1')" ;; esac
+        shift
+    done
+    if [ -s "$BASELINE" ] && [ "$force" -eq 0 ]; then
+        ts="$(sed -n 's/^snapshot_ts=//p' "$BASELINE" | head -n1)"
+        msg "baseline already present: $BASELINE (taken ${ts:-?}); use --force to retake it"
+        _log "result=ok snapshot (kept existing baseline)"
+        return 0
+    fi
+    mkdir -p -m 0755 "$STATE_DIR" || die "cannot create $STATE_DIR"
+    tmp="$(mktemp "$STATE_DIR/.baseline.XXXXXX")" || die "mktemp failed in $STATE_DIR"
+    {
+        printf '# profiler-root-helper baseline: host knobs before the profiler changed anything.\n'
+        printf '# Restore with: sudo -n profiler-root-helper reset   (do not edit by hand)\n'
+        printf 'snapshot_ts=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        printf 'snapshot_by=%s\n' "$INVOKER"
+        printf 'helper_version=%s\n' "$HELPER_VERSION"
+        printf 'kernel=%s\n' "$(uname -r)"
+        printf 'thp=%s\n' "$(thp_get)"
+        for k in "${SYSCTL_ALLOW[@]}"; do printf 'sysctl.%s=%s\n' "$k" "$(sysctl_get "$k")"; done
+        n=0
+        while IFS= read -r d; do
+            [ -n "$d" ] || continue
+            cpu="${d##*/}"
+            v="$(cat "$d/cpufreq/scaling_governor" 2>/dev/null || echo unavailable)"
+            printf 'governor.%s=%s\n' "$cpu" "$v"
+            v="$(cat "$d/cpufreq/energy_performance_preference" 2>/dev/null || echo unavailable)"
+            printf 'epp.%s=%s\n' "$cpu" "$v"
+            n=$((n + 1))
+        done < <(cpufreq_cpus)
+        if [ "$n" -eq 0 ]; then printf 'governor=unavailable\nepp=unavailable\n'; fi
+        if ananicy_present; then
+            printf 'ananicy_enabled=%s\nananicy_active=%s\n' "$(ananicy_enabled)" "$(ananicy_active)"
+        else
+            printf 'ananicy_enabled=absent\nananicy_active=absent\n'
+        fi
+        for d in /proc/irq/[0-9]*; do
+            [ -d "$d" ] || continue
+            v="$(cat "$d/smp_affinity" 2>/dev/null)" || continue
+            printf 'irq_affinity.%s=%s\n' "${d##*/}" "$v"
+        done
+        ps -eo pid=,rtprio=,comm= 2>/dev/null | awk '
+            $3 ~ /^irq\/[0-9]+-/ { split($3, a, /[\/-]/); if (!(a[2] in seen)) { seen[a[2]] = 1; printf "irq_prio.%s=%s\n", a[2], $2 } }'
+    } > "$tmp" || { rm -f -- "$tmp"; die "cannot write the baseline"; }
+    chmod 0644 "$tmp"
+    mv -f -- "$tmp" "$BASELINE" || { rm -f -- "$tmp"; die "cannot move the baseline into place"; }
+    msg "baseline written: $BASELINE ($(grep -c '^[a-z]' "$BASELINE" || true) entries)"
+    _log "result=ok snapshot force=$force"
+}
+
+# ------------------------------------------------------------------ reset ----
+do_reset() {
+    local line key val cur sub f tid changed=0 failed=0 base_en="" base_act="" now_en now_act
+    [ -s "$BASELINE" ] || die "no baseline at $BASELINE (take one first: sudo -n profiler-root-helper snapshot)"
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in ''|'#'*) continue ;; esac
+        [[ "$line" =~ ^([A-Za-z0-9_.-]+)=(.*)$ ]] || continue
+        key="${BASH_REMATCH[1]}"; val="${BASH_REMATCH[2]}"
+        [ "$val" != unavailable ] && [ "$val" != absent ] || continue
+        case "$key" in
+            thp)
+                cur="$(thp_get)"
+                [ "$cur" = "$val" ] && continue
+                if [ -w "$THP_FILE" ] && printf '%s' "$val" > "$THP_FILE" 2>/dev/null; then
+                    msg "thp: $cur -> $val"; changed=$((changed + 1))
+                else err "thp: cannot restore '$val'"; failed=$((failed + 1)); fi ;;
+            sysctl.*)
+                sub="${key#sysctl.}"
+                sysctl_allowed "$sub" || continue
+                [[ "$val" =~ $RE_INT ]] || continue
+                cur="$(sysctl_get "$sub")"
+                [ "$cur" = "$val" ] && continue
+                if sysctl -q -w -- "$sub=$val" 2>/dev/null; then
+                    msg "sysctl.$sub: $cur -> $val"; changed=$((changed + 1))
+                else err "sysctl.$sub: cannot restore '$val'"; failed=$((failed + 1)); fi ;;
+            governor.cpu*|epp.cpu*)
+                sub="${key#*.}"; [[ "$sub" =~ ^cpu[0-9]{1,4}$ ]] || continue
+                [[ "$val" =~ $RE_WORD ]] || continue
+                case "$key" in governor.*) f="$CPU_ROOT/$sub/cpufreq/scaling_governor" ;; *) f="$CPU_ROOT/$sub/cpufreq/energy_performance_preference" ;; esac
+                [ -w "$f" ] || continue
+                cur="$(cat "$f" 2>/dev/null || true)"
+                [ "$cur" = "$val" ] && continue
+                if printf '%s' "$val" > "$f" 2>/dev/null; then
+                    msg "$key: $cur -> $val"; changed=$((changed + 1))
+                else err "$key: cannot restore '$val'"; failed=$((failed + 1)); fi ;;
+            ananicy_enabled) base_en="$val" ;;
+            ananicy_active)  base_act="$val" ;;
+            irq_affinity.*)
+                sub="${key#irq_affinity.}"
+                [[ "$sub" =~ $RE_IRQ ]] && [[ "$val" =~ $RE_HEXMASK ]] || continue
+                f="$(irq_affinity_file "$sub")"
+                [ -w "$f" ] || continue
+                cur="$(cat "$f" 2>/dev/null || true)"
+                [ "$cur" = "$val" ] && continue
+                if printf '%s' "$val" > "$f" 2>/dev/null; then
+                    msg "irq-affinity.$sub: $cur -> $val"; changed=$((changed + 1))
+                else err "irq-affinity.$sub: the kernel refused '$val' (left at $cur)"; fi ;;
+            irq_prio.*)
+                sub="${key#irq_prio.}"
+                [[ "$sub" =~ $RE_IRQ ]] && [[ "$val" =~ ^[0-9]{1,2}$ ]] || continue
+                while IFS= read -r tid; do
+                    [ -n "$tid" ] || continue
+                    cur="$(ps -o rtprio= -p "$tid" 2>/dev/null | tr -d ' ' || true)"
+                    [ "$cur" = "$val" ] && continue
+                    if chrt -f -p "$val" "$tid" 2>/dev/null; then
+                        msg "irq-prio.$sub (tid $tid): $cur -> $val"; changed=$((changed + 1))
+                    else err "irq-prio.$sub: chrt failed for tid $tid"; failed=$((failed + 1)); fi
+                done < <(irq_thread_tids "$sub") ;;
+            *) ;;   # snapshot_ts, kernel, helper_version, unknown keys
+        esac
+    done < "$BASELINE"
+    if [ -n "$base_en$base_act" ] && ananicy_present; then
+        now_en="$(ananicy_enabled)"; now_act="$(ananicy_active)"
+        if [ "$base_en" = enabled ] && [ "$now_en" != enabled ]; then
+            systemctl -q enable "$ANANICY_UNIT" 2>/dev/null && { msg "ananicy: enabled"; changed=$((changed + 1)); } || { err "ananicy: enable failed"; failed=$((failed + 1)); }
+        elif [ "$base_en" = disabled ] && [ "$now_en" = enabled ]; then
+            systemctl -q disable "$ANANICY_UNIT" 2>/dev/null && { msg "ananicy: disabled"; changed=$((changed + 1)); } || { err "ananicy: disable failed"; failed=$((failed + 1)); }
+        fi
+        if [ "$base_act" = active ] && [ "$now_act" != active ]; then
+            systemctl -q start "$ANANICY_UNIT" 2>/dev/null && { msg "ananicy: started"; changed=$((changed + 1)); } || { err "ananicy: start failed"; failed=$((failed + 1)); }
+        elif [ "$base_act" != active ] && [ "$now_act" = active ]; then
+            systemctl -q stop "$ANANICY_UNIT" 2>/dev/null && { msg "ananicy: stopped"; changed=$((changed + 1)); } || { err "ananicy: stop failed"; failed=$((failed + 1)); }
+        fi
+    fi
+    # Persistent drop-ins (/etc/sysctl.d, written by the setup phases) describe the
+    # host's configured state and win over the pre-profiler baseline values.
+    sysctl -q --system >/dev/null 2>&1 || err "sysctl --system reported errors (drop-ins not fully re-applied)"
+    msg "reset: $changed change(s), $failed failure(s)"
+    _log "result=$([ "$failed" -eq 0 ] && echo ok || echo failed) reset changed=$changed failed=$failed"
+    [ "$failed" -eq 0 ]
+}
+
+# ------------------------------------------------------------------ trace ----
+default_id() { printf '%s-%s\n' "$1" "$(printf '%s' "$2" | sha256sum | cut -c1-12)"; }
+
+resolve_run_dir() {  # resolve_run_dir RAW → canonical path under <home>/.local/share/profiler/runs
+    local raw="$1" base resolved
+    [[ "$raw" =~ $RE_PATH ]] || refuse "run dir must be an absolute path without spaces (got $(quoted "$raw"))"
+    need_invoker
+    base="$(readlink -m -- "$INVOKER_HOME/.local/share/profiler/runs")"
+    resolved="$(readlink -m -- "$raw")" || refuse "cannot resolve run dir $raw"
+    case "$resolved" in "$base"/?*) ;; *) refuse "run dir must be under $base (got $resolved)" ;; esac
+    if [ ! -d "$resolved" ]; then
+        install -d -m 0755 -o "$INVOKER_UID" -g "$INVOKER_GID" -- "$resolved" || die "cannot create $resolved"
+    fi
+    [ "$(stat -c %u -- "$resolved" 2>/dev/null)" = "$INVOKER_UID" ] || refuse "run dir $resolved is not owned by $INVOKER"
+    printf '%s\n' "$resolved"
+}
+
+resolve_tool() {     # resolve_tool NAME [TOOL_DIR] → executable path
+    local name="$1" tool_dir="${2:-}" cand root r td owner mode looked=""
+    local -a roots=() valid=() cands=()
+    [[ "$name" =~ $RE_NAME ]] || refuse "bad tool name $(quoted "$name")"
+    if [ -z "$tool_dir" ]; then
+        for cand in "$TRACER_LIB/$name" "$TRACER_LIB/bin/$name"; do
+            looked="${looked:+$looked, }$cand"
+            [ -f "$cand" ] && [ -x "$cand" ] || continue
+            _safe_root_path "$cand" || refuse "$cand must be owned by root and not be group/world-writable"
+            printf '%s\n' "$cand"; return 0
+        done
+    fi
+    [ -e "$ALLOW_USER_TOOLS" ] || refuse "tool '$name' is not installed (looked in $looked; install it with: sudo -n profiler-root-helper install-tracer DIR) and user tools are not enabled on this host ($ALLOW_USER_TOOLS is absent)"
+    need_invoker
+    mapfile -t roots < <(grep -v '^[[:space:]]*#' "$ALLOW_USER_TOOLS" 2>/dev/null | grep -v '^[[:space:]]*$' || true)
+    [ "${#roots[@]}" -gt 0 ] || roots=("$INVOKER_HOME/Projects/ableton-linux/profiler")
+    for root in "${roots[@]}"; do
+        [[ "$root" =~ $RE_PATH ]] || continue
+        r="$(readlink -m -- "$root")"
+        case "$r" in "$INVOKER_HOME"/?*) valid+=("$r") ;; esac
+    done
+    [ "${#valid[@]}" -gt 0 ] || refuse "$ALLOW_USER_TOOLS names no profiler directory under $INVOKER_HOME"
+    if [ -n "$tool_dir" ]; then
+        [[ "$tool_dir" =~ $RE_PATH ]] || refuse "--tool-dir must be an absolute path without spaces"
+        td="$(readlink -m -- "$tool_dir")"
+        for r in "${valid[@]}"; do case "$td" in "$r"|"$r"/*) cands+=("$td/$name") ;; esac; done
+        [ "${#cands[@]}" -gt 0 ] || refuse "--tool-dir $td is not under an allowed profiler directory (${valid[*]})"
+    else
+        for r in "${valid[@]}"; do cands+=("$r/bin/$name" "$r/tracer/$name"); done
+    fi
+    for cand in "${cands[@]}"; do
+        looked="${looked:+$looked, }$cand"
+        [ -f "$cand" ] && [ -x "$cand" ] || continue
+        owner="$(stat -c %u -- "$cand" 2>/dev/null || echo ?)"
+        mode="$(stat -c %a -- "$cand" 2>/dev/null || echo 777)"
+        [ "$owner" = "$INVOKER_UID" ] || [ "$owner" = 0 ] || refuse "$cand is owned by uid $owner, not by $INVOKER or root"
+        (( (8#$mode & 0002) == 0 )) || refuse "$cand is world-writable"
+        printf '%s\n' "$cand"; return 0
+    done
+    refuse "tool '$name' not found (looked in $looked)"
+}
+
+session_members() {  # session_members SID → pids whose session id is SID
+    ps -eo pid=,sid= 2>/dev/null | awk -v s="$1" '$2 == s { print $1 }'
+    return 0
+}
+pidfile_value() { sed -n "s/^$2=//p" "$1" | head -n1; }
+
+ensure_pidfile_dir() { mkdir -p -m 0755 "$PIDFILE_DIR" || die "cannot create $PIDFILE_DIR"; }
+
+trace_start() {
+    local name="" run_dir_raw="" id="" tool_dir="" duration="" a p run_dir tool pidfile tdir out err_f child rc state old
+    local -a pids=() pass=() argv=()
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --tool)     [ $# -ge 2 ] || refuse "--tool needs a value"; name="$2"; shift ;;
+            --run-dir)  [ $# -ge 2 ] || refuse "--run-dir needs a value"; run_dir_raw="$2"; shift ;;
+            --id)       [ $# -ge 2 ] || refuse "--id needs a value"; id="$2"; shift ;;
+            --tool-dir) [ $# -ge 2 ] || refuse "--tool-dir needs a value"; tool_dir="$2"; shift ;;
+            --pid)      [ $# -ge 2 ] && [[ "$2" =~ $RE_PID ]] || refuse "--pid needs a positive integer"; pids+=("$2"); shift ;;
+            --duration) [ $# -ge 2 ] && [[ "$2" =~ $RE_SECS ]] || refuse "--duration needs seconds (digits only)"; duration="$2"; shift ;;
+            --)         shift; pass=("$@"); break ;;
+            *)          refuse "trace start: unknown option $(quoted "$1")" ;;
+        esac
+        shift
+    done
+    [ -n "$name" ] || refuse "trace start needs --tool NAME"
+    [ -n "$run_dir_raw" ] || refuse "trace start needs --run-dir DIR"
+    [ -z "$id" ] || [[ "$id" =~ $RE_ID ]] || refuse "bad --id $(quoted "$id")"
+    for a in ${pass[@]+"${pass[@]}"}; do [[ "$a" =~ $RE_ARG ]] || refuse "tool argument rejected: $(quoted "$a")"; done
+    need_invoker
+    run_dir="$(resolve_run_dir "$run_dir_raw")"
+    tool="$(resolve_tool "$name" "$tool_dir")"
+    for p in ${pids[@]+"${pids[@]}"}; do
+        [ -d "/proc/$p" ] || refuse "pid $p does not exist"
+        [ "$(stat -c %u "/proc/$p" 2>/dev/null || echo ?)" = "$INVOKER_UID" ] || refuse "pid $p is not a process of $INVOKER"
+    done
+    [ -n "$id" ] || id="$(default_id "$name" "$run_dir")"
+    ensure_pidfile_dir
+    pidfile="$PIDFILE_DIR/$id.pid"
+    if [ -e "$pidfile" ]; then
+        old="$(head -n1 "$pidfile" 2>/dev/null || true)"
+        if [[ "$old" =~ $RE_PID ]] && kill -0 "$old" 2>/dev/null; then
+            refuse "trace '$id' is already running (pid $old); stop it first"
+        fi
+        [[ "$old" =~ $RE_PID ]] && [ -n "$(session_members "$old")" ] && refuse "trace '$id' still has live session members; stop it first"
+        rm -f -- "$pidfile"
+    fi
+    tdir="$run_dir/trace"
+    install -d -m 0755 -o "$INVOKER_UID" -g "$INVOKER_GID" -- "$tdir" || die "cannot create $tdir"
+    out="$tdir/$name.out"; err_f="$tdir/$name.err"
+    argv=("$tool" start)
+    for p in ${pids[@]+"${pids[@]}"}; do argv+=(--pid "$p"); done
+    [ -z "$duration" ] || argv+=(--duration "$duration")
+    argv+=(${pass[@]+"${pass[@]}"})
+    printf '# %s profiler-root-helper trace start id=%s argv: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$id" "$(quoted "${argv[@]}")" >> "$out"
+    # The background subshell is never a process-group leader, so setsid does not
+    # fork: $! is the tool's pid and its session/process-group id.
+    ( cd -- "$run_dir" && exec setsid "${argv[@]}" ) >> "$out" 2>> "$err_f" < /dev/null &
+    child=$!
+    sleep 0.3
+    if kill -0 "$child" 2>/dev/null; then
+        state=running
+    else
+        rc=0; wait "$child" || rc=$?
+        if [ "$rc" -ne 0 ]; then
+            chown -R -h "$INVOKER_UID:$INVOKER_GID" -- "$tdir" 2>/dev/null || true
+            err "tool exited immediately with status $rc; last lines of $err_f:"
+            tail -n 20 -- "$err_f" >&2 2>/dev/null || true
+            die "trace start failed (id=$id tool=$tool)"
+        fi
+        state=detached
+    fi
+    {
+        printf '%s\n' "$child"
+        printf 'id=%s\ntool=%s\ntool_path=%s\nrun_dir=%s\nuser=%s\nuid=%s\ngid=%s\nstarted=%s\nsid=%s\nstate=%s\nargv=%s\n' \
+            "$id" "$name" "$tool" "$run_dir" "$INVOKER" "$INVOKER_UID" "$INVOKER_GID" \
+            "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$child" "$state" "$(quoted "${argv[@]}")"
+    } > "$pidfile" || die "cannot write $pidfile"
+    chmod 0600 "$pidfile"
+    chown -R -h "$INVOKER_UID:$INVOKER_GID" -- "$tdir" 2>/dev/null || true
+    msg "id=$id pid=$child state=$state tool=$tool out=$out err=$err_f"
+    _log "result=ok trace start id=$id pid=$child tool=$tool run_dir=$run_dir argv=$(quoted "${argv[@]}")"
+}
+
+trace_stop() {
+    local id="" name="" run_dir_raw="" tool_dir="" sig=INT tmo=30 tool_form=0 a run_dir="" tool="" pidfile
+    local have_pidfile=0 pid="" sid="" uid_rec="" run_dir_rec="" rc_tool=0 signalled=0 killed=0 p waited out err_f
+    local -a pass=() members=()
+    if [ $# -gt 0 ] && [[ "$1" != --* ]]; then id="$1"; shift; fi
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --tool)     [ $# -ge 2 ] || refuse "--tool needs a value"; name="$2"; shift ;;
+            --run-dir)  [ $# -ge 2 ] || refuse "--run-dir needs a value"; run_dir_raw="$2"; shift ;;
+            --id)       [ $# -ge 2 ] || refuse "--id needs a value"; id="$2"; shift ;;
+            --tool-dir) [ $# -ge 2 ] || refuse "--tool-dir needs a value"; tool_dir="$2"; shift ;;
+            --signal)   [ $# -ge 2 ] && [[ "$2" =~ $RE_SIG ]] || refuse "--signal must be INT, TERM, HUP, USR1, USR2, KILL or a number"; sig="$2"; shift ;;
+            --timeout)  [ $# -ge 2 ] && [[ "$2" =~ $RE_SECS ]] || refuse "--timeout needs seconds"; tmo="$2"; shift ;;
+            --)         shift; pass=("$@"); break ;;
+            *)          refuse "trace stop: unknown option $(quoted "$1")" ;;
+        esac
+        shift
+    done
+    [ -z "$id" ] || [[ "$id" =~ $RE_ID ]] || refuse "bad id $(quoted "$id")"
+    for a in ${pass[@]+"${pass[@]}"}; do [[ "$a" =~ $RE_ARG ]] || refuse "tool argument rejected: $(quoted "$a")"; done
+    need_invoker
+    if [ -n "$name" ]; then
+        tool_form=1
+        [ -n "$run_dir_raw" ] || refuse "trace stop --tool also needs --run-dir DIR"
+        run_dir="$(resolve_run_dir "$run_dir_raw")"
+        tool="$(resolve_tool "$name" "$tool_dir")"
+        [ -n "$id" ] || id="$(default_id "$name" "$run_dir")"
+    elif [ -n "$run_dir_raw" ] || [ "${#pass[@]}" -gt 0 ]; then
+        refuse "--run-dir and tool arguments need --tool NAME"
+    fi
+    [ -n "$id" ] || refuse "trace stop needs an ID or --tool NAME --run-dir DIR"
+    pidfile="$PIDFILE_DIR/$id.pid"
+    if [ -r "$pidfile" ]; then
+        have_pidfile=1
+        pid="$(head -n1 "$pidfile")"
+        [[ "$pid" =~ $RE_PID ]] || pid=""
+        sid="$(pidfile_value "$pidfile" sid)"
+        uid_rec="$(pidfile_value "$pidfile" uid)"
+        run_dir_rec="$(pidfile_value "$pidfile" run_dir)"
+        [ "$uid_rec" = "$INVOKER_UID" ] || refuse "trace '$id' belongs to uid ${uid_rec:-?}, not to $INVOKER"
+        if [ -z "$run_dir" ]; then run_dir="$(resolve_run_dir "$run_dir_rec")"; fi
+    fi
+    if [ "$have_pidfile" -eq 0 ] && [ "$tool_form" -eq 0 ]; then
+        die "no trace session '$id' (see: sudo -n profiler-root-helper trace status)" 2
+    fi
+    if [ "$tool_form" -eq 1 ]; then
+        out="$run_dir/trace/$name.out"; err_f="$run_dir/trace/$name.err"
+        install -d -m 0755 -o "$INVOKER_UID" -g "$INVOKER_GID" -- "$run_dir/trace" || die "cannot create $run_dir/trace"
+        printf '# %s profiler-root-helper trace stop id=%s argv: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$id" "$(quoted "$tool" stop ${pass[@]+"${pass[@]}"})" >> "$out"
+        ( cd -- "$run_dir" && exec timeout -k 10 "$(( tmo + 90 ))" "$tool" stop ${pass[@]+"${pass[@]}"} ) >> "$out" 2>> "$err_f" < /dev/null || rc_tool=$?
+        [ "$rc_tool" -eq 0 ] || err "'$name stop' returned $rc_tool (see $err_f)"
+    fi
+    if [ "$have_pidfile" -eq 1 ]; then
+        members=()
+        [[ "$sid" =~ $RE_PID ]] && mapfile -t members < <(session_members "$sid")
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            case " ${members[*]:-} " in *" $pid "*) ;; *) members+=("$pid") ;; esac
+        fi
+        if [ "${#members[@]}" -gt 0 ]; then
+            for p in "${members[@]}"; do kill -s "$sig" "$p" 2>/dev/null && signalled=$((signalled + 1)) || true; done
+            waited=0
+            while [ "$waited" -lt $(( tmo * 5 )) ]; do
+                for p in "${members[@]}"; do kill -0 "$p" 2>/dev/null && break; done
+                kill -0 "$p" 2>/dev/null || break
+                sleep 0.2; waited=$((waited + 1))
+            done
+            for p in "${members[@]}"; do
+                if kill -0 "$p" 2>/dev/null; then kill -KILL "$p" 2>/dev/null && killed=$((killed + 1)) || true; fi
+            done
+        fi
+        rm -f -- "$pidfile"
+    fi
+    chown -R -h "$INVOKER_UID:$INVOKER_GID" -- "$run_dir" 2>/dev/null || err "chown of $run_dir incomplete"
+    msg "id=$id stopped tool_rc=$rc_tool signalled=$signalled killed=$killed run_dir=$run_dir"
+    _log "result=$([ "$rc_tool" -eq 0 ] && [ "$killed" -eq 0 ] && echo ok || echo failed) trace stop id=$id tool_rc=$rc_tool signalled=$signalled killed=$killed"
+    [ "$rc_tool" -eq 0 ] && [ "$killed" -eq 0 ]
+}
+
+trace_status() {
+    local f id pid sid state n
+    [ $# -eq 0 ] || refuse "trace status takes no arguments"
+    shopt -s nullglob
+    for f in "$PIDFILE_DIR"/*.pid; do
+        id="$(pidfile_value "$f" id)"; pid="$(head -n1 "$f" 2>/dev/null || true)"; sid="$(pidfile_value "$f" sid)"
+        n=0; [[ "$sid" =~ $RE_PID ]] && n="$(session_members "$sid" | wc -l | tr -d ' ')"
+        if [[ "$pid" =~ $RE_PID ]] && kill -0 "$pid" 2>/dev/null; then state=running
+        elif [ "$n" -gt 0 ]; then state=detached
+        else state=exited; fi
+        msg "id=${id:-${f##*/}} pid=${pid:-?} state=$state procs=$n tool=$(pidfile_value "$f" tool_path) user=$(pidfile_value "$f" user) started=$(pidfile_value "$f" started) run_dir=$(pidfile_value "$f" run_dir)"
+    done
+    shopt -u nullglob
+    [ -n "$(ls -A "$PIDFILE_DIR" 2>/dev/null)" ] || msg "no trace sessions recorded in $PIDFILE_DIR"
+    _log "result=ok trace status"
+}
+
+trace_logs() {
+    local id="${1:-}" lines=50 f run_dir name part
+    [ -n "$id" ] && [[ "$id" =~ $RE_ID ]] || refuse "usage: trace logs ID [--lines N]"
+    shift
+    while [ $# -gt 0 ]; do
+        case "$1" in --lines) [ $# -ge 2 ] && [[ "$2" =~ ^[1-9][0-9]{0,4}$ ]] || refuse "--lines needs 1..99999"; lines="$2"; shift ;; *) refuse "trace logs: unknown option $(quoted "$1")" ;; esac
+        shift
+    done
+    f="$PIDFILE_DIR/$id.pid"
+    [ -r "$f" ] || die "no trace session '$id' (stopped sessions keep their logs in RUN_DIR/trace/)" 2
+    need_invoker
+    [ "$(pidfile_value "$f" uid)" = "$INVOKER_UID" ] || refuse "trace '$id' belongs to another user"
+    run_dir="$(pidfile_value "$f" run_dir)"; name="$(pidfile_value "$f" tool)"
+    for part in out err; do
+        msg "== $run_dir/trace/$name.$part (last $lines lines) =="
+        tail -n "$lines" -- "$run_dir/trace/$name.$part" 2>/dev/null || msg "(missing)"
+    done
+    _log "result=ok trace logs id=$id"
+}
+
+do_trace() {
+    local sub="${1:-}"
+    [ $# -gt 0 ] && shift || true
+    case "$sub" in
+        start)  trace_start "$@" ;;
+        stop)   trace_stop "$@" ;;
+        status) trace_status "$@" ;;
+        logs)   trace_logs "$@" ;;
+        *)      refuse "usage: trace start|stop|status|logs …" ;;
+    esac
+}
+
+# ---------------------------------------------------------- install-tracer ----
+do_install_tracer() {
+    local raw="${1:-}" src staging n=0 f rel mode
+    [ $# -eq 1 ] || refuse "usage: install-tracer SRC_DIR"
+    [[ "$raw" =~ $RE_PATH ]] || refuse "SRC_DIR must be an absolute path without spaces"
+    src="$(readlink -f -- "$raw" 2>/dev/null)" || refuse "cannot resolve $raw"
+    [ -d "$src" ] || refuse "$src is not a directory"
+    if [ "$INVOKER" != root ]; then
+        case "$src" in "$INVOKER_HOME"/?*) ;; *) refuse "SRC_DIR must be under $INVOKER_HOME" ;; esac
+        [ "$(stat -c %u -- "$src" 2>/dev/null)" = "$INVOKER_UID" ] || refuse "$src is not owned by $INVOKER"
+    fi
+    mkdir -p -m 0755 "$LIB_DIR" || die "cannot create $LIB_DIR"
+    staging="$LIB_DIR/.tracer.new.$$"
+    rm -rf -- "$staging"
+    mkdir -m 0755 -- "$staging" || die "cannot create $staging"
+    while IFS= read -r -d '' f; do
+        rel="${f#"$src"/}"
+        mode=0644; [ -x "$f" ] && mode=0755
+        install -D -m "$mode" -o root -g root -- "$f" "$staging/$rel" || { rm -rf -- "$staging"; die "install failed for $rel"; }
+        n=$((n + 1))
+    done < <(find "$src" \( -name __pycache__ -o -name .git \) -prune -o -type f ! -name '*.o' ! -name '*.pyc' -print0)
+    [ "$n" -gt 0 ] || { rm -rf -- "$staging"; refuse "no regular files found under $src"; }
+    ( cd -- "$staging" && find . -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum ) > "$staging/MANIFEST.sha256" \
+        || { rm -rf -- "$staging"; die "cannot write the manifest"; }
+    printf 'source=%s\ninstalled=%s\nby=%s\nfiles=%s\nhelper_version=%s\n' "$src" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$INVOKER" "$n" "$HELPER_VERSION" > "$staging/INSTALLED.txt"
+    chmod 0644 "$staging/MANIFEST.sha256" "$staging/INSTALLED.txt"
+    chown -R -h root:root -- "$staging"
+    chmod -R go-w -- "$staging"
+    if [ -d "$TRACER_LIB" ]; then rm -rf -- "$TRACER_LIB.prev"; mv -- "$TRACER_LIB" "$TRACER_LIB.prev" || die "cannot move the old $TRACER_LIB aside"; fi
+    mv -- "$staging" "$TRACER_LIB" || die "cannot move $staging into place"
+    rm -rf -- "$TRACER_LIB.prev"
+    msg "installed $n file(s) from $src to $TRACER_LIB (manifest: $TRACER_LIB/MANIFEST.sha256)"
+    _log "result=ok install-tracer src=$src files=$n"
+}
+
+# ---------------------------------------------------------------- version ----
+do_version() {
+    local self sum n ts
+    self="$(readlink -f -- "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")"
+    sum="$(sha256sum -- "$self" 2>/dev/null | cut -c1-16 || echo ?)"
+    msg "profiler-root-helper $HELPER_VERSION"
+    msg "self=$self sha256=$sum owner=$(stat -c '%U mode %a' -- "$self" 2>/dev/null || echo ?)"
+    if [ -d "$TRACER_LIB" ]; then
+        n="$(find "$TRACER_LIB" -type f 2>/dev/null | wc -l | tr -d ' ')"
+        msg "tracer_lib=$TRACER_LIB files=$n installed=$(sed -n 's/^installed=//p' "$TRACER_LIB/INSTALLED.txt" 2>/dev/null | head -n1)"
+    else
+        msg "tracer_lib=$TRACER_LIB (absent)"
+    fi
+    if [ -e "$ALLOW_USER_TOOLS" ]; then msg "user_tools=allowed ($ALLOW_USER_TOOLS)"; else msg "user_tools=disabled"; fi
+    if [ -s "$BASELINE" ]; then
+        ts="$(sed -n 's/^snapshot_ts=//p' "$BASELINE" 2>/dev/null | head -n1)"
+        msg "baseline=present ($BASELINE, ${ts:-?})"
+    else
+        msg "baseline=absent ($BASELINE)"
+    fi
+    msg "pidfiles=$PIDFILE_DIR ($(ls "$PIDFILE_DIR" 2>/dev/null | grep -c '\.pid$' || true) recorded)"
+    msg "log=$LOG"
+    _log "result=ok version"
+}
+
+# ------------------------------------------------------------------- main ----
+main() {
+    local verb="${1:-}"
+    [ $# -gt 0 ] && shift || true
+    case "$verb" in
+        ""|-h|--help|help) usage; [ -n "$verb" ] && exit 0 || exit 2 ;;
+        version) resolve_invoker; do_version; exit 0 ;;
+    esac
+    if [ "$(id -u)" -ne 0 ]; then
+        err "must run as root: sudo -n profiler-root-helper $verb …"
+        exit 4
+    fi
+    integrity_check
+    resolve_invoker
+    _log "verb=$verb argv=$(quoted "$@")"
+    case "$verb" in
+        snapshot)       do_snapshot "$@" ;;
+        reset)          [ $# -eq 0 ] || refuse "reset takes no arguments"; do_reset ;;
+        knob)           do_knob "$@" ;;
+        trace)          do_trace "$@" ;;
+        install-tracer) do_install_tracer "$@" ;;
+        *)              refuse "unknown verb '$verb' (version snapshot reset knob trace install-tracer)" ;;
+    esac
+}
+
+main "$@"

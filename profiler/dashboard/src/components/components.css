@@ -1,0 +1,631 @@
+/*
+ * Component styles for the profiler dashboard (D2). Everything uses the tokens from
+ * src/theme.css; no colour is written here as a literal. Status colours appear only on
+ * dots, glyphs, marker keys and the ribbon border - never on body text.
+ */
+
+/* ---------- utilities ---------- */
+
+.mono {
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+.muted {
+  color: var(--text-muted);
+}
+
+.note {
+  margin: 8px 0;
+  color: var(--text-secondary);
+  font-size: 13px;
+}
+
+.btn {
+  padding: 5px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  color: var(--text-primary);
+  cursor: pointer;
+  min-height: 32px;
+}
+
+.btn:hover {
+  background: var(--surface-1);
+}
+
+/* ---------- view layout ---------- */
+
+.view-title {
+  margin: 0 0 4px;
+  font-size: 18px;
+  font-weight: 600;
+}
+
+.view-lead {
+  margin: 0 0 16px;
+  color: var(--text-secondary);
+}
+
+.view-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 16px;
+  margin: 0 0 16px;
+}
+
+.view-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 8px 16px;
+  margin: 0 0 16px;
+}
+
+.section {
+  margin-top: 24px;
+}
+
+.section-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+  margin: 0 0 12px;
+}
+
+.section-head h3 {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.set-heading {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 0;
+  border: 0;
+  background: none;
+  font: inherit;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text-primary);
+  cursor: pointer;
+}
+
+.set-heading:hover {
+  text-decoration: underline;
+}
+
+.set-dot {
+  flex: 0 0 auto;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  box-shadow: 0 0 0 2px var(--surface-1);
+}
+
+/* ---------- filter bar ---------- */
+
+.filterbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 8px 12px;
+  margin: 0;
+  padding: 12px;
+  background: var(--surface-1);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+.filter {
+  display: flex;
+  flex: 1 1 140px;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 120px;
+  max-width: 260px;
+}
+
+.filter-label {
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.filter select {
+  width: 100%;
+  min-height: 32px;
+  padding: 5px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  color: var(--text-primary);
+}
+
+.filter select:disabled {
+  opacity: 0.6;
+}
+
+.filterbar-status {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-left: auto;
+  font-size: 13px;
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+/* ---------- chips / badges ---------- */
+
+.chip-icon {
+  color: var(--text-secondary);
+  font-size: 11px;
+  line-height: 1;
+}
+
+.env-badge {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.env-host {
+  font-size: 13px;
+}
+
+/* status colours for delta glyphs (the number beside them stays ink) */
+.glyph-good {
+  color: var(--status-good);
+}
+
+.glyph-critical {
+  color: var(--status-critical);
+}
+
+.glyph-warning {
+  color: var(--status-warning);
+}
+
+.glyph-none,
+.glyph-dim {
+  color: var(--text-muted);
+}
+
+/* ---------- hero & stat tiles ---------- */
+
+.hero {
+  margin: 0 0 16px;
+}
+
+.hero-label {
+  font-size: 13px;
+  color: var(--text-secondary);
+}
+
+.hero-better {
+  color: var(--delta-good-text);
+}
+
+.hero-sub {
+  margin-top: 4px;
+  font-size: 13px;
+  color: var(--text-secondary);
+}
+
+.hero-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+  margin-top: 8px;
+}
+
+.hero-kept {
+  font-size: 13px;
+  color: var(--text-secondary);
+}
+
+.kpi {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+.kpi-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.kpi-source {
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.kpi-value-row {
+  display: flex;
+  align-items: baseline;
+  gap: 4px;
+}
+
+.kpi-unit {
+  font-size: 13px;
+  color: var(--text-secondary);
+}
+
+.kpi-delta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+}
+
+.delta-glyph {
+  font-size: 12px;
+}
+
+.kpi-meta {
+  display: grid;
+  gap: 2px;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.kpi-meta strong {
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+.kpi-note {
+  margin: 0;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.kpi-reject {
+  border-left: 3px solid var(--status-critical);
+}
+
+.sparkline {
+  display: block;
+  margin-top: 2px;
+}
+
+/* ---------- chart frame ---------- */
+
+.chart-frame {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+  margin: 0;
+}
+
+.chart-frame-plain {
+  padding: 0;
+  border: 0;
+  background: transparent;
+}
+
+.chart-frame-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.chart-frame-titles {
+  min-width: 0;
+}
+
+.chart-frame-titles .card-subtitle {
+  margin-bottom: 0;
+}
+
+.chart-frame-toggle {
+  display: inline-flex;
+  flex: 0 0 auto;
+  gap: 2px;
+  padding: 2px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface-2);
+}
+
+.chart-frame-toggle button {
+  min-height: 24px;
+  padding: 3px 10px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.chart-frame-toggle button[aria-pressed='true'] {
+  background: var(--surface-1);
+  color: var(--text-primary);
+  font-weight: 600;
+  box-shadow: 0 0 0 1px var(--border);
+}
+
+.chart-frame-body {
+  min-width: 0;
+}
+
+.chart-frame-empty {
+  padding: 24px 8px;
+  color: var(--text-secondary);
+  text-align: center;
+}
+
+.chart-frame-footer {
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+/* ---------- trend chart ---------- */
+
+.trend-plot {
+  width: 100%;
+  min-width: 0;
+}
+
+.trend-plot .recharts-wrapper:focus-visible,
+.trend-plot .recharts-surface:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+  border-radius: var(--radius-sm);
+}
+
+.legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 8px;
+  margin: 0;
+  padding: 0;
+}
+
+.legend button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 24px;
+  padding: 2px 6px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.legend button[aria-pressed='true'] {
+  border-color: var(--border);
+  background: var(--surface-2);
+  color: var(--text-primary);
+}
+
+.legend button.is-muted {
+  opacity: 0.45;
+}
+
+.legend-key {
+  display: inline-block;
+  width: 14px;
+  height: 2px;
+  border-radius: 1px;
+}
+
+.chart-key {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.chart-key > span {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.key-line {
+  display: inline-block;
+  width: 14px;
+  height: 0;
+  border-top: 1px solid var(--text-secondary);
+}
+
+.key-band {
+  display: inline-block;
+  width: 14px;
+  height: 10px;
+  border-radius: 2px;
+  opacity: 0.3;
+}
+
+.key-marker {
+  display: inline-block;
+  width: 0;
+  height: 12px;
+  border-left: 1px solid var(--status-good);
+}
+
+.key-marker.is-revert {
+  border-left-color: var(--status-critical);
+}
+
+.key-marker.is-dim {
+  border-left-color: var(--series-dim);
+}
+
+.chart-tooltip {
+  max-width: 320px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-1);
+  color: var(--text-primary);
+  font-size: 12px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.12);
+}
+
+.tt-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.tt-sub {
+  margin-top: 2px;
+  color: var(--text-secondary);
+}
+
+.tt-rows {
+  display: grid;
+  gap: 3px;
+  margin: 6px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.tt-rows li {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.tt-key {
+  display: inline-block;
+  flex: 0 0 auto;
+  width: 12px;
+  height: 2px;
+  border-radius: 1px;
+}
+
+.tt-value {
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.tt-label {
+  color: var(--text-secondary);
+}
+
+.tt-delta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+.recharts-tooltip-wrapper {
+  outline: none;
+}
+
+/* ---------- data table extras ---------- */
+
+.table-caption {
+  padding: 0 0 6px;
+  caption-side: top;
+  text-align: left;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.th-sort {
+  all: unset;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-height: 24px;
+  cursor: pointer;
+}
+
+.th-sort:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
+.sort-glyph {
+  min-width: 10px;
+  font-size: 10px;
+  color: var(--text-muted);
+}
+
+table.data-dense th,
+table.data-dense td {
+  padding: 3px 8px;
+  font-size: 12px;
+}
+
+.col-select {
+  width: 32px;
+}
+
+tr.is-selected {
+  background: var(--surface-2);
+}
+
+.table-empty {
+  color: var(--text-secondary);
+  text-align: center;
+}
+
+.cell-mono {
+  font-family: var(--mono);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.cell-switches {
+  font-family: var(--mono);
+  font-size: 11px;
+}
+
+/* ---------- ribbon ---------- */
+
+.ribbon-notiming {
+  margin: 0 0 16px;
+}
+
+/* ---------- responsive ---------- */
+
+@media (max-width: 480px) {
+  .filter {
+    max-width: none;
+  }
+
+  .filterbar-status {
+    margin-left: 0;
+  }
+
+  .chart-frame-head {
+    flex-direction: column;
+    align-items: stretch;
+  }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .chart-frame-toggle button,
+  .legend button,
+  .btn {
+    transition: background-color 0.12s ease;
+  }
+}

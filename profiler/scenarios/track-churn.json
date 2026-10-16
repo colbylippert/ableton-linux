@@ -1,0 +1,49 @@
+{
+  "schema": "ableton-linux-scenario/v1",
+  "name": "track-churn",
+  "kind": "diagnostic",
+  "base_set": "Benchmark_Empty",
+  "description": "A MIDI track is inserted at index 1 and deleted again every 2 s while the empty set plays: loader, heap and wineserver work next to the audio engine.",
+  "requires": {
+    "control_surface": true,
+    "max_for_live": false,
+    "plugins": []
+  },
+  "setup": [
+    {
+      "op": "stop"
+    },
+    {
+      "op": "rewind"
+    },
+    {
+      "op": "play"
+    },
+    {
+      "op": "marker",
+      "name": "setup-done"
+    }
+  ],
+  "timeline": {
+    "period_s": 2.0,
+    "repeat": true,
+    "marker_every_s": 5.0,
+    "steps": [
+      {
+        "at_s": 0.0,
+        "op": "create_midi_track",
+        "index": 1
+      },
+      {
+        "at_s": 1.0,
+        "op": "delete_track",
+        "index": 1
+      }
+    ]
+  },
+  "teardown": [
+    {
+      "op": "stop"
+    }
+  ]
+}

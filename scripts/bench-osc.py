@@ -76,6 +76,26 @@ def decode(packet: bytes) -> tuple[str, list[object]]:
             end = packet.index(0)
             arguments.append(packet[:end].decode())
             packet = packet[(end // 4 + 1) * 4 :]
+        elif tag == "h":
+            arguments.append(struct.unpack(">q", packet[:8])[0])
+            packet = packet[8:]
+        elif tag == "d":
+            arguments.append(struct.unpack(">d", packet[:8])[0])
+            packet = packet[8:]
+        elif tag == "b":
+            # A blob carries its byte count, then the bytes padded to four. A
+            # count that is already a multiple of four adds no padding.
+            size = struct.unpack(">i", packet[:4])[0]
+            if size < 0 or len(packet) < 4 + size:
+                raise ValueError(f"truncated OSC blob of {size} bytes")
+            arguments.append(packet[4 : 4 + size])
+            packet = packet[4 + (size + 3) // 4 * 4 :]
+        elif tag in "TFNI":
+            # python-osc sends bools as T/F and None as N. These tags carry no
+            # data. I (infinitum) follows liblo's Python binding.
+            arguments.append({"T": True, "F": False, "N": None, "I": float("inf")}[tag])
+        else:
+            raise ValueError(f"unsupported OSC type tag {tag!r}")
     return address, arguments
 
 

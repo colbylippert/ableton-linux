@@ -1,0 +1,647 @@
+{
+  "schema": "ableton-linux-scenario/v1",
+  "name": "tempo-ramp",
+  "kind": "benchmark",
+  "base_set": "Benchmark_Inbuilts",
+  "description": "Tempo 90->150->90 in 1 BPM steps every 250 ms (a 30 s cycle) while the arrangement plays: warped audio re-stretching and transport rescheduling. The set's own tempo is 112; teardown restores it.",
+  "requires": {
+    "control_surface": true,
+    "max_for_live": false,
+    "plugins": []
+  },
+  "setup": [
+    {
+      "op": "stop"
+    },
+    {
+      "op": "rewind"
+    },
+    {
+      "op": "set_tempo",
+      "bpm": 90.0
+    },
+    {
+      "op": "play"
+    },
+    {
+      "op": "marker",
+      "name": "setup-done"
+    }
+  ],
+  "timeline": {
+    "period_s": 30.0,
+    "repeat": true,
+    "marker_every_s": 5.0,
+    "steps": [
+      {
+        "at_s": 0.0,
+        "op": "set_tempo",
+        "bpm": 90.0
+      },
+      {
+        "at_s": 0.25,
+        "op": "set_tempo",
+        "bpm": 91.0
+      },
+      {
+        "at_s": 0.5,
+        "op": "set_tempo",
+        "bpm": 92.0
+      },
+      {
+        "at_s": 0.75,
+        "op": "set_tempo",
+        "bpm": 93.0
+      },
+      {
+        "at_s": 1.0,
+        "op": "set_tempo",
+        "bpm": 94.0
+      },
+      {
+        "at_s": 1.25,
+        "op": "set_tempo",
+        "bpm": 95.0
+      },
+      {
+        "at_s": 1.5,
+        "op": "set_tempo",
+        "bpm": 96.0
+      },
+      {
+        "at_s": 1.75,
+        "op": "set_tempo",
+        "bpm": 97.0
+      },
+      {
+        "at_s": 2.0,
+        "op": "set_tempo",
+        "bpm": 98.0
+      },
+      {
+        "at_s": 2.25,
+        "op": "set_tempo",
+        "bpm": 99.0
+      },
+      {
+        "at_s": 2.5,
+        "op": "set_tempo",
+        "bpm": 100.0
+      },
+      {
+        "at_s": 2.75,
+        "op": "set_tempo",
+        "bpm": 101.0
+      },
+      {
+        "at_s": 3.0,
+        "op": "set_tempo",
+        "bpm": 102.0
+      },
+      {
+        "at_s": 3.25,
+        "op": "set_tempo",
+        "bpm": 103.0
+      },
+      {
+        "at_s": 3.5,
+        "op": "set_tempo",
+        "bpm": 104.0
+      },
+      {
+        "at_s": 3.75,
+        "op": "set_tempo",
+        "bpm": 105.0
+      },
+      {
+        "at_s": 4.0,
+        "op": "set_tempo",
+        "bpm": 106.0
+      },
+      {
+        "at_s": 4.25,
+        "op": "set_tempo",
+        "bpm": 107.0
+      },
+      {
+        "at_s": 4.5,
+        "op": "set_tempo",
+        "bpm": 108.0
+      },
+      {
+        "at_s": 4.75,
+        "op": "set_tempo",
+        "bpm": 109.0
+      },
+      {
+        "at_s": 5.0,
+        "op": "set_tempo",
+        "bpm": 110.0
+      },
+      {
+        "at_s": 5.25,
+        "op": "set_tempo",
+        "bpm": 111.0
+      },
+      {
+        "at_s": 5.5,
+        "op": "set_tempo",
+        "bpm": 112.0
+      },
+      {
+        "at_s": 5.75,
+        "op": "set_tempo",
+        "bpm": 113.0
+      },
+      {
+        "at_s": 6.0,
+        "op": "set_tempo",
+        "bpm": 114.0
+      },
+      {
+        "at_s": 6.25,
+        "op": "set_tempo",
+        "bpm": 115.0
+      },
+      {
+        "at_s": 6.5,
+        "op": "set_tempo",
+        "bpm": 116.0
+      },
+      {
+        "at_s": 6.75,
+        "op": "set_tempo",
+        "bpm": 117.0
+      },
+      {
+        "at_s": 7.0,
+        "op": "set_tempo",
+        "bpm": 118.0
+      },
+      {
+        "at_s": 7.25,
+        "op": "set_tempo",
+        "bpm": 119.0
+      },
+      {
+        "at_s": 7.5,
+        "op": "set_tempo",
+        "bpm": 120.0
+      },
+      {
+        "at_s": 7.75,
+        "op": "set_tempo",
+        "bpm": 121.0
+      },
+      {
+        "at_s": 8.0,
+        "op": "set_tempo",
+        "bpm": 122.0
+      },
+      {
+        "at_s": 8.25,
+        "op": "set_tempo",
+        "bpm": 123.0
+      },
+      {
+        "at_s": 8.5,
+        "op": "set_tempo",
+        "bpm": 124.0
+      },
+      {
+        "at_s": 8.75,
+        "op": "set_tempo",
+        "bpm": 125.0
+      },
+      {
+        "at_s": 9.0,
+        "op": "set_tempo",
+        "bpm": 126.0
+      },
+      {
+        "at_s": 9.25,
+        "op": "set_tempo",
+        "bpm": 127.0
+      },
+      {
+        "at_s": 9.5,
+        "op": "set_tempo",
+        "bpm": 128.0
+      },
+      {
+        "at_s": 9.75,
+        "op": "set_tempo",
+        "bpm": 129.0
+      },
+      {
+        "at_s": 10.0,
+        "op": "set_tempo",
+        "bpm": 130.0
+      },
+      {
+        "at_s": 10.25,
+        "op": "set_tempo",
+        "bpm": 131.0
+      },
+      {
+        "at_s": 10.5,
+        "op": "set_tempo",
+        "bpm": 132.0
+      },
+      {
+        "at_s": 10.75,
+        "op": "set_tempo",
+        "bpm": 133.0
+      },
+      {
+        "at_s": 11.0,
+        "op": "set_tempo",
+        "bpm": 134.0
+      },
+      {
+        "at_s": 11.25,
+        "op": "set_tempo",
+        "bpm": 135.0
+      },
+      {
+        "at_s": 11.5,
+        "op": "set_tempo",
+        "bpm": 136.0
+      },
+      {
+        "at_s": 11.75,
+        "op": "set_tempo",
+        "bpm": 137.0
+      },
+      {
+        "at_s": 12.0,
+        "op": "set_tempo",
+        "bpm": 138.0
+      },
+      {
+        "at_s": 12.25,
+        "op": "set_tempo",
+        "bpm": 139.0
+      },
+      {
+        "at_s": 12.5,
+        "op": "set_tempo",
+        "bpm": 140.0
+      },
+      {
+        "at_s": 12.75,
+        "op": "set_tempo",
+        "bpm": 141.0
+      },
+      {
+        "at_s": 13.0,
+        "op": "set_tempo",
+        "bpm": 142.0
+      },
+      {
+        "at_s": 13.25,
+        "op": "set_tempo",
+        "bpm": 143.0
+      },
+      {
+        "at_s": 13.5,
+        "op": "set_tempo",
+        "bpm": 144.0
+      },
+      {
+        "at_s": 13.75,
+        "op": "set_tempo",
+        "bpm": 145.0
+      },
+      {
+        "at_s": 14.0,
+        "op": "set_tempo",
+        "bpm": 146.0
+      },
+      {
+        "at_s": 14.25,
+        "op": "set_tempo",
+        "bpm": 147.0
+      },
+      {
+        "at_s": 14.5,
+        "op": "set_tempo",
+        "bpm": 148.0
+      },
+      {
+        "at_s": 14.75,
+        "op": "set_tempo",
+        "bpm": 149.0
+      },
+      {
+        "at_s": 15.0,
+        "op": "set_tempo",
+        "bpm": 150.0
+      },
+      {
+        "at_s": 15.25,
+        "op": "set_tempo",
+        "bpm": 149.0
+      },
+      {
+        "at_s": 15.5,
+        "op": "set_tempo",
+        "bpm": 148.0
+      },
+      {
+        "at_s": 15.75,
+        "op": "set_tempo",
+        "bpm": 147.0
+      },
+      {
+        "at_s": 16.0,
+        "op": "set_tempo",
+        "bpm": 146.0
+      },
+      {
+        "at_s": 16.25,
+        "op": "set_tempo",
+        "bpm": 145.0
+      },
+      {
+        "at_s": 16.5,
+        "op": "set_tempo",
+        "bpm": 144.0
+      },
+      {
+        "at_s": 16.75,
+        "op": "set_tempo",
+        "bpm": 143.0
+      },
+      {
+        "at_s": 17.0,
+        "op": "set_tempo",
+        "bpm": 142.0
+      },
+      {
+        "at_s": 17.25,
+        "op": "set_tempo",
+        "bpm": 141.0
+      },
+      {
+        "at_s": 17.5,
+        "op": "set_tempo",
+        "bpm": 140.0
+      },
+      {
+        "at_s": 17.75,
+        "op": "set_tempo",
+        "bpm": 139.0
+      },
+      {
+        "at_s": 18.0,
+        "op": "set_tempo",
+        "bpm": 138.0
+      },
+      {
+        "at_s": 18.25,
+        "op": "set_tempo",
+        "bpm": 137.0
+      },
+      {
+        "at_s": 18.5,
+        "op": "set_tempo",
+        "bpm": 136.0
+      },
+      {
+        "at_s": 18.75,
+        "op": "set_tempo",
+        "bpm": 135.0
+      },
+      {
+        "at_s": 19.0,
+        "op": "set_tempo",
+        "bpm": 134.0
+      },
+      {
+        "at_s": 19.25,
+        "op": "set_tempo",
+        "bpm": 133.0
+      },
+      {
+        "at_s": 19.5,
+        "op": "set_tempo",
+        "bpm": 132.0
+      },
+      {
+        "at_s": 19.75,
+        "op": "set_tempo",
+        "bpm": 131.0
+      },
+      {
+        "at_s": 20.0,
+        "op": "set_tempo",
+        "bpm": 130.0
+      },
+      {
+        "at_s": 20.25,
+        "op": "set_tempo",
+        "bpm": 129.0
+      },
+      {
+        "at_s": 20.5,
+        "op": "set_tempo",
+        "bpm": 128.0
+      },
+      {
+        "at_s": 20.75,
+        "op": "set_tempo",
+        "bpm": 127.0
+      },
+      {
+        "at_s": 21.0,
+        "op": "set_tempo",
+        "bpm": 126.0
+      },
+      {
+        "at_s": 21.25,
+        "op": "set_tempo",
+        "bpm": 125.0
+      },
+      {
+        "at_s": 21.5,
+        "op": "set_tempo",
+        "bpm": 124.0
+      },
+      {
+        "at_s": 21.75,
+        "op": "set_tempo",
+        "bpm": 123.0
+      },
+      {
+        "at_s": 22.0,
+        "op": "set_tempo",
+        "bpm": 122.0
+      },
+      {
+        "at_s": 22.25,
+        "op": "set_tempo",
+        "bpm": 121.0
+      },
+      {
+        "at_s": 22.5,
+        "op": "set_tempo",
+        "bpm": 120.0
+      },
+      {
+        "at_s": 22.75,
+        "op": "set_tempo",
+        "bpm": 119.0
+      },
+      {
+        "at_s": 23.0,
+        "op": "set_tempo",
+        "bpm": 118.0
+      },
+      {
+        "at_s": 23.25,
+        "op": "set_tempo",
+        "bpm": 117.0
+      },
+      {
+        "at_s": 23.5,
+        "op": "set_tempo",
+        "bpm": 116.0
+      },
+      {
+        "at_s": 23.75,
+        "op": "set_tempo",
+        "bpm": 115.0
+      },
+      {
+        "at_s": 24.0,
+        "op": "set_tempo",
+        "bpm": 114.0
+      },
+      {
+        "at_s": 24.25,
+        "op": "set_tempo",
+        "bpm": 113.0
+      },
+      {
+        "at_s": 24.5,
+        "op": "set_tempo",
+        "bpm": 112.0
+      },
+      {
+        "at_s": 24.75,
+        "op": "set_tempo",
+        "bpm": 111.0
+      },
+      {
+        "at_s": 25.0,
+        "op": "set_tempo",
+        "bpm": 110.0
+      },
+      {
+        "at_s": 25.25,
+        "op": "set_tempo",
+        "bpm": 109.0
+      },
+      {
+        "at_s": 25.5,
+        "op": "set_tempo",
+        "bpm": 108.0
+      },
+      {
+        "at_s": 25.75,
+        "op": "set_tempo",
+        "bpm": 107.0
+      },
+      {
+        "at_s": 26.0,
+        "op": "set_tempo",
+        "bpm": 106.0
+      },
+      {
+        "at_s": 26.25,
+        "op": "set_tempo",
+        "bpm": 105.0
+      },
+      {
+        "at_s": 26.5,
+        "op": "set_tempo",
+        "bpm": 104.0
+      },
+      {
+        "at_s": 26.75,
+        "op": "set_tempo",
+        "bpm": 103.0
+      },
+      {
+        "at_s": 27.0,
+        "op": "set_tempo",
+        "bpm": 102.0
+      },
+      {
+        "at_s": 27.25,
+        "op": "set_tempo",
+        "bpm": 101.0
+      },
+      {
+        "at_s": 27.5,
+        "op": "set_tempo",
+        "bpm": 100.0
+      },
+      {
+        "at_s": 27.75,
+        "op": "set_tempo",
+        "bpm": 99.0
+      },
+      {
+        "at_s": 28.0,
+        "op": "set_tempo",
+        "bpm": 98.0
+      },
+      {
+        "at_s": 28.25,
+        "op": "set_tempo",
+        "bpm": 97.0
+      },
+      {
+        "at_s": 28.5,
+        "op": "set_tempo",
+        "bpm": 96.0
+      },
+      {
+        "at_s": 28.75,
+        "op": "set_tempo",
+        "bpm": 95.0
+      },
+      {
+        "at_s": 29.0,
+        "op": "set_tempo",
+        "bpm": 94.0
+      },
+      {
+        "at_s": 29.25,
+        "op": "set_tempo",
+        "bpm": 93.0
+      },
+      {
+        "at_s": 29.5,
+        "op": "set_tempo",
+        "bpm": 92.0
+      },
+      {
+        "at_s": 29.75,
+        "op": "set_tempo",
+        "bpm": 91.0
+      }
+    ]
+  },
+  "teardown": [
+    {
+      "op": "stop"
+    },
+    {
+      "op": "set_tempo",
+      "bpm": 112.0
+    }
+  ]
+}

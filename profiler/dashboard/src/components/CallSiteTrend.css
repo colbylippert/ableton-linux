@@ -1,0 +1,67 @@
+/* CallSiteTrend — stacked share bars per traced run; categorical per call-site key, fixed within a view. */
+
+.cst {
+  min-width: 0;
+}
+
+.cst-plot {
+  overflow: hidden;
+}
+
+.cst-plot .recharts-surface:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
+.cst-inlabel {
+  pointer-events: none;
+  font-variant-numeric: tabular-nums;
+}
+
+.cst-legend {
+  margin-top: 8px;
+}
+
+.cst-legend li {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 6px;
+}
+
+.cst-swatch {
+  display: inline-block;
+  flex: 0 0 auto;
+  width: 12px;
+  height: 12px;
+  border-radius: 2px;
+  box-shadow: 0 0 0 2px var(--surface-1);
+}
+
+.cst-name {
+  font-weight: 500;
+}
+
+.cst-detail {
+  font-size: 11px;
+}
+
+.cst-cell-site {
+  display: inline-flex;
+  align-items: flex-start;
+  gap: 8px;
+}
+
+.cst-cell-site .cst-swatch {
+  margin-top: 3px;
+}
+
+.cst-chips {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.cst-empty {
+  padding: 16px;
+}

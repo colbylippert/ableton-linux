@@ -1,0 +1,230 @@
+#!/usr/bin/env bash
+# profiler/bin/trace-prereqs — the tracer's prerequisites on this host and in
+# the installed runtime, as a table. Read-only. Exit 1 when any hard
+# requirement FAILs, else 0 (WARN and PENDING rows never fail).
+#
+#   trace-prereqs [--runtime DIR] [--no-color]
+#
+# Rows: kernel version, kernel/module BTF, bpftool + BTF dump + feature probe
+# (bpf_probe_read_user, JIT), uprobe PMU, tracefs, bpftrace, USDT notes in
+# ntdll.so and pipeasio64.dll.so (PENDING until patches 0108/0017 are built;
+# bpftrace -l usdt:… listed when present), perf, clang with a BPF-target smoke
+# compile, pahole, /dev/ntsync (mode 0666) + "ntsync" in wineserver, sysctls
+# (perf_event_paranoid, kptr_restrict, sched_rt_runtime_us, bpf_jit_enable),
+# the privilege route (sudo -n profiler-root-helper version, else sudo -n),
+# ulimit -l, transparent hugepages.
+# Runtime resolution: --runtime > ABLETON_WINE_ROOT > ~/.config/ableton-wine/config
+# runtime_root= > ~/.local/opt/wine-d2d1-nspa-11.13.
+set -uo pipefail     # not -e: every probe may fail and still be reported
+
+abl_cfg() {
+    local file="${ABLETON_CONFIG_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}/ableton-wine}/config" line
+    [ -r "$file" ] || return 0
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in "$1="*) printf '%s\n' "${line#*=}"; return 0 ;; esac
+    done < "$file"
+    return 0
+}
+
+RT="${ABLETON_WINE_ROOT:-}"
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --runtime) [ $# -ge 2 ] || { echo "trace-prereqs: --runtime needs a directory" >&2; exit 2; }; RT="$2"; shift ;;
+        --runtime=*) RT="${1#*=}" ;;
+        --no-color) export NO_COLOR=1 ;;
+        -h|--help) sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        *) echo "trace-prereqs: unknown option $1" >&2; exit 2 ;;
+    esac
+    shift
+done
+[ -n "$RT" ] || RT="$(abl_cfg runtime_root)"
+[ -n "$RT" ] || RT="$HOME/.local/opt/wine-d2d1-nspa-11.13"
+
+# ---------------------------------------------------------------- output ----
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ] && [ "${TERM:-}" != dumb ]; then
+    C0=$'\033[0m' CB=$'\033[1m' CD=$'\033[2m' CR=$'\033[31m' CG=$'\033[32m' CY=$'\033[33m' CC=$'\033[36m'
+else
+    C0='' CB='' CD='' CR='' CG='' CY='' CC=''
+fi
+case "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" in
+    *[Uu][Tt][Ff]-8*|*[Uu][Tt][Ff]8*) G_OK='✓' G_WARN='⚠' G_FAIL='✗' G_PEND='…' ;;
+    *) G_OK='+' G_WARN='!' G_FAIL='x' G_PEND='.' ;;
+esac
+n_ok=0 n_warn=0 n_fail=0 n_pending=0
+row() {   # STATUS NAME DETAIL
+    local st="$1" name="$2" detail="${3:-}" color glyph
+    case "$st" in
+        OK) color="$CG"; glyph="$G_OK"; n_ok=$((n_ok + 1)) ;;
+        WARN) color="$CY"; glyph="$G_WARN"; n_warn=$((n_warn + 1)) ;;
+        FAIL) color="$CR"; glyph="$G_FAIL"; n_fail=$((n_fail + 1)) ;;
+        PENDING) color="$CC"; glyph="$G_PEND"; n_pending=$((n_pending + 1)) ;;
+    esac
+    printf '  %s%s %-7s%s %-30s %s\n' "$color" "$glyph" "$st" "$C0" "$name" "$detail"
+}
+first_line() { head -n1 2>/dev/null | tr -d '\r'; }
+
+printf '%strace-prereqs%s — tracer prerequisites  %s(runtime: %s)%s\n' "$CB" "$C0" "$CD" "$RT" "$C0"
+printf '  %s%-9s %-30s %s%s\n' "$CD" "status" "check" "detail" "$C0"
+
+# ---------------------------------------------------------------- kernel ----
+kver="$(uname -r)"; kmaj="${kver%%.*}"; rest="${kver#*.}"; kmin="${rest%%[^0-9]*}"
+[[ "$kmaj" =~ ^[0-9]+$ ]] || kmaj=0; [[ "$kmin" =~ ^[0-9]+$ ]] || kmin=0
+if (( kmaj > 6 || (kmaj == 6 && kmin >= 14) )); then row OK "kernel" "$kver"; else row FAIL "kernel" "$kver is older than 6.14 (NTSync, optimized uprobes)"; fi
+
+if [ -r /sys/kernel/btf/vmlinux ]; then
+    row OK "kernel BTF" "/sys/kernel/btf/vmlinux ($(( $(stat -c %s /sys/kernel/btf/vmlinux 2>/dev/null || echo 0) / 1048576 )) MiB)"
+else
+    row FAIL "kernel BTF" "/sys/kernel/btf/vmlinux missing (CONFIG_DEBUG_INFO_BTF): CO-RE tracer cannot load"
+fi
+if [ -r /sys/kernel/btf/ntsync ]; then
+    row OK "ntsync module BTF" "/sys/kernel/btf/ntsync (fentry/fexit on ntsync ioctls)"
+elif grep -q 'ntsync' "/lib/modules/$kver/modules.builtin" 2>/dev/null; then
+    row OK "ntsync module BTF" "ntsync is built in; its types are in the vmlinux BTF"
+else
+    row WARN "ntsync module BTF" "no /sys/kernel/btf/ntsync (module not loaded or no BTF): wine-trace falls back to --ntsync kprobe"
+fi
+
+# --------------------------------------------------------------- bpftool ----
+if command -v bpftool >/dev/null 2>&1; then
+    bt_ver="$(bpftool version 2>/dev/null | first_line)"
+    if [ -n "$(bpftool btf dump file /sys/kernel/btf/vmlinux format c 2>/dev/null | first_line)" ]; then
+        row OK "bpftool" "${bt_ver:-present}; BTF dump works (skeleton generation)"
+    else
+        row FAIL "bpftool" "${bt_ver:-present}, but 'btf dump file /sys/kernel/btf/vmlinux format c' prints nothing"
+    fi
+    probe="$(bpftool feature probe kernel 2>/dev/null || true)"
+    if ! grep -q 'bpf_probe_read_user' <<< "$probe" && sudo -n true 2>/dev/null; then
+        probe="$(sudo -n bpftool feature probe kernel 2>/dev/null || true)"
+    fi
+    if grep -q 'bpf_probe_read_user is available' <<< "$probe"; then
+        row OK "bpf feature probe" "bpf_probe_read_user available$(grep -q 'HAVE_BPF_JIT' <<< "$probe" && printf '; HAVE_BPF_JIT')"
+    elif grep -q 'bpf_probe_read_user is NOT available' <<< "$probe"; then
+        row FAIL "bpf feature probe" "bpf_probe_read_user is NOT available (stack windows cannot be read)"
+    else
+        row WARN "bpf feature probe" "could not confirm bpf_probe_read_user (helper probes need root; run: sudo bpftool feature probe kernel)"
+    fi
+else
+    row FAIL "bpftool" "missing (pacman -S bpf): needed for skeletons and feature probes"
+fi
+jit="$(cat /proc/sys/net/core/bpf_jit_enable 2>/dev/null || echo '?')"
+if [ "$jit" = 1 ]; then row OK "BPF JIT" "net.core.bpf_jit_enable=1"; else row WARN "BPF JIT" "net.core.bpf_jit_enable=$jit (expected 1; sysctl -w net.core.bpf_jit_enable=1)"; fi
+
+# --------------------------------------------------------------- uprobes ----
+if [ -r /sys/bus/event_source/devices/uprobe/type ]; then
+    row OK "uprobe PMU" "/sys/bus/event_source/devices/uprobe (type $(cat /sys/bus/event_source/devices/uprobe/type))"
+else
+    row FAIL "uprobe PMU" "/sys/bus/event_source/devices/uprobe missing (CONFIG_UPROBE_EVENTS): USDT probes cannot attach"
+fi
+if mountpoint -q /sys/kernel/tracing 2>/dev/null; then row OK "tracefs" "/sys/kernel/tracing mounted"; else row WARN "tracefs" "/sys/kernel/tracing not mounted (bpftrace -l and uprobe_events need it)"; fi
+
+if command -v bpftrace >/dev/null 2>&1; then
+    row OK "bpftrace" "$(bpftrace --version 2>/dev/null | first_line)"
+    have_bpftrace=1
+else
+    row FAIL "bpftrace" "missing (pacman -S bpftrace): the prototype tracer wine-trace.bt needs it"
+    have_bpftrace=0
+fi
+
+# ---------------------------------------------------------- USDT in Wine ----
+ntdll="$RT/lib/wine/x86_64-unix/ntdll.so"
+pipeasio="$RT/lib/wine/x86_64-unix/pipeasio64.dll.so"
+if [ ! -x "$RT/bin/wine" ] || [ ! -x "$RT/bin/wineserver" ]; then
+    row FAIL "runtime" "not installed at $RT (setup phase install / installer.sh runtime install)"
+else
+    row OK "runtime" "$RT ($("$RT/bin/wine" --version 2>/dev/null | first_line))"
+fi
+usdt_count() {   # FILE → number of stapsdt notes (0 when absent/unreadable)
+    local n
+    n="$(readelf -n -- "$1" 2>/dev/null | grep -c stapsdt || true)"
+    [[ "$n" =~ ^[0-9]+$ ]] && printf '%s\n' "$n" || printf '0\n'
+}
+usdt_row() {   # LABEL FILE PATCH
+    local label="$1" file="$2" patch="$3" n listed
+    if [ ! -f "$file" ]; then row FAIL "$label" "missing: $file"; return; fi
+    n="$(usdt_count "$file")"
+    if [ "$n" -eq 0 ]; then
+        row PENDING "$label" "no .note.stapsdt yet ($patch not built): run the dev loop / official build after the patch lands"
+        return
+    fi
+    listed=""
+    if [ "$have_bpftrace" -eq 1 ]; then
+        listed="$(bpftrace -l "usdt:$file:*" 2>/dev/null | grep -c . || true)"
+        [[ "$listed" =~ ^[0-9]+$ ]] || listed=0
+        listed="; bpftrace -l lists $listed"
+    fi
+    row OK "$label" "$n stapsdt note(s)$listed"
+}
+usdt_row "USDT ntdll.so" "$ntdll" "patch 0108-ntdll-add-static-trace-points"
+usdt_row "USDT pipeasio64.dll.so" "$pipeasio" "patch pipeasio/0017-usdt-block-markers"
+
+# ------------------------------------------------------------- toolchain ----
+if command -v perf >/dev/null 2>&1; then
+    row OK "perf" "$(perf version 2>/dev/null | first_line)"
+else
+    row WARN "perf" "missing (pacman -S perf): profile-app --backend perf unavailable; the bpf backend still works"
+fi
+if command -v clang >/dev/null 2>&1; then
+    if printf 'int f(void) { return 1; }\n' | clang -target bpf -O2 -c -x c - -o /dev/null 2>/dev/null; then
+        row OK "clang (bpf target)" "$(clang --version 2>/dev/null | first_line); -target bpf compiles"
+    else
+        row FAIL "clang (bpf target)" "$(clang --version 2>/dev/null | first_line): 'clang -target bpf' smoke compile failed"
+    fi
+else
+    row FAIL "clang (bpf target)" "missing (pacman -S clang): the CO-RE tracer cannot be built"
+fi
+if command -v pahole >/dev/null 2>&1; then row OK "pahole" "$(pahole --version 2>/dev/null | first_line)"; else row WARN "pahole" "missing (pacman -S pahole): BTF inspection unavailable"; fi
+command -v readelf >/dev/null 2>&1 || row WARN "binutils" "readelf/strings missing (pacman -S binutils)"
+
+# ---------------------------------------------------------------- ntsync ----
+if [ -c /dev/ntsync ]; then
+    mode="$(stat -c %a /dev/ntsync 2>/dev/null || echo '?')"
+    if [ "$mode" = 666 ]; then row OK "/dev/ntsync" "character device, mode 0666"; else row WARN "/dev/ntsync" "mode $mode (expected 0666 so Wine can open it as $(id -un))"; fi
+else
+    row FAIL "/dev/ntsync" "missing: kernel 6.14+ with CONFIG_NTSYNC, or: sudo modprobe ntsync"
+fi
+if [ -x "$RT/bin/wineserver" ]; then
+    srv="$(strings -- "$RT/bin/wineserver" 2>/dev/null | grep -c ntsync || true)"
+    [[ "$srv" =~ ^[0-9]+$ ]] || srv=0
+    if [ "$srv" -gt 0 ]; then row OK "wineserver ntsync" "$srv 'ntsync' references in $RT/bin/wineserver"; else row FAIL "wineserver ntsync" "0 'ntsync' references: the runtime was built without linux/ntsync.h"; fi
+fi
+
+# --------------------------------------------------------------- sysctls ----
+pep="$(sysctl -n kernel.perf_event_paranoid 2>/dev/null || echo '?')"
+if [[ "$pep" =~ ^-?[0-9]+$ ]] && [ "$pep" -le 1 ]; then
+    row OK "perf_event_paranoid" "$pep (perf_event_open without root)"
+else
+    row WARN "perf_event_paranoid" "$pep (> 1: perf/BPF need root — fine through sudo -n or the root helper; vm profile sets -1)"
+fi
+kptr="$(sysctl -n kernel.kptr_restrict 2>/dev/null || echo '?')"
+if [ "$kptr" = 0 ]; then row OK "kptr_restrict" "0"; else row WARN "kptr_restrict" "$kptr (kernel symbols hidden from unprivileged perf; vm profile sets 0)"; fi
+row OK "sched_rt_runtime_us" "$(sysctl -n kernel.sched_rt_runtime_us 2>/dev/null || echo '?') (-1 = unthrottled RT; recorded by the root helper baseline)"
+
+# ------------------------------------------------------------- privilege ----
+helper=/usr/local/sbin/profiler-root-helper
+if [ -x "$helper" ] && hv="$(sudo -n "$helper" version 2>/dev/null | first_line)" && [ -n "$hv" ]; then
+    row OK "privilege route" "sudo -n profiler-root-helper version → $hv"
+elif sudo -n true 2>/dev/null; then
+    if [ -x "$helper" ]; then row WARN "privilege route" "passwordless sudo works, but 'sudo -n $helper version' fails (sudoers 91-profiler-helper?)"; else row WARN "privilege route" "passwordless sudo works; profiler-root-helper not installed (setup phase sudo)"; fi
+else
+    row FAIL "privilege route" "neither 'sudo -n profiler-root-helper version' nor 'sudo -n true' works: the tracer needs root (setup phase sudo)"
+fi
+
+# ---------------------------------------------------------------- limits ----
+ml="$(ulimit -l 2>/dev/null || echo '?')"
+if [ "$ml" = unlimited ] || { [[ "$ml" =~ ^[0-9]+$ ]] && [ "$ml" -ge 65536 ]; }; then
+    row OK "ulimit -l" "$ml (memlock for BPF maps/ring buffers)"
+else
+    row WARN "ulimit -l" "$ml KiB (< 64 MiB; the audio group's memlock unlimited applies after re-login, setup phase limits)"
+fi
+thp="$(cat /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null || echo '[?]')"
+thp="${thp#*[}"; thp="${thp%%]*}"
+if [ "$thp" = always ]; then
+    row WARN "transparent hugepages" "always (compaction stalls add latency jitter; profiler-root-helper knob set thp madvise)"
+else
+    row OK "transparent hugepages" "$thp"
+fi
+
+# --------------------------------------------------------------- summary ----
+printf '\n  %s%d ok, %d warn, %d pending, %d failed%s\n' "$CB" "$n_ok" "$n_warn" "$n_pending" "$n_fail" "$C0"
+[ "$n_fail" -eq 0 ] || { printf '  %s%s hard requirement(s) unmet%s\n' "$CR" "$n_fail" "$C0"; exit 1; }
+exit 0

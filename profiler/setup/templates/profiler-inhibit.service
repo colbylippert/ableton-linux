@@ -1,0 +1,16 @@
+# ~/.config/systemd/user/profiler-inhibit.service — written by profiler/setup/phases/05-session.sh
+# Keeps the Plasma session awake, unlocked and quiet while the profiler drives
+# Live from SSH: kde-inhibit holds the inhibitions for as long as its child runs.
+[Unit]
+Description=Profiler: inhibit sleep, screen locking and notifications in the Plasma session
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=@@KDE_INHIBIT@@ --power --screenSaver --notifications sleep infinity
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target

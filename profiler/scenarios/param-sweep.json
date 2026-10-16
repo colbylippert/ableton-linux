@@ -1,0 +1,999 @@
+{
+  "schema": "ableton-linux-scenario/v1",
+  "name": "param-sweep",
+  "kind": "benchmark",
+  "base_set": "Benchmark_Inbuilts",
+  "description": "Three Drum Buss parameters on track 0 (device 2: Drive, Crunch, Boom Amount, all 0..1 in the set file) swept 0->1->0 as a 2 s triangle at 20 Hz each: automation and device UI redraw. AbletonOSC handles the 60 messages per second in 100 ms batches. Confirm the parameter indices once with liveosc.py query /live/device/get/parameters/name 0 2.",
+  "requires": {
+    "control_surface": true,
+    "max_for_live": false,
+    "plugins": []
+  },
+  "setup": [
+    {
+      "op": "stop"
+    },
+    {
+      "op": "rewind"
+    },
+    {
+      "op": "play"
+    },
+    {
+      "op": "marker",
+      "name": "setup-done"
+    }
+  ],
+  "timeline": {
+    "period_s": 2.0,
+    "repeat": true,
+    "marker_every_s": 5.0,
+    "steps": [
+      {
+        "at_s": 0.0,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 2,
+        "value": 0.0
+      },
+      {
+        "at_s": 0.0,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 4,
+        "value": 0.0
+      },
+      {
+        "at_s": 0.0,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 8,
+        "value": 0.0
+      },
+      {
+        "at_s": 0.05,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 2,
+        "value": 0.05
+      },
+      {
+        "at_s": 0.05,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 4,
+        "value": 0.05
+      },
+      {
+        "at_s": 0.05,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 8,
+        "value": 0.05
+      },
+      {
+        "at_s": 0.1,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 2,
+        "value": 0.1
+      },
+      {
+        "at_s": 0.1,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 4,
+        "value": 0.1
+      },
+      {
+        "at_s": 0.1,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 8,
+        "value": 0.1
+      },
+      {
+        "at_s": 0.15,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 2,
+        "value": 0.15
+      },
+      {
+        "at_s": 0.15,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 4,
+        "value": 0.15
+      },
+      {
+        "at_s": 0.15,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 8,
+        "value": 0.15
+      },
+      {
+        "at_s": 0.2,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 2,
+        "value": 0.2
+      },
+      {
+        "at_s": 0.2,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 4,
+        "value": 0.2
+      },
+      {
+        "at_s": 0.2,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 8,
+        "value": 0.2
+      },
+      {
+        "at_s": 0.25,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 2,
+        "value": 0.25
+      },
+      {
+        "at_s": 0.25,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 4,
+        "value": 0.25
+      },
+      {
+        "at_s": 0.25,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 8,
+        "value": 0.25
+      },
+      {
+        "at_s": 0.3,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 2,
+        "value": 0.3
+      },
+      {
+        "at_s": 0.3,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 4,
+        "value": 0.3
+      },
+      {
+        "at_s": 0.3,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 8,
+        "value": 0.3
+      },
+      {
+        "at_s": 0.35,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 2,
+        "value": 0.35
+      },
+      {
+        "at_s": 0.35,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 4,
+        "value": 0.35
+      },
+      {
+        "at_s": 0.35,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 8,
+        "value": 0.35
+      },
+      {
+        "at_s": 0.4,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 2,
+        "value": 0.4
+      },
+      {
+        "at_s": 0.4,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 4,
+        "value": 0.4
+      },
+      {
+        "at_s": 0.4,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 8,
+        "value": 0.4
+      },
+      {
+        "at_s": 0.45,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 2,
+        "value": 0.45
+      },
+      {
+        "at_s": 0.45,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 4,
+        "value": 0.45
+      },
+      {
+        "at_s": 0.45,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 8,
+        "value": 0.45
+      },
+      {
+        "at_s": 0.5,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 2,
+        "value": 0.5
+      },
+      {
+        "at_s": 0.5,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 4,
+        "value": 0.5
+      },
+      {
+        "at_s": 0.5,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 8,
+        "value": 0.5
+      },
+      {
+        "at_s": 0.55,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 2,
+        "value": 0.55
+      },
+      {
+        "at_s": 0.55,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 4,
+        "value": 0.55
+      },
+      {
+        "at_s": 0.55,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 8,
+        "value": 0.55
+      },
+      {
+        "at_s": 0.6,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 2,
+        "value": 0.6
+      },
+      {
+        "at_s": 0.6,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 4,
+        "value": 0.6
+      },
+      {
+        "at_s": 0.6,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 8,
+        "value": 0.6
+      },
+      {
+        "at_s": 0.65,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 2,
+        "value": 0.65
+      },
+      {
+        "at_s": 0.65,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 4,
+        "value": 0.65
+      },
+      {
+        "at_s": 0.65,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 8,
+        "value": 0.65
+      },
+      {
+        "at_s": 0.7,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 2,
+        "value": 0.7
+      },
+      {
+        "at_s": 0.7,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 4,
+        "value": 0.7
+      },
+      {
+        "at_s": 0.7,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 8,
+        "value": 0.7
+      },
+      {
+        "at_s": 0.75,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 2,
+        "value": 0.75
+      },
+      {
+        "at_s": 0.75,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 4,
+        "value": 0.75
+      },
+      {
+        "at_s": 0.75,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 8,
+        "value": 0.75
+      },
+      {
+        "at_s": 0.8,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 2,
+        "value": 0.8
+      },
+      {
+        "at_s": 0.8,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 4,
+        "value": 0.8
+      },
+      {
+        "at_s": 0.8,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 8,
+        "value": 0.8
+      },
+      {
+        "at_s": 0.85,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 2,
+        "value": 0.85
+      },
+      {
+        "at_s": 0.85,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 4,
+        "value": 0.85
+      },
+      {
+        "at_s": 0.85,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 8,
+        "value": 0.85
+      },
+      {
+        "at_s": 0.9,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 2,
+        "value": 0.9
+      },
+      {
+        "at_s": 0.9,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 4,
+        "value": 0.9
+      },
+      {
+        "at_s": 0.9,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 8,
+        "value": 0.9
+      },
+      {
+        "at_s": 0.95,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 2,
+        "value": 0.95
+      },
+      {
+        "at_s": 0.95,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 4,
+        "value": 0.95
+      },
+      {
+        "at_s": 0.95,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 8,
+        "value": 0.95
+      },
+      {
+        "at_s": 1.0,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 2,
+        "value": 1.0
+      },
+      {
+        "at_s": 1.0,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 4,
+        "value": 1.0
+      },
+      {
+        "at_s": 1.0,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 8,
+        "value": 1.0
+      },
+      {
+        "at_s": 1.05,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 2,
+        "value": 0.95
+      },
+      {
+        "at_s": 1.05,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 4,
+        "value": 0.95
+      },
+      {
+        "at_s": 1.05,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 8,
+        "value": 0.95
+      },
+      {
+        "at_s": 1.1,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 2,
+        "value": 0.9
+      },
+      {
+        "at_s": 1.1,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 4,
+        "value": 0.9
+      },
+      {
+        "at_s": 1.1,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 8,
+        "value": 0.9
+      },
+      {
+        "at_s": 1.15,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 2,
+        "value": 0.85
+      },
+      {
+        "at_s": 1.15,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 4,
+        "value": 0.85
+      },
+      {
+        "at_s": 1.15,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 8,
+        "value": 0.85
+      },
+      {
+        "at_s": 1.2,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 2,
+        "value": 0.8
+      },
+      {
+        "at_s": 1.2,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 4,
+        "value": 0.8
+      },
+      {
+        "at_s": 1.2,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 8,
+        "value": 0.8
+      },
+      {
+        "at_s": 1.25,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 2,
+        "value": 0.75
+      },
+      {
+        "at_s": 1.25,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 4,
+        "value": 0.75
+      },
+      {
+        "at_s": 1.25,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 8,
+        "value": 0.75
+      },
+      {
+        "at_s": 1.3,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 2,
+        "value": 0.7
+      },
+      {
+        "at_s": 1.3,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 4,
+        "value": 0.7
+      },
+      {
+        "at_s": 1.3,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 8,
+        "value": 0.7
+      },
+      {
+        "at_s": 1.35,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 2,
+        "value": 0.65
+      },
+      {
+        "at_s": 1.35,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 4,
+        "value": 0.65
+      },
+      {
+        "at_s": 1.35,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 8,
+        "value": 0.65
+      },
+      {
+        "at_s": 1.4,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 2,
+        "value": 0.6
+      },
+      {
+        "at_s": 1.4,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 4,
+        "value": 0.6
+      },
+      {
+        "at_s": 1.4,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 8,
+        "value": 0.6
+      },
+      {
+        "at_s": 1.45,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 2,
+        "value": 0.55
+      },
+      {
+        "at_s": 1.45,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 4,
+        "value": 0.55
+      },
+      {
+        "at_s": 1.45,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 8,
+        "value": 0.55
+      },
+      {
+        "at_s": 1.5,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 2,
+        "value": 0.5
+      },
+      {
+        "at_s": 1.5,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 4,
+        "value": 0.5
+      },
+      {
+        "at_s": 1.5,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 8,
+        "value": 0.5
+      },
+      {
+        "at_s": 1.55,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 2,
+        "value": 0.45
+      },
+      {
+        "at_s": 1.55,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 4,
+        "value": 0.45
+      },
+      {
+        "at_s": 1.55,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 8,
+        "value": 0.45
+      },
+      {
+        "at_s": 1.6,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 2,
+        "value": 0.4
+      },
+      {
+        "at_s": 1.6,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 4,
+        "value": 0.4
+      },
+      {
+        "at_s": 1.6,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 8,
+        "value": 0.4
+      },
+      {
+        "at_s": 1.65,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 2,
+        "value": 0.35
+      },
+      {
+        "at_s": 1.65,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 4,
+        "value": 0.35
+      },
+      {
+        "at_s": 1.65,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 8,
+        "value": 0.35
+      },
+      {
+        "at_s": 1.7,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 2,
+        "value": 0.3
+      },
+      {
+        "at_s": 1.7,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 4,
+        "value": 0.3
+      },
+      {
+        "at_s": 1.7,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 8,
+        "value": 0.3
+      },
+      {
+        "at_s": 1.75,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 2,
+        "value": 0.25
+      },
+      {
+        "at_s": 1.75,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 4,
+        "value": 0.25
+      },
+      {
+        "at_s": 1.75,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 8,
+        "value": 0.25
+      },
+      {
+        "at_s": 1.8,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 2,
+        "value": 0.2
+      },
+      {
+        "at_s": 1.8,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 4,
+        "value": 0.2
+      },
+      {
+        "at_s": 1.8,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 8,
+        "value": 0.2
+      },
+      {
+        "at_s": 1.85,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 2,
+        "value": 0.15
+      },
+      {
+        "at_s": 1.85,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 4,
+        "value": 0.15
+      },
+      {
+        "at_s": 1.85,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 8,
+        "value": 0.15
+      },
+      {
+        "at_s": 1.9,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 2,
+        "value": 0.1
+      },
+      {
+        "at_s": 1.9,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 4,
+        "value": 0.1
+      },
+      {
+        "at_s": 1.9,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 8,
+        "value": 0.1
+      },
+      {
+        "at_s": 1.95,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 2,
+        "value": 0.05
+      },
+      {
+        "at_s": 1.95,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 4,
+        "value": 0.05
+      },
+      {
+        "at_s": 1.95,
+        "op": "set_param",
+        "track": 0,
+        "device": 2,
+        "param": 8,
+        "value": 0.05
+      }
+    ]
+  },
+  "teardown": [
+    {
+      "op": "stop"
+    }
+  ]
+}

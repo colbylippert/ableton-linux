@@ -11,10 +11,11 @@ point-version gap with upstream's actively-maintained branch and with ENCORE
 The rebase involved five merge conflicts and uncovered three additional build
 breaks, plus a `build.sh`/`pipefail` tooling issue.
 
-The Wine series contains 95 patch files and ends at 0107. The absent numbers
+The Wine series contains 96 patch files and ends at 0108. The absent numbers
 are 0027, 0044, 0072, 0074, 0090 through 0095, 0097, and 0098; their reasons
 are declared in `SERIES_GAPS` in `scripts/build-audit.sh`. Patch 0073 keeps
 the wheel coordinate fix separate. Patch 0100 combines 10 pointer patches.
+Patch 0108 adds the static trace points of the interface profiler.
 
 A separate performance series contains one reviewed patch under
 `patches/performance/`. Patch 0001 provides the NTSync alertable wait trial.
@@ -22,13 +23,21 @@ The research note defines tests for 4 deferred performance proposals, numbered
 0002 to 0005. See
 `notes/MOONSHOT-CPU-WINE-BOUNDED-FASTPATHS.md`.
 
+A PipeASIO series under `patches/pipeasio/` applies to the vendored PipeASIO
+1.5.0 source, not to Wine. It is numbered on its own and ends at 0017; the
+absent numbers 0003 and 0007 are declared in `PIPEASIO_GAPS` in
+`scripts/build-audit.sh`. Patch 0017 adds the block markers of the interface
+profiler. `scripts/build-audit.sh` names the required final member of every
+series.
+
 ## Applying the series
 
 Run `./build.sh`. Inside the Podman image, `scripts/container-build.sh`
 unpacks `vendor/wine-base-5c23dd1c.tar.zst`, creates a Git repository, and
 applies `patches/[0-9][0-9][0-9][0-9]-*.patch` in lexical order with
 `git am --3way`. It then applies `patches/performance/*.patch`. The Nix build
-uses the same file order.
+uses the same file order. The PipeASIO patches are applied to the unpacked
+PipeASIO 1.5.0 source with `patch -p1` in a later step of the same build.
 
 The build script adds a fixed identity and date to early plain-diff patches.
 Use `./build.sh` to reproduce this step.
@@ -433,3 +442,28 @@ Apply them in sequence with the rest of the series.
   window comes back without a new present from Live (issue 263). It uses a
   window-owner-thread callback, revalidates geometry and ignores partial
   exposes. See `notes/ABLETON-WINE-OFFSCREEN-EXPOSE.md`.
+- `0108` adds eight static USDT trace points (SystemTap SDT notes, provider
+  `wine`) to the unix side of ntdll: `syscall_entry` and `syscall_exit` in
+  the x86_64 syscall dispatcher, `unixcall_entry` and `unixcall_exit` in the
+  unix-call dispatcher (`dlls/ntdll/unix/signal_x86_64.c`),
+  `server_req_start` and `server_req_end` around the wineserver request in
+  `server_call_unlocked`, and `server_wait_start` and `server_wait_end`
+  around `wait_select_reply` (`dlls/ntdll/unix/server.c`). Each site is one
+  5-byte nop plus a descriptor in the non-allocated `.note.stapsdt` section;
+  nothing runs until an eBPF tracer attaches to a chosen process, and there
+  is no switch to set. `dlls/ntdll/unix/sdt.h` is systemtap's `<sys/sdt.h>`
+  (CC0) with the x86_64 nop widened so the kernel's optimised uprobe applies;
+  `sdt-config.h` enables the `?` and `R` section flags. `sync.c` is
+  untouched, so `performance/0001` keeps applying. The fingerprint literal is
+  `WINE_USDT_V1`, and the audit also counts the eight probe names in
+  `ntdll.so`. See `profiler/tracer/README.md`.
+- `pipeasio/0017` adds six USDT probes (provider `pipeasio`) to the PipeASIO
+  driver: `cycle_start` and `cycle_end` around the PipeWire cycle in
+  `audio_on_process`, and `block_start`, `block_before_live`,
+  `block_after_live` and `block_end` on the ASIO process path, keyed by a
+  per-instance block sequence and carrying the cycle deadline (PipeWire's
+  next wakeup). Telemetry samples gain the sequence and the slack against
+  that deadline, the per-second `cycles=` line gains `block_range=A-B late=N`
+  (the fingerprint), and the data-loop and lifecycle threads are named
+  `pipeasio-rt` and `pipeasio-worker`. The WoW64 PE half never sees `sdt.h`.
+  The audit counts the six probe names in `pipeasio64.dll.so`.

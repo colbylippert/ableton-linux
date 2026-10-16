@@ -1,0 +1,1315 @@
+From f52a75a23566ae6a02037a1bd37773e7032af514 Mon Sep 17 00:00:00 2001
+From: Profiler Workbench <profiler@localhost>
+Date: Fri, 16 Oct 2026 14:03:35 -0400
+Subject: [PATCH] asio: add USDT block markers and name the driver threads
+
+A tracer can see Live's syscalls but cannot tell which audio block they
+belong to or whether that block came in late. Add static trace points
+(USDT, provider "pipeasio"; systemtap's sdt.h vendored under include/ with
+the x86-64 site widened to a 5-byte nop) around the PipeWire cycle and the
+host callback: cycle_start and cycle_end in audio_on_process, block_start,
+block_before_live, block_after_live and block_end on the ASIO process path.
+They are keyed by a per-instance block sequence and carry the cycle
+deadline, PipeWire's next wakeup. Each site is one 5-byte nop plus an ELF
+note, so nothing runs until a tracer attaches to a chosen process; the
+probes are always compiled in and need no setting.
+
+The deadline arithmetic lives in include/pipeasio_block_clock.h, shared
+with telemetry: every sample now records the block sequence and its slack
+against the deadline, and the per-second cycle line gains
+block_range=A-B late=N so a tracer's view can be reconciled with the
+driver's. The clock.position gap is measured before the host runs so the
+block markers can report it; the xrun accounting itself is unchanged. The
+data-loop thread is named pipeasio-rt and the lifecycle worker
+pipeasio-worker, which Wine propagates to comm. The WoW64 PE front end
+never sees sdt.h: PIPEASIO_PROBE is a no-op there.
+
+Verification: test_block_clock passes with gcc 16 and clang 23 (24 checks,
+also under ASan/UBSan). A probe-only unit built with the driver's flags
+carries all six notes and 5-byte nops under gcc and clang, keeps them
+through strip --strip-unneeded, and compiles to nothing with
+PIPEASIO_WOW64_PE (also for an i686 mingw target). src/audio.c compiles in
+the unixlib configuration against PipeWire 1.6.9 headers with gcc and
+clang without new warnings; src/asio.c awaits the container build (no Wine
+SDK on the check host).
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ README.md                      |  34 ++-
+ include/audio.h                |  14 ++
+ include/pipeasio_block_clock.h |  50 ++++
+ include/pipeasio_probe.h       |  66 +++++
+ include/pipeasio_telemetry.h   |   2 +
+ include/sdt-config.h           |  15 ++
+ include/sdt.h                  | 532 +++++++++++++++++++++++++++++++++++++++++
+ src/asio.c                     |  78 +++++-
+ src/audio.c                    | 110 ++++++---
+ tests/unit/CMakeLists.txt      |   3 +
+ tests/unit/test_block_clock.c  |  61 +++++
+ 11 files changed, 928 insertions(+), 37 deletions(-)
+
+diff --git a/README.md b/README.md
+index baf97ee..7ac35af 100644
+--- a/README.md
++++ b/README.md
+@@ -569,7 +569,11 @@ A full area drops the next sample, and audio continues. The lifecycle worker
+ reports once per second. It sorts at most 8192 samples. It writes the 50th,
+ 95th and 99th percentiles as p50, p95 and p99. It writes the largest value as
+ maximum, plus the dropped sample count, through a separate stderr output.
+-The cycle record also counts silent mismatch cycles as `muted`.
++The cycle record also counts silent mismatch cycles as `muted`, and it ends
++with `block_range=A-B late=N`: the first and last block sequence number
++sampled in the interval (the `seq` of the `pipeasio:block_start` trace point,
++see [Trace points](#trace-points)) and how many sampled blocks queued their
++output after the cycle deadline, PipeWire's next wakeup.
+ When that output is full, PipeASIO drops the current report.
+ Stop and Destroy continue. Clock reads and fixed sample
+ writes add CPU work. Use telemetry during
+@@ -692,6 +696,34 @@ The driver has its own COM identity: CLSID
+ `HKCU\Software\ASIO\PipeASIO`, and DLL filename `pipeasio64.dll`. That is why
+ it coexists with WineASIO: neither overrides the other.
+ 
++### Trace points
++
++The ELF driver halves (`pipeasio64.dll.so`, and `pipeasio32.so` for WoW64)
++carry static USDT trace points under the provider `pipeasio`. Each one is a
++5-byte `nop` plus an ELF note, so it costs nothing until a tracer attaches a
++uprobe to a chosen process; the probes are always compiled in and need no
++setting. `readelf -n lib/wine/x86_64-unix/pipeasio64.dll.so` lists them and
++`bpftrace -l 'usdt:/path/to/pipeasio64.dll.so:pipeasio:*'` attaches to them.
++
++| Probe | Arguments | Site |
++|---|---|---|
++| `cycle_start` | `clock_nsec, next_nsec, duration, position, flags` | PipeWire process cycle entry (`spa_io_clock` fields) |
++| `cycle_end` | `missed, delivered` | cycle exit: `clock.position` gap before this cycle, host consumed it |
++| `block_start` | `seq, nframes, rate, clock_nsec, deadline_ns, flags` | host gate answered; `flags`: 1 admitted, 2 time info, 4 muted |
++| `block_before_live` / `block_after_live` | `seq` | immediately around the host's `bufferSwitch` |
++| `block_end` | `seq, flags, missed` | every output published |
++
++`seq` counts the blocks of a driver instance from 1. `deadline_ns` is
++PipeWire's `clock.next_nsec` (or the cycle start plus one quantum), in
++CLOCK_MONOTONIC nanoseconds like every other time here: a block whose
++`block_end` lands after it was late, and the graph ran the next cycle without
++it. The data-loop thread is named `pipeasio-rt` and the lifecycle worker
++`pipeasio-worker` (`/proc/<pid>/task/<tid>/comm`), so a tracer can tell them
++apart. The 32-bit mingw front end has no trace points. `include/pipeasio_probe.h`
++is the contract; `include/sdt.h` is the vendored systemtap header (CC0) with
++the x86-64 probe site widened to a 5-byte `nop` so recent kernels can use their
++optimized uprobe path.
++
+ ### Testing
+ 
+ `ctest --test-dir build` runs the Linux-native unit and contract tests plus the
+diff --git a/include/audio.h b/include/audio.h
+index 8e558e5..1a7bd50 100644
+--- a/include/audio.h
++++ b/include/audio.h
+@@ -147,6 +147,20 @@ void audio_drop_force_quantum(audio_client_t *client);
+  * 0 before the first cycle. Feeds the ASIO host's systemTime. */
+ uint64_t audio_get_time_nsec(audio_client_t *client);
+ 
++/* Logical deadline of the most recent process cycle, in the graph clock domain
++ * of audio_get_time_nsec (CLOCK_MONOTONIC nanoseconds): the data loop's next
++ * wakeup (clock.next_nsec), or the cycle start plus one quantum when the
++ * daemon reports none.  0 before the first cycle of an activation.  The host
++ * callback must return before it; the block trace points and the telemetry
++ * slack measure against it (pipeasio-usdt-block-markers). */
++uint64_t audio_get_cycle_deadline_nsec(audio_client_t *client);
++
++/* Graph cycles the host was due but did not get between the previous process
++ * cycle and the current one: the clock.position gap, measured at cycle entry
++ * and only in steady state (quantum equal to the host buffer, same clock id).
++ * Meaningful during the process callback of that cycle. */
++uint32_t audio_get_cycle_missed(audio_client_t *client);
++
+ /* Ports */
+ 
+ audio_port_t *audio_port_register(audio_client_t *client, const char *port_name, uint64_t flags,
+diff --git a/include/pipeasio_block_clock.h b/include/pipeasio_block_clock.h
+new file mode 100644
+index 0000000..ebad3bb
+--- /dev/null
++++ b/include/pipeasio_block_clock.h
+@@ -0,0 +1,50 @@
++/*
++ * SPDX-License-Identifier: GPL-3.0-or-later
++ *
++ * Copyright (C) 2026 PipeASIO contributors
++ *
++ * This program is free software: you can redistribute it and/or modify it under
++ * the terms of the GNU General Public License as published by the Free Software
++ * Foundation, either version 3 of the License, or (at your option) any later
++ * version.
++ *
++ * This program is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
++ * FOR A PARTICULAR PURPOSE.  See the GNU General Public License for more
++ * details.
++ *
++ * You should have received a copy of the GNU General Public License along with
++ * this program.  If not, see <https://www.gnu.org/licenses/>.
++ */
++
++/* Block deadline arithmetic shared by the backend, the telemetry report and
++ * the unit test.  Pure C: no PipeWire or Wine dependency. */
++#pragma once
++
++#include <stdint.h>
++
++/* Duration of nframes at rate in nanoseconds, rounded to nearest; 0 while the
++ * rate is unknown. */
++static inline uint64_t
++pipeasio_block_period_ns(uint32_t nframes, uint32_t rate)
++{
++    return rate ? ((uint64_t)nframes * 1000000000ull + rate / 2) / rate : 0;
++}
++
++/* PipeWire: clock.nsec is the start of the current cycle and clock.next_nsec
++ * the logical start of the next one, the data loop's next wakeup.  The host
++ * callback must return before it.  A position io without a usable next_nsec
++ * gets one period after the cycle start. */
++static inline uint64_t
++pipeasio_block_deadline_ns(uint64_t nsec, uint64_t next_nsec, uint32_t duration, uint32_t rate)
++{
++    return next_nsec > nsec ? next_nsec : nsec + pipeasio_block_period_ns(duration, rate);
++}
++
++/* Positive while the block ended before its deadline, negative by the amount
++ * it was late. */
++static inline int64_t
++pipeasio_block_slack_ns(uint64_t deadline_ns, uint64_t end_ns)
++{
++    return (int64_t)(deadline_ns - end_ns);
++}
+diff --git a/include/pipeasio_probe.h b/include/pipeasio_probe.h
+new file mode 100644
+index 0000000..1bfcc2a
+--- /dev/null
++++ b/include/pipeasio_probe.h
+@@ -0,0 +1,66 @@
++/*
++ * SPDX-License-Identifier: GPL-3.0-or-later
++ *
++ * Copyright (C) 2026 PipeASIO contributors
++ *
++ * This program is free software: you can redistribute it and/or modify it under
++ * the terms of the GNU General Public License as published by the Free Software
++ * Foundation, either version 3 of the License, or (at your option) any later
++ * version.
++ *
++ * This program is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
++ * FOR A PARTICULAR PURPOSE.  See the GNU General Public License for more
++ * details.
++ *
++ * You should have received a copy of the GNU General Public License along with
++ * this program.  If not, see <https://www.gnu.org/licenses/>.
++ */
++
++/* Static trace points (USDT, provider "pipeasio") of the ELF driver halves. */
++#pragma once
++
++/*
++ * PIPEASIO_PROBE(name, args...) expands to one 5-byte nop in the instruction
++ * stream plus a .note.stapsdt ELF note that describes the argument locations.
++ * Nothing runs at the site until a tracer (bpftrace, libbpf) turns the nop
++ * into a uprobe for the processes it selects, so the probes are compiled in
++ * unconditionally and cost nothing while unattached.  List them with
++ *   readelf -n lib/wine/x86_64-unix/pipeasio64.dll.so
++ *   bpftrace -l 'usdt:/path/to/pipeasio64.dll.so:pipeasio:*'
++ *
++ * Probe contract (argument order; u32 arguments arrive as 4@, u64 as 8@):
++ *   cycle_start(clock_nsec u64, next_nsec u64, duration u32, position u64, flags u32)
++ *       audio_on_process entry: the PipeWire cycle's spa_io_clock fields.
++ *   cycle_end(missed u32, delivered u32)
++ *       audio_on_process exit: graph cycles the host missed before this one
++ *       (clock.position gap) and whether the host consumed this cycle.
++ *   block_start(seq u64, nframes u32, rate u32, clock_nsec u64, deadline_ns u64, flags u32)
++ *       process_callback once the host gate answered; flags are PIPEASIO_BLOCK_*.
++ *   block_before_live(seq u64) / block_after_live(seq u64)
++ *       immediately around the host's bufferSwitch / bufferSwitchTimeInfo call.
++ *   block_end(seq u64, flags u32, missed u32)
++ *       after every output was published, before the host gate is left.
++ *
++ * seq is the driver instance's block counter: 1 for its first callback, and
++ * 0 never occurs so a tracer can use it for "no block".  Every time is in
++ * CLOCK_MONOTONIC nanoseconds, the PipeWire graph clock domain.
++ *
++ * The mingw-built WoW64 PE front end (PIPEASIO_WOW64_PE) must never include
++ * sdt.h: PE has no .note.stapsdt and the mingw assembler lacks the section
++ * flags, so there the macro is a no-op.
++ */
++#if defined(__linux__) && !defined(PIPEASIO_WOW64_PE)
++#ifndef SDT_USE_VARIADIC
++#define SDT_USE_VARIADIC 1
++#endif
++#include "sdt.h"
++#define PIPEASIO_PROBE(name, ...) STAP_PROBEV(pipeasio, name, ##__VA_ARGS__)
++#else
++#define PIPEASIO_PROBE(name, ...) ((void)0)
++#endif
++
++/* block_start / block_end flag bits */
++#define PIPEASIO_BLOCK_ADMITTED 0x1u  /* the host gate admitted the callback */
++#define PIPEASIO_BLOCK_TIME_INFO 0x2u /* bufferSwitchTimeInfo carried the block */
++#define PIPEASIO_BLOCK_MUTED 0x4u     /* quantum mismatch: silence swapped both ways */
+diff --git a/include/pipeasio_telemetry.h b/include/pipeasio_telemetry.h
+index 69dadaf..518de4c 100644
+--- a/include/pipeasio_telemetry.h
++++ b/include/pipeasio_telemetry.h
+@@ -33,6 +33,8 @@ typedef struct pipeasio_telemetry_sample
+ {
+     uint64_t wall_ns[PIPEASIO_TELEMETRY_PHASES];
+     uint64_t cpu_ns[PIPEASIO_TELEMETRY_PHASES];
++    uint64_t seq;      /* driver block sequence: the seq of pipeasio:block_start */
++    int64_t  slack_ns; /* cycle deadline minus the output-queued time; negative = late */
+     uint32_t flags;
+ } pipeasio_telemetry_sample;
+ 
+diff --git a/include/sdt-config.h b/include/sdt-config.h
+new file mode 100644
+index 0000000..eedf746
+--- /dev/null
++++ b/include/sdt-config.h
+@@ -0,0 +1,15 @@
++/* <sys/sdt-config.h> - assembler feature answers for the vendored sdt.h.
++
++   Like sdt.h this file is dedicated to the public domain, pursuant to CC0
++   (https://creativecommons.org/publicdomain/zero/1.0/)
++
++   Upstream systemtap generates it at configure time.  PipeASIO hard-codes both
++   answers: the "?" section flag (autogroup) and the "R" flag (SHF_GNU_RETAIN,
++   binutils 2.36+) are understood by every assembler that builds the driver,
++   including the 2.38 of the Ubuntu 22.04 build container.  Should an
++   assembler reject the "aGR" flags of .stapsdt.base, set RETAIN to 0: nothing
++   links the driver with --gc-sections, so the probe notes survive either way.
++*/
++
++#define _SDT_ASM_SECTION_AUTOGROUP_SUPPORT 1
++#define _SDT_ASM_SECTION_RETAIN_SUPPORT 1
+diff --git a/include/sdt.h b/include/sdt.h
+new file mode 100644
+index 0000000..f0fbb77
+--- /dev/null
++++ b/include/sdt.h
+@@ -0,0 +1,532 @@
++/* <sys/sdt.h> - Systemtap static probe definition macros.
++
++   This file is dedicated to the public domain, pursuant to CC0
++   (https://creativecommons.org/publicdomain/zero/1.0/)
++*/
++
++/* PipeASIO vendored copy of systemtap's sys/sdt.h (pipeasio-usdt-block-markers).
++   Changes against upstream, both marked with _SDT_DEF_NOP:
++   1. On x86_64 the probe site is the 5-byte nop 0f 1f 44 00 00
++      ("nopl 0x0(%rax,%rax,1)") instead of the 1-byte "nop", so the kernel's
++      optimized uprobe path (5-byte-nop emulation) can apply; a kernel without
++      it single-steps the site as before.
++   2. "sdt-config.h" is the sibling file in this directory.
++   Nothing else differs; keep it that way so the file stays diffable against
++   upstream.  Both files remain CC0. */
++
++#ifndef _SYS_SDT_H
++#define _SYS_SDT_H    1
++
++/*
++  This file defines a family of macros
++
++       STAP_PROBEn(op1, ..., opn)
++
++  that emit a nop into the instruction stream, and some data into an auxiliary
++  note section.  The data in the note section describes the operands, in terms
++  of size and location.  Each location is encoded as assembler operand string.
++  Consumer tools such as gdb or systemtap insert breakpoints on top of
++  the nop, and decode the location operand-strings, like an assembler,
++  to find the values being passed.
++
++  The operand strings are selected by the compiler for each operand.
++  They are constrained by gcc inline-assembler codes.  The default is:
++
++  #define STAP_SDT_ARG_CONSTRAINT nor
++
++  This is a good default if the operands tend to be integral and
++  moderate in number (smaller than number of registers).  In other
++  cases, the compiler may report "'asm' requires impossible reload" or
++  similar.  In this case, consider simplifying the macro call (fewer
++  and simpler operands), reduce optimization, or override the default
++  constraints string via:
++
++  #define STAP_SDT_ARG_CONSTRAINT g
++  #include <sys/sdt.h>
++
++  See also:
++  https://sourceware.org/systemtap/wiki/UserSpaceProbeImplementation
++  https://gcc.gnu.org/onlinedocs/gcc/Constraints.html
++ */
++
++
++
++#ifdef __ASSEMBLER__
++# define _SDT_PROBE(provider, name, n, arglist)	\
++  _SDT_ASM_BODY(provider, name, _SDT_ASM_SUBSTR_1, (_SDT_DEPAREN_##n arglist)) \
++  _SDT_ASM_BASE
++# define _SDT_ASM_1(x)			x;
++# define _SDT_ASM_2(a, b)		a,b;
++# define _SDT_ASM_3(a, b, c)		a,b,c;
++# define _SDT_ASM_5(a, b, c, d, e)	a,b,c,d,e;
++# define _SDT_ASM_STRING_1(x)		.asciz #x;
++# define _SDT_ASM_SUBSTR_1(x)		.ascii #x;
++# define _SDT_DEPAREN_0()				/* empty */
++# define _SDT_DEPAREN_1(a)				a
++# define _SDT_DEPAREN_2(a,b)				a b
++# define _SDT_DEPAREN_3(a,b,c)				a b c
++# define _SDT_DEPAREN_4(a,b,c,d)			a b c d
++# define _SDT_DEPAREN_5(a,b,c,d,e)			a b c d e
++# define _SDT_DEPAREN_6(a,b,c,d,e,f)			a b c d e f
++# define _SDT_DEPAREN_7(a,b,c,d,e,f,g)			a b c d e f g
++# define _SDT_DEPAREN_8(a,b,c,d,e,f,g,h)		a b c d e f g h
++# define _SDT_DEPAREN_9(a,b,c,d,e,f,g,h,i)		a b c d e f g h i
++# define _SDT_DEPAREN_10(a,b,c,d,e,f,g,h,i,j)		a b c d e f g h i j
++# define _SDT_DEPAREN_11(a,b,c,d,e,f,g,h,i,j,k)		a b c d e f g h i j k
++# define _SDT_DEPAREN_12(a,b,c,d,e,f,g,h,i,j,k,l)	a b c d e f g h i j k l
++#else
++#if defined _SDT_HAS_SEMAPHORES
++#define _SDT_NOTE_SEMAPHORE_USE(provider, name) \
++  __asm__ __volatile__ ("" :: "m" (provider##_##name##_semaphore));
++#else
++#define _SDT_NOTE_SEMAPHORE_USE(provider, name)
++#endif
++
++# define _SDT_PROBE(provider, name, n, arglist) \
++  do {									    \
++    _SDT_NOTE_SEMAPHORE_USE(provider, name); \
++    __asm__ __volatile__ (_SDT_ASM_BODY(provider, name, _SDT_ASM_ARGS, (n)) \
++			  :: _SDT_ASM_OPERANDS_##n arglist);		    \
++    __asm__ __volatile__ (_SDT_ASM_BASE);				    \
++  } while (0)
++# define _SDT_S(x)			#x
++# define _SDT_ASM_1(x)			_SDT_S(x) "\n"
++# define _SDT_ASM_2(a, b)		_SDT_S(a) "," _SDT_S(b) "\n"
++# define _SDT_ASM_3(a, b, c)		_SDT_S(a) "," _SDT_S(b) "," \
++					_SDT_S(c) "\n"
++# define _SDT_ASM_5(a, b, c, d, e)	_SDT_S(a) "," _SDT_S(b) "," \
++					_SDT_S(c) "," _SDT_S(d) "," \
++					_SDT_S(e) "\n"
++# define _SDT_ASM_ARGS(n)		_SDT_ASM_TEMPLATE_##n
++# define _SDT_ASM_STRING_1(x)		_SDT_ASM_1(.asciz #x)
++# define _SDT_ASM_SUBSTR_1(x)		_SDT_ASM_1(.ascii #x)
++
++# define _SDT_ARGFMT(no)                _SDT_ASM_1(_SDT_SIGN %n[_SDT_S##no]) \
++                                        _SDT_ASM_1(_SDT_SIZE %n[_SDT_S##no]) \
++                                        _SDT_ASM_1(_SDT_TYPE %n[_SDT_S##no]) \
++                                        _SDT_ASM_SUBSTR(_SDT_ARGTMPL(_SDT_A##no))
++
++
++# ifndef STAP_SDT_ARG_CONSTRAINT
++# if defined __powerpc__
++# define STAP_SDT_ARG_CONSTRAINT        nZr
++# elif defined __arm__
++# define STAP_SDT_ARG_CONSTRAINT        g
++# else
++# define STAP_SDT_ARG_CONSTRAINT        nor
++# endif
++# endif
++
++# define _SDT_STRINGIFY(x)              #x
++# define _SDT_ARG_CONSTRAINT_STRING(x)  _SDT_STRINGIFY(x)
++/* _SDT_S encodes the size and type as 0xSSTT which is decoded by the assembler
++   macros _SDT_SIZE and _SDT_TYPE */
++# define _SDT_ARG(n, x)				    \
++  [_SDT_S##n] "n" ((_SDT_ARGSIGNED (x) ? (int)-1 : 1) * (-(((int) _SDT_ARGSIZE (x)) << 8) + (-(0x7f & __builtin_classify_type (x))))), \
++  [_SDT_A##n] _SDT_ARG_CONSTRAINT_STRING (STAP_SDT_ARG_CONSTRAINT) (_SDT_ARGVAL (x))
++#endif
++#define _SDT_ASM_STRING(x)		_SDT_ASM_STRING_1(x)
++#define _SDT_ASM_SUBSTR(x)		_SDT_ASM_SUBSTR_1(x)
++
++#define _SDT_ARGARRAY(x)	(__builtin_classify_type (x) == 14	\
++				 || __builtin_classify_type (x) == 5)
++
++#ifdef __cplusplus
++# define _SDT_ARGSIGNED(x)	(!_SDT_ARGARRAY (x) \
++				 && __sdt_type<__typeof (x)>::__sdt_signed)
++# define _SDT_ARGSIZE(x)	(_SDT_ARGARRAY (x) \
++				 ? sizeof (void *) : sizeof (x))
++# define _SDT_ARGVAL(x)		(x)
++
++# include <cstddef>
++
++template<typename __sdt_T>
++struct __sdt_type
++{
++  static const bool __sdt_signed = false;
++};
++  
++#define __SDT_ALWAYS_SIGNED(T) \
++template<> struct __sdt_type<T> { static const bool __sdt_signed = true; };
++#define __SDT_COND_SIGNED(T,CT)						\
++template<> struct __sdt_type<T> { static const bool __sdt_signed = ((CT)(-1) < 1); };
++__SDT_ALWAYS_SIGNED(signed char)
++__SDT_ALWAYS_SIGNED(short)
++__SDT_ALWAYS_SIGNED(int)
++__SDT_ALWAYS_SIGNED(long)
++__SDT_ALWAYS_SIGNED(long long)
++__SDT_ALWAYS_SIGNED(volatile signed char)
++__SDT_ALWAYS_SIGNED(volatile short)
++__SDT_ALWAYS_SIGNED(volatile int)
++__SDT_ALWAYS_SIGNED(volatile long)
++__SDT_ALWAYS_SIGNED(volatile long long)
++__SDT_ALWAYS_SIGNED(const signed char)
++__SDT_ALWAYS_SIGNED(const short)
++__SDT_ALWAYS_SIGNED(const int)
++__SDT_ALWAYS_SIGNED(const long)
++__SDT_ALWAYS_SIGNED(const long long)
++__SDT_ALWAYS_SIGNED(const volatile signed char)
++__SDT_ALWAYS_SIGNED(const volatile short)
++__SDT_ALWAYS_SIGNED(const volatile int)
++__SDT_ALWAYS_SIGNED(const volatile long)
++__SDT_ALWAYS_SIGNED(const volatile long long)
++__SDT_COND_SIGNED(char, char)
++__SDT_COND_SIGNED(wchar_t, wchar_t)
++__SDT_COND_SIGNED(volatile char, char)
++__SDT_COND_SIGNED(volatile wchar_t, wchar_t)
++__SDT_COND_SIGNED(const char, char)
++__SDT_COND_SIGNED(const wchar_t, wchar_t)
++__SDT_COND_SIGNED(const volatile char, char)
++__SDT_COND_SIGNED(const volatile wchar_t, wchar_t)
++#if defined (__GNUC__) && (__GNUC__ > 4 || (__GNUC__ == 4 && __GNUC_MINOR__ >= 4))
++/* __SDT_COND_SIGNED(char16_t) */
++/* __SDT_COND_SIGNED(char32_t) */
++#endif
++
++template<typename __sdt_E>
++struct __sdt_type<__sdt_E[]> : public __sdt_type<__sdt_E *> {};
++
++template<typename __sdt_E, size_t __sdt_N>
++struct __sdt_type<__sdt_E[__sdt_N]> : public __sdt_type<__sdt_E *> {};
++
++#elif !defined(__ASSEMBLER__)
++__extension__ extern unsigned long long __sdt_unsp;
++# define _SDT_ARGINTTYPE(x)						\
++  __typeof (__builtin_choose_expr (((__builtin_classify_type (x)	\
++				     + 3) & -4) == 4, (x), 0U))
++# define _SDT_ARGSIGNED(x)						\
++  (!__extension__							\
++   (__builtin_constant_p ((((unsigned long long)			\
++			    (_SDT_ARGINTTYPE (x)) __sdt_unsp)		\
++			   & ((unsigned long long)1 << (sizeof (unsigned long long)	\
++				       * __CHAR_BIT__ - 1))) == 0)	\
++    || (_SDT_ARGINTTYPE (x)) -1 > (_SDT_ARGINTTYPE (x)) 0))
++# define _SDT_ARGSIZE(x)	\
++  (_SDT_ARGARRAY (x) ? sizeof (void *) : sizeof (x))
++# define _SDT_ARGVAL(x)		(x)
++#endif
++
++#if defined __powerpc__ || defined __powerpc64__
++# define _SDT_ARGTMPL(id)	%I[id]%[id]
++#elif defined __i386__
++# define _SDT_ARGTMPL(id)	%k[id]  /* gcc.gnu.org/PR80115 sourceware.org/PR24541 */
++#else
++# define _SDT_ARGTMPL(id)	%[id]
++#endif
++
++/* NB: gdb PR24541 highlighted an unspecified corner of the sdt.h
++   operand note format.
++
++   The named register may be a longer or shorter (!) alias for the
++   storage where the value in question is found.  For example, on
++   i386, 64-bit value may be put in register pairs, and the register
++   name stored would identify just one of them.  Previously, gcc was
++   asked to emit the %w[id] (16-bit alias of some registers holding
++   operands), even when a wider 32-bit value was used.
++
++   Bottom line: the byte-width given before the @ sign governs.  If
++   there is a mismatch between that width and that of the named
++   register, then a sys/sdt.h note consumer may need to employ
++   architecture-specific heuristics to figure out where the compiler
++   has actually put the complete value.
++*/
++
++#ifdef __LP64__
++# define _SDT_ASM_ADDR	.8byte
++#else
++# define _SDT_ASM_ADDR	.4byte
++#endif
++
++/* The ia64 and s390 nop instructions take an argument. */
++#if defined(__ia64__) || defined(__s390__) || defined(__s390x__)
++#define _SDT_NOP	nop 0
++#else
++#define _SDT_NOP	nop
++#endif
++
++/* PipeASIO: x86_64 sites are a 5-byte nop so the optimized uprobe path applies.
++   _SDT_ASM_1 cannot carry the comma-separated .byte list (its _SDT_S
++   re-invocation would split on the commas), hence the 5-argument helper. */
++#if defined(__x86_64__)
++# define _SDT_DEF_NOP _SDT_ASM_5(990: .byte 0x0f, 0x1f, 0x44, 0x00, 0x00)
++#else
++# define _SDT_DEF_NOP _SDT_ASM_1(990: _SDT_NOP)
++#endif
++
++#define _SDT_NOTE_NAME	"stapsdt"
++#define _SDT_NOTE_TYPE	3
++
++/* If the assembler supports the necessary feature, then we can play
++   nice with code in COMDAT sections, which comes up in C++ code.
++   Without that assembler support, some combinations of probe placements
++   in certain kinds of C++ code may produce link-time errors.  */
++#include "sdt-config.h"
++#if _SDT_ASM_SECTION_AUTOGROUP_SUPPORT
++# define _SDT_ASM_AUTOGROUP "?"
++#else
++# define _SDT_ASM_AUTOGROUP ""
++#endif
++
++#define _SDT_DEF_MACROS							     \
++	_SDT_ASM_1(.altmacro)						     \
++	_SDT_ASM_1(.macro _SDT_SIGN x)				     	     \
++	_SDT_ASM_1(.iflt \\x)						     \
++	_SDT_ASM_1(.ascii "-")						     \
++	_SDT_ASM_1(.endif)						     \
++	_SDT_ASM_1(.endm)						     \
++	_SDT_ASM_1(.macro _SDT_SIZE_ x)					     \
++	_SDT_ASM_1(.ascii "\x")						     \
++	_SDT_ASM_1(.endm)						     \
++	_SDT_ASM_1(.macro _SDT_SIZE x)					     \
++	_SDT_ASM_1(_SDT_SIZE_ %%((-(-\\x*((-\\x>0)-(-\\x<0))))>>8))	     \
++	_SDT_ASM_1(.endm)						     \
++	_SDT_ASM_1(.macro _SDT_TYPE_ x)				             \
++	_SDT_ASM_2(.ifc 8,\\x)					     	     \
++	_SDT_ASM_1(.ascii "f")						     \
++	_SDT_ASM_1(.endif)						     \
++	_SDT_ASM_1(.ascii "@")						     \
++	_SDT_ASM_1(.endm)						     \
++	_SDT_ASM_1(.macro _SDT_TYPE x)				     	     \
++	_SDT_ASM_1(_SDT_TYPE_ %%((\\x)&(0xff)))			     \
++	_SDT_ASM_1(.endm)
++
++#define _SDT_UNDEF_MACROS						      \
++  _SDT_ASM_1(.purgem _SDT_SIGN)						      \
++  _SDT_ASM_1(.purgem _SDT_SIZE_)					      \
++  _SDT_ASM_1(.purgem _SDT_SIZE)						      \
++  _SDT_ASM_1(.purgem _SDT_TYPE_)					      \
++  _SDT_ASM_1(.purgem _SDT_TYPE)
++
++#define _SDT_ASM_BODY(provider, name, pack_args, args, ...)		      \
++  _SDT_DEF_MACROS							      \
++  _SDT_DEF_NOP							      \
++  _SDT_ASM_3(		.pushsection .note.stapsdt,_SDT_ASM_AUTOGROUP,"note") \
++  _SDT_ASM_1(		.balign 4)					      \
++  _SDT_ASM_3(		.4byte 992f-991f, 994f-993f, _SDT_NOTE_TYPE)	      \
++  _SDT_ASM_1(991:	.asciz _SDT_NOTE_NAME)				      \
++  _SDT_ASM_1(992:	.balign 4)					      \
++  _SDT_ASM_1(993:	_SDT_ASM_ADDR 990b)				      \
++  _SDT_ASM_1(		_SDT_ASM_ADDR _.stapsdt.base)			      \
++  _SDT_SEMAPHORE(provider,name)						      \
++  _SDT_ASM_STRING(provider)						      \
++  _SDT_ASM_STRING(name)							      \
++  pack_args args							      \
++  _SDT_ASM_SUBSTR(\x00)							      \
++  _SDT_UNDEF_MACROS							      \
++  _SDT_ASM_1(994:	.balign 4)					      \
++  _SDT_ASM_1(		.popsection)
++
++#if _SDT_ASM_SECTION_RETAIN_SUPPORT
++# define _SDT_ASM_RETAIN "aGR"
++#else
++# define _SDT_ASM_RETAIN "aG"
++#endif
++
++
++#define _SDT_ASM_BASE                                                   \
++  _SDT_ASM_1(.ifndef _.stapsdt.base)					      \
++  _SDT_ASM_5(		.pushsection .stapsdt.base,_SDT_ASM_RETAIN,"progbits",.stapsdt.base,comdat) \
++  _SDT_ASM_1(		.weak _.stapsdt.base)				      \
++  _SDT_ASM_1(		.hidden _.stapsdt.base)				      \
++  _SDT_ASM_1(	_.stapsdt.base: .space 1)				      \
++  _SDT_ASM_2(		.size _.stapsdt.base, 1)			      \
++  _SDT_ASM_1(		.popsection)					      \
++  _SDT_ASM_1(.endif)
++
++#if defined _SDT_HAS_SEMAPHORES
++#define _SDT_SEMAPHORE(p,n) \
++	_SDT_ASM_1(		_SDT_ASM_ADDR p##_##n##_semaphore)
++#else
++#define _SDT_SEMAPHORE(p,n) _SDT_ASM_1(		_SDT_ASM_ADDR 0)
++#endif
++
++#define _SDT_ASM_BLANK _SDT_ASM_SUBSTR(\x20)
++#define _SDT_ASM_TEMPLATE_0		/* no arguments */
++#define _SDT_ASM_TEMPLATE_1		_SDT_ARGFMT(1)
++#define _SDT_ASM_TEMPLATE_2		_SDT_ASM_TEMPLATE_1 _SDT_ASM_BLANK _SDT_ARGFMT(2)
++#define _SDT_ASM_TEMPLATE_3		_SDT_ASM_TEMPLATE_2 _SDT_ASM_BLANK _SDT_ARGFMT(3)
++#define _SDT_ASM_TEMPLATE_4		_SDT_ASM_TEMPLATE_3 _SDT_ASM_BLANK _SDT_ARGFMT(4)
++#define _SDT_ASM_TEMPLATE_5		_SDT_ASM_TEMPLATE_4 _SDT_ASM_BLANK _SDT_ARGFMT(5)
++#define _SDT_ASM_TEMPLATE_6		_SDT_ASM_TEMPLATE_5 _SDT_ASM_BLANK _SDT_ARGFMT(6)
++#define _SDT_ASM_TEMPLATE_7		_SDT_ASM_TEMPLATE_6 _SDT_ASM_BLANK _SDT_ARGFMT(7)
++#define _SDT_ASM_TEMPLATE_8		_SDT_ASM_TEMPLATE_7 _SDT_ASM_BLANK _SDT_ARGFMT(8)
++#define _SDT_ASM_TEMPLATE_9		_SDT_ASM_TEMPLATE_8 _SDT_ASM_BLANK _SDT_ARGFMT(9)
++#define _SDT_ASM_TEMPLATE_10		_SDT_ASM_TEMPLATE_9 _SDT_ASM_BLANK _SDT_ARGFMT(10)
++#define _SDT_ASM_TEMPLATE_11		_SDT_ASM_TEMPLATE_10 _SDT_ASM_BLANK _SDT_ARGFMT(11)
++#define _SDT_ASM_TEMPLATE_12		_SDT_ASM_TEMPLATE_11 _SDT_ASM_BLANK _SDT_ARGFMT(12)
++#define _SDT_ASM_OPERANDS_0()		[__sdt_dummy] "g" (0)
++#define _SDT_ASM_OPERANDS_1(arg1)	_SDT_ARG(1, arg1)
++#define _SDT_ASM_OPERANDS_2(arg1, arg2) \
++  _SDT_ASM_OPERANDS_1(arg1), _SDT_ARG(2, arg2)
++#define _SDT_ASM_OPERANDS_3(arg1, arg2, arg3) \
++  _SDT_ASM_OPERANDS_2(arg1, arg2), _SDT_ARG(3, arg3)
++#define _SDT_ASM_OPERANDS_4(arg1, arg2, arg3, arg4) \
++  _SDT_ASM_OPERANDS_3(arg1, arg2, arg3), _SDT_ARG(4, arg4)
++#define _SDT_ASM_OPERANDS_5(arg1, arg2, arg3, arg4, arg5) \
++  _SDT_ASM_OPERANDS_4(arg1, arg2, arg3, arg4), _SDT_ARG(5, arg5)
++#define _SDT_ASM_OPERANDS_6(arg1, arg2, arg3, arg4, arg5, arg6) \
++  _SDT_ASM_OPERANDS_5(arg1, arg2, arg3, arg4, arg5), _SDT_ARG(6, arg6)
++#define _SDT_ASM_OPERANDS_7(arg1, arg2, arg3, arg4, arg5, arg6, arg7) \
++  _SDT_ASM_OPERANDS_6(arg1, arg2, arg3, arg4, arg5, arg6), _SDT_ARG(7, arg7)
++#define _SDT_ASM_OPERANDS_8(arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8) \
++  _SDT_ASM_OPERANDS_7(arg1, arg2, arg3, arg4, arg5, arg6, arg7), \
++    _SDT_ARG(8, arg8)
++#define _SDT_ASM_OPERANDS_9(arg1,arg2,arg3,arg4,arg5,arg6,arg7,arg8,arg9) \
++  _SDT_ASM_OPERANDS_8(arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8), \
++    _SDT_ARG(9, arg9)
++#define _SDT_ASM_OPERANDS_10(arg1,arg2,arg3,arg4,arg5,arg6,arg7,arg8,arg9,arg10) \
++  _SDT_ASM_OPERANDS_9(arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8, arg9), \
++    _SDT_ARG(10, arg10)
++#define _SDT_ASM_OPERANDS_11(arg1,arg2,arg3,arg4,arg5,arg6,arg7,arg8,arg9,arg10,arg11) \
++  _SDT_ASM_OPERANDS_10(arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8, arg9, arg10), \
++    _SDT_ARG(11, arg11)
++#define _SDT_ASM_OPERANDS_12(arg1,arg2,arg3,arg4,arg5,arg6,arg7,arg8,arg9,arg10,arg11,arg12) \
++  _SDT_ASM_OPERANDS_11(arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8, arg9, arg10, arg11), \
++    _SDT_ARG(12, arg12)
++
++/* These macros can be used in C, C++, or assembly code.
++   In assembly code the arguments should use normal assembly operand syntax.  */
++
++#define STAP_PROBE(provider, name) \
++  _SDT_PROBE(provider, name, 0, ())
++#define STAP_PROBE1(provider, name, arg1) \
++  _SDT_PROBE(provider, name, 1, (arg1))
++#define STAP_PROBE2(provider, name, arg1, arg2) \
++  _SDT_PROBE(provider, name, 2, (arg1, arg2))
++#define STAP_PROBE3(provider, name, arg1, arg2, arg3) \
++  _SDT_PROBE(provider, name, 3, (arg1, arg2, arg3))
++#define STAP_PROBE4(provider, name, arg1, arg2, arg3, arg4) \
++  _SDT_PROBE(provider, name, 4, (arg1, arg2, arg3, arg4))
++#define STAP_PROBE5(provider, name, arg1, arg2, arg3, arg4, arg5) \
++  _SDT_PROBE(provider, name, 5, (arg1, arg2, arg3, arg4, arg5))
++#define STAP_PROBE6(provider, name, arg1, arg2, arg3, arg4, arg5, arg6)	\
++  _SDT_PROBE(provider, name, 6, (arg1, arg2, arg3, arg4, arg5, arg6))
++#define STAP_PROBE7(provider, name, arg1, arg2, arg3, arg4, arg5, arg6, arg7) \
++  _SDT_PROBE(provider, name, 7, (arg1, arg2, arg3, arg4, arg5, arg6, arg7))
++#define STAP_PROBE8(provider,name,arg1,arg2,arg3,arg4,arg5,arg6,arg7,arg8) \
++  _SDT_PROBE(provider, name, 8, (arg1,arg2,arg3,arg4,arg5,arg6,arg7,arg8))
++#define STAP_PROBE9(provider,name,arg1,arg2,arg3,arg4,arg5,arg6,arg7,arg8,arg9)\
++  _SDT_PROBE(provider, name, 9, (arg1,arg2,arg3,arg4,arg5,arg6,arg7,arg8,arg9))
++#define STAP_PROBE10(provider,name,arg1,arg2,arg3,arg4,arg5,arg6,arg7,arg8,arg9,arg10) \
++  _SDT_PROBE(provider, name, 10, \
++	     (arg1,arg2,arg3,arg4,arg5,arg6,arg7,arg8,arg9,arg10))
++#define STAP_PROBE11(provider,name,arg1,arg2,arg3,arg4,arg5,arg6,arg7,arg8,arg9,arg10,arg11) \
++  _SDT_PROBE(provider, name, 11, \
++	     (arg1,arg2,arg3,arg4,arg5,arg6,arg7,arg8,arg9,arg10,arg11))
++#define STAP_PROBE12(provider,name,arg1,arg2,arg3,arg4,arg5,arg6,arg7,arg8,arg9,arg10,arg11,arg12) \
++  _SDT_PROBE(provider, name, 12, \
++	     (arg1,arg2,arg3,arg4,arg5,arg6,arg7,arg8,arg9,arg10,arg11,arg12))
++
++/* This STAP_PROBEV macro can be used in variadic scenarios, where the
++   number of probe arguments is not known until compile time.  Since
++   variadic macro support may vary with compiler options, you must
++   pre-#define SDT_USE_VARIADIC to enable this type of probe.
++
++   The trick to count __VA_ARGS__ was inspired by this post by
++   Laurent Deniau <laurent.deniau@cern.ch>:
++       http://groups.google.com/group/comp.std.c/msg/346fc464319b1ee5
++
++   Note that our _SDT_NARG is called with an extra 0 arg that's not
++   counted, so we don't have to worry about the behavior of macros
++   called without any arguments.  */
++
++#define _SDT_NARG(...) __SDT_NARG(__VA_ARGS__, 12,11,10,9,8,7,6,5,4,3,2,1,0)
++#define __SDT_NARG(_0,_1,_2,_3,_4,_5,_6,_7,_8,_9,_10,_11,_12, N, ...) N
++#ifdef SDT_USE_VARIADIC
++#define _SDT_PROBE_N(provider, name, N, ...) \
++  _SDT_PROBE(provider, name, N, (__VA_ARGS__))
++#define STAP_PROBEV(provider, name, ...) \
++  _SDT_PROBE_N(provider, name, _SDT_NARG(0, ##__VA_ARGS__), ##__VA_ARGS__)
++#endif
++
++/* These macros are for use in asm statements.  You must compile
++   with -std=gnu99 or -std=c99 to use the STAP_PROBE_ASM macro.
++
++   The STAP_PROBE_ASM macro generates a quoted string to be used in the
++   template portion of the asm statement, concatenated with strings that
++   contain the actual assembly code around the probe site.
++
++   For example:
++
++	asm ("before\n"
++	     STAP_PROBE_ASM(provider, fooprobe, %eax 4(%esi))
++	     "after");
++
++   emits the assembly code for "before\nafter", with a probe in between.
++   The probe arguments are the %eax register, and the value of the memory
++   word located 4 bytes past the address in the %esi register.  Note that
++   because this is a simple asm, not a GNU C extended asm statement, these
++   % characters do not need to be doubled to generate literal %reg names.
++
++   In a GNU C extended asm statement, the probe arguments can be specified
++   using the macro STAP_PROBE_ASM_TEMPLATE(n) for n arguments.  The paired
++   macro STAP_PROBE_ASM_OPERANDS gives the C values of these probe arguments,
++   and appears in the input operand list of the asm statement.  For example:
++
++	asm ("someinsn %0,%1\n" // %0 is output operand, %1 is input operand
++	     STAP_PROBE_ASM(provider, fooprobe, STAP_PROBE_ASM_TEMPLATE(3))
++	     "otherinsn %[namedarg]"
++	     : "r" (outvar)
++	     : "g" (some_value), [namedarg] "i" (1234),
++	       STAP_PROBE_ASM_OPERANDS(3, some_value, some_ptr->field, 1234));
++
++    This is just like writing:
++
++	STAP_PROBE3(provider, fooprobe, some_value, some_ptr->field, 1234));
++
++    but the probe site is right between "someinsn" and "otherinsn".
++
++    The probe arguments in STAP_PROBE_ASM can be given as assembly
++    operands instead, even inside a GNU C extended asm statement.
++    Note that these can use operand templates like %0 or %[name],
++    and likewise they must write %%reg for a literal operand of %reg.  */
++
++#define _SDT_ASM_BODY_1(p,n,...) _SDT_ASM_BODY(p,n,_SDT_ASM_SUBSTR,(__VA_ARGS__))
++#define _SDT_ASM_BODY_2(p,n,...) _SDT_ASM_BODY(p,n,/*_SDT_ASM_STRING */,__VA_ARGS__)
++#define _SDT_ASM_BODY_N2(p,n,no,...) _SDT_ASM_BODY_ ## no(p,n,__VA_ARGS__)
++#define _SDT_ASM_BODY_N1(p,n,no,...) _SDT_ASM_BODY_N2(p,n,no,__VA_ARGS__)
++#define _SDT_ASM_BODY_N(p,n,...) _SDT_ASM_BODY_N1(p,n,_SDT_NARG(0, __VA_ARGS__),__VA_ARGS__)
++
++#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 199901L
++# define STAP_PROBE_ASM(provider, name, ...)		\
++  _SDT_ASM_BODY_N(provider, name, __VA_ARGS__)					\
++  _SDT_ASM_BASE
++# define STAP_PROBE_ASM_OPERANDS(n, ...) _SDT_ASM_OPERANDS_##n(__VA_ARGS__)
++#else
++# define STAP_PROBE_ASM(provider, name, args)	\
++  _SDT_ASM_BODY(provider, name, /* _SDT_ASM_STRING */, (args))	\
++  _SDT_ASM_BASE
++#endif
++#define STAP_PROBE_ASM_TEMPLATE(n) _SDT_ASM_TEMPLATE_##n,"use _SDT_ASM_TEMPLATE_"
++
++
++/* DTrace compatible macro names.  */
++#define DTRACE_PROBE(provider,probe)		\
++  STAP_PROBE(provider,probe)
++#define DTRACE_PROBE1(provider,probe,parm1)	\
++  STAP_PROBE1(provider,probe,parm1)
++#define DTRACE_PROBE2(provider,probe,parm1,parm2)	\
++  STAP_PROBE2(provider,probe,parm1,parm2)
++#define DTRACE_PROBE3(provider,probe,parm1,parm2,parm3) \
++  STAP_PROBE3(provider,probe,parm1,parm2,parm3)
++#define DTRACE_PROBE4(provider,probe,parm1,parm2,parm3,parm4)	\
++  STAP_PROBE4(provider,probe,parm1,parm2,parm3,parm4)
++#define DTRACE_PROBE5(provider,probe,parm1,parm2,parm3,parm4,parm5)	\
++  STAP_PROBE5(provider,probe,parm1,parm2,parm3,parm4,parm5)
++#define DTRACE_PROBE6(provider,probe,parm1,parm2,parm3,parm4,parm5,parm6) \
++  STAP_PROBE6(provider,probe,parm1,parm2,parm3,parm4,parm5,parm6)
++#define DTRACE_PROBE7(provider,probe,parm1,parm2,parm3,parm4,parm5,parm6,parm7) \
++  STAP_PROBE7(provider,probe,parm1,parm2,parm3,parm4,parm5,parm6,parm7)
++#define DTRACE_PROBE8(provider,probe,parm1,parm2,parm3,parm4,parm5,parm6,parm7,parm8) \
++  STAP_PROBE8(provider,probe,parm1,parm2,parm3,parm4,parm5,parm6,parm7,parm8)
++#define DTRACE_PROBE9(provider,probe,parm1,parm2,parm3,parm4,parm5,parm6,parm7,parm8,parm9) \
++  STAP_PROBE9(provider,probe,parm1,parm2,parm3,parm4,parm5,parm6,parm7,parm8,parm9)
++#define DTRACE_PROBE10(provider,probe,parm1,parm2,parm3,parm4,parm5,parm6,parm7,parm8,parm9,parm10) \
++  STAP_PROBE10(provider,probe,parm1,parm2,parm3,parm4,parm5,parm6,parm7,parm8,parm9,parm10)
++#define DTRACE_PROBE11(provider,probe,parm1,parm2,parm3,parm4,parm5,parm6,parm7,parm8,parm9,parm10,parm11) \
++  STAP_PROBE11(provider,probe,parm1,parm2,parm3,parm4,parm5,parm6,parm7,parm8,parm9,parm10,parm11)
++#define DTRACE_PROBE12(provider,probe,parm1,parm2,parm3,parm4,parm5,parm6,parm7,parm8,parm9,parm10,parm11,parm12) \
++  STAP_PROBE12(provider,probe,parm1,parm2,parm3,parm4,parm5,parm6,parm7,parm8,parm9,parm10,parm11,parm12)
++
++
++#endif /* sys/sdt.h */
+diff --git a/src/asio.c b/src/asio.c
+index 9aafb96..fb3fcde 100644
+--- a/src/asio.c
++++ b/src/asio.c
+@@ -72,8 +72,10 @@
+ #include "pipeasio_rt.h"
+ #include "pipeasio_admission_gate.h"
+ #ifndef PIPEASIO_WOW64_PE
++#include "pipeasio_block_clock.h"
+ #include "pipeasio_telemetry.h"
+ #endif
++#include "pipeasio_probe.h" /* a no-op for the WoW64 PE front end */
+ #ifdef PIPEASIO_WOW64_PE
+ #include "pipeasio_wow64_pe.h"
+ #endif
+@@ -296,6 +298,8 @@ typedef struct pipeasio_telemetry_cycle
+     bool                      valid;
+     bool                      live_returned;
+     uint32_t                  flags;
++    uint64_t                  seq;         /* block sequence of this callback */
++    uint64_t                  deadline_ns; /* audio_get_cycle_deadline_nsec at entry */
+ } pipeasio_telemetry_cycle;
+ #endif
+ 
+@@ -318,6 +322,10 @@ typedef struct IPipeASIOImpl
+     /* The PipeWire callback sets this pointer while Live processes one block.
+      * The report worker reads completed samples from fixed storage. */
+     pipeasio_telemetry_cycle *telemetry_cycle;
++    /* Block sequence for the static trace points and telemetry: the callback
++     * thread alone increments it, at process_callback entry, so the first
++     * block is 1 and 0 means "no block" (pipeasio-usdt-block-markers). */
++    uint64_t block_seq;
+ #endif
+     _Atomic uint32_t gate_owner_seq;
+     _Atomic uint32_t lifecycle_waiters;
+@@ -836,6 +844,10 @@ telemetry_cycle_finish(pipeasio_telemetry_cycle *cycle)
+             = telemetry_delta_ns(&cycle->post_wall, &output_wall);
+     sample.cpu_ns[PIPEASIO_TELEMETRY_POST_LIVE] = telemetry_delta_ns(&cycle->post_cpu, &output_cpu);
+     sample.flags                                = cycle->flags;
++    sample.seq                                  = cycle->seq;
++    sample.slack_ns = pipeasio_block_slack_ns(cycle->deadline_ns,
++                                              (uint64_t)output_wall.tv_sec * 1000000000ull
++                                                      + (uint64_t)output_wall.tv_nsec);
+     pipeasio_telemetry_ring_publish(&cycle->state->ring, &sample);
+ }
+ 
+@@ -861,7 +873,10 @@ telemetry_emit(IPipeASIOImpl *This)
+     uint64_t                  values[PIPEASIO_TELEMETRY_CAPACITY];
+     uint64_t                  dropped;
+     uint64_t                  muted;
++    uint64_t                  first_seq;
++    uint64_t                  last_seq;
+     size_t                    time_info = 0;
++    size_t                    late      = 0;
+     if (!state)
+         return;
+     count   = pipeasio_telemetry_ring_snapshot(&state->ring, &first);
+@@ -871,20 +886,32 @@ telemetry_emit(IPipeASIOImpl *This)
+     {
+         if (dropped || muted)
+             telemetry_log(state,
+-                          "cycles=%llu time_info=0 legacy=0 muted=%llu dropped=%llu\n",
++                          "cycles=%llu time_info=0 legacy=0 muted=%llu dropped=%llu "
++                          "block_range=0-0 late=0\n",
+                           (unsigned long long)muted, (unsigned long long)muted,
+                           (unsigned long long)dropped);
+         return;
+     }
+     for (size_t i = 0; i < count; ++i)
+-        if (pipeasio_telemetry_ring_at(&state->ring, first + i)->flags
+-            & PIPEASIO_TELEMETRY_TIME_INFO)
++    {
++        const pipeasio_telemetry_sample *sample
++                = pipeasio_telemetry_ring_at(&state->ring, first + i);
++        if (sample->flags & PIPEASIO_TELEMETRY_TIME_INFO)
+             ++time_info;
++        if (sample->slack_ns < 0)
++            ++late;
++    }
++    /* The callback thread publishes in block order, so the first and last
++     * samples bound the block sequence range of this interval. */
++    first_seq = pipeasio_telemetry_ring_at(&state->ring, first)->seq;
++    last_seq  = pipeasio_telemetry_ring_at(&state->ring, first + count - 1)->seq;
+     telemetry_log(state,
+-                  "cycles=%llu time_info=%llu legacy=%llu muted=%llu dropped=%llu\n",
++                  "cycles=%llu time_info=%llu legacy=%llu muted=%llu dropped=%llu "
++                  "block_range=%llu-%llu late=%llu\n",
+                   (unsigned long long)(count + muted), (unsigned long long)time_info,
+                   (unsigned long long)(count - time_info), (unsigned long long)muted,
+-                  (unsigned long long)dropped);
++                  (unsigned long long)dropped, (unsigned long long)first_seq,
++                  (unsigned long long)last_seq, (unsigned long long)late);
+     for (unsigned clock_kind = 0; clock_kind < 2; ++clock_kind)
+         for (unsigned phase = 0; phase < PIPEASIO_TELEMETRY_PHASES; ++phase)
+         {
+@@ -1017,9 +1044,11 @@ pipeasio_host_call_process(pipeasio_host_call_token *token, int32_t buffer_index
+ #ifndef PIPEASIO_WOW64_PE
+         if (This->telemetry_cycle)
+             telemetry_cycle_before_live(This->telemetry_cycle, true);
++        PIPEASIO_PROBE(block_before_live, This->block_seq);
+ #endif
+         cb->swapBuffersWithTimeInfo(&This->host_time, buffer_index, 1);
+ #ifndef PIPEASIO_WOW64_PE
++        PIPEASIO_PROBE(block_after_live, This->block_seq);
+         if (This->telemetry_cycle)
+             telemetry_cycle_after_live(This->telemetry_cycle);
+ #endif
+@@ -1029,9 +1058,11 @@ pipeasio_host_call_process(pipeasio_host_call_token *token, int32_t buffer_index
+ #ifndef PIPEASIO_WOW64_PE
+         if (This->telemetry_cycle)
+             telemetry_cycle_before_live(This->telemetry_cycle, false);
++        PIPEASIO_PROBE(block_before_live, This->block_seq);
+ #endif
+         cb->swapBuffers(buffer_index, 1);
+ #ifndef PIPEASIO_WOW64_PE
++        PIPEASIO_PROBE(block_after_live, This->block_seq);
+         if (This->telemetry_cycle)
+             telemetry_cycle_after_live(This->telemetry_cycle);
+ #endif
+@@ -1571,6 +1602,11 @@ static DWORD WINAPI
+ lifecycle_worker(void *arg)
+ {
+     IPipeASIOImpl *This = arg;
++    /* Wine writes thread descriptions to /proc/<pid>/task/<tid>/comm, so a
++     * tracer can pick this thread out by name. */
++    static const WCHAR worker_name[]
++            = { 'p', 'i', 'p', 'e', 'a', 's', 'i', 'o', '-', 'w', 'o', 'r', 'k', 'e', 'r', 0 };
++    SetThreadDescription(GetCurrentThread(), worker_name);
+ 
+     for (;;)
+     {
+@@ -3356,16 +3392,32 @@ process_callback(audio_nframes_t nframes, void *arg)
+ {
+     IPipeASIOImpl *This = (IPipeASIOImpl *)arg;
+ #ifndef PIPEASIO_WOW64_PE
++    /* Block markers: the sequence and the cycle deadline (PipeWire's next
++     * wakeup) are fixed at entry; the flags fill in as the block proceeds. */
++    const uint64_t            seq         = ++This->block_seq;
++    const uint64_t            deadline_ns = audio_get_cycle_deadline_nsec(This->audio_client);
++    uint32_t                  block_flags = 0;
+     pipeasio_telemetry_cycle  cycle;
+     pipeasio_telemetry_state *telemetry
+             = atomic_load_explicit(&This->telemetry, memory_order_acquire);
+     if (telemetry)
++    {
+         telemetry_cycle_begin(telemetry, &cycle);
++        cycle.seq         = seq;
++        cycle.deadline_ns = deadline_ns;
++    }
+ #endif
+     pipeasio_host_call_token token;
+-    bool admitted = pipeasio_host_call_begin(This, PIPEASIO_HOST_PROCESS, &token);
+-    int  half     = 0;
+-    BOOL muted    = FALSE;
++    bool     admitted = pipeasio_host_call_begin(This, PIPEASIO_HOST_PROCESS, &token);
++    int      half     = 0;
++    BOOL     muted    = FALSE;
++    uint32_t rate     = atomic_load_explicit(&This->host_sample_rate, memory_order_acquire);
++#ifndef PIPEASIO_WOW64_PE
++    if (admitted)
++        block_flags |= PIPEASIO_BLOCK_ADMITTED;
++    PIPEASIO_PROBE(block_start, seq, nframes, rate, audio_get_time_nsec(This->audio_client),
++                   deadline_ns, block_flags);
++#endif
+ 
+     if (admitted)
+     {
+@@ -3374,7 +3426,6 @@ process_callback(audio_nframes_t nframes, void *arg)
+          * cycle after activation (CreateBuffers), when the driver is not yet
+          * Running, so only the host_sample_rate store survived (issue #20).
+          * Tell the host before it processes the first buffer at that rate. */
+-        uint32_t rate = atomic_load_explicit(&This->host_sample_rate, memory_order_acquire);
+         if (rate != atomic_load_explicit(&This->host_announced_rate, memory_order_acquire))
+         {
+             atomic_store_explicit(&This->host_announced_rate, rate, memory_order_release);
+@@ -3387,6 +3438,12 @@ process_callback(audio_nframes_t nframes, void *arg)
+          * silence instead of wrong-speed playback while the config watcher
+          * adopts the foreign quantum (pipeasio-quantum-converge). */
+         muted = audio_quantum_muted(This->audio_client) ? TRUE : FALSE;
++#ifndef PIPEASIO_WOW64_PE
++        if (This->host_time_info_mode)
++            block_flags |= PIPEASIO_BLOCK_TIME_INFO;
++        if (muted)
++            block_flags |= PIPEASIO_BLOCK_MUTED;
++#endif
+ 
+         /* Read only while admitted: Start writes host_buffer_index after
+          * draining the host gate, which rejected callbacks are not part of. */
+@@ -3433,6 +3490,9 @@ process_callback(audio_nframes_t nframes, void *arg)
+         else
+             telemetry_cycle_finish(&cycle);
+     }
++    /* Every output is queued: the block is over.  missed is the clock.position
++     * gap the backend found at this cycle's entry. */
++    PIPEASIO_PROBE(block_end, seq, block_flags, audio_get_cycle_missed(This->audio_client));
+ #endif
+     if (admitted)
+         This->host_buffer_index = half ? 0 : 1;
+diff --git a/src/audio.c b/src/audio.c
+index d9c6637..ab54e8f 100644
+--- a/src/audio.c
++++ b/src/audio.c
+@@ -21,10 +21,12 @@
+ #define _GNU_SOURCE /* SCHED_FIFO and friends */
+ 
+ #include "audio.h"
++#include "pipeasio_block_clock.h"
+ #include "pipeasio_config.h"
+ #include "pipeasio_hotplug.h"
+ #include "pipeasio_offsets.h"
+ #include "pipeasio_parse.h"
++#include "pipeasio_probe.h"
+ #include "pipeasio_pw_buffer.h"
+ #include "pipeasio_rt_priority.h"
+ #ifndef PIPEASIO_AUDIO_UNIXLIB
+@@ -106,9 +108,13 @@ static DWORD WINAPI
+ audio_rt_trampoline(LPVOID raw)
+ {
+     struct audio_rt_state *s = raw;
++    /* Wine writes thread descriptions to /proc/<pid>/task/<tid>/comm, so a
++     * tracer can pick the data-loop thread out by name. */
++    static const WCHAR rt_name[] = { 'p', 'i', 'p', 'e', 'a', 's', 'i', 'o', '-', 'r', 't', 0 };
+ 
+     s->ptid = pthread_self();
+     atomic_store_explicit(&s->ready, true, memory_order_release);
++    SetThreadDescription(GetCurrentThread(), rt_name);
+ 
+     TRACE("rt thread entry: tid=%lx\n", (unsigned long)GetCurrentThreadId());
+ 
+@@ -362,6 +368,11 @@ struct audio_client
+ 
+     /* Last spa_io_position.clock.nsec - feeds audio_get_time_nsec. */
+     _Atomic uint64_t   last_clock_nsec;
++    /* The rest of that cycle clock - next wakeup, quantum and rate - feeds
++     * audio_get_cycle_deadline_nsec (pipeasio-usdt-block-markers). */
++    _Atomic uint64_t   last_next_nsec;
++    _Atomic uint32_t   last_duration;
++    _Atomic uint32_t   last_rate;
+     bool               debug_enabled;
+     bool               quantum_warned;
+     _Atomic bool       quantum_muted;          /* mismatch mute active (issue #49) */
+@@ -384,6 +395,7 @@ struct audio_client
+     _Atomic uint32_t   xrun_count;          /* cycles we missed, this activation */
+     uint64_t           last_clock_position; /* previous cycle's clock.position */
+     uint32_t           last_clock_id;       /* timeline the position belongs to */
++    uint32_t           cycle_missed;        /* position gap found at this cycle's entry */
+ 
+     /* Latency the connected device chain reports, per direction, in samples.
+      * Written on the filter loop from a peer's SPA_PARAM_Latency, read by
+@@ -666,6 +678,9 @@ audio_open(const char *client_name, uint32_t options, uint32_t *status)
+     }
+     atomic_init(&c->sample_rate, AUDIO_DEFAULT_SAMPLE_RATE);
+     atomic_init(&c->last_clock_nsec, 0);
++    atomic_init(&c->last_next_nsec, 0);
++    atomic_init(&c->last_duration, 0);
++    atomic_init(&c->last_rate, 0);
+     atomic_init(&c->observed_quantum, 0);
+     atomic_init(&c->quantum_muted, false);
+     atomic_init(&c->global_force_quantum, 0);
+@@ -1154,6 +1169,11 @@ audio_activate_locked(audio_client_t *c)
+     atomic_store_explicit(&c->xrun_count, 0, memory_order_relaxed);
+     c->last_clock_position = 0;
+     c->last_clock_id       = 0;
++    c->cycle_missed        = 0;
++    /* No cycle yet: audio_get_cycle_deadline_nsec reports 0 until one lands. */
++    atomic_store_explicit(&c->last_next_nsec, 0, memory_order_relaxed);
++    atomic_store_explicit(&c->last_duration, 0, memory_order_relaxed);
++    atomic_store_explicit(&c->last_rate, 0, memory_order_relaxed);
+ 
+     atomic_store_explicit(&c->active, true, memory_order_release);
+     pw_thread_loop_lock(c->loop);
+@@ -1366,6 +1386,27 @@ audio_get_time_nsec(audio_client_t *c)
+     return c ? atomic_load_explicit(&c->last_clock_nsec, memory_order_acquire) : 0;
+ }
+ 
++uint64_t
++audio_get_cycle_deadline_nsec(audio_client_t *c)
++{
++    uint32_t duration;
++    if (!c)
++        return 0;
++    duration = atomic_load_explicit(&c->last_duration, memory_order_acquire);
++    if (!duration)
++        return 0; /* no cycle since activation */
++    return pipeasio_block_deadline_ns(
++            atomic_load_explicit(&c->last_clock_nsec, memory_order_acquire),
++            atomic_load_explicit(&c->last_next_nsec, memory_order_acquire), duration,
++            atomic_load_explicit(&c->last_rate, memory_order_acquire));
++}
++
++uint32_t
++audio_get_cycle_missed(audio_client_t *c)
++{
++    return c ? c->cycle_missed : 0;
++}
++
+ /* Ports. */
+ 
+ audio_port_t *
+@@ -2516,9 +2557,22 @@ static void
+ audio_on_process(void *userdata, struct spa_io_position *position)
+ {
+     audio_client_t *c = userdata;
++    /* Zeros stand in for a NULL position io. */
++    static const struct spa_io_clock no_clock;
++    const struct spa_io_clock       *cycle_clock = position ? &position->clock : &no_clock;
++    const uint32_t                   quantum     = (uint32_t)cycle_clock->duration;
+ 
+     if (position)
++    {
+         atomic_store_explicit(&c->last_clock_nsec, position->clock.nsec, memory_order_release);
++        /* The rest of the cycle clock feeds audio_get_cycle_deadline_nsec. */
++        atomic_store_explicit(&c->last_next_nsec, position->clock.next_nsec, memory_order_release);
++        atomic_store_explicit(&c->last_duration, quantum, memory_order_release);
++        atomic_store_explicit(&c->last_rate, position->clock.rate.denom, memory_order_release);
++    }
++    /* Static trace point: the full PipeWire cycle, dequeue to queue, starts here. */
++    PIPEASIO_PROBE(cycle_start, cycle_clock->nsec, cycle_clock->next_nsec, quantum,
++                   cycle_clock->position, cycle_clock->flags);
+     for (uint32_t i = 0; i < c->n_ports; ++i)
+     {
+         audio_port_t     *port = c->ports[i];
+@@ -2527,8 +2581,6 @@ audio_on_process(void *userdata, struct spa_io_position *position)
+         atomic_store_explicit(&port->cycle_buffer, buffer, memory_order_release);
+     }
+ 
+-    const uint32_t quantum = position ? (uint32_t)position->clock.duration : 0;
+-
+     /* Remember the raw graph quantum every cycle (read by
+      * audio_observed_quantum):
+      * follow-device mode settles its buffer size to it, the config watcher
+@@ -2584,6 +2636,25 @@ audio_on_process(void *userdata, struct spa_io_position *position)
+             audio_signal_diagnostic(c, AUDIO_DIAGNOSTIC_TRACE, quantum, position);
+     }
+ 
++    /* Cycles the host was due but did not get since the previous one.
++     * SPA_IO_CLOCK_FLAG_XRUN_RECOVER cannot serve here: impl-node.c only sets
++     * it around the driver node's own process_node, and we are deliberately a
++     * follower.  clock.position instead advances one duration per cycle, so a
++     * larger gap is the cycles our bufferSwitch was too slow for.  Only judge
++     * that at our steady quantum (renegotiation is not a dropout) and across
++     * one clock.id (a new driver rebases the timeline).  Measured before the
++     * host runs so the block markers can report it; charged to the xrun count
++     * below only when the host consumed both cycles (a deliberate Stop is
++     * idle, not late). */
++    uint32_t missed = 0;
++    if (position && quantum && quantum == c->buffer_size && position->clock.id == c->last_clock_id
++        && c->last_clock_position && position->clock.position > c->last_clock_position)
++    {
++        const uint64_t cycles = (position->clock.position - c->last_clock_position) / quantum;
++        missed                = cycles > 1 ? (uint32_t)(cycles - 1) : 0;
++    }
++    c->cycle_missed = missed;
++
+     /* Deliver the host callback.  At matched sizes, once per cycle.  While
+      * muted, the graph cycles at the foreign quantum but the host still
+      * expects buffer_size frames per bufferSwitch: invoking it once per
+@@ -2621,35 +2692,19 @@ audio_on_process(void *userdata, struct spa_io_position *position)
+          * duration returns. */
+         c->mute_accum = 0;
+ 
+-    /* Count cycles the host was due but did not get.  SPA_IO_CLOCK_FLAG_XRUN_RECOVER
+-     * cannot serve here: impl-node.c only sets it around the driver node's own
+-     * process_node, and we are deliberately a follower.  clock.position instead
+-     * advances one duration per cycle, so a larger gap is the cycles our
+-     * bufferSwitch was too slow for.  Only judge that at our steady quantum
+-     * (renegotiation is not a dropout), across one clock.id (a new driver
+-     * rebases the timeline), and when the host consumed both cycles (a
+-     * deliberate Stop is idle, not late).  Report the first, then every 64th. */
++    /* Charge the gap measured above (report the first, then every 64th) and
++     * move the position window on. */
+     if (delivered && position && quantum && quantum == c->buffer_size)
+     {
+-        const uint64_t pos = position->clock.position;
+-        if (position->clock.id != c->last_clock_id)
++        if (missed)
+         {
+-            c->last_clock_id       = position->clock.id;
+-            c->last_clock_position = 0;
+-        }
+-        if (c->last_clock_position && pos > c->last_clock_position)
+-        {
+-            const uint64_t cycles = (pos - c->last_clock_position) / quantum;
+-            const uint32_t missed = cycles > 1 ? (uint32_t)(cycles - 1) : 0;
+-            if (missed)
+-            {
+-                uint32_t n = atomic_fetch_add_explicit(&c->xrun_count, missed, memory_order_relaxed)
+-                             + missed;
+-                if (n == missed || (n % 64) < missed)
+-                    audio_signal_diagnostic(c, AUDIO_DIAGNOSTIC_XRUN, quantum, position);
+-            }
++            uint32_t n = atomic_fetch_add_explicit(&c->xrun_count, missed, memory_order_relaxed)
++                         + missed;
++            if (n == missed || (n % 64) < missed)
++                audio_signal_diagnostic(c, AUDIO_DIAGNOSTIC_XRUN, quantum, position);
+         }
+-        c->last_clock_position = pos;
++        c->last_clock_id       = position->clock.id;
++        c->last_clock_position = position->clock.position;
+     }
+     else
+         c->last_clock_position = 0;
+@@ -2676,6 +2731,7 @@ audio_on_process(void *userdata, struct spa_io_position *position)
+                 pw_filter_queue_buffer(port->pw_filter_port, buffer);
+         }
+     }
++    PIPEASIO_PROBE(cycle_end, missed, (uint32_t)delivered);
+ }
+ 
+ /* The core info event lands during audio_open's initial sync. Log all three
+diff --git a/tests/unit/CMakeLists.txt b/tests/unit/CMakeLists.txt
+index 04a2bfd..55e9366 100644
+--- a/tests/unit/CMakeLists.txt
++++ b/tests/unit/CMakeLists.txt
+@@ -42,3 +42,6 @@ set_tests_properties(test_handle_table PROPERTIES TIMEOUT 10)
+ pipeasio_add_unit_test(test_telemetry test_telemetry.c)
+ target_link_libraries(test_telemetry PRIVATE Threads::Threads)
+ set_tests_properties(test_telemetry PROPERTIES TIMEOUT 10)
++
++pipeasio_add_unit_test(test_block_clock test_block_clock.c)
++set_tests_properties(test_block_clock PROPERTIES TIMEOUT 10)
+diff --git a/tests/unit/test_block_clock.c b/tests/unit/test_block_clock.c
+new file mode 100644
+index 0000000..23945d9
+--- /dev/null
++++ b/tests/unit/test_block_clock.c
+@@ -0,0 +1,61 @@
++/* SPDX-License-Identifier: GPL-3.0-or-later */
++#include "pipeasio_block_clock.h"
++#include "pipeasio_telemetry.h"
++#include "test_helpers.h"
++
++int
++main(void)
++{
++    TEST_GROUP("block period")
++    {
++        EXPECT_EQ(pipeasio_block_period_ns(64, 48000), 1333333u);
++        EXPECT_EQ(pipeasio_block_period_ns(128, 44100), 2902494u);
++        EXPECT_EQ(pipeasio_block_period_ns(1024, 48000), 21333333u);
++        EXPECT_EQ(pipeasio_block_period_ns(48000, 48000), 1000000000u);
++        EXPECT_EQ(pipeasio_block_period_ns(64, 0), 0u);
++        EXPECT_EQ(pipeasio_block_period_ns(0, 48000), 0u);
++    }
++
++    TEST_GROUP("deadline prefers next_nsec")
++    {
++        EXPECT_EQ(pipeasio_block_deadline_ns(1000, 2500, 64, 48000), 2500u);
++        /* No usable next_nsec: one period after the cycle start. */
++        EXPECT_EQ(pipeasio_block_deadline_ns(1000, 0, 64, 48000), 1334333u);
++        EXPECT_EQ(pipeasio_block_deadline_ns(1000, 1000, 64, 48000), 1334333u);
++        EXPECT_EQ(pipeasio_block_deadline_ns(1000, 999, 64, 48000), 1334333u);
++        EXPECT_EQ(pipeasio_block_deadline_ns(1000, 0, 64, 0), 1000u);
++        EXPECT_EQ(pipeasio_block_deadline_ns(0, 0, 0, 0), 0u);
++    }
++
++    TEST_GROUP("slack sign")
++    {
++        EXPECT_EQ(pipeasio_block_slack_ns(2000, 1500), 500);
++        EXPECT_EQ(pipeasio_block_slack_ns(2000, 2000), 0);
++        EXPECT_TRUE(pipeasio_block_slack_ns(2000, 2500) == -500);
++        EXPECT_TRUE(pipeasio_block_slack_ns(2000, 2500) < 0);
++        EXPECT_TRUE(pipeasio_block_slack_ns(0, 1) == -1);
++    }
++
++    TEST_GROUP("seq and slack round-trip through the ring")
++    {
++        pipeasio_telemetry_ring   ring;
++        pipeasio_telemetry_sample sample = { 0 };
++        uint64_t                  first;
++        pipeasio_telemetry_ring_init(&ring);
++        sample.seq                              = 123456789012ull;
++        sample.slack_ns                         = -42;
++        sample.wall_ns[PIPEASIO_TELEMETRY_LIVE] = 7;
++        sample.flags                            = PIPEASIO_TELEMETRY_TIME_INFO;
++        EXPECT_TRUE(pipeasio_telemetry_ring_publish(&ring, &sample));
++        EXPECT_EQ(pipeasio_telemetry_ring_snapshot(&ring, &first), 1u);
++        const pipeasio_telemetry_sample *stored = pipeasio_telemetry_ring_at(&ring, first);
++        EXPECT_EQ(stored->seq, 123456789012ull);
++        EXPECT_TRUE(stored->slack_ns == -42);
++        EXPECT_EQ(stored->wall_ns[PIPEASIO_TELEMETRY_LIVE], 7u);
++        EXPECT_EQ(stored->flags, PIPEASIO_TELEMETRY_TIME_INFO);
++        pipeasio_telemetry_ring_consume(&ring, first, 1);
++        EXPECT_EQ(pipeasio_telemetry_ring_snapshot(&ring, NULL), 0u);
++    }
++
++    return test_report();
++}

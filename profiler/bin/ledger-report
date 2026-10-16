@@ -1,0 +1,564 @@
+#!/usr/bin/env python3
+"""Validate profiler/ledger.jsonl and render it as Markdown.
+
+    ledger-report [--ledger PATH] [--output FILE] [--history-dir DIR]
+
+Every ledger line is one ableton-linux-profiler-ledger/v1 object (fields and
+rules: profiler/LEDGER.md). The report shows verdict counts, one row per trial,
+the runs behind every kept trial and the open hotspots: call sites from the
+baseline traced runs under profiler/history/ that no trial has targeted yet.
+Trials on a virtualised host, or citing a virtualised run, raise the
+NO TIMING CLAIMS banner. Exit 2 when any line is invalid; the report still
+renders and names the bad lines.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+import re
+import sys
+from typing import Any
+
+
+SCHEMA = "ableton-linux-profiler-ledger/v1"
+VERDICTS = ("keep", "revert", "inconclusive", "tooling", "mechanism-confirmed")
+# A virtualised host supports no timing claim (CLAUDE.md).
+VIRTUAL_VERDICTS = ("tooling", "mechanism-confirmed")
+CHANGE_KINDS = ("wine-patch", "pipeasio-patch", "launcher", "config", "tooling")
+FIELDS = (
+    "schema", "trial", "date", "host", "branch", "hypothesis", "evidence", "change", "probe_result",
+    "runs", "metrics", "traced_confirmation", "verdict", "rationale", "commit", "minutes",
+)
+EVIDENCE_KEYS = ("run", "set", "call_site", "share_of_lost_slack")
+CHANGE_KEYS = ("kind", "patch", "switch", "probe", "note")
+PROBE_KEYS = ("pass", "fail", "skip", "log")
+RUNS_KEYS = ("aa", "abab", "traced")
+PAIR_KEYS = ("a", "b")
+METRICS_KEYS = ("primary", "per_set", "xruns", "cpu_live_pct")
+PER_SET_KEYS = ("a_median", "b_median", "aa_spread", "delta", "ratio_to_spread")
+CONFIRMATION_KEYS = ("call_site_share_before", "after")
+TRIAL_RE = re.compile(r"T[0-9]{4}")
+DATE_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?Z")
+HOST_RE = re.compile(r"bare-metal|vm:[A-Za-z0-9._-]+")
+SLUG_RE = re.compile(r"[A-Za-z0-9._-]+")
+SWITCH_RE = re.compile(r"[A-Z][A-Z0-9_]*=.+")
+COMMIT_RE = re.compile(r"[0-9a-f]{7,40}")
+MIN_ABAB_PAIRS = 3
+HYPOTHESIS_CELL_LIMIT = 100
+HERE = Path(__file__).resolve().parent
+DEFAULT_LEDGER = HERE.parent / "ledger.jsonl"
+DEFAULT_HISTORY_DIR = HERE.parent / "history"
+
+
+def is_number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def is_text(value: Any) -> bool:
+    return isinstance(value, str) and value.strip() != ""
+
+
+def is_count(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def expect_object(value: Any, where: str, keys: tuple[str, ...]) -> list[str]:
+    if not isinstance(value, dict):
+        return [f"{where} must be an object"]
+    problems = [f"{where} is missing {name}" for name in keys if name not in value]
+    problems.extend(f"{where} has unknown key {name}" for name in value if name not in keys)
+    return problems
+
+
+def expect_pair(value: Any, where: str) -> list[str]:
+    problems = expect_object(value, where, PAIR_KEYS)
+    if problems:
+        return problems
+    return [f"{where}.{name} must be a run id" for name in PAIR_KEYS if not is_text(value[name])]
+
+
+def expect_arm_values(value: Any, where: str) -> list[str]:
+    if value is None:
+        return []
+    problems = expect_object(value, where, PAIR_KEYS)
+    if problems:
+        return problems
+    return [f"{where}.{name} must be null or a number" for name in PAIR_KEYS if value[name] is not None and not is_number(value[name])]
+
+
+def validate_evidence(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return ["evidence must be a list"]
+    problems: list[str] = []
+    for index, item in enumerate(value):
+        where = f"evidence[{index}]"
+        item_problems = expect_object(item, where, EVIDENCE_KEYS)
+        if item_problems:
+            problems.extend(item_problems)
+            continue
+        problems.extend(f"{where}.{name} must be a non-empty string" for name in ("run", "set", "call_site") if not is_text(item[name]))
+        share = item["share_of_lost_slack"]
+        if not (is_number(share) and 0 <= share <= 1):
+            problems.append(f"{where}.share_of_lost_slack must be a number between 0 and 1")
+    return problems
+
+
+def validate_change(value: Any) -> list[str]:
+    problems = expect_object(value, "change", CHANGE_KEYS)
+    if problems:
+        return problems
+    if value["kind"] not in CHANGE_KINDS:
+        problems.append("change.kind must be one of " + ", ".join(CHANGE_KINDS))
+    for name in ("patch", "probe", "note"):
+        if value[name] is not None and not is_text(value[name]):
+            problems.append(f"change.{name} must be null or a path")
+    switch = value["switch"]
+    if switch is not None and not (isinstance(switch, str) and SWITCH_RE.fullmatch(switch)):
+        problems.append("change.switch must be null or NAME=value")
+    return problems
+
+
+def validate_probe_result(value: Any) -> list[str]:
+    if value is None:
+        return []
+    problems = expect_object(value, "probe_result", PROBE_KEYS)
+    if problems:
+        return problems
+    problems.extend(f"probe_result.{name} must be a count" for name in ("pass", "fail", "skip") if not is_count(value[name]))
+    if value["log"] is not None and not is_text(value["log"]):
+        problems.append("probe_result.log must be null or a path")
+    return problems
+
+
+def validate_runs(value: Any) -> list[str]:
+    problems = expect_object(value, "runs", RUNS_KEYS)
+    if problems:
+        return problems
+    if not isinstance(value["aa"], list):
+        problems.append("runs.aa must be a list of [run, run] pairs")
+    else:
+        for index, pair in enumerate(value["aa"]):
+            if not (isinstance(pair, list) and len(pair) == 2 and all(is_text(item) for item in pair)):
+                problems.append(f"runs.aa[{index}] must be [run, run]")
+    if not isinstance(value["abab"], list):
+        problems.append("runs.abab must be a list of {a, b} pairs")
+    else:
+        for index, pair in enumerate(value["abab"]):
+            problems.extend(expect_pair(pair, f"runs.abab[{index}]"))
+    if value["traced"] is not None:
+        problems.extend(expect_pair(value["traced"], "runs.traced"))
+    return problems
+
+
+def validate_metrics(value: Any) -> list[str]:
+    if value is None:
+        return []
+    problems = expect_object(value, "metrics", METRICS_KEYS)
+    if problems:
+        return problems
+    if not is_text(value["primary"]):
+        problems.append("metrics.primary must name a history metric")
+    if not isinstance(value["per_set"], dict):
+        problems.append("metrics.per_set must be an object keyed by Set")
+    else:
+        for name, values in value["per_set"].items():
+            where = f"metrics.per_set[{name}]"
+            set_problems = expect_object(values, where, PER_SET_KEYS)
+            if set_problems:
+                problems.extend(set_problems)
+                continue
+            problems.extend(f"{where}.{key} must be null or a number" for key in PER_SET_KEYS if values[key] is not None and not is_number(values[key]))
+    problems.extend(expect_arm_values(value["xruns"], "metrics.xruns"))
+    problems.extend(expect_arm_values(value["cpu_live_pct"], "metrics.cpu_live_pct"))
+    return problems
+
+
+def validate_traced_confirmation(value: Any) -> list[str]:
+    if value is None:
+        return []
+    problems = expect_object(value, "traced_confirmation", CONFIRMATION_KEYS)
+    if problems:
+        return problems
+    return [f"traced_confirmation.{name} must be null or a number" for name in CONFIRMATION_KEYS if value[name] is not None and not is_number(value[name])]
+
+
+def verdict_rules(value: dict[str, Any]) -> list[str]:
+    """Cross-field rules: the acceptance gate from CLAUDE.md, applied to the verdict."""
+    problems: list[str] = []
+    verdict, runs = value["verdict"], value["runs"]
+    if value["host"] != "bare-metal" and verdict not in VIRTUAL_VERDICTS:
+        problems.append("verdicts on a virtualised host are limited to " + " or ".join(VIRTUAL_VERDICTS))
+    if verdict == "keep":
+        if not runs["aa"]:
+            problems.append("verdict keep needs an A/A pair in runs.aa")
+        if len(runs["abab"]) < MIN_ABAB_PAIRS:
+            problems.append(f"verdict keep needs at least {MIN_ABAB_PAIRS} untraced A/B pairs in runs.abab")
+        if runs["traced"] is None:
+            problems.append("verdict keep needs one traced run per arm in runs.traced")
+        metrics = value["metrics"]
+        if metrics is None:
+            problems.append("verdict keep needs metrics")
+        else:
+            xruns = metrics["xruns"]
+            if xruns is None or xruns["a"] != 0 or xruns["b"] != 0:
+                problems.append("verdict keep needs metrics.xruns recorded as 0 for both arms")
+            if not metrics["per_set"]:
+                problems.append("verdict keep needs metrics.per_set")
+        probe = value["probe_result"]
+        if probe is None or probe["fail"] != 0:
+            problems.append("verdict keep needs probe_result with fail 0")
+        problems.extend(f"verdict keep needs change.{name}" for name in ("switch", "probe", "note") if value["change"][name] is None)
+    if verdict == "mechanism-confirmed":
+        if runs["traced"] is None:
+            problems.append("verdict mechanism-confirmed needs runs.traced")
+        if value["traced_confirmation"] is None:
+            problems.append("verdict mechanism-confirmed needs traced_confirmation")
+    return problems
+
+
+def validate_trial(value: Any) -> list[str]:
+    problems = expect_object(value, "line", FIELDS)
+    if problems:
+        return problems
+    if value["schema"] != SCHEMA:
+        problems.append(f"schema must be {SCHEMA}")
+    trial = value["trial"]
+    if not (isinstance(trial, str) and TRIAL_RE.fullmatch(trial)):
+        problems.append("trial must look like T0007")
+        trial = None
+    if not (isinstance(value["date"], str) and DATE_RE.fullmatch(value["date"])):
+        problems.append("date must be UTC ISO 8601 like 2026-10-17T10:00:00Z")
+    if not (isinstance(value["host"], str) and HOST_RE.fullmatch(value["host"])):
+        problems.append("host must be bare-metal or vm:<name>")
+    branch = value["branch"]
+    if trial is not None:
+        prefix = f"trial/{trial}-"
+        if not (isinstance(branch, str) and branch.startswith(prefix) and SLUG_RE.fullmatch(branch[len(prefix):])):
+            problems.append(f"branch must be {prefix}<slug>")
+    problems.extend(f"{name} must be a non-empty string" for name in ("hypothesis", "rationale") if not is_text(value[name]))
+    problems.extend(validate_evidence(value["evidence"]))
+    problems.extend(validate_change(value["change"]))
+    problems.extend(validate_probe_result(value["probe_result"]))
+    problems.extend(validate_runs(value["runs"]))
+    problems.extend(validate_metrics(value["metrics"]))
+    problems.extend(validate_traced_confirmation(value["traced_confirmation"]))
+    if value["verdict"] not in VERDICTS:
+        problems.append("verdict must be one of " + ", ".join(VERDICTS))
+    commit = value["commit"]
+    if commit is not None and not (isinstance(commit, str) and COMMIT_RE.fullmatch(commit)):
+        problems.append("commit must be null or 7-40 hex characters")
+    minutes = value["minutes"]
+    if minutes is not None and not (is_number(minutes) and minutes >= 0):
+        problems.append("minutes must be null or a number >= 0")
+    if not problems:
+        problems.extend(verdict_rules(value))
+    return problems
+
+
+def load_ledger(path: Path) -> tuple[list[dict[str, Any]], list[tuple[int, str]]]:
+    trials: list[dict[str, Any]] = []
+    problems: list[tuple[int, str]] = []
+    seen: dict[str, int] = {}
+    for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        if not line.strip():
+            continue
+        try:
+            value = json.loads(line)
+        except ValueError as error:
+            problems.append((number, f"invalid JSON: {error}"))
+            continue
+        line_problems = validate_trial(value)
+        if not line_problems and value["trial"] in seen:
+            line_problems.append(f"duplicate trial {value['trial']} (first on line {seen[value['trial']]})")
+        if line_problems:
+            problems.extend((number, item) for item in line_problems)
+            continue
+        seen[value["trial"]] = number
+        trials.append(value)
+    return trials, problems
+
+
+def load_json(path: Path) -> Any:
+    try:
+        with path.open(encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, ValueError):
+        return None
+
+
+def load_history(history_dir: Path) -> dict[str, Any]:
+    runs: dict[str, dict[str, Any]] = {}
+    for path in sorted((history_dir / "runs").glob("*.json")):
+        value = load_json(path)
+        if isinstance(value, dict) and is_text(value.get("run_id")):
+            runs[value["run_id"]] = value
+    baselines = load_json(history_dir / "baselines.json")
+    return {"runs": runs, "baselines": baselines if isinstance(baselines, dict) else {}}
+
+
+def cited_runs(trial: dict[str, Any]) -> list[str]:
+    runs = trial["runs"]
+    names = [item["run"] for item in trial["evidence"]]
+    for pair in runs["aa"]:
+        names.extend(pair)
+    for pair in runs["abab"]:
+        names.extend((pair["a"], pair["b"]))
+    if runs["traced"] is not None:
+        names.extend((runs["traced"]["a"], runs["traced"]["b"]))
+    return list(dict.fromkeys(names))
+
+
+def virtualised_trials(trials: list[dict[str, Any]], history: dict[str, Any]) -> dict[str, str]:
+    """Trial id -> virtualisation name for trials on, or citing a run from, a virtualised host."""
+    result: dict[str, str] = {}
+    for trial in trials:
+        if trial["host"].startswith("vm:"):
+            result[trial["trial"]] = trial["host"][3:]
+            continue
+        for name in cited_runs(trial):
+            value = history["runs"].get(name, {}).get("virtualization")
+            if isinstance(value, str) and value != "none":
+                result[trial["trial"]] = value
+                break
+    return result
+
+
+def has_call_sites(record: dict[str, Any]) -> bool:
+    sets = record.get("sets")
+    return isinstance(sets, dict) and any(
+        isinstance(metrics, dict) and metrics.get("call_sites_top") for metrics in sets.values()
+    )
+
+
+def baseline_key(record: dict[str, Any]) -> str:
+    return f"{record.get('structure') or '-'}/{record.get('scenario') or '-'}"
+
+
+def hotspot_sources(history: dict[str, Any]) -> dict[tuple[str, str], dict[str, Any]]:
+    """(machine, structure/scenario) -> the run whose call sites define the open hotspots."""
+    runs = history["runs"]
+    sources: dict[tuple[str, str], dict[str, Any]] = {}
+    for machine_id, keys in history["baselines"].items():
+        if not isinstance(keys, dict):
+            continue
+        for key, run_id in sorted(keys.items()):
+            # history-add keys a traced baseline "<structure>/<scenario>@<trace mode>".
+            record = runs.get(run_id)
+            if isinstance(record, dict) and has_call_sites(record):
+                sources[(machine_id, key.split("@", 1)[0])] = record
+    # Without a traced baseline, fall back to the newest traced run of the same
+    # identity that ran without switches and outside any trial.
+    candidates = [
+        record for record in runs.values()
+        if record.get("trace_mode") not in (None, "off") and not record.get("trial")
+        and not record.get("switches") and is_text(record.get("machine_id")) and has_call_sites(record)
+    ]
+    newest: dict[tuple[str, str], dict[str, Any]] = {}
+    for record in sorted(candidates, key=lambda item: (item.get("started_at") or "", item["run_id"])):
+        newest[(record["machine_id"], baseline_key(record))] = record
+    for key, record in newest.items():
+        sources.setdefault(key, record)
+    return sources
+
+
+def open_hotspots(trials: list[dict[str, Any]], history: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, list[str]]]:
+    targeted: dict[str, list[str]] = {}
+    for trial in trials:
+        for item in trial["evidence"]:
+            targeted.setdefault(item["call_site"], []).append(trial["trial"])
+    rows: list[dict[str, Any]] = []
+    for (machine_id, key), record in sorted(hotspot_sources(history).items()):
+        for set_name, metrics in sorted(record["sets"].items()):
+            sites = metrics.get("call_sites_top") if isinstance(metrics, dict) else None
+            for site in sites or []:
+                if isinstance(site, dict) and is_text(site.get("key")):
+                    rows.append({
+                        "machine_id": machine_id, "baseline": key, "run_id": record["run_id"], "set": set_name,
+                        "key": site["key"], "share": site.get("share"), "trials": targeted.get(site["key"], []),
+                    })
+    rows.sort(key=lambda row: (-(row["share"] if is_number(row["share"]) else -1.0), row["set"], row["key"]))
+    return rows, targeted
+
+
+def cell(value: Any, limit: int | None = None) -> str:
+    if value is None:
+        return "-"
+    result = " ".join(str(value).split()).replace("|", "\\|")
+    if limit is not None and len(result) > limit:
+        result = result[: limit - 3].rstrip() + "..."
+    return result
+
+
+def code(value: Any) -> str:
+    return f"`{value}`" if is_text(value) else "-"
+
+
+def share_cell(value: Any) -> str:
+    return f"{value:.2f}" if is_number(value) else "-"
+
+
+def primary_cell(metrics: Any) -> str:
+    if metrics is None:
+        return "-"
+    parts = []
+    for set_name, values in sorted(metrics["per_set"].items()):
+        delta, ratio = values["delta"], values["ratio_to_spread"]
+        if delta is None:
+            continue
+        ratio_text = f"{ratio:.1f}x spread" if is_number(ratio) else "spread unknown"
+        parts.append(f"{set_name} {delta:+g} ({ratio_text})")
+    return cell(f"{metrics['primary']}: " + ("; ".join(parts) if parts else "no per-set deltas"))
+
+
+def run_link(run_id: str, history: dict[str, Any], history_dir: Path) -> str:
+    if run_id in history["runs"]:
+        return f"[{run_id}]({(history_dir / 'runs' / (run_id + '.json')).as_posix()})"
+    return f"`{run_id}`"
+
+
+def kept_block(trial: dict[str, Any], history: dict[str, Any], history_dir: Path) -> list[str]:
+    change, runs, probe = trial["change"], trial["runs"], trial["probe_result"]
+
+    def link(run_id: str) -> str:
+        return run_link(run_id, history, history_dir)
+
+    lines = [f"### {trial['trial']} - {cell(trial['hypothesis'])}", ""]
+    lines.append(f"- Branch `{trial['branch']}`, commit {code(trial['commit'])}, {trial['date'][:10]}, {trial['host']}, {cell(trial['minutes'])} minutes.")
+    lines.append(f"- Change: {change['kind']}; patch {code(change['patch'])}; switch {code(change['switch'])}; probe {code(change['probe'])}; note {code(change['note'])}.")
+    if probe is not None:
+        log = f" (`{probe['log']}`)" if probe["log"] else ""
+        lines.append(f"- Probe: {probe['pass']} pass / {probe['fail']} fail / {probe['skip']} skip{log}.")
+    lines.append("- A/A pairs: " + ", ".join(f"{link(a)} <-> {link(b)}" for a, b in runs["aa"]) + ".")
+    lines.append("- A/B pairs: " + ", ".join(f"{link(pair['a'])} -> {link(pair['b'])}" for pair in runs["abab"]) + ".")
+    traced = runs["traced"]
+    if traced is not None:
+        confirmation = trial["traced_confirmation"] or {}
+        before, after = confirmation.get("call_site_share_before"), confirmation.get("after")
+        lines.append(f"- Traced: {link(traced['a'])} -> {link(traced['b'])}; call-site share {share_cell(before)} -> {share_cell(after)}.")
+        sources = [history["runs"].get(traced[name], {}).get("source_dir") for name in PAIR_KEYS]
+        if all(is_text(source) for source in sources):
+            lines.append(
+                f"- Compare: `python3 scripts/bench-report.py compare --before {sources[0]} --after {sources[1]} --output <dir>`"
+            )
+    lines.append(f"- Rationale: {cell(trial['rationale'])}")
+    lines.append("")
+    return lines
+
+
+def render(
+    trials: list[dict[str, Any]], problems: list[tuple[int, str]], history: dict[str, Any],
+    ledger_path: Path, history_dir: Path,
+) -> str:
+    counts = {verdict: 0 for verdict in VERDICTS}
+    for trial in trials:
+        counts[trial["verdict"]] += 1
+    minutes = sum(trial["minutes"] for trial in trials if is_number(trial["minutes"]))
+    next_id = f"T{max((int(trial['trial'][1:]) for trial in trials), default=0) + 1:04d}"
+    baseline_count = sum(len(keys) for keys in history["baselines"].values() if isinstance(keys, dict))
+    lines = [
+        "# Profiler ledger report",
+        "",
+        f"- Ledger: `{ledger_path.as_posix()}`: {len(trials)} valid trial(s), {len(problems)} problem(s).",
+        f"- History: `{history_dir.as_posix()}`: {len(history['runs'])} run(s), {baseline_count} baseline(s).",
+        f"- Next trial id: `{next_id}`.",
+        "",
+    ]
+    virtual = virtualised_trials(trials, history)
+    if virtual:
+        names = ", ".join(f"{trial} ({value})" for trial, value in sorted(virtual.items()))
+        lines += [
+            f"> NO TIMING CLAIMS: {len(virtual)} trial(s) ran on or cite a virtualised host: {names}. "
+            "Use them for mechanism and tooling evidence only.",
+            "",
+        ]
+    lines += ["## Summary", "", "| Verdict | Trials |", "|---|---|"]
+    lines += [f"| {verdict} | {counts[verdict]} |" for verdict in VERDICTS]
+    lines += [f"| total | {len(trials)} |", "", f"Minutes recorded: {minutes:g}.", "", "## Trials", ""]
+    if trials:
+        lines += [
+            "| Trial | Date | Host | Hypothesis | Switch | Primary delta vs A/A spread | Verdict | Commit |",
+            "|---|---|---|---|---|---|---|---|",
+        ]
+        for trial in trials:
+            lines.append("| " + " | ".join((
+                trial["trial"], trial["date"][:10], trial["host"], cell(trial["hypothesis"], HYPOTHESIS_CELL_LIMIT),
+                code(trial["change"]["switch"]), primary_cell(trial["metrics"]), trial["verdict"], code(trial["commit"]),
+            )) + " |")
+    else:
+        lines.append("No trials yet.")
+    lines += ["", "## Kept trials", ""]
+    kept = [trial for trial in trials if trial["verdict"] == "keep"]
+    if kept:
+        for trial in kept:
+            lines += kept_block(trial, history, history_dir)
+    else:
+        lines += ["None.", ""]
+    rows, targeted = open_hotspots(trials, history)
+    open_rows = [row for row in rows if not row["trials"]]
+    lines += [
+        "## Open hotspots",
+        "",
+        "Call sites from each machine's traced baseline run (or, without one, the newest traced run of the "
+        "same identity without switches or trial) that no trial in the ledger has targeted.",
+        "",
+    ]
+    if open_rows:
+        lines += ["| Machine | Baseline | Run | Set | Call site | Share of lost slack |", "|---|---|---|---|---|---|"]
+        lines += [
+            f"| {row['machine_id'][:12]} | {row['baseline']} | {run_link(row['run_id'], history, history_dir)} | "
+            f"{row['set']} | {cell(row['key'])} | {share_cell(row['share'])} |"
+            for row in open_rows
+        ]
+    elif rows:
+        lines.append("Every recorded baseline call site has a trial.")
+    else:
+        lines.append("No baseline call sites recorded: run a traced baseline and `profiler/bin/history-add` it.")
+    if targeted:
+        lines += ["", "Targeted call sites: " + "; ".join(
+            f"{cell(key)} ({', '.join(sorted(set(names)))})" for key, names in sorted(targeted.items())
+        ) + "."]
+    if problems:
+        lines += ["", "## Invalid lines", ""]
+        lines += [f"- line {number}: {cell(problem)}" for number, problem in problems]
+    return "\n".join(lines) + "\n"
+
+
+def parser() -> argparse.ArgumentParser:
+    result = argparse.ArgumentParser(
+        prog="ledger-report", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    result.add_argument("--ledger", default=str(DEFAULT_LEDGER), help="default: profiler/ledger.jsonl")
+    result.add_argument("--output", help="write the Markdown here instead of stdout")
+    result.add_argument("--history-dir", default=str(DEFAULT_HISTORY_DIR), help="default: profiler/history")
+    return result
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parser().parse_args(argv)
+    ledger_path = Path(args.ledger).expanduser()
+    history_dir = Path(args.history_dir).expanduser()
+    try:
+        trials, problems = load_ledger(ledger_path)
+    except OSError as error:
+        print(f"ledger-report: {error}", file=sys.stderr)
+        return 2
+    text = render(trials, problems, load_history(history_dir), ledger_path, history_dir)
+    if args.output:
+        try:
+            with open(args.output, "w", encoding="utf-8", newline="\n") as handle:
+                handle.write(text)
+        except OSError as error:
+            print(f"ledger-report: {error}", file=sys.stderr)
+            return 2
+        print(f"ledger-report: wrote {args.output}")
+    else:
+        sys.stdout.write(text)
+    for number, problem in problems:
+        print(f"{ledger_path}:{number}: {problem}", file=sys.stderr)
+    return 2 if problems else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

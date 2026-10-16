@@ -1,0 +1,13 @@
+/* RunTable — identity columns; chips and mono cells stay on one line. */
+
+.rt-nowrap {
+  white-space: nowrap;
+}
+
+.rt-sets {
+  font-size: 12px;
+}
+
+.rt table.data td .chip {
+  vertical-align: middle;
+}

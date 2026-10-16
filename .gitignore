@@ -45,3 +45,8 @@ m4l-hang-*/
 # bytecode from tools/m4l-font-audit.py
 __pycache__/
 *.pyc
+
+# profiler workbench (local fork)
+profiler/runs/
+profiler/dashboard/node_modules/
+profiler/dashboard/dist/

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Measure the 5 standard Live sets in a fixed order. Each launch uses the
-# selected runtime and prefix. A unique value identifies every Live session.
+# Measure the 5 standard Live sets in a fixed order, or a chosen list. Each
+# launch uses the selected runtime and prefix. A unique value identifies every
+# Live session.
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -9,13 +10,21 @@ root="$(cd "$here/.." && pwd)"
 ableton_config_init
 . "$here/lib/lifecycle.sh"
 
-sets=(Benchmark_Zero Benchmark_Empty Benchmark_Inbuilts Benchmark_Max4Live Benchmark_VSTs)
+canonical_sets=(Benchmark_Zero Benchmark_Empty Benchmark_Inbuilts Benchmark_Max4Live Benchmark_VSTs)
+sets=("${canonical_sets[@]}")
 duration="${ABLETON_BENCH_DURATION:-30}"
 launch_timeout="${ABLETON_BENCH_LAUNCH_TIMEOUT:-180}"
 settle="${ABLETON_BENCH_SETTLE_SECONDS:-5}"
 tag="manual"
 output=""
 launcher="${ABLETON_BENCH_LAUNCHER:-$here/ableton-live}"
+trace="${ABLETON_BENCH_TRACE:-off}"
+scenario="${ABLETON_BENCH_SCENARIO:-}"
+tracer="${ABLETON_BENCH_TRACER:-$root/profiler/bin/wine-trace}"
+root_helper="${ABLETON_BENCH_ROOT_HELPER:-profiler-root-helper}"
+sudo="${ABLETON_BENCH_SUDO:-sudo}"
+scenario_tool="${ABLETON_BENCH_SCENARIO_TOOL:-$root/profiler/control/scenario-run.py}"
+privilege=none
 dry_run=0
 skip_vst_check=0
 declare -A crackle=()
@@ -32,6 +41,12 @@ usage: scripts/bench-suite.sh [options]
   --settle SECONDS            stabilisation time before measurement (default 5)
   --crackle SET=STATE         listener report: heard, not-heard, or unknown
   --launcher PATH             Live launcher path
+  --trace MODE                off, interface, or drilldown: run the interface
+                              tracer during every measurement (default off)
+  --scenario NAME             drive Live with profiler/scenarios/NAME.json during
+                              every measurement
+  --sets A,B,C                sets to run, in this order (default the five
+                              standard sets; names may omit Benchmark_)
   --skip-vst-check            accept a VST set prepared for plug-in tests
   --dry-run                   check the run and print its plan; Live stays closed
 
@@ -41,6 +56,12 @@ playback. The suite writes source data, report.json, and report.md. The command
 also writes one <machine-id>-<YYYYMMDDTHHMMSSffffffZ>_cpu-benchmark.csv file
 with system resource readings. The command closes each started Live process by
 its exact process ID. Other Wine sessions continue.
+
+A run with --sets or --scenario has the diagnostic structure: compare accepts
+it only with --structure diagnostic. Tracing runs the tracer as root through
+profiler-root-helper on PATH or passwordless sudo. ABLETON_BENCH_TRACE,
+ABLETON_BENCH_SCENARIO, ABLETON_BENCH_TRACER, ABLETON_BENCH_ROOT_HELPER,
+ABLETON_BENCH_SUDO, and ABLETON_BENCH_SCENARIO_TOOL set the defaults.
 EOF
 }
 
@@ -77,13 +98,26 @@ while [ "$#" -gt 0 ]; do
             case "$observation_set" in
                 Zero|Empty|Inbuilts|Max4Live|VSTs) observation_set="Benchmark_$observation_set" ;;
             esac
-            case " ${sets[*]} " in *" $observation_set "*) ;;
-                *) fail "unknown crackle set: $observation_set" ;;
-            esac
             case "$observation_state" in heard|not-heard|unknown) ;;
                 *) fail "invalid crackle observation: $observation_state" ;;
             esac
             crackle["$observation_set"]="$observation_state"
+            ;;
+        --trace) shift; trace="${1:-}" ;;
+        --scenario) shift; scenario="${1:-}" ;;
+        --sets)
+            shift
+            sets=()
+            IFS=, read -r -a chosen <<< "${1:-}"
+            for chosen_set in "${chosen[@]}"; do
+                case "$chosen_set" in
+                    Zero|Empty|Inbuilts|Max4Live|VSTs) chosen_set="Benchmark_$chosen_set" ;;
+                esac
+                case "$chosen_set" in ''|*[!A-Za-z0-9_.-]*) fail "invalid set name in --sets: '$chosen_set'" ;; esac
+                case " ${sets[*]} " in *" $chosen_set "*) fail "duplicate set in --sets: $chosen_set" ;; esac
+                sets+=("$chosen_set")
+            done
+            [ "${#sets[@]}" -gt 0 ] || fail "--sets wants a comma-separated list of set names"
             ;;
         --skip-vst-check) skip_vst_check=1 ;;
         --dry-run) dry_run=1 ;;
@@ -96,6 +130,20 @@ done
 whole_seconds "$duration" duration 3600 10
 whole_seconds "$launch_timeout" launch-timeout 3600
 whole_seconds "$settle" settle 120
+case "$trace" in off|interface|drilldown) ;; *) fail "--trace must be off, interface, or drilldown" ;; esac
+case "$scenario" in *[!A-Za-z0-9_.-]*) fail "scenario name may use letters, digits, '_', '.', and '-' only: $scenario" ;; esac
+# A crackle report must name a set of this run. The list is final here.
+for observation_set in "${!crackle[@]}"; do
+    case " ${sets[*]} " in *" $observation_set "*) ;;
+        *) fail "unknown crackle set: $observation_set" ;;
+    esac
+done
+# Only the five standard sets in their order, without a scenario, form a
+# benchmark. Everything else is a diagnostic run.
+structure=diagnostic
+[ -n "$scenario" ] || [ "${sets[*]}" != "${canonical_sets[*]}" ] || structure=benchmark
+trace_tool_mode=summary
+[ "$trace" != drilldown ] || trace_tool_mode=drilldown
 case "$tag" in ''|*$'\n'*|*$'\r'*) fail "tag must be one non-empty line" ;; esac
 safe_tag="$(printf '%s' "$tag" | tr -cs '[:alnum:]_.-' '-')"
 safe_tag="${safe_tag#-}"; safe_tag="${safe_tag%-}"
@@ -130,9 +178,18 @@ find_vst()
     return 1
 }
 
+# The standard sets live in bench; every other set is a profiler/sets file.
+set_file_for()
+{
+    case " ${canonical_sets[*]} " in
+        *" $1 "*) printf '%s\n' "$root/bench/BenchmarkSets Project/$1.als" ;;
+        *) printf '%s\n' "$root/profiler/sets/$1.als" ;;
+    esac
+}
+
 preflight()
 {
-    local set_name set_file live_pids prefix_pids live_exes=()
+    local set_name set_file live_pids prefix_pids live_exes=() profiler_sets=0
     command -v python3 >/dev/null 2>&1 || fail "python3 is required"
     command -v sha256sum >/dev/null 2>&1 || fail "sha256sum is required"
     command -v setsid >/dev/null 2>&1 || fail "setsid is required for a supervised launcher"
@@ -141,14 +198,21 @@ preflight()
     [ -x "$ABLETON_WINE_ROOT/bin/wine" ] || fail "Wine is missing at $ABLETON_WINE_ROOT/bin/wine"
     [ -x "$ABLETON_WINE_ROOT/bin/wineserver" ] || fail "wineserver is missing at $ABLETON_WINE_ROOT/bin/wineserver"
     [ -f "$ABLETON_WINEPREFIX/system.reg" ] || fail "prefix is incomplete: $ABLETON_WINEPREFIX"
-    for set_name in "${sets[@]}"; do
-        set_file="$root/bench/BenchmarkSets Project/$set_name.als"
+    for set_name in "${canonical_sets[@]}" "${sets[@]}"; do
+        set_file="$(set_file_for "$set_name")"
         [ -s "$set_file" ] || fail "benchmark set is missing: $set_file"
+        case "$set_file" in "$root/profiler/sets/"*) profiler_sets=1 ;; esac
     done
     ( cd "$root" && sha256sum -c bench/SHA256SUMS >/dev/null ) \
         || fail "a canonical benchmark asset differs from bench/SHA256SUMS"
     if find "$root/bench" -type d -name Backup -print -quit | grep -q .; then
         fail "a Live Backup directory is present under bench; canonical assets must remain clean"
+    fi
+    if [ "$profiler_sets" -eq 1 ]; then
+        [ -s "$root/profiler/sets/SHA256SUMS" ] \
+            || fail "profiler/sets/SHA256SUMS is missing; run profiler/bin/sets freeze"
+        ( cd "$root" && sha256sum -c profiler/sets/SHA256SUMS >/dev/null ) \
+            || fail "a profiler set differs from profiler/sets/SHA256SUMS"
     fi
     mapfile -t live_exes < <(find "$ABLETON_WINEPREFIX/drive_c/ProgramData/Ableton" \
         -path '*/Program/Ableton Live*.exe' -type f -print 2>/dev/null | sort -V)
@@ -164,6 +228,24 @@ preflight()
     if [ "$dry_run" -ne 1 ] || [ "${ABLETON_BENCH_TESTING:-0}" != 1 ]; then
         python3 "$here/bench-report.py" check-udp --port "${ABL_BENCH_OSC_RECV:-19002}" \
             || fail "the benchmark OSC receive port is already in use"
+        python3 "$here/bench-report.py" check-udp --port "${ABL_BENCH_OSC_SEND:-19001}" \
+            || fail "the Live control port is already in use; the control device could not listen"
+    fi
+    if [ "$trace" != off ]; then
+        [ -x "$tracer" ] || fail "tracer is not executable: $tracer"
+        # The tracer needs root. The helper is the bare-metal route; sudo -n
+        # is the VM route. Neither may ask for a password.
+        if command -v "$root_helper" >/dev/null 2>&1; then
+            privilege=root-helper
+        elif "$sudo" -n true >/dev/null 2>&1; then
+            privilege=sudo
+        else
+            fail "tracing needs profiler-root-helper or passwordless sudo"
+        fi
+    fi
+    if [ -n "$scenario" ]; then
+        [ -f "$scenario_tool" ] || fail "scenario tool is missing: $scenario_tool"
+        python3 "$scenario_tool" --validate "$scenario" || fail "unknown or invalid scenario: $scenario"
     fi
     [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] || fail "a desktop session is required (DISPLAY and WAYLAND_DISPLAY are unset)"
     case "$output" in
@@ -178,10 +260,12 @@ preflight
 
 if [ "$dry_run" -eq 1 ]; then
     printf 'benchmark plan: duration=%ss output=%s\n' "$duration" "$output"
+    printf 'trace=%s privilege=%s structure=%s scenario=%s\n' "$trace" "$privilege" "$structure" "${scenario:-none}"
     for index in "${!sets[@]}"; do
         set_name="${sets[index]}"
         mode=playback
         [ "$set_name" != Benchmark_Zero ] || mode=idle-no-controller
+        [ -z "$scenario" ] || mode=scenario
         printf '%d\t%s\t%s\t%ss\n' "$((index + 1))" "$set_name" "$mode" "$duration"
     done
     exit 0
@@ -190,7 +274,10 @@ fi
 mkdir -p -- "$output/sets"
 exec > >(tee -a "$output/suite.log") 2>&1
 run_id="bench-$(date -u +%Y%m%dT%H%M%SZ)-$$"
-init_args=(init-run --output "$output/run.json" --tag "$tag" --duration "$duration")
+init_args=(init-run --output "$output/run.json" --tag "$tag" --duration "$duration"
+    --structure "$structure" --trace-mode "$trace" --privilege "$privilege")
+[ "$trace" = off ] || init_args+=(--tracer "$tracer")
+[ -z "$scenario" ] || init_args+=(--scenario "$scenario")
 for set_name in "${sets[@]}"; do init_args+=(--set "$set_name"); done
 python3 "$here/bench-report.py" "${init_args[@]}"
 python3 "$here/bench-report.py" profile \
@@ -312,10 +399,47 @@ stop_owned_session()
     return "$rc"
 }
 
+# The tracer runs as root. The helper finds its own copy of the tool and takes
+# the tool arguments after --; sudo runs the configured tracer directly.
+trace_run()
+{
+    local verb="$1"
+    shift
+    case "$privilege" in
+        root-helper) "$root_helper" trace "$verb" --tool wine-trace --run-dir "$output" -- "$@" ;;
+        sudo) "$sudo" -n -- "$tracer" "$verb" "$@" ;;
+        *) return 1 ;;
+    esac
+}
+
+# The output directory is created as the user so the files stay readable
+# after the run. Every owned Live process is attached.
+trace_active=""
+trace_start()
+{
+    local pid args=()
+    [ "$trace" != off ] || return 0
+    mkdir -p -- "$set_dir/raw/interface"
+    args=(--out "$set_dir/raw/interface" --run-id "$active_token")
+    for pid in "${current_live[@]}"; do args+=(--pid "$pid"); done
+    args+=(--mode "$trace_tool_mode")
+    trace_run start "${args[@]}" || fail "tracer did not start for $set_name"
+    trace_active="$set_dir/raw/interface"
+}
+
+trace_stop()
+{
+    local out="$trace_active"
+    [ -n "$out" ] || return 0
+    trace_active=""
+    trace_run stop --out "$out"
+}
+
 finish()
 {
     local rc=$? status=failed
     trap - EXIT HUP INT TERM
+    trace_stop || true
     stop_owned_session || true
     if [ "$finalized" -ne 1 ]; then
         [ "$rc" -lt 128 ] || status=interrupted
@@ -334,14 +458,15 @@ for index in "${!sets[@]}"; do
     existing_live="$(global_live_pids)"
     [ -z "$existing_live" ] \
         || fail "another Live session appeared before $set_name (pid(s): $(printf '%s' "$existing_live" | tr '\n' ' '))"
-    set_file="$root/bench/BenchmarkSets Project/$set_name.als"
+    set_file="$(set_file_for "$set_name")"
     set_dir="$output/sets/$(printf '%02d' "$((index + 1))")-$set_name"
     mkdir -p -- "$set_dir/raw"
     mode=playback
     osc=on
     if [ "$set_name" = Benchmark_Zero ]; then mode=idle-no-controller; osc=off; fi
+    if [ -n "$scenario" ]; then mode=scenario; osc=on; fi
     active_token="$run_id:$set_name"
-    printf '== %d/5 %s: start Live ==\n' "$((index + 1))" "$set_name"
+    printf '== %d/%d %s: start Live ==\n' "$((index + 1))" "${#sets[@]}" "$set_name"
     ABLETON_BENCH_RUN_ID="$active_token" setsid -- "$launcher" "$set_file" \
         > "$set_dir/raw/launcher.log" 2>&1 &
     launcher_pid=$!
@@ -353,19 +478,29 @@ for index in "${!sets[@]}"; do
             --prefix "$ABLETON_WINEPREFIX"
     fi
 
+    # The tracer starts before the settle time so attaching does not disturb
+    # the measurement. A scenario prepares the set itself instead of playing.
     if [ "$osc" = on ]; then
         python3 "$here/bench-osc.py" probe --timeout "$launch_timeout" \
             > "$set_dir/raw/osc-probe.txt" 2> "$set_dir/raw/osc-probe.stderr.txt" \
-            || fail "$set_name control device did not answer"
+            || fail "$set_name control device did not answer (no /abl/bench/pong on UDP ${ABL_BENCH_OSC_RECV:-19002} within ${launch_timeout}s; the set's M4L device or the AbletonOSC Control Surface must be active)"
         wait_log_quiet || fail "$set_name log did not settle within ${launch_timeout}s"
-        python3 "$here/bench-osc.py" send /abl/bench/rewind
-        python3 "$here/bench-osc.py" send /abl/bench/play
+        if [ "$mode" = scenario ]; then
+            python3 "$scenario_tool" setup --scenario "$scenario" \
+                || fail "$set_name scenario setup failed: $scenario"
+        else
+            python3 "$here/bench-osc.py" send /abl/bench/rewind
+            python3 "$here/bench-osc.py" send /abl/bench/play
+        fi
+        trace_start
         sleep "$settle"
     else
         wait_log_quiet || fail "$set_name log did not settle within ${launch_timeout}s"
+        if [ "$trace" != off ]; then trace_start; sleep "$settle"; fi
     fi
 
-    printf '== %d/5 %s: measure for %ss ==\n' "$((index + 1))" "$set_name" "$duration"
+    printf '== %d/%d %s: measure for %ss ==\n' "$((index + 1))" "${#sets[@]}" "$set_name" "$duration"
+    set_sha256="$(sha256sum -- "$set_file")"
     capture_args=(
         --duration "$duration"
         --output-dir "$set_dir"
@@ -375,9 +510,21 @@ for index in "${!sets[@]}"; do
         --osc "$osc"
         --manual-crackle "${crackle[$set_name]:-not-provided}"
         --log "$set_dir/raw/launcher.log"
+        --set-sha256 "${set_sha256%% *}"
+        --trace-mode "$trace"
     )
+    [ -z "$scenario" ] || capture_args+=(--scenario "$scenario" --scenario-tool "$scenario_tool")
     for pid in "${current_live[@]}"; do capture_args+=(--live-pid "$pid"); done
     "$here/bench-run.sh" "${capture_args[@]}"
+    if [ "$trace" != off ]; then
+        trace_stop || fail "tracer did not stop for $set_name"
+        # Exit 2 means the tracer left no usable output. The measurement keeps
+        # its confounder and the run continues.
+        interface_rc=0
+        python3 "$here/bench-report.py" interface --set-dir "$set_dir" || interface_rc=$?
+        [ "$interface_rc" -eq 0 ] || [ "$interface_rc" -eq 2 ] \
+            || fail "interface post-processing failed for $set_name"
+    fi
     [ "$osc" = off ] || python3 "$here/bench-osc.py" send /abl/bench/stop || true
     stop_owned_session || fail "could not end only the runner-owned $set_name session"
 

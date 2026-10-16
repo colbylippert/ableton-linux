@@ -1,5 +1,5 @@
 # Convenience wrapper over the scripts. See README.md.
-.PHONY: all build install setup refresh uninstall test test-bench bench-compare test-glyph-path test-d2d-resize test-pipewire-pro-audio-ab vendor-cache verify check pointer-safety-check clean distclean
+.PHONY: all build install setup refresh uninstall test test-bench test-profiler bench-compare test-glyph-path test-d2d-resize test-pipewire-pro-audio-ab vendor-cache verify check pointer-safety-check clean distclean
 
 all: build
 
@@ -41,10 +41,26 @@ test:                         ## run installer and launcher lifecycle gates
 	./scripts/test-pipeasio-installer.sh
 	./scripts/test-bench-report.py
 	./scripts/test-bench-suite.sh
+	$(MAKE) test-profiler
 
 test-bench:                    ## run benchmark report and run checks
 	./scripts/test-bench-report.py
 	./scripts/test-bench-suite.sh
+
+# The profiler workbench (local fork) keeps its tests beside its code. They
+# run through python3 -I so a planted module next to the test cannot load.
+test-profiler: test-bench      ## run profiler workbench checks (control layer, scenarios, tracer, ledger, history)
+	./profiler/control/vendor.sh --check
+	python3 -I ./profiler/control/tests/test_bench_handler.py
+	python3 -I ./profiler/control/tests/test_liveosc.py
+	python3 -I ./profiler/control/tests/test_scenario_run.py
+	python3 -I ./profiler/scenarios/tests/test_scenarios.py
+	python3 -I ./profiler/tracer/tests/test_gen_tables.py
+	python3 -I ./profiler/tracer/tests/test_symbolize.py
+	python3 -I ./profiler/tracer/tests/test_reduce.py
+	python3 -I ./profiler/tracer/tests/test_validate.py
+	python3 -I ./profiler/bin/tests/test-ledger-report.py
+	python3 -I ./profiler/bin/tests/test-history-add.py
 
 bench-compare:                 ## compare completed runs (BEFORE=... AFTER=... OUTPUT=...)
 	@test -n "$(BEFORE)" -a -n "$(AFTER)" -a -n "$(OUTPUT)"

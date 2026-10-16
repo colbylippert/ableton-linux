@@ -1,0 +1,301 @@
+{
+  "schema": "ableton-linux-scenario/v1",
+  "name": "clip-launch-storm",
+  "kind": "benchmark",
+  "base_set": "Benchmark_Inbuilts",
+  "description": "Four MIDI clips created in setup on track 1 (Operator) and track 3 (Wavetable) are fired alternately every 500 ms with quarter-note launch quantization while the arrangement plays. The sets have no session clips; firing an empty scene would stop the arrangement on every track.",
+  "requires": {
+    "control_surface": true,
+    "max_for_live": false,
+    "plugins": []
+  },
+  "setup": [
+    {
+      "op": "stop"
+    },
+    {
+      "op": "rewind"
+    },
+    {
+      "op": "set_quantization",
+      "quantization": 7
+    },
+    {
+      "op": "create_clip",
+      "track": 1,
+      "clip": 0,
+      "length": 4.0
+    },
+    {
+      "op": "add_notes",
+      "track": 1,
+      "clip": 0,
+      "notes": [
+        [
+          36,
+          0,
+          0.5,
+          100,
+          0
+        ],
+        [
+          36,
+          1,
+          0.5,
+          100,
+          0
+        ],
+        [
+          43,
+          2,
+          0.5,
+          100,
+          0
+        ],
+        [
+          36,
+          3,
+          0.5,
+          100,
+          0
+        ]
+      ]
+    },
+    {
+      "op": "create_clip",
+      "track": 1,
+      "clip": 1,
+      "length": 4.0
+    },
+    {
+      "op": "add_notes",
+      "track": 1,
+      "clip": 1,
+      "notes": [
+        [
+          38,
+          0,
+          0.25,
+          110,
+          0
+        ],
+        [
+          45,
+          0.5,
+          0.25,
+          100,
+          0
+        ],
+        [
+          38,
+          1,
+          0.25,
+          110,
+          0
+        ],
+        [
+          50,
+          1.5,
+          0.25,
+          100,
+          0
+        ],
+        [
+          38,
+          2,
+          0.25,
+          110,
+          0
+        ],
+        [
+          45,
+          2.5,
+          0.25,
+          100,
+          0
+        ],
+        [
+          38,
+          3,
+          0.25,
+          110,
+          0
+        ],
+        [
+          50,
+          3.5,
+          0.25,
+          100,
+          0
+        ]
+      ]
+    },
+    {
+      "op": "create_clip",
+      "track": 3,
+      "clip": 0,
+      "length": 8.0
+    },
+    {
+      "op": "add_notes",
+      "track": 3,
+      "clip": 0,
+      "notes": [
+        [
+          60,
+          0,
+          4,
+          90,
+          0
+        ],
+        [
+          64,
+          0,
+          4,
+          90,
+          0
+        ],
+        [
+          67,
+          0,
+          4,
+          90,
+          0
+        ],
+        [
+          62,
+          4,
+          4,
+          90,
+          0
+        ],
+        [
+          65,
+          4,
+          4,
+          90,
+          0
+        ],
+        [
+          69,
+          4,
+          4,
+          90,
+          0
+        ]
+      ]
+    },
+    {
+      "op": "create_clip",
+      "track": 3,
+      "clip": 1,
+      "length": 8.0
+    },
+    {
+      "op": "add_notes",
+      "track": 3,
+      "clip": 1,
+      "notes": [
+        [
+          55,
+          0,
+          2,
+          100,
+          0
+        ],
+        [
+          59,
+          0,
+          2,
+          100,
+          0
+        ],
+        [
+          62,
+          0,
+          2,
+          100,
+          0
+        ],
+        [
+          57,
+          2,
+          2,
+          100,
+          0
+        ],
+        [
+          60,
+          2,
+          2,
+          100,
+          0
+        ],
+        [
+          64,
+          2,
+          2,
+          100,
+          0
+        ],
+        [
+          55,
+          4,
+          4,
+          100,
+          0
+        ],
+        [
+          62,
+          4,
+          4,
+          100,
+          0
+        ]
+      ]
+    },
+    {
+      "op": "play"
+    },
+    {
+      "op": "marker",
+      "name": "clips-ready"
+    }
+  ],
+  "timeline": {
+    "period_s": 2.0,
+    "repeat": true,
+    "marker_every_s": 5.0,
+    "steps": [
+      {
+        "at_s": 0.0,
+        "op": "fire_clip",
+        "track": 1,
+        "clip": 0
+      },
+      {
+        "at_s": 0.5,
+        "op": "fire_clip",
+        "track": 3,
+        "clip": 0
+      },
+      {
+        "at_s": 1.0,
+        "op": "fire_clip",
+        "track": 1,
+        "clip": 1
+      },
+      {
+        "at_s": 1.5,
+        "op": "fire_clip",
+        "track": 3,
+        "clip": 1
+      }
+    ]
+  },
+  "teardown": [
+    {
+      "op": "stop"
+    }
+  ]
+}

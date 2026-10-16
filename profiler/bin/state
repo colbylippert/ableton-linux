@@ -1,0 +1,382 @@
+#!/usr/bin/env bash
+# profiler/bin/state — snapshot, restore, diff, list and clean-crash for the
+# Ableton/Wine state a profiling trial can dirty, so every trial starts from the
+# same "golden" machine.
+#
+#   state snapshot [--name NAME]                 take/replace the snapshot (default name: golden)
+#   state restore  [--name NAME] [--keep-logs]   put everything back; refuses while the prefix is in use
+#   state diff     [--name NAME]                 drift of the live state from the snapshot (exit 1 when any)
+#   state list     [--names]                     snapshots with date/method/items (--names: one name per line)
+#   state clean-crash                            remove CrashDetection.cfg, CrashRecoveryInfo.cfg, BaseFiles/*
+#   global options: --dry-run (print the commands, change nothing) · --force · -h
+#
+# Snapshot set (~/.local/share/profiler/golden/<name>/):
+#   prefix/                ~/.wine-ableton            (ABLETON_WINEPREFIX > ~/.config/ableton-wine/config prefix= > default)
+#   runtime/               ~/.local/opt/wine-d2d1-nspa-11.13 (ABLETON_WINE_ROOT > config runtime_root= > default)
+#   config-ableton-wine/   ~/.config/ableton-wine
+#   pipeasio-config.ini    ~/.config/pipeasio/config.ini
+#   pipewire.conf.d/       ~/.config/pipewire/pipewire.conf.d
+#   data/                  ~/.local/share/ableton-wine
+#   ableton-live           ~/.local/bin/ableton-live
+#   user-library/          Live's User Library when it lives outside the prefix
+#                          (user_library= in ~/.config/profiler/setup.conf, recorded by setup phase osc)
+#   pw-metadata-settings.txt, wpctl-status.txt, MANIFEST.json (+ items.tsv, the machine-readable item list)
+# Mechanism: `cp -a --reflink=always` when the snapshot root is on btrfs (instant,
+# shares extents), `rsync -aHAX --delete` otherwise (or when a reflink copy fails).
+# Restore replays the paths recorded in the snapshot (not the current environment),
+# refuses while any process uses the prefix or the runtime, runs `wineserver -k`
+# then `-w`, replaces every item, resets `pw-metadata -n settings 0 clock.force-quantum 0`
+# and clears crash-recovery files. --keep-logs carries the current Preferences/Log.txt
+# files over. Output conventions and `run` come from profiler/setup/lib/log.sh.
+set -euo pipefail
+
+here="$(cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")" && pwd -P)"
+LOG_LIB="$here/../setup/lib/log.sh"
+[ -r "$LOG_LIB" ] || { printf 'state: missing %s\n' "$LOG_LIB" >&2; exit 2; }
+# never inherit the setup driver's terminal fd / log file (when a phase calls us
+# through `run`, our output must flow through its pipe)
+LOG_FD=1; LOGFILE=""; CURRENT_PHASE=""
+# shellcheck source=../setup/lib/log.sh
+. "$LOG_LIB"
+
+usage() { sed -n '2,36p' "$0" | sed 's/^# \{0,1\}//'; }
+
+abl_cfg() {   # KEY → value from the installer's ~/.config/ableton-wine/config
+    local file="${ABLETON_CONFIG_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}/ableton-wine}/config" line
+    [ -r "$file" ] || return 0
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in "$1="*) printf '%s\n' "${line#*=}"; return 0 ;; esac
+    done < "$file"
+    return 0
+}
+setup_cfg() {   # KEY → value from ~/.config/profiler/setup.conf
+    local file="${PROFILER_SETUP_CONF:-${XDG_CONFIG_HOME:-$HOME/.config}/profiler/setup.conf}" line value=""
+    [ -r "$file" ] || return 0
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in "$1="*) value="${line#*=}" ;; esac
+    done < "$file"
+    printf '%s\n' "$value"
+}
+dry() { [ "${DRY_RUN:-0}" = 1 ]; }
+
+# ---------------------------------------------------------------- paths ----
+CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
+DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
+STATE_DIR="${PROFILER_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/profiler}"
+SHARE_DIR="${PROFILER_SHARE_DIR:-$DATA_HOME/profiler}"
+SNAP_ROOT="$SHARE_DIR/golden"
+PREFIX="${ABLETON_WINEPREFIX:-}"; [ -n "$PREFIX" ] || PREFIX="$(abl_cfg prefix)"; [ -n "$PREFIX" ] || PREFIX="$HOME/.wine-ableton"
+RUNTIME="${ABLETON_WINE_ROOT:-}"; [ -n "$RUNTIME" ] || RUNTIME="$(abl_cfg runtime_root)"; [ -n "$RUNTIME" ] || RUNTIME="$HOME/.local/opt/wine-d2d1-nspa-11.13"
+LAUNCHER="${ABLETON_BIN_HOME:-$HOME/.local/bin}/ableton-live"
+USER_LIBRARY="$(setup_cfg user_library)"
+
+declare -a ITEM_KEY=() ITEM_SRC=() ITEM_DEST=() ITEM_KIND=()
+add_item() { ITEM_KEY+=("$1"); ITEM_SRC+=("$2"); ITEM_DEST+=("$3"); ITEM_KIND+=("$4"); }
+items_define() {
+    add_item prefix "$PREFIX" prefix dir
+    add_item runtime "$RUNTIME" runtime dir
+    add_item config "$CONFIG_HOME/ableton-wine" config-ableton-wine dir
+    add_item pipeasio "$CONFIG_HOME/pipeasio/config.ini" pipeasio-config.ini file
+    add_item pipewire "$CONFIG_HOME/pipewire/pipewire.conf.d" pipewire.conf.d dir
+    add_item data "$DATA_HOME/ableton-wine" data dir
+    add_item launcher "$LAUNCHER" ableton-live file
+    if [ -n "$USER_LIBRARY" ]; then
+        case "$USER_LIBRARY" in "$PREFIX"/*) ;; *) add_item user-library "$USER_LIBRARY" user-library dir ;; esac
+    fi
+}
+# load the item list recorded in a snapshot (key, source, dest, kind, present)
+items_load() {
+    local key src dest kind present
+    ITEM_KEY=(); ITEM_SRC=(); ITEM_DEST=(); ITEM_KIND=(); ITEM_PRESENT=()
+    while IFS=$'\t' read -r key src dest kind present; do
+        [ -n "$key" ] || continue
+        ITEM_KEY+=("$key"); ITEM_SRC+=("$src"); ITEM_DEST+=("$dest"); ITEM_KIND+=("$kind"); ITEM_PRESENT+=("${present:-0}")
+    done < "$1/items.tsv"
+}
+declare -a ITEM_PRESENT=()
+
+# ------------------------------------------------------------ processes ----
+prefix_pids() {   # WINEPREFIX=<prefix> in the environment (any runtime)
+    local proc pid
+    while IFS= read -r -d '' proc; do
+        pid="${proc#/proc/}"; pid="${pid%/environ}"
+        [[ "$pid" =~ ^[0-9]+$ ]] && printf '%s\n' "$pid"
+    done < <(grep -rzlFx --null "WINEPREFIX=$1" /proc/[0-9]*/environ 2>/dev/null || true)
+    return 0
+}
+runtime_pids() {   # /proc/PID/exe under the runtime root
+    local p exe root
+    root="$(readlink -f -- "$1" 2>/dev/null || printf '%s' "$1")"
+    for p in /proc/[0-9]*; do
+        exe="$(readlink -f -- "$p/exe" 2>/dev/null || true)"
+        case "$exe" in "$root"/*) printf '%s\n' "${p#/proc/}" ;; esac
+    done
+    return 0
+}
+live_pids() {   # any "Ableton Live*.exe"
+    local p cmd
+    for p in /proc/[0-9]*; do
+        cmd="$(tr '\0' ' ' < "$p/cmdline" 2>/dev/null || true)"
+        case "$cmd" in *"Ableton Live"*.exe*) printf '%s\n' "${p#/proc/}" ;; esac
+    done
+    return 0
+}
+# prints "pid comm" for every process using PREFIX/RUNTIME (args); returns 0 when any
+busy_list() {
+    local prefix="$1" runtime="$2" pid out=""
+    out="$( { prefix_pids "$prefix"; runtime_pids "$runtime"; live_pids; } | sort -un)"
+    [ -n "$out" ] || return 1
+    while IFS= read -r pid; do
+        [ -n "$pid" ] || continue
+        printf '%s %s\n' "$pid" "$(cat "/proc/$pid/comm" 2>/dev/null || echo ?)"
+    done <<< "$out"
+    return 0
+}
+refuse_if_busy() {   # PREFIX RUNTIME WHAT
+    local list
+    if list="$(busy_list "$1" "$2")"; then
+        [ "${FORCE:-0}" = 1 ] && [ "$3" != restore ] && { warn "processes use the prefix/runtime (--force): $(printf '%s' "$list" | tr '\n' ',')"; return 0; }
+        die "refusing to $3 while processes use the prefix or runtime (quit Live first, File > Quit): $(printf '%s' "$list" | tr '\n' ';' | sed 's/;/; /g')" 1
+    fi
+    return 0
+}
+
+# ----------------------------------------------------------------- copy ----
+METHOD=rsync
+decide_method() {   # DEST_ROOT: reflink when the snapshot root and the prefix are both on btrfs
+    local dfs sfs
+    dfs="$(stat -f -c %T -- "$1" 2>/dev/null || echo ?)"
+    sfs="$(stat -f -c %T -- "$PREFIX" 2>/dev/null || echo ?)"
+    if [ "$dfs" = btrfs ] && [ "$sfs" = btrfs ]; then METHOD=reflink; else METHOD=rsync; fi
+    kv "method" "$METHOD (snapshot root on $dfs, prefix on $sfs)"
+}
+copy_tree() {   # SRC DST (DST must not exist)
+    local src="$1" dst="$2"
+    if [ "$METHOD" = reflink ]; then
+        if run --quiet --allow-fail -- cp -a --reflink=always -- "$src" "$dst"; then return 0; fi
+        warn "reflink copy failed for $src (exit $RUN_STATUS); falling back to rsync"
+        run -- rm -rf -- "$dst" || return 1
+    fi
+    if [ -d "$src" ] && [ ! -L "$src" ]; then
+        run -- rsync -aHAX --delete -- "$src/" "$dst/" || return 1
+    else
+        run -- cp -a -- "$src" "$dst" || return 1
+    fi
+}
+show_lines() {   # TEXT [MAX]: indented listing (first MAX lines)
+    local max="${2:-200}" n=0 line
+    while IFS= read -r line; do
+        n=$(( n + 1 ))
+        if [ "$n" -le "$max" ]; then printf '%s      %s%s%s %s\n' "$C_DIM" "$C_DIM" "$G_BAR" "$C_RESET" "$line"; fi
+    done <<< "$1"
+    [ "$n" -le "$max" ] || printf '%s      %s … %d more line(s)%s\n' "$C_DIM" "$G_BAR" $(( n - max )) "$C_RESET"
+}
+json_str() { local s="$1"; s="${s//\\/\\\\}"; s="${s//\"/\\\"}"; s="${s//$'\n'/\\n}"; s="${s//$'\t'/\\t}"; printf '"%s"' "$s"; }
+file_sha() { sha256sum < "$1" 2>/dev/null | cut -d' ' -f1 || true; }
+prefs_dirs() { local d; for d in "$1"/drive_c/users/*/AppData/Roaming/Ableton/"Live "*/Preferences; do [ -d "$d" ] && printf '%s\n' "$d"; done; return 0; }
+
+# -------------------------------------------------------------- commands ----
+cmd_snapshot() {
+    local name="$1" tmp i present snapdir v
+    [ -d "$PREFIX" ] || die "prefix $PREFIX does not exist: nothing to snapshot" 1
+    items_define
+    step "snapshot '$name' of prefix $PREFIX + runtime $RUNTIME"
+    refuse_if_busy "$PREFIX" "$RUNTIME" snapshot
+    run -- mkdir -p -- "$SNAP_ROOT" || exit 1
+    [ -d "$SNAP_ROOT" ] && decide_method "$SNAP_ROOT" || decide_method "$HOME"
+    tmp="$SNAP_ROOT/.$name.tmp.$$"
+    run -- rm -rf -- "$tmp" || exit 1
+    run -- mkdir -p -- "$tmp" || exit 1
+    ITEM_PRESENT=()
+    for i in "${!ITEM_KEY[@]}"; do
+        if [ -e "${ITEM_SRC[i]}" ] || [ -L "${ITEM_SRC[i]}" ]; then
+            step "${ITEM_KEY[i]}: ${ITEM_SRC[i]}"
+            copy_tree "${ITEM_SRC[i]}" "$tmp/${ITEM_DEST[i]}" || exit 1
+            ITEM_PRESENT+=(1)
+        else
+            info "${ITEM_KEY[i]}: ${ITEM_SRC[i]} is absent (recorded as absent)"
+            ITEM_PRESENT+=(0)
+        fi
+    done
+    if dry; then
+        info "would record pw-metadata/wpctl text, items.tsv and MANIFEST.json, then move $tmp to $SNAP_ROOT/$name"
+        return 0
+    fi
+    pw-metadata -n settings > "$tmp/pw-metadata-settings.txt" 2>&1 || true
+    wpctl status > "$tmp/wpctl-status.txt" 2>&1 || true
+    for i in "${!ITEM_KEY[@]}"; do
+        printf '%s\t%s\t%s\t%s\t%s\n' "${ITEM_KEY[i]}" "${ITEM_SRC[i]}" "${ITEM_DEST[i]}" "${ITEM_KIND[i]}" "${ITEM_PRESENT[i]}"
+    done > "$tmp/items.tsv"
+    v="$(tr -d '[:space:]' < "$DATA_HOME/ableton-wine/VERSION" 2>/dev/null || true)"
+    {
+        printf '{\n  "schema": "ableton-linux-profiler-state/v1",\n'
+        printf '  "name": %s,\n  "created": "%s",\n  "host": %s,\n  "user": %s,\n' \
+            "$(json_str "$name")" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(json_str "$(hostname 2>/dev/null || uname -n)")" "$(json_str "$(id -un)")"
+        printf '  "method": "%s",\n  "prefix": %s,\n  "runtime": %s,\n' "$METHOD" "$(json_str "$PREFIX")" "$(json_str "$RUNTIME")"
+        printf '  "runtime_version": %s,\n  "runtime_build_info_sha256": "%s",\n' "$(json_str "$v")" "$(file_sha "$RUNTIME/ABLETON-WINE-BUILD-INFO.txt")"
+        printf '  "registry": {"system.reg": "%s", "user.reg": "%s", "userdef.reg": "%s"},\n' \
+            "$(file_sha "$PREFIX/system.reg")" "$(file_sha "$PREFIX/user.reg")" "$(file_sha "$PREFIX/userdef.reg")"
+        printf '  "items": [\n'
+        for i in "${!ITEM_KEY[@]}"; do
+            present=false; [ "${ITEM_PRESENT[i]}" = 1 ] && present=true
+            printf '    {"key": %s, "source": %s, "dest": %s, "kind": "%s", "present": %s}%s\n' \
+                "$(json_str "${ITEM_KEY[i]}")" "$(json_str "${ITEM_SRC[i]}")" "$(json_str "${ITEM_DEST[i]}")" "${ITEM_KIND[i]}" "$present" \
+                "$([ "$i" -lt $(( ${#ITEM_KEY[@]} - 1 )) ] && printf ',')"
+        done
+        printf '  ]\n}\n'
+    } > "$tmp/MANIFEST.json"
+    snapdir="$SNAP_ROOT/$name"
+    [ ! -e "$snapdir" ] || { run -- rm -rf -- "$snapdir" || exit 1; }
+    run -- mv -T -- "$tmp" "$snapdir" || exit 1
+    ok "snapshot '$name' ($METHOD) → $snapdir"
+}
+
+cmd_restore() {
+    local name="$1" keep_logs="$2" snap i src dest rt keep="" rel f ts
+    snap="$SNAP_ROOT/$name"
+    [ -f "$snap/items.tsv" ] || die "no snapshot named '$name' under $SNAP_ROOT (see: state list)" 1
+    items_load "$snap"
+    rt="$RUNTIME"
+    for i in "${!ITEM_KEY[@]}"; do
+        case "${ITEM_KEY[i]}" in prefix) PREFIX="${ITEM_SRC[i]}" ;; runtime) rt="${ITEM_SRC[i]}" ;; esac
+    done
+    [ "$rt" = "$RUNTIME" ] || warn "the snapshot's runtime ($rt) differs from the configured one ($RUNTIME); restoring the recorded path"
+    step "restore '$name' → prefix $PREFIX, runtime $rt"
+    refuse_if_busy "$PREFIX" "$rt" restore
+    if [ -x "$rt/bin/wineserver" ]; then
+        run --allow-fail --timeout 30 -- env WINEPREFIX="$PREFIX" "$rt/bin/wineserver" -k || true
+        run --allow-fail --timeout 60 -- env WINEPREFIX="$PREFIX" "$rt/bin/wineserver" -w || true
+    fi
+    if [ "$keep_logs" -eq 1 ] && ! dry; then
+        keep="$(mktemp -d "${TMPDIR:-/tmp}/state-keep.XXXXXX")"
+        for f in "$PREFIX"/drive_c/users/*/AppData/Roaming/Ableton/"Live "*/Preferences/Log.txt; do
+            [ -f "$f" ] || continue
+            rel="${f#"$PREFIX"/}"
+            mkdir -p -- "$keep/$(dirname -- "$rel")" && cp -p -- "$f" "$keep/$rel"
+        done
+        info "keeping $(find "$keep" -type f | wc -l) Log.txt file(s) across the restore"
+    fi
+    METHOD=rsync; [ -d "$SNAP_ROOT" ] && decide_method "$SNAP_ROOT"
+    for i in "${!ITEM_KEY[@]}"; do
+        src="${ITEM_SRC[i]}"; dest="$snap/${ITEM_DEST[i]}"
+        case "$src" in "$HOME"/?*) ;; *) die "refusing to replace '$src': not under $HOME" 1 ;; esac
+        step "${ITEM_KEY[i]} → $src"
+        run -- rm -rf -- "$src" || exit 1
+        if [ "${ITEM_PRESENT[i]}" = 1 ]; then
+            run -- mkdir -p -- "$(dirname -- "$src")" || exit 1
+            copy_tree "$dest" "$src" || exit 1
+        else
+            info "${ITEM_KEY[i]} was absent in the snapshot: left absent"
+        fi
+    done
+    if [ -n "$keep" ]; then
+        while IFS= read -r f; do
+            rel="${f#"$keep"/}"
+            run -- mkdir -p -- "$PREFIX/$(dirname -- "$rel")" || exit 1
+            run -- cp -p -- "$f" "$PREFIX/$rel" || exit 1
+        done < <(find "$keep" -type f)
+        rm -rf -- "$keep"
+    fi
+    run --allow-fail -- pw-metadata -n settings 0 clock.force-quantum 0 || warn "could not reset clock.force-quantum (PipeWire not running?)"
+    do_clean_crash
+    ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    run -- sh -c 'mkdir -p -- "$(dirname -- "$3")" && printf "name=%s\nts=%s\n" "$1" "$2" > "$3"' record "$name" "$ts" "$STATE_DIR/state-last-restore" || true
+    ok "restored '$name' from $snap"
+}
+
+cmd_diff() {
+    local name="$1" snap i src dest out n total=0 r a b
+    snap="$SNAP_ROOT/$name"
+    [ -f "$snap/items.tsv" ] || die "no snapshot named '$name' under $SNAP_ROOT (see: state list)" 1
+    items_load "$snap"
+    step "drift of the live state from snapshot '$name' ($snap)"
+    for i in "${!ITEM_KEY[@]}"; do
+        src="${ITEM_SRC[i]}"; dest="$snap/${ITEM_DEST[i]}"
+        if [ "${ITEM_PRESENT[i]}" != 1 ]; then
+            if [ -e "$src" ]; then warn "${ITEM_KEY[i]}: absent in the snapshot, present now ($src)"; total=$(( total + 1 )); else ok "${ITEM_KEY[i]}: absent in both"; fi
+            continue
+        fi
+        if [ ! -e "$src" ] && [ ! -L "$src" ]; then warn "${ITEM_KEY[i]}: in the snapshot, missing now ($src)"; total=$(( total + 1 )); continue; fi
+        if [ -d "$dest" ] && [ ! -L "$dest" ]; then
+            out="$(rsync -ani --delete -- "$dest/" "$src/" 2>/dev/null | grep -v '^\.d' || true)"
+            n="$(printf '%s' "$out" | grep -c . || true)"
+            if [ "$n" -eq 0 ]; then
+                ok "${ITEM_KEY[i]}: identical (size/mtime)"
+            else
+                warn "${ITEM_KEY[i]}: $n change(s) in $src"
+                show_lines "$out"
+                total=$(( total + 1 ))
+            fi
+        else
+            if cmp -s -- "$dest" "$src"; then ok "${ITEM_KEY[i]}: identical"; else warn "${ITEM_KEY[i]}: differs ($src)"; total=$(( total + 1 )); fi
+        fi
+    done
+    for r in system.reg user.reg userdef.reg; do
+        a="$(file_sha "$snap/prefix/$r")"; b="$(file_sha "$PREFIX/$r")"
+        if [ "$a" = "$b" ]; then ok "registry $r: identical"; else warn "registry $r: differs (snapshot ${a:0:12}… live ${b:0:12}…)"; fi
+    done
+    if [ "$total" -eq 0 ]; then ok "no drift from '$name'"; return 0; fi
+    warn "$total item(s) differ from '$name' (restore with: state restore --name $name)"
+    return 1
+}
+
+cmd_list() {
+    local names_only="$1" d name created method n
+    if [ ! -d "$SNAP_ROOT" ]; then [ "$names_only" -eq 1 ] || info "no snapshots yet ($SNAP_ROOT does not exist)"; return 0; fi
+    [ "$names_only" -eq 1 ] || printf '  %s%-14s %-22s %-8s %s%s\n' "$C_BOLD" "name" "created" "method" "items" "$C_RESET"
+    for d in "$SNAP_ROOT"/*/; do
+        [ -f "$d/MANIFEST.json" ] || continue
+        name="${d%/}"; name="${name##*/}"
+        if [ "$names_only" -eq 1 ]; then printf '%s\n' "$name"; continue; fi
+        created="$(sed -n 's/^ *"created": *"\([^"]*\)".*/\1/p' "$d/MANIFEST.json" | head -n1)"
+        method="$(sed -n 's/^ *"method": *"\([^"]*\)".*/\1/p' "$d/MANIFEST.json" | head -n1)"
+        n="$(grep -c '"present": true' "$d/MANIFEST.json" || true)"
+        printf '  %-14s %-22s %-8s %s present  %s%s%s\n' "$name" "${created:-?}" "${method:-?}" "${n:-0}" "$C_DIM" "${d%/}" "$C_RESET"
+    done
+    return 0
+}
+
+do_clean_crash() {
+    local d f n=0 live
+    live="$(live_pids)"
+    if [ -n "$live" ] && [ "${FORCE:-0}" != 1 ]; then
+        die "Live is running (pid $(printf '%s' "$live" | tr '\n' ' ')): quit it (File > Quit) before clean-crash" 1
+    fi
+    while IFS= read -r d; do
+        for f in CrashDetection.cfg CrashRecoveryInfo.cfg; do
+            if [ -e "$d/$f" ]; then run -- rm -f -- "$d/$f" || exit 1; n=$(( n + 1 )); fi
+        done
+        if [ -d "$d/BaseFiles" ] && [ -n "$(find "$d/BaseFiles" -mindepth 1 -print -quit 2>/dev/null)" ]; then
+            run -- find "$d/BaseFiles" -mindepth 1 -delete || exit 1
+            n=$(( n + 1 ))
+        fi
+    done < <(prefs_dirs "$PREFIX")
+    if [ "$n" -eq 0 ]; then ok "no crash-recovery files in $PREFIX"; else ok "cleared $n crash-recovery item(s) in $PREFIX"; fi
+}
+
+# ------------------------------------------------------------------ main ----
+cmd=""; name=golden; keep_logs=0; names_only=0; FORCE="${FORCE:-0}"
+while [ $# -gt 0 ]; do
+    case "$1" in
+        snapshot|restore|diff|list|clean-crash) [ -z "$cmd" ] || die "one command at a time (got '$cmd' and '$1')" 2; cmd="$1" ;;
+        --name) [ $# -ge 2 ] || die "--name needs a value" 2; name="$2"; shift ;;
+        --name=*) name="${1#*=}" ;;
+        --keep-logs) keep_logs=1 ;;
+        --names) names_only=1 ;;
+        --dry-run) DRY_RUN=1 ;;
+        --force) FORCE=1 ;;
+        -h|--help) usage; exit 0 ;;
+        *) die "unknown argument '$1' (see --help)" 2 ;;
+    esac
+    shift
+done
+export DRY_RUN="${DRY_RUN:-0}"
+[ -n "$cmd" ] || { usage >&2; exit 2; }
+[[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || die "snapshot name must match [A-Za-z0-9][A-Za-z0-9_.-]* (got '$name')" 2
+case "$cmd" in
+    snapshot) cmd_snapshot "$name" ;;
+    restore) cmd_restore "$name" "$keep_logs" ;;
+    diff) cmd_diff "$name" ;;
+    list) cmd_list "$names_only" ;;
+    clean-crash) do_clean_crash ;;
+esac

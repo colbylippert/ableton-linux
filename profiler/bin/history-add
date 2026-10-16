@@ -1,0 +1,397 @@
+#!/usr/bin/env python3
+"""Record one completed benchmark run under profiler/history/.
+
+    history-add RUN_DIR [--trial T0007] [--arm A|B|AA] [--baseline] [--history-dir DIR]
+
+RUN_DIR holds the suite output written by scripts/bench-suite.sh (run.json,
+report.json, profile/profile.json, sets/NN-<Set>/measurement.json) or is the
+parent of a bench/ directory that does. The record keeps the run identity and
+the per-Set numbers the dashboard and the ledger read; a value the run did not
+produce is null. The record goes to <history-dir>/runs/<run_id>.json;
+--baseline also names the run in <history-dir>/baselines.json for its machine
+and "<structure>/<scenario or ->" ("...@<trace mode>" for a traced run, so an
+untraced and a traced baseline coexist). Recording the same run again changes
+nothing.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+from typing import Any
+
+
+SCHEMA = "ableton-linux-profiler-history/v1"
+CANONICAL_SETS = (
+    "Benchmark_Zero", "Benchmark_Empty", "Benchmark_Inbuilts", "Benchmark_Max4Live", "Benchmark_VSTs",
+)
+ARMS = ("A", "B", "AA")
+TRIAL_RE = re.compile(r"T[0-9]{4}")
+RUN_ID_RE = re.compile(r"[^A-Za-z0-9_.-]+")
+COMMIT_RE = re.compile(r"[0-9a-f]{40}")
+TOP_N = 10
+HOTSPOT_KEYS = ("role", "kind", "caller", "n", "total_ns")
+HERE = Path(__file__).resolve().parent
+REPOSITORY = HERE.parents[1]
+DEFAULT_HISTORY_DIR = HERE.parent / "history"
+
+
+def nested(value: Any, *keys: str) -> Any:
+    for key in keys:
+        if not isinstance(value, dict):
+            return None
+        value = value.get(key)
+    return value
+
+
+def number(value: Any) -> Any:
+    # JSON booleans are ints in Python; the record keeps numbers only.
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return value
+
+
+def text(value: Any) -> Any:
+    return value if isinstance(value, str) and value else None
+
+
+def scalar(value: Any) -> Any:
+    return value if isinstance(value, str) else number(value)
+
+
+def load_json(path: Path) -> Any:
+    try:
+        with path.open(encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, ValueError):
+        return None
+
+
+def suite_directory(run_dir: Path) -> Path | None:
+    for candidate in (run_dir, run_dir / "bench"):
+        if (candidate / "run.json").is_file() or (candidate / "report.json").is_file():
+            return candidate
+    return None
+
+
+def run_identifier(run: dict[str, Any], suite_dir: Path) -> str:
+    value = text(run.get("id"))
+    if not value:
+        value = suite_dir.name
+        if value == "bench" and suite_dir.parent.name:
+            value = suite_dir.parent.name
+    return RUN_ID_RE.sub("-", value).strip("-") or "run"
+
+
+def load_inputs(suite_dir: Path) -> tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]]]:
+    """Return run.json, profile.json and the measurements; report.json fills any gap."""
+    report = load_json(suite_dir / "report.json")
+    report = report if isinstance(report, dict) else {}
+    run = load_json(suite_dir / "run.json")
+    if not isinstance(run, dict):
+        run = report.get("run") if isinstance(report.get("run"), dict) else {}
+    profile = load_json(suite_dir / "profile/profile.json")
+    if not isinstance(profile, dict):
+        profile = report.get("profile") if isinstance(report.get("profile"), dict) else {}
+    sets = report.get("sets")
+    if not isinstance(sets, list):
+        sets = [load_json(path) for path in sorted((suite_dir / "sets").glob("*/measurement.json"))]
+    return run, profile, [item for item in sets if isinstance(item, dict)]
+
+
+def run_scenario(run: dict[str, Any]) -> Any:
+    value = run.get("scenario")
+    if isinstance(value, dict):
+        value = value.get("name")
+    return text(value)
+
+
+def run_structure(run: dict[str, Any], scenario: Any) -> Any:
+    value = text(run.get("structure"))
+    if value:
+        return value
+    # Runs recorded before the suite wrote "structure" follow the suite's rule.
+    order = run.get("set_order")
+    if not isinstance(order, list):
+        return None
+    return "benchmark" if tuple(order) == CANONICAL_SETS and scenario is None else "diagnostic"
+
+
+def run_trace_mode(run: dict[str, Any]) -> str:
+    value = run.get("trace")
+    if isinstance(value, dict):
+        value = value.get("mode")
+    # A run without a trace record was untraced.
+    return text(value) or "off"
+
+
+def profile_hostname(profile: dict[str, Any]) -> Any:
+    value = text(nested(profile, "system", "hostname"))
+    if value:
+        return value
+    words = (text(nested(profile, "system", "uname")) or "").split()
+    return words[1] if len(words) > 1 else None
+
+
+def profile_virtualization(profile: dict[str, Any]) -> Any:
+    value = nested(profile, "system", "virtualization")
+    if isinstance(value, dict):
+        value = value.get("value")
+    return text(value)
+
+
+def build_info_fields(build_info: Any) -> dict[str, str]:
+    fields: dict[str, str] = {}
+    for line in (build_info if isinstance(build_info, str) else "").splitlines():
+        key, separator, value = line.partition(":")
+        if separator and key.strip():
+            fields.setdefault(key.strip(), value.strip())
+    return fields
+
+
+def runtime_record(profile: dict[str, Any]) -> dict[str, Any]:
+    runtime = nested(profile, "runtime")
+    runtime = runtime if isinstance(runtime, dict) else {}
+    fields = build_info_fields(runtime.get("build_info"))
+    dev_info = text(runtime.get("dev_info"))
+    root = text(runtime.get("root"))
+    if dev_info is None and root:
+        # wine-dev.sh sync stamps the dev runtime; the profile does not copy it.
+        try:
+            dev_info = (Path(root) / "PROFILER-DEV-INFO.txt").read_text(encoding="utf-8").strip() or None
+        except OSError:
+            dev_info = None
+    return {
+        "dist_version": text(runtime.get("dist_version")) or text(fields.get("dist-version")),
+        "source_tree_sha": text(runtime.get("source_tree_sha")) or text(fields.get("source-tree")),
+        "dev_info": dev_info,
+    }
+
+
+def switch_record(profile: dict[str, Any]) -> dict[str, str]:
+    gates = nested(profile, "configuration", "benchmark_gates")
+    if not isinstance(gates, dict):
+        return {}
+    return {str(key): str(value) for key, value in sorted(gates.items())}
+
+
+def voluntary_switch_rate(measurement: dict[str, Any]) -> Any:
+    """Voluntary context switches per second over Live's processes."""
+    pids = nested(measurement, "process", "summary", "live", "pids")
+    processes = nested(measurement, "process", "details", "processes")
+    elapsed = number(nested(measurement, "process", "details", "elapsed_seconds"))
+    if not isinstance(pids, list) or not pids or not isinstance(processes, list) or not elapsed:
+        return None
+    counts = [
+        number(item.get("voluntary_context_switches"))
+        for item in processes if isinstance(item, dict) and item.get("pid") in pids
+    ]
+    if len(counts) != len(pids) or any(value is None for value in counts):
+        return None
+    return round(sum(counts) / elapsed, 1)
+
+
+def call_sites_top(interface: dict[str, Any]) -> Any:
+    sites = interface.get("call_sites")
+    if not isinstance(sites, list):
+        return None
+    return [
+        {
+            "key": text(site.get("key")),
+            "share": number(site.get("share_of_lost_slack")),
+            "total_ns_in_late_blocks": number(site.get("total_ns_in_late_blocks")),
+        }
+        for site in sites[:TOP_N] if isinstance(site, dict)
+    ]
+
+
+def hotspots_top(interface: dict[str, Any]) -> Any:
+    spots = interface.get("hotspots_non_audio")
+    if not isinstance(spots, list):
+        return None
+    return [{key: scalar(spot.get(key)) for key in HOTSPOT_KEYS} for spot in spots[:TOP_N] if isinstance(spot, dict)]
+
+
+def set_record(measurement: dict[str, Any]) -> dict[str, Any]:
+    summary = nested(measurement, "process", "summary")
+    details = nested(measurement, "process", "details")
+    interface = measurement.get("interface")
+    interface = interface if isinstance(interface, dict) else {}
+    return {
+        "mode": text(measurement.get("mode")),
+        "host_cpu_pct": number(nested(details, "host_cpu_percent", "cpu")),
+        "live_cpu_pct_per_core": number(nested(summary, "live", "cpu_percent_of_one_core")),
+        "wine_cpu_pct_per_core": number(nested(summary, "wine_prefix", "cpu_percent_of_one_core")),
+        "pipewire_cpu_pct": number(nested(summary, "pipewire", "cpu_percent_of_one_core")),
+        "irq_per_s": number(nested(measurement, "kernel_counters", "interrupts", "total_rate_per_second")),
+        "softirq_per_s": number(nested(measurement, "kernel_counters", "softirqs", "total_rate_per_second")),
+        "pipewire_errors": number(nested(measurement, "pipewire", "pw_top", "err_delta")),
+        "xruns": number(nested(measurement, "logs", "xrun_line_count")),
+        "dsp_avg": number(nested(measurement, "osc_dsp", "average_percent")),
+        "dsp_peak": number(nested(measurement, "osc_dsp", "peak_percent")),
+        "audio_workers": number(nested(summary, "live", "audio_worker_count")),
+        "voluntary_switches_per_s": voluntary_switch_rate(measurement),
+        "late_blocks": number(nested(interface, "blocks", "late")),
+        "near_late_blocks": number(nested(interface, "blocks", "near_late")),
+        "slack_p01_ns": number(nested(interface, "blocks", "slack_ns", "p01")),
+        "slack_p50_ns": number(nested(interface, "blocks", "slack_ns", "p50")),
+        "lost_slack_total_ns": number(nested(interface, "lost_slack", "total_ns")),
+        "call_sites_top": call_sites_top(interface),
+        "hotspots_non_audio_top": hotspots_top(interface),
+    }
+
+
+def history_record(
+    run: dict[str, Any], profile: dict[str, Any], measurements: list[dict[str, Any]], *,
+    run_id: str, source_dir: str, trial: str | None, arm: str | None, commit: str | None,
+) -> dict[str, Any]:
+    scenario = run_scenario(run)
+    sets: dict[str, Any] = {}
+    for measurement in measurements:
+        name = text(measurement.get("set"))
+        if name and name not in sets:
+            sets[name] = set_record(measurement)
+    return {
+        "schema": SCHEMA,
+        "run_id": run_id,
+        "tag": text(run.get("tag")),
+        "started_at": text(run.get("created_at")),
+        "machine_id": text(nested(run, "machine", "id")) or text(nested(profile, "machine", "id")),
+        "hostname": profile_hostname(profile),
+        "virtualization": profile_virtualization(profile),
+        "structure": run_structure(run, scenario),
+        "scenario": scenario,
+        "trace_mode": run_trace_mode(run),
+        "duration_s": number(run.get("duration_seconds_per_set")),
+        "runtime": runtime_record(profile),
+        "switches": switch_record(profile),
+        "harness_sha": text(nested(run, "harness", "identity_hash")),
+        "commit": commit,
+        "trial": trial,
+        "arm": arm,
+        "source_dir": source_dir,
+        "sets": sets,
+    }
+
+
+def git_head(repository: Path) -> str | None:
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(repository), "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=15, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    value = completed.stdout.strip()
+    return value if completed.returncode == 0 and COMMIT_RE.fullmatch(value) else None
+
+
+def display_path(path: Path) -> str:
+    try:
+        return "~/" + path.relative_to(Path.home()).as_posix()
+    except (ValueError, RuntimeError):
+        return path.as_posix()
+
+
+def write_json(path: Path, value: Any) -> bool:
+    """Write value as indented JSON with LF endings; False when the file already matched."""
+    data = json.dumps(value, indent=2) + "\n"
+    try:
+        if path.read_text(encoding="utf-8") == data:
+            return False
+    except OSError:
+        pass
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    with open(temporary, "w", encoding="utf-8", newline="\n") as handle:
+        handle.write(data)
+    os.replace(temporary, path)
+    return True
+
+
+def baseline_key(record: dict[str, Any]) -> str:
+    """"<structure>/<scenario or ->"; a traced run gets "@<trace_mode>" so it never replaces the untraced baseline."""
+    key = f"{record['structure'] or '-'}/{record['scenario'] or '-'}"
+    if record["trace_mode"] != "off":
+        key += f"@{record['trace_mode']}"
+    return key
+
+
+def update_baselines(path: Path, machine_id: str, key: str, run_id: str) -> bool:
+    value = load_json(path)
+    value = value if isinstance(value, dict) else {}
+    machine = value.get(machine_id)
+    machine = machine if isinstance(machine, dict) else {}
+    machine[key] = run_id
+    value[machine_id] = dict(sorted(machine.items()))
+    return write_json(path, dict(sorted(value.items())))
+
+
+def parser() -> argparse.ArgumentParser:
+    result = argparse.ArgumentParser(
+        prog="history-add", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    result.add_argument("run_dir", help="suite output directory, or its parent when the output is in RUN_DIR/bench")
+    result.add_argument("--trial", help="trial id the run belongs to, such as T0007")
+    result.add_argument("--arm", choices=ARMS, help="A/B arm of the run; AA for one half of an A/A pair")
+    result.add_argument("--baseline", action="store_true", help="name the run in baselines.json")
+    result.add_argument("--history-dir", default=str(DEFAULT_HISTORY_DIR), help="default: profiler/history")
+    return result
+
+
+def main(argv: list[str] | None = None) -> int:
+    arguments = parser()
+    args = arguments.parse_args(argv)
+    if args.trial is not None and not TRIAL_RE.fullmatch(args.trial):
+        arguments.error("--trial must look like T0007")
+    run_dir = Path(args.run_dir).expanduser().resolve()
+    suite_dir = suite_directory(run_dir)
+    if suite_dir is None:
+        print(f"history-add: no run.json or report.json under {run_dir} or {run_dir / 'bench'}", file=sys.stderr)
+        return 2
+    run, profile, measurements = load_inputs(suite_dir)
+    run_id = run_identifier(run, suite_dir)
+    status = run.get("status")
+    if status != "complete":
+        print(f"history-add: warning: run status is {status!r}, not 'complete'", file=sys.stderr)
+    if not measurements:
+        print("history-add: warning: no set measurements found", file=sys.stderr)
+    record = history_record(
+        run, profile, measurements, run_id=run_id, source_dir=display_path(suite_dir),
+        trial=args.trial, arm=args.arm, commit=git_head(REPOSITORY),
+    )
+    history_dir = Path(args.history_dir).expanduser().resolve()
+    target = history_dir / "runs" / f"{run_id}.json"
+    try:
+        changed = write_json(target, record)
+    except OSError as error:
+        print(f"history-add: {error}", file=sys.stderr)
+        return 2
+    print(f"history-add: {'wrote' if changed else 'unchanged'} {display_path(target)}")
+    if not args.baseline:
+        return 0
+    if status != "complete":
+        print("history-add: refusing to make an incomplete run the baseline", file=sys.stderr)
+        return 2
+    if record["machine_id"] is None:
+        print("history-add: the run has no machine id; cannot record a baseline", file=sys.stderr)
+        return 2
+    if record["switches"] or record["trial"] or record["arm"]:
+        print("history-add: warning: the baseline run has switches, a trial or an arm recorded", file=sys.stderr)
+    key = baseline_key(record)
+    try:
+        changed = update_baselines(history_dir / "baselines.json", record["machine_id"], key, run_id)
+    except OSError as error:
+        print(f"history-add: {error}", file=sys.stderr)
+        return 2
+    print(f"history-add: baseline {record['machine_id']} {key} -> {run_id} ({'written' if changed else 'unchanged'})")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

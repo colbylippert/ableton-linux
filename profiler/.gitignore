@@ -1,0 +1,13 @@
+# Runtime output never lives in the repo: build.sh snapshots every non-ignored file
+# into /tmp and aborts if the tree changes during a build.
+*.log
+runs/
+scratch/
+__pycache__/
+*.pyc
+dashboard/node_modules/
+dashboard/dist/
+control/vendor/AbletonOSC/logs/
+tracer/build/
+tracer/*.skel.h
+tracer/*.o

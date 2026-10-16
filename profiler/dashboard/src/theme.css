@@ -1,0 +1,507 @@
+/*
+ * Profiler gains — design tokens and base layout.
+ *
+ * Tokens come from the dataviz reference palette (references/palette.md): the chart
+ * chrome, the eight categorical slots (dark column = the same hues re-stepped for the
+ * dark surface, validated as a set), the blue sequential ramp, the blue<->red diverging
+ * pair, the fixed status scale and the ordinal before/after pair. Validator output for
+ * both modes is recorded in DESIGN.md. Nothing below is eyeballed.
+ *
+ * Dark mode is declared twice on purpose: once under the OS preference (guarded so an
+ * explicit light stamp wins) and once under the viewer's toggle (data-theme="dark").
+ */
+
+:root {
+  color-scheme: light;
+
+  /* chart chrome & ink */
+  --page: #f9f9f7;
+  --surface-1: #fcfcfb;
+  --surface-2: #f0efec; /* raised rows, chips, neutral diverging midpoint */
+  --text-primary: #0b0b0b;
+  --text-secondary: #52514e;
+  --text-muted: #898781; /* axis ticks, captions >= 12px; never body text */
+  --grid: #e1e0d9;
+  --axis: #c3c2b7;
+  --border: rgba(11, 11, 11, 0.1);
+  --delta-good-text: #006300;
+  --focus: #2a78d6;
+
+  /* categorical slots, fixed order, never cycled */
+  --series-1: #2a78d6; /* blue */
+  --series-2: #eb6834; /* orange */
+  --series-3: #1baf7a; /* aqua */
+  --series-4: #eda100; /* yellow */
+  --series-5: #e87ba4; /* magenta */
+  --series-6: #008300; /* green */
+  --series-7: #4a3aa7; /* violet */
+  --series-8: #e34948; /* red */
+  --series-dim: #898781; /* de-emphasis: context series in the emphasis form */
+
+  /* Set -> slot (suite order). A non-canonical Set wears --set-other. */
+  --set-zero: var(--series-1);
+  --set-empty: var(--series-2);
+  --set-inbuilts: var(--series-3);
+  --set-max4live: var(--series-4);
+  --set-vsts: var(--series-5);
+  --set-other: var(--series-6);
+
+  /* sequential (blue), light -> dark */
+  --seq-100: #cde2fb;
+  --seq-150: #b7d3f6;
+  --seq-200: #9ec5f4;
+  --seq-250: #86b6ef;
+  --seq-300: #6da7ec;
+  --seq-350: #5598e7;
+  --seq-400: #3987e5;
+  --seq-450: #2a78d6;
+  --seq-500: #256abf;
+  --seq-550: #1c5cab;
+  --seq-600: #184f95;
+  --seq-650: #104281;
+  --seq-700: #0d366b;
+
+  /* diverging: blue (improvement) <-> neutral <-> red (regression) */
+  --div-neg: #e34948;
+  --div-mid: #f0efec;
+  --div-pos: #2a78d6;
+
+  /* ordinal before/after pair (dumbbells, before/after bars): one hue, two shades */
+  --ord-before: #86b6ef; /* step 250 */
+  --ord-after: #1c5cab; /* step 550 */
+
+  /* status: fixed, reserved, always paired with an icon + label */
+  --status-good: #0ca30c;
+  --status-warning: #fab219;
+  --status-serious: #ec835a;
+  --status-critical: #d03b3b;
+
+  /* mark specs */
+  --line-width: 2px;
+  --marker-r: 4px;
+  --bar-max: 24px;
+  --surface-gap: 2px;
+  --radius: 8px;
+  --radius-sm: 4px;
+  --gutter: 16px;
+
+  --font: system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --mono: ui-monospace, 'Cascadia Mono', 'Consolas', 'DejaVu Sans Mono', monospace;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme='light']) {
+    color-scheme: dark;
+    --page: #0d0d0d;
+    --surface-1: #1a1a19;
+    --surface-2: #262624;
+    --text-primary: #ffffff;
+    --text-secondary: #c3c2b7;
+    --text-muted: #898781;
+    --grid: #2c2c2a;
+    --axis: #383835;
+    --border: rgba(255, 255, 255, 0.1);
+    --delta-good-text: #0ca30c;
+    --focus: #3987e5;
+
+    --series-1: #3987e5;
+    --series-2: #d95926;
+    --series-3: #199e70;
+    --series-4: #c98500;
+    --series-5: #d55181;
+    --series-6: #008300;
+    --series-7: #9085e9;
+    --series-8: #e66767;
+    --series-dim: #898781;
+
+    --div-neg: #e66767;
+    --div-mid: #383835;
+    --div-pos: #3987e5;
+
+    --ord-before: #9ec5f4; /* step 200 */
+    --ord-after: #3987e5; /* step 400 */
+  }
+}
+
+:root[data-theme='dark'] {
+  color-scheme: dark;
+  --page: #0d0d0d;
+  --surface-1: #1a1a19;
+  --surface-2: #262624;
+  --text-primary: #ffffff;
+  --text-secondary: #c3c2b7;
+  --text-muted: #898781;
+  --grid: #2c2c2a;
+  --axis: #383835;
+  --border: rgba(255, 255, 255, 0.1);
+  --delta-good-text: #0ca30c;
+  --focus: #3987e5;
+
+  --series-1: #3987e5;
+  --series-2: #d95926;
+  --series-3: #199e70;
+  --series-4: #c98500;
+  --series-5: #d55181;
+  --series-6: #008300;
+  --series-7: #9085e9;
+  --series-8: #e66767;
+  --series-dim: #898781;
+
+  --div-neg: #e66767;
+  --div-mid: #383835;
+  --div-pos: #3987e5;
+
+  --ord-before: #9ec5f4;
+  --ord-after: #3987e5;
+}
+
+/* ---------- base ---------- */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  -webkit-text-size-adjust: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--page);
+  color: var(--text-primary);
+  font-family: var(--font);
+  font-size: 14px;
+  line-height: 1.45;
+  overflow-x: hidden;
+}
+
+a {
+  color: inherit;
+}
+
+button,
+input,
+select {
+  font: inherit;
+  color: inherit;
+}
+
+:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    transition: none !important;
+    animation: none !important;
+  }
+}
+
+/* ---------- app shell ---------- */
+
+.app {
+  max-width: 1280px;
+  margin: 0 auto;
+  padding: 0 var(--gutter) 48px;
+}
+
+.app-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px 16px;
+  padding: 20px 0 12px;
+}
+
+.app-title {
+  margin: 0;
+  font-size: 20px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+.app-meta {
+  color: var(--text-secondary);
+  font-size: 13px;
+}
+
+.app-header .spacer {
+  flex: 1 1 auto;
+}
+
+.theme-toggle {
+  display: inline-flex;
+  gap: 2px;
+  padding: 2px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface-1);
+}
+
+.theme-toggle button {
+  border: 0;
+  background: transparent;
+  padding: 4px 10px;
+  border-radius: var(--radius-sm);
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+
+.theme-toggle button[aria-pressed='true'] {
+  background: var(--surface-2);
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+/* tabs: one row, scrolls horizontally on phones, never the page */
+.tablist {
+  display: flex;
+  gap: 4px;
+  overflow-x: auto;
+  scrollbar-width: thin;
+  border-bottom: 1px solid var(--border);
+  margin: 0 calc(-1 * var(--gutter));
+  padding: 0 var(--gutter);
+}
+
+.tab {
+  flex: 0 0 auto;
+  border: 0;
+  background: transparent;
+  padding: 10px 12px;
+  margin-bottom: -1px;
+  border-bottom: 2px solid transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.tab:hover {
+  color: var(--text-primary);
+  background: var(--surface-2);
+  border-radius: var(--radius-sm) var(--radius-sm) 0 0;
+}
+
+.tab[aria-selected='true'] {
+  color: var(--text-primary);
+  font-weight: 600;
+  border-bottom-color: var(--text-primary);
+}
+
+.filterbar-slot {
+  padding: 12px 0 4px;
+}
+
+.tabpanel {
+  padding-top: 16px;
+}
+
+/* ---------- cards & grids ---------- */
+
+.card {
+  background: var(--surface-1);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 16px;
+}
+
+.card-title {
+  margin: 0 0 4px;
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.card-subtitle {
+  margin: 0 0 12px;
+  color: var(--text-secondary);
+  font-size: 13px;
+}
+
+.grid {
+  display: grid;
+  gap: 16px;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+}
+
+.grid-kpi {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+}
+
+/* ---------- figures (stat tiles, hero) ---------- */
+
+.hero-figure {
+  font-size: 48px;
+  font-weight: 600;
+  line-height: 1.1;
+  letter-spacing: -0.02em;
+  /* proportional figures on purpose: tabular-nums only in columns */
+}
+
+.kpi-value {
+  font-size: 28px;
+  font-weight: 600;
+  line-height: 1.15;
+}
+
+.kpi-label {
+  color: var(--text-secondary);
+  font-size: 13px;
+}
+
+/* ---------- tables ---------- */
+
+.table-wrap {
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
+table.data {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 13px;
+}
+
+table.data th,
+table.data td {
+  text-align: left;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--grid);
+  vertical-align: top;
+}
+
+table.data th {
+  color: var(--text-secondary);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+table.data td.num,
+table.data th.num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+table.data tbody tr:hover {
+  background: var(--surface-2);
+}
+
+/* ---------- chips, badges, ribbon ---------- */
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  color: var(--text-primary);
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: nowrap;
+}
+
+.chip .dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--text-muted);
+  box-shadow: 0 0 0 2px var(--surface-1);
+}
+
+.chip-good .dot {
+  background: var(--status-good);
+}
+.chip-warning .dot {
+  background: var(--status-warning);
+}
+.chip-serious .dot {
+  background: var(--status-serious);
+}
+.chip-critical .dot {
+  background: var(--status-critical);
+}
+.chip-dim {
+  color: var(--text-secondary);
+}
+
+.ribbon {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  border-radius: var(--radius);
+  border: 1px solid var(--status-serious);
+  background: var(--surface-1);
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+.ribbon .icon {
+  color: var(--status-serious);
+  font-size: 18px;
+  line-height: 1;
+}
+
+/* ---------- empty states & placeholders ---------- */
+
+.empty {
+  padding: 24px;
+  border: 1px dashed var(--axis);
+  border-radius: var(--radius);
+  color: var(--text-secondary);
+  text-align: center;
+}
+
+.empty code,
+.view-scaffold code {
+  font-family: var(--mono);
+  font-size: 12px;
+  background: var(--surface-2);
+  padding: 1px 4px;
+  border-radius: 3px;
+}
+
+.view-scaffold h2 {
+  margin: 0 0 4px;
+  font-size: 18px;
+}
+
+.view-scaffold .lead {
+  margin: 0 0 16px;
+  color: var(--text-secondary);
+}
+
+.view-scaffold ul {
+  margin: 8px 0 0;
+  padding-left: 20px;
+  color: var(--text-secondary);
+}
+
+@media (max-width: 480px) {
+  .hero-figure {
+    font-size: 40px;
+  }
+  .card {
+    padding: 12px;
+  }
+}

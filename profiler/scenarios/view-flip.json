@@ -1,0 +1,58 @@
+{
+  "schema": "ableton-linux-scenario/v1",
+  "name": "view-flip",
+  "kind": "diagnostic",
+  "base_set": "Benchmark_Inbuilts",
+  "description": "Session, Arranger and the device chain detail are shown in turn each second while the arrangement plays: Direct2D and UI redraw. Teardown shows the Arranger again.",
+  "requires": {
+    "control_surface": true,
+    "max_for_live": false,
+    "plugins": []
+  },
+  "setup": [
+    {
+      "op": "stop"
+    },
+    {
+      "op": "rewind"
+    },
+    {
+      "op": "play"
+    },
+    {
+      "op": "marker",
+      "name": "setup-done"
+    }
+  ],
+  "timeline": {
+    "period_s": 3.0,
+    "repeat": true,
+    "marker_every_s": 5.0,
+    "steps": [
+      {
+        "at_s": 0.0,
+        "op": "show_view",
+        "view": "Session"
+      },
+      {
+        "at_s": 1.0,
+        "op": "show_view",
+        "view": "Arranger"
+      },
+      {
+        "at_s": 2.0,
+        "op": "show_view",
+        "view": "Detail/DeviceChain"
+      }
+    ]
+  },
+  "teardown": [
+    {
+      "op": "stop"
+    },
+    {
+      "op": "show_view",
+      "view": "Arranger"
+    }
+  ]
+}

@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+# profiler/bin/bench — scripts/bench-suite.sh the profiler way:
+#   * AbletonOSC bench ports: ABL_BENCH_OSC_SEND=11000 ABL_BENCH_OSC_RECV=11001
+#     (the canonical Sets keep their M4L device on 19001/19002; both may be
+#     overridden in the environment)
+#   * the desktop session environment via profiler/bin/with-session-env
+#     (exit 3 without a DISPLAY)
+#   * --output defaults to ~/.local/share/profiler/runs/<UTC>-<tag>/bench
+#     (never inside the repo: build.sh snapshots every non-ignored file)
+#   * ABLETON_WINE_ROOT is honoured (A/B against the dev runtime) and shown
+#   * every other argument is forwarded unchanged — see scripts/bench-suite.sh
+#     --help (--tag, --duration, --trace off|interface|drilldown, --scenario,
+#     --sets, --dry-run, …)
+# The run directory is printed at the end, also after a failure or a dry run.
+set -euo pipefail
+
+here="$(cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")" && pwd -P)"
+repo="$(cd -- "$here/../.." && pwd -P)"
+suite="$repo/scripts/bench-suite.sh"
+runs_root="${PROFILER_SHARE_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/profiler}/runs"
+
+usage() {
+    cat <<EOF
+usage: profiler/bin/bench [--tag LABEL] [--output DIR] [bench-suite options...]
+
+Wrapper around scripts/bench-suite.sh: exports ABL_BENCH_OSC_SEND=11000 and
+ABL_BENCH_OSC_RECV=11001 (AbletonOSC bench handler) unless already set, runs the
+suite inside the desktop session (with-session-env), defaults --output to
+$runs_root/<UTC>-<tag>/bench
+and prints the run directory at the end. ABLETON_WINE_ROOT selects the runtime.
+Everything else is passed through; the suite's own help follows.
+
+EOF
+}
+
+[ -x "$suite" ] || { printf 'bench: missing %s\n' "$suite" >&2; exit 2; }
+export ABL_BENCH_OSC_SEND="${ABL_BENCH_OSC_SEND:-11000}"
+export ABL_BENCH_OSC_RECV="${ABL_BENCH_OSC_RECV:-11001}"
+
+tag=manual
+output=""
+args=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -h|--help) usage; exec "$suite" --help ;;
+        --tag) [ $# -ge 2 ] || { printf 'bench: --tag needs a value\n' >&2; exit 2; }; tag="$2"; args+=(--tag "$2"); shift ;;
+        --tag=*) tag="${1#*=}"; args+=(--tag "$tag") ;;
+        --output) [ $# -ge 2 ] || { printf 'bench: --output needs a value\n' >&2; exit 2; }; output="$2"; args+=(--output "$2"); shift ;;
+        --output=*) output="${1#*=}"; args+=(--output "$output") ;;
+        *) args+=("$1") ;;
+    esac
+    shift
+done
+
+# the suite's own tag sanitising, so the directory name matches its report label
+safe_tag="$(printf '%s' "$tag" | tr -cs '[:alnum:]_.-' '-')"
+safe_tag="${safe_tag#-}"; safe_tag="${safe_tag%-}"
+[ -n "$safe_tag" ] || safe_tag=run
+if [ -z "$output" ]; then
+    run_dir="$runs_root/$(date -u +%Y%m%dT%H%M%SZ)-$safe_tag"
+    output="$run_dir/bench"
+    args+=(--output "$output")
+else
+    run_dir="$(dirname -- "$output")"
+fi
+
+printf 'bench: runtime  %s\n' "${ABLETON_WINE_ROOT:-(configured default: ~/.config/ableton-wine/config or ~/.local/opt/wine-d2d1-nspa-11.13)}"
+printf 'bench: osc      send %s / recv %s\n' "$ABL_BENCH_OSC_SEND" "$ABL_BENCH_OSC_RECV"
+printf 'bench: output   %s\n' "$output"
+
+rc=0
+"$here/with-session-env" "$suite" ${args[@]+"${args[@]}"} || rc=$?
+printf 'bench: run directory %s (exit %s)\n' "$run_dir" "$rc"
+exit "$rc"

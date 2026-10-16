@@ -1,0 +1,31 @@
+# profiler/setup/plugins.lock — the third-party VST3 fixtures that Benchmark_VSTs
+# loads (scripts/bench-suite.sh find_vst: Dexed.vst3 and K1v_x64.vst3 under
+# ~/.wine-ableton/drive_c/Program Files/Common Files/VST3/ or …/Program Files/VSTPlugins/).
+# Consumed by profiler/setup/phases/11-plugins.sh; read by verify.sh.
+#
+# Format (one record per line; '#' starts a comment; blank lines are ignored):
+#   NAME  key=value  key=value …
+# NAME is [a-z0-9_-]+ and names the download directory ~/.cache/profiler/downloads/NAME/.
+# Fields are separated by whitespace, so no value may contain spaces. Required:
+#   url=      download URL of a zip archive (fetched with curl -fsSL -o)
+#   sha256=   hex digest of that zip, or the literal "unpinned" (download without
+#             verification and print the digest so it can be pinned here)
+#   member=   path inside the zip to copy into the VST3 directory, verbatim name kept
+# Optional:
+#   kind=     bundle (member is a directory copied with cp -a) | file (a single file)
+#   version=  upstream version, informational
+#   size=     zip size in bytes, informational (quick sanity check before hashing)
+#   license=  informational
+# Unknown keys are ignored. A pinned digest that no longer matches is an error:
+# re-check the upstream file before updating this lock (the K1v URL is unversioned,
+# so the author can replace the archive silently).
+#
+# Both digests below were computed on 2026-10-16 from freshly downloaded archives.
+# Dexed's matches the digest GitHub publishes for that release asset. Zip layout:
+#   Dexed-1.0.1-win.zip: Dexed.vst3/ (bundle: Contents/x86_64-win/Dexed.vst3,
+#                        Contents/Resources/moduleinfo.json), Dexed.clap, Dexed.exe, LICENSE (GPL-3.0)
+#   K1v.zip:             K1v_x64.vst3, K1v_Win32.vst3, K1v_x64.dll, K1v_Win32.dll, changes.txt (v1.26, 2022-09-29)
+# Never redistribute the archives; the download directory is outside the repo.
+
+dexed  url=https://github.com/asb2m10/dexed/releases/download/v1.0.1/Dexed-1.0.1-win.zip  sha256=1f118445f2c5c411636bb41ddf8b456db09af74cd38f9ede8a93a01020505f05  member=Dexed.vst3    kind=bundle  version=1.0.1  size=9742538   license=GPL-3.0
+k1v    url=https://nilsschneider.de/files/K1v.zip                                            sha256=32bdb421efb951ff9965786932cbad40b0fe57a3f03e0810d3bee89f51f27a46  member=K1v_x64.vst3  kind=file    version=1.26   size=12991595  license=freeware

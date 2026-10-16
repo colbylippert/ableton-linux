@@ -1,0 +1,725 @@
+#!/usr/bin/env bash
+# wine-trace -- driver for the Wine interface tracer (design B, section 3b CLI contract).
+#
+#   wine-trace start  --out DIR [--pid P]... [--run-id TOKEN] [--mode summary|drilldown] [--proto]
+#                     [--no-ntsync] [--sched|--no-sched] [--no-follow] [--no-pid-filter]
+#                     [--wine-root DIR] [--prefix DIR] [--tables FILE] [--attach-timeout S]
+#   wine-trace stop   --out DIR [--stop-timeout S]
+#   wine-trace run    --duration S  <start options>
+#   wine-trace status --out DIR
+#
+# Backend: profiler/tracer/build/wine-trace (libbpf, production) when it exists, else --proto:
+# the bpftrace prototype profiler/tracer/wine-trace.bt whose event lines profiler/tracer/reduce.py
+# joins offline into blocks.jsonl, threads.jsonl, summary.json (and events.jsonl in drilldown).
+#
+# start: discovers the prefix pids (scripts/lib/lifecycle.sh: ableton_prefix_pids, narrowed by
+#   --run-id through ABLETON_BENCH_RUN_ID=TOKEN) unless --pid is given, resolves ntdll.so and
+#   pipeasio64.dll.so from the pids' /proc/PID/maps (fallback: the runtime root), snapshots the
+#   maps, generates DIR/wine-trace.bt, checks it with bpftrace --dry-run (retrying without the
+#   kernel-side NTSync probes), daemonises bpftrace with setsid (pidfile DIR/wine-trace.pid),
+#   waits for the "hdr" line (= every probe attached) and writes DIR/tracer.json.
+# stop: SIGINT (then TERM, KILL), waits, runs reduce.py (+ symbolize.py --blocks when present),
+#   updates tracer.json with stopped_monotonic_ns / lost_events / probe hits.
+# Output files are chowned to SUDO_UID:SUDO_GID so the invoking user can read them.
+#
+# Needs root (sudo -n): bpftrace attaches uprobes and fentry programs.  Never touches anything
+# outside DIR.  Exit codes: 0 ok, 1 error, 2 usage, 3 not running (status).
+
+set -euo pipefail
+
+self="$(readlink -f -- "${BASH_SOURCE[0]}")"
+bin_dir="$(dirname -- "$self")"
+profiler_dir="$(dirname -- "$bin_dir")"
+repo_dir="$(dirname -- "$profiler_dir")"
+tracer_dir="$profiler_dir/tracer"
+template="$tracer_dir/wine-trace.bt"
+reduce_py="$tracer_dir/reduce.py"
+symbolize_py="$tracer_dir/symbolize.py"
+libbpf_bin="$tracer_dir/build/wine-trace"
+WINE_TRACE_VERSION="wine-trace/1"
+
+verb=""
+out=""
+pids=()
+run_id=""
+mode="summary"
+proto=0
+ntsync=1
+sched=""
+follow=1
+pid_filter=1
+wine_root=""
+prefix=""
+tables=""
+duration=""
+attach_timeout=60
+stop_timeout=30
+
+usage()
+{
+    sed -n '2,25p' "$self" | sed 's/^# \{0,1\}//' >&2
+    exit 2
+}
+
+log()
+{
+    printf 'wine-trace: %s\n' "$*" >&2
+    if [ -n "$out" ] && [ -d "$out" ]; then
+        printf '%s wine-trace: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >> "$out/wine-trace.log" 2>/dev/null || true
+    fi
+}
+
+die()
+{
+    log "error: $*"
+    chown_out
+    exit 1
+}
+
+parse_args()
+{
+    [ "$#" -ge 1 ] || usage
+    verb="$1"
+    shift
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --out) [ "$#" -ge 2 ] || usage; out="$2"; shift 2 ;;
+            --pid) [ "$#" -ge 2 ] || usage; pids+=("$2"); shift 2 ;;
+            --run-id) [ "$#" -ge 2 ] || usage; run_id="$2"; shift 2 ;;
+            --mode) [ "$#" -ge 2 ] || usage; mode="$2"; shift 2 ;;
+            --proto) proto=1; shift ;;
+            --no-ntsync) ntsync=0; shift ;;
+            --sched) sched=1; shift ;;
+            --no-sched) sched=0; shift ;;
+            --no-follow) follow=0; shift ;;
+            --no-pid-filter) pid_filter=0; shift ;;
+            --wine-root) [ "$#" -ge 2 ] || usage; wine_root="$2"; shift 2 ;;
+            --prefix) [ "$#" -ge 2 ] || usage; prefix="$2"; shift 2 ;;
+            --tables) [ "$#" -ge 2 ] || usage; tables="$2"; shift 2 ;;
+            --duration) [ "$#" -ge 2 ] || usage; duration="$2"; shift 2 ;;
+            --attach-timeout) [ "$#" -ge 2 ] || usage; attach_timeout="$2"; shift 2 ;;
+            --stop-timeout) [ "$#" -ge 2 ] || usage; stop_timeout="$2"; shift 2 ;;
+            -h|--help) usage ;;
+            *) printf 'wine-trace: unknown argument %s\n' "$1" >&2; usage ;;
+        esac
+    done
+    case "$verb" in start|stop|run|status) ;; *) usage ;; esac
+    case "$mode" in summary|drilldown) ;; *) die "--mode must be summary or drilldown (got '$mode')" ;; esac
+    [ -n "$out" ] || die "--out DIR is required"
+    for value in ${pids[@]+"${pids[@]}"} "$attach_timeout" "$stop_timeout" ${duration:+"$duration"}; do
+        case "$value" in ''|*[!0-9]*) die "numeric argument expected, got '$value'" ;; esac
+    done
+    if [ "$verb" = run ] && [ -z "$duration" ]; then
+        die "run needs --duration S"
+    fi
+    [ -n "$sched" ] || { [ "$mode" = drilldown ] && sched=1 || sched=0; }
+}
+
+require_root()
+{
+    [ "$(id -u)" -eq 0 ] || die "$verb needs root: run through sudo -n (uprobe/fentry attach)"
+}
+
+invoking_home()
+{
+    local home=""
+    if [ -n "${SUDO_USER:-}" ]; then
+        home="$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6 || true)"
+    fi
+    printf '%s\n' "${home:-${HOME:-/root}}"
+}
+
+chown_out()
+{
+    if [ -n "${SUDO_UID:-}" ] && [ -d "$out" ]; then
+        chown -R "${SUDO_UID}:${SUDO_GID:-$SUDO_UID}" "$out" 2>/dev/null || log "warning: chown of $out failed"
+    fi
+}
+
+pidfile_pid()
+{
+    local pid=""
+    [ -f "$out/wine-trace.pid" ] && IFS= read -r pid < "$out/wine-trace.pid" || pid=""
+    case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+    printf '%s\n' "$pid"
+}
+
+tracer_alive()
+{
+    local pid
+    pid="$(pidfile_pid)" || return 1
+    kill -0 "$pid" 2>/dev/null
+}
+
+monotonic_ns()
+{
+    python3 -I -c 'import time; print(time.monotonic_ns())'
+}
+
+# Prefix pids through the repo's lifecycle library, evaluated as the invoking user's HOME.
+# Prints "root<TAB>DIR", "prefix<TAB>DIR" and one "pid<TAB>N" line per process.
+discover_pids()
+(
+    HOME="$(invoking_home)"
+    export HOME
+    [ -z "$wine_root" ] || export ABLETON_WINE_ROOT="$wine_root"
+    [ -z "$prefix" ] || export ABLETON_WINEPREFIX="$prefix"
+    export ABLETON_CONFIG_LAYOUT_ROOTS="runtime prefix"
+    # shellcheck source=../../scripts/lib/config.sh
+    . "$repo_dir/scripts/lib/config.sh"
+    # shellcheck source=../../scripts/lib/lifecycle.sh
+    . "$repo_dir/scripts/lib/lifecycle.sh"
+    if ! ableton_config_init 2>/dev/null; then
+        : "${ABLETON_WINE_ROOT:=$HOME/.local/opt/$ABLETON_RUNTIME_NAME}"
+        : "${ABLETON_WINEPREFIX:=$HOME/.wine-ableton}"
+    fi
+    printf 'root\t%s\nprefix\t%s\n' "$ABLETON_WINE_ROOT" "$ABLETON_WINEPREFIX"
+    while IFS= read -r pid; do
+        [ -n "$pid" ] || continue
+        if [ -n "$run_id" ] && ! ableton_pid_has_env "$pid" "ABLETON_BENCH_RUN_ID=$run_id"; then
+            continue
+        fi
+        printf 'pid\t%s\n' "$pid"
+    done < <(ableton_prefix_pids "$ABLETON_WINE_ROOT" "$ABLETON_WINEPREFIX")
+)
+
+resolve_pids()
+{
+    local line key value
+    while IFS="$(printf '\t')" read -r key value; do
+        case "$key" in
+            root) [ -n "$wine_root" ] || wine_root="$value" ;;
+            prefix) [ -n "$prefix" ] || prefix="$value" ;;
+            pid) [ "$explicit_pids" -eq 1 ] || pids+=("$value") ;;
+        esac
+    done < <(discover_pids 2>/dev/null || true)
+    [ "${#pids[@]}" -gt 0 ] || die "no traced pids: pass --pid or start Live in the prefix${run_id:+ (run id $run_id)}"
+    local pid alive=()
+    for pid in "${pids[@]}"; do
+        if [ -d "/proc/$pid" ]; then alive+=("$pid"); else log "warning: pid $pid is gone; skipped"; fi
+    done
+    pids=(${alive[@]+"${alive[@]}"})
+    [ "${#pids[@]}" -gt 0 ] || die "none of the requested pids is alive"
+}
+
+# First mapped file matching $1 (an "/x86_64-unix/<name>" suffix) in the traced pids' maps.
+find_mapped()
+{
+    local pid path
+    for pid in "${pids[@]}"; do
+        path="$(grep -F -- "$1" "/proc/$pid/maps" 2>/dev/null | head -n 1 | sed 's/^[^/]*//' || true)"
+        if [ -n "$path" ] && [ -e "$path" ]; then
+            readlink -f -- "$path"
+            return 0
+        fi
+    done
+    return 1
+}
+
+resolve_libraries()
+{
+    ntdll="$(find_mapped /x86_64-unix/ntdll.so || true)"
+    if [ -z "$ntdll" ] && [ -n "$wine_root" ] && [ -e "$wine_root/lib/wine/x86_64-unix/ntdll.so" ]; then
+        ntdll="$(readlink -f -- "$wine_root/lib/wine/x86_64-unix/ntdll.so")"
+    fi
+    [ -n "$ntdll" ] || die "cannot find ntdll.so: none of the pids maps it and --wine-root is unset"
+    pipeasio="$(find_mapped /x86_64-unix/pipeasio64.dll.so || find_mapped /x86_64-unix/pipeasio.dll.so || true)"
+    if [ -z "$pipeasio" ] && [ -n "$wine_root" ] && [ -e "$wine_root/lib/wine/x86_64-unix/pipeasio64.dll.so" ]; then
+        pipeasio="$(readlink -f -- "$wine_root/lib/wine/x86_64-unix/pipeasio64.dll.so")"
+    fi
+    if [ -z "$wine_root" ]; then
+        wine_root="${ntdll%/lib/wine/x86_64-unix/ntdll.so}"
+        [ "$wine_root" != "$ntdll" ] || wine_root=""
+    fi
+    wine_version=""
+    if [ -n "$wine_root" ] && [ -f "$wine_root/ABLETON-WINE-BUILD-INFO.txt" ]; then
+        wine_version="$(sed -n 's/^wine:[[:space:]]*wine-\([0-9][0-9.]*\).*$/\1/p' "$wine_root/ABLETON-WINE-BUILD-INFO.txt" | head -n 1)"
+    fi
+    if [ -z "$wine_version" ]; then
+        wine_version="$(printf '%s\n' "$wine_root" | grep -oE '[0-9]+\.[0-9]+' | tail -n 1 || true)"
+    fi
+}
+
+snapshot_maps()
+{
+    local pid suffix="${1:-}"
+    for pid in "${pids[@]}"; do
+        cat "/proc/$pid/maps" > "$out/maps-$pid$suffix.txt" 2>/dev/null || true
+    done
+}
+
+write_pids_tsv()
+{
+    local pid comm image exe
+    : > "$out/pids.tsv"
+    for pid in "${pids[@]}"; do
+        comm="$(cat "/proc/$pid/comm" 2>/dev/null || true)"
+        image="$(tr '\0' '\n' 2>/dev/null < "/proc/$pid/cmdline" | sed -n '1p')"
+        image="${image##*\\}"
+        image="${image##*/}"
+        exe="$(readlink -f -- "/proc/$pid/exe" 2>/dev/null || true)"
+        printf '%s\t%s\t%s\t%s\n' "$pid" "$comm" "${image:-$comm}" "$exe" >> "$out/pids.tsv"
+    done
+}
+
+list_probes()
+{
+    # "provider:name" of every USDT probe bpftrace sees in the two libraries, plus the kernel
+    # probes the template may use.  Missing entries make the generator drop those blocks.
+    : > "$out/probes.txt"
+    bpftrace -l "usdt:$ntdll:wine:*" 2>/dev/null | sed -n 's/^usdt:.*:\(wine:[A-Za-z_0-9]*\)$/\1/p' >> "$out/probes.txt" || true
+    if [ -n "$pipeasio" ]; then
+        bpftrace -l "usdt:$pipeasio:pipeasio:*" 2>/dev/null | sed -n 's/^usdt:.*:\(pipeasio:[A-Za-z_0-9]*\)$/\1/p' >> "$out/probes.txt" || true
+    fi
+    # Kernel probes: bpftrace prints the match (as fentry:... or, in older builds, kfunc:...)
+    # and nothing when the function or tracepoint is unknown.
+    local probe
+    for probe in fentry:ntsync:ntsync_char_ioctl fexit:ntsync:ntsync_char_ioctl fentry:ntsync:ntsync_obj_ioctl \
+                 tracepoint:sched:sched_process_exec tracepoint:task:task_rename \
+                 tracepoint:sched:sched_waking tracepoint:sched:sched_switch; do
+        if [ -n "$(bpftrace -l "$probe" 2>/dev/null | grep -F -- "${probe##*:}" || true)" ]; then
+            printf '%s\n' "$probe" >> "$out/probes.txt"
+        fi
+    done
+    grep -qx 'wine:syscall_entry' "$out/probes.txt" \
+        || die "$ntdll has no wine: USDT probes (patch 0108 not in this runtime?); bpftrace -l 'usdt:$ntdll:wine:*' is empty"
+    if [ -n "$pipeasio" ] && ! grep -qx 'pipeasio:block_start' "$out/probes.txt"; then
+        log "warning: $pipeasio has no pipeasio: USDT probes (patch pipeasio/0017 not in this runtime?); block join unavailable"
+    fi
+    [ -n "$pipeasio" ] || log "warning: pipeasio64.dll.so not found; block join unavailable"
+}
+
+# generate_script SECTIONS-TO-STRIP (comma list) -> $out/wine-trace.bt
+generate_script()
+{
+    local strip="$1" filter="1"
+    [ "$pid_filter" -eq 1 ] && filter='@pids[pid]'
+    python3 -I - "$template" "$out/wine-trace.bt" "$ntdll" "${pipeasio:-/nonexistent/pipeasio64.dll.so}" \
+        "$filter" "$(IFS=,; printf '%s' "${pids[*]}")" "$strip" "$out/probes.txt" "$out/attach.txt" <<'PY'
+import re
+import sys
+
+(template, dest, ntdll, pipeasio, filt, pid_list, strip, probes_file, attach_file) = sys.argv[1:10]
+strip = set(part for part in strip.split(",") if part)
+with open(probes_file, encoding="utf-8") as handle:
+    available = set(line.strip() for line in handle if line.strip())
+with open(template, encoding="utf-8") as handle:
+    lines = handle.read().split("\n")
+
+# 1. optional sections
+kept = []
+skipping = None
+for line in lines:
+    match = re.match(r"^// @@SECTION (\w+) (BEGIN|END)$", line)
+    if match:
+        name, edge = match.groups()
+        if name in strip:
+            skipping = name if edge == "BEGIN" else None
+        continue
+    if skipping is None:
+        kept.append(line)
+
+# 2. probe blocks whose probe is unavailable
+head_re = re.compile(r"^(usdt:@(NTDLL|PIPEASIO)@:([a-z0-9_]+:[A-Za-z0-9_]+)|((?:fentry|fexit|tracepoint):[A-Za-z0-9_:]+))")
+output = []
+attached = []
+index = 0
+while index < len(kept):
+    line = kept[index]
+    match = head_re.match(line)
+    if not match:
+        output.append(line)
+        index += 1
+        continue
+    probe = match.group(3) or match.group(4)
+    end = index
+    while end < len(kept) and kept[end] != "}":
+        end += 1
+    block = kept[index:end + 1]
+    index = end + 1
+    if probe in available:
+        output.extend(block)
+        attached.append(probe)
+    else:
+        while output and output[-1].startswith("//"):
+            output.pop()
+
+# 3. placeholders
+pids = [pid for pid in pid_list.split(",") if pid]
+init = " ".join("@pids[(uint32)%s] = 1;" % pid for pid in pids) or "@pids[(uint32)0] = 0;"
+text = "\n".join(output)
+text = text.replace("@NTDLL@", ntdll).replace("@PIPEASIO@", pipeasio).replace("@FILTER@", filt)
+text = text.replace("@PIDS_INIT@", init)
+if re.search(r"^// @@SECTION", text, re.M) or "@NTDLL@" in text or "@PIPEASIO@" in text:
+    sys.exit("wine-trace: template rewrite left a placeholder behind")
+with open(dest, "w", encoding="utf-8", newline="\n") as handle:
+    handle.write(re.sub(r"\n{3,}", "\n\n", text).rstrip("\n") + "\n")
+with open(attach_file, "w", encoding="utf-8", newline="\n") as handle:
+    for probe in attached:
+        handle.write(probe + "\n")
+PY
+}
+
+compile_check()
+{
+    # --dry-run attaches every probe and detaches again (bpftrace >= 0.21).  Older builds
+    # reject the flag: skip the check and let wait_for_header catch a failing script.
+    if bpftrace -q -B full --dry-run "$out/wine-trace.bt" > "$out/dry-run.log" 2>&1; then
+        return 0
+    fi
+    if grep -qiE 'unrecognized option|invalid option|unknown option' "$out/dry-run.log"; then
+        log "warning: this bpftrace has no --dry-run; skipping the compile check"
+        return 0
+    fi
+    return 1
+}
+
+write_tracer_json()
+{
+    python3 -I - "$out" "$@" <<'PY'
+import json
+import os
+import platform
+import sys
+import time
+
+out = sys.argv[1]
+fields = dict(arg.split("=", 1) for arg in sys.argv[2:])
+pids = []
+pids_tsv = os.path.join(out, "pids.tsv")
+if os.path.isfile(pids_tsv):
+    with open(pids_tsv, encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) >= 4 and parts[0].isdigit():
+                pids.append({"pid": int(parts[0]), "comm": parts[1], "image": parts[2], "exe": parts[3]})
+attach = []
+attach_txt = os.path.join(out, "attach.txt")
+if os.path.isfile(attach_txt):
+    with open(attach_txt, encoding="utf-8") as handle:
+        attach = [line.strip() for line in handle if line.strip()]
+started = int(fields.get("started_monotonic_ns") or time.monotonic_ns())
+data = {
+    "version": fields.get("version", "wine-trace/1"),
+    "backend": fields.get("backend", "bpftrace"),
+    "mode": fields.get("mode", "summary"),
+    "sample_rate": 1,
+    "attach": attach,
+    "started_monotonic_ns": started,
+    "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    "pids": pids,
+    "run_id": fields.get("run_id") or None,
+    "pid_filter": fields.get("pid_filter") == "1",
+    "wine_root": fields.get("wine_root") or None,
+    "wine_version": fields.get("wine_version") or None,
+    "ntdll": fields.get("ntdll") or None,
+    "pipeasio": fields.get("pipeasio") or None,
+    "ntsync": fields.get("ntsync", "off"),
+    "sched": fields.get("sched") == "1",
+    "follow": fields.get("follow") == "1",
+    "tables": fields.get("tables") or None,
+    "kernel": platform.release(),
+    "tool_version": fields.get("tool_version") or None,
+    "script": fields.get("script") or None,
+    "events": fields.get("events") or None,
+    "pidfile": "wine-trace.pid",
+    "stopped_monotonic_ns": None,
+    "lost_events": None,
+}
+path = os.path.join(out, "tracer.json")
+with open(path + ".tmp", "w", encoding="utf-8", newline="\n") as handle:
+    json.dump(data, handle, indent=1)
+    handle.write("\n")
+os.replace(path + ".tmp", path)
+PY
+}
+
+update_tracer_json()
+{
+    # update_tracer_json key=value...  (merges into tracer.json; values that parse as int stay int)
+    python3 -I - "$out/tracer.json" "$@" <<'PY'
+import json
+import os
+import sys
+
+path = sys.argv[1]
+data = {}
+if os.path.isfile(path):
+    with open(path, encoding="utf-8") as handle:
+        data = json.load(handle)
+for arg in sys.argv[2:]:
+    key, value = arg.split("=", 1)
+    data[key] = int(value) if value.lstrip("-").isdigit() else (value or None)
+with open(path + ".tmp", "w", encoding="utf-8", newline="\n") as handle:
+    json.dump(data, handle, indent=1)
+    handle.write("\n")
+os.replace(path + ".tmp", path)
+PY
+}
+
+wait_for_header()
+{
+    local pid="$1" deadline=$((SECONDS + attach_timeout))
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        if grep -q '^hdr ' "$out/events.txt" 2>/dev/null; then
+            return 0
+        fi
+        if ! kill -0 "$pid" 2>/dev/null; then
+            log "bpftrace exited before attaching; $out/bpftrace.stderr says:"
+            tail -n 20 "$out/bpftrace.stderr" >&2 2>/dev/null || true
+            return 1
+        fi
+        sleep 0.2
+    done
+    log "bpftrace did not report attachment within ${attach_timeout}s"
+    return 1
+}
+
+daemonise()
+{
+    # $1 = pidfile, $2 = stdout file, $3 = stderr file, rest = command.  The inner shell records
+    # its own pid and then execs the tool, so the pidfile names the tool itself.
+    local pidfile="$1" stdout_file="$2" stderr_file="$3"
+    shift 3
+    rm -f -- "$pidfile"
+    setsid bash -c 'printf "%s\n" "$$" > "$1"; shift; exec "$@"' _ "$pidfile" "$@" > "$stdout_file" 2> "$stderr_file" < /dev/null &
+    local deadline=$((SECONDS + 10))
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        [ -s "$pidfile" ] && return 0
+        sleep 0.05
+    done
+    die "daemon did not write $pidfile"
+}
+
+cmd_start()
+{
+    require_root
+    command -v python3 >/dev/null 2>&1 || die "python3 is required"
+    mkdir -p -- "$out"
+    if tracer_alive; then
+        die "a tracer is already running for $out (pid $(pidfile_pid)); stop it first"
+    fi
+    rm -f -- "$out/wine-trace.pid"
+    explicit_pids=$(( ${#pids[@]} > 0 ))
+    resolve_pids
+    log "pids: ${pids[*]}${run_id:+ (run id $run_id)}"
+    resolve_libraries
+    write_pids_tsv
+    snapshot_maps ""
+    local backend="bpftrace" started_ns tool_version script_name="" events_name=""
+    if [ "$proto" -eq 0 ] && [ -x "$libbpf_bin" ]; then
+        backend="libbpf"
+        tool_version="$("$libbpf_bin" --version 2>/dev/null | head -n 1 || true)"
+        local args=(--out "$out" --mode "$mode")
+        local pid
+        for pid in "${pids[@]}"; do args+=(--pid "$pid"); done
+        [ "$ntsync" -eq 1 ] || args+=(--ntsync off)
+        [ "$sched" -eq 1 ] && args+=(--sched on) || args+=(--sched off)
+        [ -n "$run_id" ] && args+=(--run-id "$run_id")
+        log "backend: libbpf $libbpf_bin ${args[*]}"
+        started_ns="$(monotonic_ns)"
+        daemonise "$out/wine-trace.pid" "$out/wine-trace.stdout" "$out/wine-trace.stderr" "$libbpf_bin" "${args[@]}"
+        sleep 1
+        tracer_alive || { tail -n 20 "$out/wine-trace.stderr" >&2 2>/dev/null || true; die "libbpf tracer exited early"; }
+        : > "$out/attach.txt"
+    else
+        command -v bpftrace >/dev/null 2>&1 || die "bpftrace is not installed (pacman -S bpftrace) and $libbpf_bin does not exist"
+        [ -f "$template" ] || die "template $template missing"
+        tool_version="$(bpftrace --version 2>/dev/null | head -n 1 || true)"
+        list_probes
+        local strip=""
+        [ "$ntsync" -eq 1 ] || strip="ntsync"
+        [ "$sched" -eq 1 ] || strip="${strip:+$strip,}sched"
+        [ "$follow" -eq 1 ] || strip="${strip:+$strip,}follow"
+        generate_script "$strip"
+        if ! compile_check; then
+            if [ "$ntsync" -eq 1 ]; then
+                log "warning: bpftrace rejected the script with the kernel-side NTSync probes; retrying without them ($out/dry-run.log)"
+                cp -- "$out/dry-run.log" "$out/dry-run-ntsync.log"
+                ntsync=0
+                generate_script "ntsync${strip:+,$strip}"
+                compile_check || { cat "$out/dry-run.log" >&2; die "bpftrace rejected $out/wine-trace.bt"; }
+            else
+                cat "$out/dry-run.log" >&2
+                die "bpftrace rejected $out/wine-trace.bt"
+            fi
+        fi
+        script_name="wine-trace.bt"
+        events_name="events.txt"
+        log "backend: bpftrace ($tool_version), $(wc -l < "$out/attach.txt") probes, ntsync=$([ "$ntsync" -eq 1 ] && echo fentry || echo off) sched=$sched follow=$follow"
+        export BPFTRACE_PERF_RB_PAGES="${BPFTRACE_PERF_RB_PAGES:-1024}"
+        daemonise "$out/wine-trace.pid" "$out/events.txt" "$out/bpftrace.stderr" bpftrace -q -B full "$out/wine-trace.bt"
+        wait_for_header "$(pidfile_pid)" || { rm -f -- "$out/wine-trace.pid"; chown_out; exit 1; }
+        started_ns="$(sed -n 's/^hdr mono_start_ns=\([0-9]*\).*$/\1/p' "$out/events.txt" | head -n 1)"
+    fi
+    local table_name=""
+    if [ -n "$tables" ]; then
+        table_name="$tables"
+    elif [ -n "$wine_version" ] && [ -f "$tracer_dir/tables/wine-$wine_version.json" ]; then
+        table_name="wine-$wine_version.json"
+    fi
+    write_tracer_json "version=$WINE_TRACE_VERSION" "backend=$backend" "mode=$mode" "started_monotonic_ns=$started_ns" \
+        "run_id=$run_id" "pid_filter=$pid_filter" "wine_root=$wine_root" "wine_version=$wine_version" \
+        "ntdll=$ntdll" "pipeasio=$pipeasio" "ntsync=$([ "$ntsync" -eq 1 ] && echo fentry || echo off)" \
+        "sched=$sched" "follow=$follow" "tables=$table_name" "tool_version=$tool_version" \
+        "script=$script_name" "events=$events_name"
+    chown_out
+    log "started: pid $(pidfile_pid), started_monotonic_ns=$started_ns, out=$out"
+}
+
+stop_daemon()
+{
+    local pid="$1" deadline
+    kill -INT "$pid" 2>/dev/null || return 0
+    deadline=$((SECONDS + stop_timeout))
+    while kill -0 "$pid" 2>/dev/null; do
+        [ "$SECONDS" -lt "$deadline" ] || break
+        sleep 0.1
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+        log "warning: tracer ignored SIGINT for ${stop_timeout}s; sending SIGTERM"
+        kill -TERM "$pid" 2>/dev/null || true
+        deadline=$((SECONDS + 10))
+        while kill -0 "$pid" 2>/dev/null; do
+            [ "$SECONDS" -lt "$deadline" ] || break
+            sleep 0.1
+        done
+    fi
+    if kill -0 "$pid" 2>/dev/null; then
+        log "warning: tracer ignored SIGTERM; sending SIGKILL (buffered output is lost)"
+        kill -KILL "$pid" 2>/dev/null || true
+        sleep 0.5
+    fi
+}
+
+cmd_stop()
+{
+    require_root
+    [ -d "$out" ] || die "$out does not exist"
+    local pid="" stopped_ns backend="bpftrace" lost_extra=0 rc=0
+    if [ -f "$out/tracer.json" ]; then
+        backend="$(sed -n 's/^[[:space:]]*"backend":[[:space:]]*"\([a-z]*\)".*$/\1/p' "$out/tracer.json" | head -n 1)"
+        backend="${backend:-bpftrace}"
+        local json_mode
+        json_mode="$(sed -n 's/^[[:space:]]*"mode":[[:space:]]*"\([a-z]*\)".*$/\1/p' "$out/tracer.json" | head -n 1)"
+        [ -z "$json_mode" ] || mode="$json_mode"
+    fi
+    stopped_ns="$(monotonic_ns)"
+    if pid="$(pidfile_pid)" && kill -0 "$pid" 2>/dev/null; then
+        if [ "$backend" = bpftrace ]; then
+            local tsv_pids=()
+            [ -f "$out/pids.tsv" ] && mapfile -t tsv_pids < <(cut -f1 "$out/pids.tsv")
+            pids=(${tsv_pids[@]+"${tsv_pids[@]}"})
+            [ "${#pids[@]}" -eq 0 ] || snapshot_maps "-stop"
+        fi
+        stop_daemon "$pid"
+    else
+        log "warning: no running tracer for $out (pidfile ${pid:-absent}); reducing what is there"
+    fi
+    rm -f -- "$out/wine-trace.pid"
+    if [ "$backend" = bpftrace ]; then
+        [ -s "$out/events.txt" ] || die "$out/events.txt is empty: nothing to reduce"
+        if [ -f "$out/bpftrace.stderr" ]; then
+            lost_extra="$(grep -oE 'Lost [0-9]+ events?' "$out/bpftrace.stderr" | awk '{s+=$2} END {print s+0}')"
+            if grep -qiE 'error|WARNING' "$out/bpftrace.stderr"; then
+                log "bpftrace stderr has diagnostics ($out/bpftrace.stderr):"
+                tail -n 10 "$out/bpftrace.stderr" >&2 || true
+            fi
+        fi
+        local reduce_args=(--in "$out" --tracer-json "$out/tracer.json" --mode "$mode" \
+                           --stopped-monotonic-ns "$stopped_ns" --lost-events-extra "$lost_extra")
+        [ -z "$tables" ] || reduce_args+=(--tables "$tables")
+        log "reducing: python3 -I $reduce_py ${reduce_args[*]}"
+        python3 -I "$reduce_py" "${reduce_args[@]}" || rc=$?
+        [ "$rc" -eq 0 ] || { chown_out; die "reduce.py failed with $rc"; }
+    else
+        update_tracer_json "stopped_monotonic_ns=$stopped_ns"
+        [ -f "$out/blocks.jsonl" ] || log "warning: the libbpf backend left no blocks.jsonl in $out"
+    fi
+    write_maps_json "$stopped_ns"
+    if [ -f "$symbolize_py" ] && [ -f "$out/blocks.jsonl" ] && [ -f "$out/maps.json" ]; then
+        # symbolize.py (design B section 4) resolves stack windows; the prototype has none, so
+        # this only validates the pipeline, dumps Live's import table (imports.json) and seeds
+        # symcache.json.  blocks.jsonl stays as reduce.py wrote it (summary.json matches it);
+        # the symbolized copy is blocks.symbolized.jsonl.
+        log "symbolizing: python3 -I $symbolize_py --blocks blocks.jsonl --maps maps.json --out blocks.symbolized.jsonl"
+        python3 -I "$symbolize_py" --blocks "$out/blocks.jsonl" --maps "$out/maps.json" \
+            --out "$out/blocks.symbolized.jsonl" --symcache "$out/symcache.json" \
+            --imports-out "$out/imports.json" --quiet 2>> "$out/wine-trace.log" \
+            || log "warning: symbolize.py failed (see $out/wine-trace.log); blocks keep placeholder callers"
+    fi
+    chown_out
+    log "stopped: out=$out stopped_monotonic_ns=$stopped_ns lost_extra=$lost_extra"
+}
+
+# maps.json for symbolize.py: {"type":"maps","snapshots":[{"t":..,"pid":..,"text":..}]} from the
+# start (maps-<pid>.txt, t=0) and stop (maps-<pid>-stop.txt, t=stop offset) snapshots.
+write_maps_json()
+{
+    python3 -I - "$out" "$1" <<'PY'
+import glob
+import json
+import os
+import re
+import sys
+
+out, stopped = sys.argv[1], int(sys.argv[2] or 0)
+started = 0
+tracer_path = os.path.join(out, "tracer.json")
+if os.path.isfile(tracer_path):
+    with open(tracer_path, encoding="utf-8") as handle:
+        started = int(json.load(handle).get("started_monotonic_ns") or 0)
+offset = max(0.0, (stopped - started) / 1e9) if started and stopped else 0.0
+snapshots = []
+for path in sorted(glob.glob(os.path.join(out, "maps-*.txt"))):
+    match = re.match(r"maps-(\d+)(-stop)?\.txt$", os.path.basename(path))
+    if not match:
+        continue
+    with open(path, encoding="utf-8", errors="replace") as handle:
+        text = handle.read()
+    if not text.strip():
+        continue
+    snapshots.append({"t": offset if match.group(2) else 0.0, "pid": int(match.group(1)), "text": text})
+if not snapshots:
+    sys.exit(0)
+target = os.path.join(out, "maps.json")
+with open(target + ".tmp", "w", encoding="utf-8", newline="\n") as handle:
+    json.dump({"type": "maps", "snapshots": snapshots}, handle)
+    handle.write("\n")
+os.replace(target + ".tmp", target)
+PY
+}
+
+cmd_status()
+{
+    local pid
+    if pid="$(pidfile_pid)" && kill -0 "$pid" 2>/dev/null; then
+        printf 'running pid=%s out=%s\n' "$pid" "$out"
+        return 0
+    fi
+    printf 'not running out=%s\n' "$out"
+    return 3
+}
+
+cmd_run()
+{
+    cmd_start
+    trap 'trap - INT TERM; log "interrupted; stopping"; cmd_stop; exit 130' INT TERM
+    log "tracing for ${duration}s"
+    sleep "$duration"
+    trap - INT TERM
+    cmd_stop
+}
+
+main()
+{
+    parse_args "$@"
+    case "$verb" in
+        start) cmd_start ;;
+        stop) cmd_stop ;;
+        run) cmd_run ;;
+        status) cmd_status ;;
+    esac
+}
+
+main "$@"

@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <meta
+      name="description"
+      content="Gains over time for the Wine interface profiler: benchmark outcomes, interface metrics, trials and call sites read straight from profiler/history and the ledger."
+    />
+    <title>Profiler gains</title>
+    <script>
+      // Apply the viewer's remembered theme before first paint so dark mode never flashes light.
+      // localStorage is a per-viewer convenience only; every read is guarded (private windows, blocked storage).
+      (function () {
+        try {
+          var t = localStorage.getItem('profiler-dashboard.theme');
+          if (t === 'light' || t === 'dark') document.documentElement.setAttribute('data-theme', t);
+        } catch (e) {
+          /* storage unavailable: fall back to prefers-color-scheme */
+        }
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

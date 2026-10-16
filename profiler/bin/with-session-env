@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+# profiler/bin/with-session-env — run a command with the desktop session's
+# environment. Anything with a window (the Live installer's Inno Setup payload,
+# Live itself, xdotool, check-live-audio.sh, the bench suite) started from an
+# SSH session needs DISPLAY/WAYLAND_DISPLAY/XAUTHORITY/DBUS of the Plasma
+# session; this reads them from `systemctl --user show-environment` on every
+# call (XAUTHORITY carries a random suffix per login) and exports only an
+# allowlist, then execs the command. Wine stays on winex11 through Xwayland
+# (DISPLAY=:0 on the Plasma Wayland session).
+#
+#   with-session-env CMD [ARG…]      exec CMD with the session environment
+#   with-session-env --print         print the resolved variables, exit 0
+#   with-session-env -h | --help
+#
+# Exit status: the command's own; 3 when no DISPLAY is available (nothing GUI
+# can run — log in to the desktop session on the console first); 2 on usage.
+# Values already in the environment are kept when the session lacks them; the
+# session's values win otherwise. XDG_RUNTIME_DIR defaults to /run/user/<uid>.
+set -euo pipefail
+
+ALLOW=(DISPLAY WAYLAND_DISPLAY XAUTHORITY DBUS_SESSION_BUS_ADDRESS
+       XDG_CURRENT_DESKTOP XDG_SESSION_TYPE XDG_SESSION_DESKTOP DESKTOP_SESSION
+       KDE_FULL_SESSION KDE_SESSION_VERSION)
+
+usage() {
+    cat <<'EOF'
+usage: with-session-env CMD [ARG...]
+       with-session-env --print
+
+Runs CMD with DISPLAY, WAYLAND_DISPLAY, XAUTHORITY, DBUS_SESSION_BUS_ADDRESS and
+the desktop identity variables of the logged-in user session (from
+`systemctl --user show-environment`). Exit 3 when no DISPLAY is available.
+EOF
+}
+
+print_only=0
+case "${1:-}" in
+    -h|--help) usage; exit 0 ;;
+    --print) print_only=1; shift ;;
+    --) shift ;;
+esac
+if [ "$print_only" -eq 0 ] && [ $# -eq 0 ]; then usage >&2; exit 2; fi
+
+declare -A session=()
+if command -v systemctl >/dev/null 2>&1; then
+    while IFS= read -r line; do
+        key="${line%%=*}"; val="${line#*=}"
+        [ "$key" != "$line" ] || continue
+        [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+        # systemctl quotes a value only when it needs it ("…"); strip that form
+        case "$val" in \"*\") val="${val#\"}"; val="${val%\"}" ;; esac
+        session[$key]="$val"
+    done < <(systemctl --user show-environment 2>/dev/null || true)
+fi
+for key in "${ALLOW[@]}"; do
+    if [ -n "${session[$key]+x}" ] && [ -n "${session[$key]}" ]; then
+        export "$key=${session[$key]}"
+    fi
+done
+: "${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"
+export XDG_RUNTIME_DIR
+
+if [ -z "${DISPLAY:-}" ]; then
+    cat >&2 <<EOF
+with-session-env: no DISPLAY in the user session (systemctl --user show-environment) or in the environment.
+  Nothing with a window can run. Log in to the desktop session on the console
+  (profiler setup phase "session" enables SDDM autologin), then retry.
+EOF
+    exit 3
+fi
+
+if [ "$print_only" -eq 1 ]; then
+    for key in XDG_RUNTIME_DIR "${ALLOW[@]}"; do
+        [ -n "${!key:-}" ] && printf '%s=%s\n' "$key" "${!key}"
+    done
+    exit 0
+fi
+exec "$@"

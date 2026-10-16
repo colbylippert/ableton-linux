@@ -1,0 +1,148 @@
+/* TrialCard — one ledger line in detail. */
+
+.tc {
+  display: grid;
+  gap: 16px;
+}
+
+.tc-dim .tc-title .mono {
+  color: var(--text-secondary);
+}
+
+.tc-head {
+  display: grid;
+  gap: 6px;
+}
+
+.tc-title {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  margin: 0;
+  font-size: 18px;
+  font-weight: 600;
+}
+
+.tc-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 16px;
+  color: var(--text-secondary);
+  font-size: 13px;
+}
+
+.tc-guard {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.tc-grid {
+  display: grid;
+  gap: 16px 24px;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+}
+
+.tc-section h4 {
+  margin: 0 0 4px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
+.tc-section p {
+  margin: 0 0 10px;
+}
+
+.tc-dl {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 4px 12px;
+  margin: 0;
+  font-size: 13px;
+}
+
+.tc-dl dt {
+  color: var(--text-secondary);
+}
+
+.tc-dl dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.tc-probe {
+  font-variant-numeric: tabular-nums;
+}
+
+.tc-runs {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: 4px;
+  font-size: 13px;
+}
+
+.tc-runs > li {
+  margin: 0 0 4px;
+}
+
+.tc-runs .tc-runs {
+  margin: 2px 0 0 10px;
+}
+
+.tc-group {
+  color: var(--text-secondary);
+  font-weight: 600;
+}
+
+.tc-runref {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 8px;
+}
+
+.tc-arm {
+  display: inline-block;
+  min-width: 22px;
+  padding: 0 4px;
+  border-radius: 3px;
+  background: var(--surface-2);
+  font-family: var(--mono);
+  font-size: 11px;
+  text-align: center;
+}
+
+.tc-dir {
+  font-size: 11px;
+}
+
+.tc-missing {
+  margin: 6px 0 0;
+}
+
+.tc-charts .section-head {
+  margin-bottom: 8px;
+}
+
+.tc-metric select {
+  min-height: 28px;
+  padding: 2px 6px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-1);
+}
+
+.tc-keyrow {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 16px;
+}
+
+.tc-pairs .chart-frame {
+  min-width: 0;
+}

@@ -1,0 +1,108 @@
+{
+  "schema": "ableton-linux-scenario/v1",
+  "name": "load-devices",
+  "kind": "diagnostic",
+  "base_set": "Benchmark_Empty",
+  "description": "Five stock instruments are loaded onto the empty MIDI track 1 and five audio effects onto the audio track 2, one every 3 s, while the empty set plays: browser walk and device loader. Each load is confirmed on /abl/bench/load-device in osc.tsv.",
+  "requires": {
+    "control_surface": true,
+    "max_for_live": false,
+    "plugins": []
+  },
+  "setup": [
+    {
+      "op": "stop"
+    },
+    {
+      "op": "rewind"
+    },
+    {
+      "op": "play"
+    },
+    {
+      "op": "marker",
+      "name": "setup-done"
+    }
+  ],
+  "timeline": {
+    "repeat": false,
+    "marker_every_s": 5.0,
+    "steps": [
+      {
+        "at_s": 0.0,
+        "op": "load_device",
+        "kind": "instruments",
+        "name": "Operator",
+        "track": 1
+      },
+      {
+        "at_s": 3.0,
+        "op": "load_device",
+        "kind": "instruments",
+        "name": "Wavetable",
+        "track": 1
+      },
+      {
+        "at_s": 6.0,
+        "op": "load_device",
+        "kind": "instruments",
+        "name": "Analog",
+        "track": 1
+      },
+      {
+        "at_s": 9.0,
+        "op": "load_device",
+        "kind": "instruments",
+        "name": "Drift",
+        "track": 1
+      },
+      {
+        "at_s": 12.0,
+        "op": "load_device",
+        "kind": "instruments",
+        "name": "Meld",
+        "track": 1
+      },
+      {
+        "at_s": 15.0,
+        "op": "load_device",
+        "kind": "audio_effects",
+        "name": "Reverb",
+        "track": 2
+      },
+      {
+        "at_s": 18.0,
+        "op": "load_device",
+        "kind": "audio_effects",
+        "name": "Hybrid Reverb",
+        "track": 2
+      },
+      {
+        "at_s": 21.0,
+        "op": "load_device",
+        "kind": "audio_effects",
+        "name": "Roar",
+        "track": 2
+      },
+      {
+        "at_s": 24.0,
+        "op": "load_device",
+        "kind": "audio_effects",
+        "name": "Compressor",
+        "track": 2
+      },
+      {
+        "at_s": 27.0,
+        "op": "load_device",
+        "kind": "audio_effects",
+        "name": "EQ Eight",
+        "track": 2
+      }
+    ]
+  },
+  "teardown": [
+    {
+      "op": "stop"
+    }
+  ]
+}

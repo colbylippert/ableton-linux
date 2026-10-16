@@ -1,0 +1,66 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
+# wine-trace — libbpf CO-RE tracer for the Wine interface profiler (design B §3b).
+#
+# Built on the Linux host that runs the tracer (CachyOS: clang, bpf (bpftool), libbpf,
+# elfutils, zlib).  Everything generated lands in $(BUILD) (profiler/.gitignore:
+# tracer/build/), so `build.sh`'s source snapshot never sees the artifacts.
+#
+#   make            -> build/wine-trace (+ build/vmlinux.h, build/wine-trace.bpf.o, build/wine-trace.skel.h)
+#   make check      -> build + static sanity checks (program sections, --version)
+#   make clean
+#
+# Overrides: CLANG=, BPFTOOL=, CC=, BUILD=, VMLINUX_BTF=, BPF_CPU=v3
+
+CLANG      ?= clang
+BPFTOOL    ?= bpftool
+CC         ?= cc
+BUILD      ?= build
+VMLINUX_BTF ?= /sys/kernel/btf/vmlinux
+BPF_CPU    ?= v3
+ARCH       ?= x86
+
+BPF_CFLAGS := -O2 -g -target bpf -mcpu=$(BPF_CPU) -D__TARGET_ARCH_$(ARCH) -I. -I$(BUILD) \
+              -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -Wno-missing-field-initializers
+CFLAGS     ?= -O2 -g
+CFLAGS     += -Wall -Wextra -std=gnu11 -I. -I$(BUILD) -D_GNU_SOURCE
+LDLIBS     := -lbpf -lelf -lz -pthread
+
+BIN   := $(BUILD)/wine-trace
+BPFO  := $(BUILD)/wine-trace.bpf.o
+SKEL  := $(BUILD)/wine-trace.skel.h
+VMLX  := $(BUILD)/vmlinux.h
+
+.PHONY: all clean check vmlinux
+
+all: $(BIN)
+
+vmlinux: $(VMLX)
+
+$(BUILD):
+	mkdir -p $(BUILD)
+
+# Generated from the running kernel's BTF; regenerate after a kernel update (make clean).
+$(VMLX): | $(BUILD)
+	$(BPFTOOL) btf dump file $(VMLINUX_BTF) format c > $@.tmp && mv $@.tmp $@
+
+$(BPFO): wine-trace.bpf.c wine-trace.h $(VMLX) | $(BUILD)
+	$(CLANG) $(BPF_CFLAGS) -c wine-trace.bpf.c -o $@
+
+$(SKEL): $(BPFO)
+	$(BPFTOOL) gen skeleton $(BPFO) > $@.tmp && mv $@.tmp $@
+
+$(BIN): wine-trace.c wine-trace.h $(SKEL)
+	$(CC) $(CFLAGS) wine-trace.c -o $@ $(LDLIBS)
+
+check: all
+	@echo "== programs in $(BPFO)"
+	@readelf -S -W $(BPFO) | grep -oE ' (usdt|fentry/[a-z_]+|fexit/[a-z_]+|kprobe/[a-z_]+|kretprobe/[a-z_]+|tp_btf/[a-z_]+|tracepoint/[a-z_/]+|perf_event) ' | sort | uniq -c
+	@test "$$(readelf -S -W $(BPFO) | grep -c ' usdt ')" -ge 1
+	@echo "== maps"
+	@$(BPFTOOL) btf dump file $(BPFO) format raw 2>/dev/null | grep -E "VAR '(agg|agg0|inflight|sched|pids|tids|cfg|gl|rb|stats|unixlibs|trigger_ids)'" | sed 's/.*VAR/VAR/'
+	@echo "== loader"
+	@$(BIN) --version
+	@ls -l $(BIN) $(BPFO)
+
+clean:
+	rm -rf $(BUILD)

@@ -1,0 +1,140 @@
+/* CompareDrawer — two runs, per-Set deltas with the noise verdict. */
+
+.cd {
+  display: grid;
+  gap: 12px;
+}
+
+.cd-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 16px;
+}
+
+.cd-head .card-title {
+  margin: 0;
+}
+
+.cd-runs {
+  display: flex;
+  flex: 1 1 auto;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 12px;
+  min-width: 0;
+}
+
+.cd-run {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 8px;
+  font-size: 13px;
+}
+
+.cd-arm {
+  display: inline-block;
+  min-width: 20px;
+  padding: 0 5px;
+  border-radius: 3px;
+  background: var(--surface-2);
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 600;
+  text-align: center;
+}
+
+.cd-arrow {
+  color: var(--text-muted);
+}
+
+.cd-actions {
+  display: flex;
+  gap: 6px;
+}
+
+.cd-refuse {
+  font-weight: 400;
+}
+
+.cd-refuse strong {
+  font-weight: 600;
+}
+
+.cd-summary {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 12px;
+  font-size: 13px;
+}
+
+.cd-counts {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.cd-metric {
+  white-space: nowrap;
+}
+
+.cd-source {
+  font-size: 11px;
+}
+
+.cd-delta {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  white-space: nowrap;
+}
+
+/* diverging cell bar: a 64 px track with the midline; fill grows from the middle */
+.cd-bar {
+  position: relative;
+  display: inline-block;
+  width: 64px;
+  height: 10px;
+  border-radius: 2px;
+  background: var(--div-mid);
+  overflow: hidden;
+}
+
+.cd-bar::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 50%;
+  width: 1px;
+  background: var(--axis);
+}
+
+.cd-bar-fill {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+}
+
+.cd-bar-pos {
+  left: 50%;
+  background: var(--div-pos);
+  border-radius: 0 2px 2px 0;
+}
+
+.cd-bar-neg {
+  right: 50%;
+  background: var(--div-neg);
+  border-radius: 2px 0 0 2px;
+}
+
+.cd-glyph {
+  font-size: 11px;
+}
+
+.cd-delta-text {
+  font-variant-numeric: tabular-nums;
+}

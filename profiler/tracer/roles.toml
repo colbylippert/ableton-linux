@@ -1,0 +1,73 @@
+# profiler/tracer/roles.toml -- thread-role classification for the interface tracer
+# (design B section 5).  Loaded by symbolize.load_roles(): tomllib on Python 3.11+,
+# symbolize.parse_toml_subset() before that (tables, arrays of tables, strings,
+# ints, booleans and flat arrays only -- keep this file inside that subset).
+#
+# Wine 11.13 writes SetThreadDescription names into /proc/PID/task/TID/comm
+# (15 chars), so the static rules work on comm alone.  Rules are tried in order
+# and the first match wins.  Every field is optional:
+#   role          the role string; "{comm}" and "{exe}" are substituted
+#   comm          regex (re.search) on the thread's comm
+#   exe           regex (case-insensitive) on the process executable's basename,
+#                 e.g. "Ableton Live 12 Trial.exe" (ModuleMap.exe_name(pid))
+#   process_comm  regex on the process's own comm (the comm of its main thread)
+#   main          true: only the main thread (tid == pid); false: only other threads
+#   named         true: only threads whose comm differs from the process comm
+#                 (i.e. they carry a SetThreadDescription name); false: only unnamed
+# A thread matching no rule gets `fallback`.
+
+version = 1
+fallback = "unknown:{comm}"
+
+# Roles the tracer keeps when started with --roles audio (fnmatch patterns).
+# (Top-level keys must stay above the first table header.)
+audio_roles = ["pipeasio_callback", "audio_worker", "pipeasio_rt", "pipeasio_worker", "plugin:*"]
+
+# Roles the reducer assigns from events rather than from comm:
+#   pipeasio_callback  the tid that fires pipeasio:block_start (re-learned on every block)
+#   plugin:<module>    threads whose NtCreateThreadEx start routine (5th argument,
+#                      *(user_rsp+0x28) in the entry's stack window) symbolizes into a
+#                      PE module that is neither a Wine DLL nor the Live executable
+[dynamic]
+pipeasio_callback = "tid firing pipeasio:block_start"
+plugin = "NtCreateThreadEx start routine in a plugin module"
+
+[[rule]]
+role = "wineserver"
+process_comm = "^wineserver$"
+
+[[rule]]
+role = "audio_worker"
+comm = "^AudioCalc$"
+
+[[rule]]
+role = "pipeasio_rt"
+comm = "^pipeasio-rt$"
+
+[[rule]]
+role = "pipeasio_worker"
+comm = "^pipeasio-worker$"
+
+[[rule]]
+role = "webview"
+exe = "^msedgewebview2\\.exe$"
+
+[[rule]]
+role = "max"
+exe = "^Max\\.exe$"
+
+[[rule]]
+role = "push2"
+exe = "^Push2DisplayProcess\\.exe$"
+
+[[rule]]
+role = "main"
+exe = "\\.exe$"
+main = true
+
+# Every other thread of the Live process (named or not: Wine 11.13 gives unnamed threads the
+# process comm, so they appear as live:Ableton Live 12), matching reduce.py's classifier.
+# Add `named = true` to restrict this to SetThreadDescription-named threads.
+[[rule]]
+role = "live:{comm}"
+exe = "^Ableton Live"

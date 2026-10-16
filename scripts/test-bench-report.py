@@ -9,7 +9,9 @@ import csv
 import json
 import os
 from pathlib import Path
+import signal
 import stat
+import struct
 import sys
 import tempfile
 import threading
@@ -29,10 +31,28 @@ def load(name: str, filename: str):
     return module
 
 
+def load_osc():
+    if hasattr(signal, "SIGPIPE"):
+        return load("bench_osc", "bench-osc.py")
+    # Windows has no SIGPIPE; bench-osc.py installs the Unix default at import.
+    with mock.patch.object(signal, "SIGPIPE", signal.SIGTERM, create=True), mock.patch.object(signal, "signal"):
+        return load("bench_osc", "bench-osc.py")
+
+
 report = load("bench_report", "bench-report.py")
-osc = load("bench_osc", "bench-osc.py")
+osc = load_osc()
 FIXTURE_MACHINE_ID = "0123456789abcdef0123456789abcdef"
 FIXTURE_CREATED_AT = "2026-08-26T12:34:56.123456Z"
+# The tracer starts 0.6 s before the fixture window (1.0 s to 31.0 s on the monotonic clock).
+FIXTURE_TRACER_START_NS = 400_000_000
+FIXTURE_PERIOD_NS = 1_333_333
+FIXTURE_FRAMES = [
+    "ntdll.dll!NtWaitForSingleObject+0x14", "kernelbase.dll!WaitForSingleObjectEx+0xe3",
+    "Ableton Live 12 Trial.exe+0x1a2b3c", "Ableton Live 12 Trial.exe+0x9999",
+]
+FIXTURE_CALLER = " <- ".join(FIXTURE_FRAMES[:3])
+SITE_A_KEY = f"ntsync_wait|NtWaitForSingleObject|{FIXTURE_CALLER}"
+SITE_B_KEY = "syscall|NtReleaseSemaphore|unsampled"
 
 
 def benchmark_profile(gates=None):
@@ -106,7 +126,7 @@ def benchmark_resource_sample(index=1):
     }
 
 
-def benchmark_measurement(name, live_cpu=10.0, missing=False, zero=False):
+def benchmark_measurement(name, live_cpu=10.0, missing=False, zero=False, mode=None):
     value = 0 if zero else live_cpu
     timing = {
         "supervision_interval_seconds": 30.0, "output_span_seconds": 29.5, "output_line_count": 30,
@@ -123,7 +143,7 @@ def benchmark_measurement(name, live_cpu=10.0, missing=False, zero=False):
     }
     measurement = {
         "schema": report.SCHEMA, "kind": "set-measurement",
-        "set": name, "mode": report.CANONICAL_MODES[name], "duration_seconds": 30,
+        "set": name, "mode": mode or report.CANONICAL_MODES.get(name, "playback"), "duration_seconds": 30,
         "window": {
             "requested_duration_seconds": 30,
             "monotonic_start_ns": 1_000_000_000,
@@ -195,13 +215,17 @@ def benchmark_measurement(name, live_cpu=10.0, missing=False, zero=False):
     return measurement
 
 
-def write_benchmark_run(root, *, status="complete", duration=30, profile=None, live_cpu=10.0, missing=False, zero=False):
+def write_benchmark_run(
+    root, *, status="complete", duration=30, profile=None, live_cpu=10.0, missing=False, zero=False,
+    sets=None, structure=None, scenario=None, trace_mode=None, tracer=None, modes=None,
+):
     (root / "profile").mkdir(parents=True)
     (root / "sets").mkdir()
-    (root / "run.json").write_text(json.dumps({
+    names = list(sets or report.CANONICAL_SETS)
+    run = {
         "schema": report.SCHEMA, "kind": "benchmark-run", "harness": {"identity_hash": "harness-a"},
         "status": status, "tag": root.name, "duration_seconds_per_set": duration,
-        "set_order": list(report.CANONICAL_SETS), "created_at": FIXTURE_CREATED_AT,
+        "set_order": names, "created_at": FIXTURE_CREATED_AT,
         "machine": {
             "id": FIXTURE_MACHINE_ID, "scope": "stable per-user benchmark ID", "source": "persistent-random-v1",
         },
@@ -210,14 +234,112 @@ def write_benchmark_run(root, *, status="complete", duration=30, profile=None, l
             "filename": report.cpu_benchmark_csv_filename(FIXTURE_MACHINE_ID, FIXTURE_CREATED_AT),
             "timestamp": report.filename_timestamp(FIXTURE_CREATED_AT),
         },
-    }))
+    }
+    if structure:
+        run["structure"] = structure
+    if scenario:
+        run["scenario"] = scenario
+    if trace_mode:
+        run["trace"] = {"mode": trace_mode, "tracer": tracer, "privilege": "sudo"}
+    (root / "run.json").write_text(json.dumps(run))
     (root / "profile/profile.json").write_text(json.dumps(profile or benchmark_profile()))
-    for index, name in enumerate(report.CANONICAL_SETS, 1):
+    for index, name in enumerate(names, 1):
         directory = root / "sets" / f"{index:02d}-{name}"
         directory.mkdir()
-        measurement = benchmark_measurement(name, live_cpu, missing, zero)
+        measurement = benchmark_measurement(name, live_cpu, missing, zero, (modes or {}).get(name))
         measurement["duration_seconds"] = duration
+        if trace_mode:
+            measurement["trace"] = {"mode": trace_mode, "directory": report.INTERFACE_DIRECTORY}
         (directory / "measurement.json").write_text(json.dumps(measurement))
+
+
+def interface_tracer(stopped_ns=31_400_000_000, lost_events=0, version="wine-trace/1"):
+    return {
+        "version": version, "mode": "summary", "sample_rate": 64,
+        "attach": ["ntdll.so:wine:*", "pipeasio64.dll.so:pipeasio:*"],
+        "started_monotonic_ns": FIXTURE_TRACER_START_NS, "stopped_monotonic_ns": stopped_ns,
+        "lost_events": lost_events, "probe_hits": {"syscall_entry": 1000},
+        "overhead_estimate_ns_per_block": 500,
+    }
+
+
+def interface_crossing(tid, role, kind, identifier, n, total_ns, max_ns, woken_by=None):
+    crossing = {"tid": tid, "role": role, "kind": kind, "id": identifier, "n": n, "total_ns": total_ns, "max_ns": max_ns}
+    if woken_by:
+        crossing["woken_by"] = woken_by
+    return crossing
+
+
+def interface_block(seq, t_start, slack_ns, crossings=(), stacks=(), elapsed=0.00043):
+    return {
+        "seq": seq, "t_start": t_start, "t_end": round(t_start + elapsed, 6),
+        "period_ns": FIXTURE_PERIOD_NS, "slack_ns": slack_ns, "late": slack_ns < 0,
+        "near_late": 0 <= slack_ns < 200_000, "missed_cycles": int(slack_ns < 0),
+        "crossings": list(crossings), "stacks": list(stacks),
+    }
+
+
+def interface_blocks():
+    """Twelve blocks: two late, three near-late, five on time, two outside the window."""
+    site_a = lambda n, total, peak, woken_by=None: interface_crossing(  # noqa: E731
+        4242, "pipeasio_callback", "ntsync_wait", "NtWaitForSingleObject", n, total, peak, woken_by,
+    )
+    site_b = lambda n, total, peak: interface_crossing(  # noqa: E731
+        4301, "audio_worker", "syscall", "NtReleaseSemaphore", n, total, peak,
+    )
+    site_c = interface_crossing(4301, "audio_worker", "syscall", "NtYieldExecution", 10, 50_000, 9_000)
+    site_main = interface_crossing(4200, "main", "server_req", "select", 5, 90_000, 40_000)
+    stack_a = {"tid": 4242, "kind": "ntsync_wait", "id": "NtWaitForSingleObject", "frames": FIXTURE_FRAMES, "stop": "max_frames"}
+    waker = {"tid": 4301, "role": "audio_worker"}
+    return [
+        {"type": "header", "monotonic_start_ns": FIXTURE_TRACER_START_NS, "mode": "summary"},
+        interface_block(1, 0.1, -999_999, [site_a(100, 9_000_000, 9_000_000)]),
+        interface_block(2, 1.0, -210_000, [site_a(4, 300_000, 210_000, waker), site_b(3, 2_100, 900)], [stack_a], 0.00154),
+        interface_block(3, 2.0, -50_000, [site_a(8, 400_000, 150_000), site_b(2, 1_000, 600)], [stack_a]),
+        interface_block(4, 3.0, 50_000, [site_a(2, 100_000, 80_000)], [stack_a]),
+        interface_block(5, 4.0, 150_000, [site_b(1, 60_000, 60_000)]),
+        interface_block(6, 5.0, 199_000),
+        interface_block(7, 6.0, 900_000, [site_c, site_a(1, 20_000, 20_000)], [stack_a]),
+        interface_block(8, 7.0, 950_000, [site_c, site_main]),
+        interface_block(9, 8.0, 1_000_000, [site_c]),
+        interface_block(10, 9.0, 1_100_000, [site_c]),
+        interface_block(11, 10.0, 850_000, [site_c]),
+        interface_block(12, 31.0, -5_000, [site_a(1, 5_000, 5_000)]),
+    ]
+
+
+def interface_threads():
+    bin_ = lambda t, tid, role, crossings: {  # noqa: E731
+        "t": t, "window_ms": 100, "tid": tid, "role": role, "oncpu_ns": 1_000, "offcpu_ns": 99_000_000,
+        "crossings": crossings, "top_ids": [],
+    }
+    return [
+        {"type": "header", "monotonic_start_ns": FIXTURE_TRACER_START_NS},
+        bin_(0.1, 4301, "audio_worker", {"syscall": {"n": 999, "total_ns": 999}}),
+        bin_(1.0, 4301, "audio_worker", {"syscall": {"n": 40, "total_ns": 950_000}}),
+        bin_(1.1, 4301, "audio_worker", {"syscall": {"n": 60, "total_ns": 1_050_000}}),
+        bin_(1.0, 4200, "main", {"server_req": {"n": 2, "total_ns": 80_000}, "syscall": {"n": 10, "total_ns": 20_000}}),
+    ]
+
+
+def write_interface_files(set_dir, tracer=None, blocks=None, threads=None):
+    directory = set_dir / "raw/interface"
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "tracer.json").write_text(json.dumps(tracer or interface_tracer()))
+    (directory / "blocks.jsonl").write_text("".join(json.dumps(item) + "\n" for item in blocks or interface_blocks()))
+    (directory / "threads.jsonl").write_text("".join(json.dumps(item) + "\n" for item in threads or interface_threads()))
+    return directory
+
+
+def fixture_interface_section(**options):
+    measurement = benchmark_measurement("Benchmark_Empty")
+    measurement["trace"] = {"mode": "interface", "directory": report.INTERFACE_DIRECTORY}
+    blocks = [item for item in interface_blocks() if item.get("type") != "header"]
+    threads = [item for item in interface_threads() if item.get("type") != "header"]
+    return report.interface_section(
+        measurement, options.pop("tracer", interface_tracer()), {}, blocks, FIXTURE_TRACER_START_NS,
+        threads, FIXTURE_TRACER_START_NS, **options,
+    )
 
 
 class ParserTests(unittest.TestCase):
@@ -1114,6 +1236,402 @@ ERR:          5
         self.assertIn("Live 12.4.3 (users/lgillingham): MaxAudioThreads=10", rendered)
         self.assertIn("Live 12.4.3 (users/Public): MaxAudioThreads=Live default", rendered)
         self.assertIn("Options.txt SHA-256 `absent`", rendered)
+
+
+class ProfilerTests(unittest.TestCase):
+    def test_interface_window_filtering_and_counts(self):
+        section = fixture_interface_section()
+        self.assertEqual(section["schema"], report.INTERFACE_SCHEMA)
+        self.assertEqual(section["mode"], "interface")
+        self.assertEqual(section["window"], {"blocks_in_file": 12, "blocks_in_window": 10})
+        blocks = section["blocks"]
+        self.assertEqual((blocks["count"], blocks["late"], blocks["near_late"], blocks["late_per_minute"]), (10, 2, 3, 4.0))
+        self.assertEqual(blocks["slack_ns"], {"min": -210_000, "p01": -210_000, "p50": 199_000, "p99": 1_100_000})
+        self.assertEqual(blocks["elapsed_ns"], {"p50": 430_000, "p99": 1_540_000, "max": 1_540_000})
+        self.assertEqual(blocks["deadline_ns"], {"min": FIXTURE_PERIOD_NS, "max": FIXTURE_PERIOD_NS})
+        self.assertEqual(section["thresholds"], {
+            "near_late_fraction": 0.15, "deadline_ns_mode": FIXTURE_PERIOD_NS, "near_late_slack_ns": 200_000,
+        })
+        tracer = section["tracer"]
+        self.assertEqual((tracer["started_offset_seconds"], tracer["stopped_offset_seconds"]), (-0.6, 30.4))
+        self.assertTrue(tracer["coverage_complete"])
+        self.assertEqual(tracer["overhead"]["estimate_ns_per_block"], 500)
+        self.assertEqual(section["kinds"]["ntsync_wait"], {"n": 15, "total_ns": 820_000})
+        self.assertEqual(section["kinds"]["syscall"], {"n": 56, "total_ns": 313_100})
+        self.assertEqual(section["kinds"]["unixcall"], {"n": 0, "total_ns": 0})
+        self.assertEqual(section["roles"]["audio_worker"], {
+            "bins": 2, "crossings_per_100ms": {"p50": 40, "p99": 60},
+            "total_ns_per_100ms": {"p50": 950_000, "p99": 1_050_000},
+        })
+        self.assertEqual(section["roles"]["main"]["bins"], 1)
+        self.assertEqual(section["hotspots_non_audio"], [
+            {"role": "main", "kind": "server_req", "caller": "unsampled", "n": 5, "total_ns": 90_000},
+        ])
+        self.assertEqual(section["confounders"], [])
+        self.assertEqual(section["evidence"]["blocks"], "raw/interface/blocks.jsonl")
+
+    def test_interface_ranking_and_lost_slack_shares(self):
+        section = fixture_interface_section()
+        lost = section["lost_slack"]
+        self.assertEqual((lost["total_ns"], lost["attributed_ns"], lost["unattributed_ns"]), (861_000, 702_100, 158_900))
+        sites = section["call_sites"]
+        self.assertEqual([site["rank"] for site in sites], [1, 2, 3, 4])
+        first = sites[0]
+        self.assertEqual(first["key"], SITE_A_KEY)
+        self.assertEqual((first["kind"], first["name"], first["caller"]), ("ntsync_wait", "NtWaitForSingleObject", FIXTURE_CALLER))
+        self.assertEqual((first["late_blocks"], first["near_late_blocks"], first["n_in_late_blocks"]), (2, 1, 14))
+        self.assertEqual(first["per_late_block"], 4.6667)
+        self.assertEqual((first["total_ns_in_late_blocks"], first["max_ns"]), (800_000, 210_000))
+        self.assertEqual((first["n_all_blocks"], first["total_ns_all_blocks"]), (15, 820_000))
+        self.assertEqual(first["share_of_lost_slack"], 0.7542)
+        self.assertEqual(first["woken_by"], [{"tid": 4301, "role": "audio_worker", "count": 4}])
+        second = sites[1]
+        self.assertEqual(second["key"], SITE_B_KEY)
+        self.assertEqual((second["n_in_late_blocks"], second["total_ns_in_late_blocks"]), (6, 63_100))
+        self.assertEqual(second["share_of_lost_slack"], 0.0612)
+        self.assertTrue(all(0 <= site["share_of_lost_slack"] <= 1 for site in sites))
+        self.assertAlmostEqual(sum(site["share_of_lost_slack"] for site in sites), lost["attributed_ns"] / lost["total_ns"], places=3)
+        self.assertIsNone(sites[3]["per_late_block"])
+        self.assertEqual(len(fixture_interface_section(top=2)["call_sites"]), 2)
+        self.assertEqual(fixture_interface_section(near_late_fraction=0.0)["blocks"]["near_late"], 0)
+
+    def test_interface_coverage_and_lost_event_confounders(self):
+        early = fixture_interface_section(tracer=interface_tracer(stopped_ns=30_000_000_000))
+        self.assertFalse(early["tracer"]["coverage_complete"])
+        self.assertEqual(early["tracer"]["stopped_offset_seconds"], 29.0)
+        self.assertEqual(early["confounders"], ["interface-tracer-coverage-incomplete"])
+        lossy = fixture_interface_section(tracer=interface_tracer(lost_events=3))
+        self.assertEqual(lossy["confounders"], ["interface-lost-events"])
+        self.assertEqual(lossy["tracer"]["lost_events"], 3)
+
+    def test_interface_subcommand_rewrites_measurement(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = Path(temporary) / "run"
+            write_benchmark_run(run_dir, trace_mode="interface")
+            set_dir = next((run_dir / "sets").glob("*-Benchmark_Empty"))
+            write_interface_files(set_dir)
+            args = type("Args", (), {"set_dir": str(set_dir), "near_late_fraction": 0.15, "top": 20})()
+            self.assertEqual(report.interface(args), 0)
+            measurement = json.loads((set_dir / "measurement.json").read_text())
+            self.assertEqual(measurement["interface"]["schema"], report.INTERFACE_SCHEMA)
+            self.assertEqual(measurement["interface"]["blocks"]["late"], 2)
+            self.assertEqual(measurement["interface"]["call_sites"][0]["key"], SITE_A_KEY)
+            self.assertEqual(measurement["confounders"], [])
+            self.assertEqual(measurement["evidence"]["interface_blocks"], "raw/interface/blocks.jsonl")
+            write_interface_files(set_dir, tracer=interface_tracer(stopped_ns=30_000_000_000))
+            self.assertEqual(report.interface(args), 0)
+            self.assertEqual(report.interface(args), 0)
+            measurement = json.loads((set_dir / "measurement.json").read_text())
+            self.assertEqual([item["kind"] for item in measurement["confounders"]], ["interface-tracer-coverage-incomplete"])
+            self.assertIn("after:interface-tracer-coverage-incomplete", report.measurement_confounders(measurement, "after"))
+
+    def test_interface_subcommand_refuses_missing_tracer_output(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = Path(temporary) / "run"
+            write_benchmark_run(run_dir, trace_mode="interface")
+            set_dir = next((run_dir / "sets").glob("*-Benchmark_Empty"))
+            args = type("Args", (), {"set_dir": str(set_dir), "near_late_fraction": 0.15, "top": 20})()
+            with mock.patch("builtins.print"):
+                self.assertEqual(report.interface(args), 2)
+            measurement = json.loads((set_dir / "measurement.json").read_text())
+            self.assertIsNone(measurement["interface"])
+            self.assertEqual([item["kind"] for item in measurement["confounders"]], ["interface-tracer-output-missing"])
+            self.assertIn("before:interface-tracer-output-missing", report.measurement_confounders(measurement, "before"))
+            untraced = next((run_dir / "sets").glob("*-Benchmark_Zero"))
+            measurement = json.loads((untraced / "measurement.json").read_text())
+            measurement["trace"]["mode"] = "off"
+            (untraced / "measurement.json").write_text(json.dumps(measurement))
+            before = (untraced / "measurement.json").read_text()
+            with mock.patch("builtins.print"):
+                self.assertEqual(report.interface(type("Args", (), {"set_dir": str(untraced), "near_late_fraction": 0.15, "top": 20})()), 0)
+            self.assertEqual((untraced / "measurement.json").read_text(), before)
+
+    def test_render_adds_interface_crossings_section(self):
+        measurement = benchmark_measurement("Benchmark_Zero")
+        measurement["interface"] = fixture_interface_section()
+        rendered = report.markdown_report({
+            "run": {"tag": "fixture", "status": "complete", "duration_seconds_per_set": 30,
+                    "structure": "benchmark", "trace": {"mode": "interface"}, "scenario": None},
+            "profile": benchmark_profile(), "sets": [measurement, benchmark_measurement("Benchmark_Empty")],
+            "generated_at": "fixture",
+        })
+        lines = rendered.splitlines()
+        self.assertIn("- Trace: `interface`", lines)
+        self.assertIn("- Structure: `benchmark`", lines)
+        self.assertIn("- Scenario: `none`", lines)
+        self.assertLess(lines.index("## Results"), lines.index("## Interface crossings"))
+        self.assertLess(lines.index("## Interface crossings"), lines.index("## Run details"))
+        self.assertIn("### Benchmark_Zero", lines)
+        self.assertIn("- Interface data unavailable; see the measurement confounders.", lines[lines.index("### Benchmark_Empty"):])
+        table_header = next(line for line in lines if line.startswith("| Rank |"))
+        self.assertEqual(table_header, "| Rank | Crossing | Caller | Per late block | Share of lost slack |")
+        row = next(line for line in lines if line.startswith("| 1 |"))
+        self.assertEqual(row, f"| 1 | ntsync_wait NtWaitForSingleObject | {FIXTURE_CALLER} | 4.67 | 75.4% |")
+        self.assertIn("lost slack attributed 81.5%", rendered)
+        header = next(line for line in lines if line.startswith("| Set | Mode |"))
+        separator = lines[lines.index(header) + 1]
+        set_row = next(line for line in lines if line.startswith("| Benchmark_Zero |"))
+        self.assertEqual((header.count("|"), separator.count("|"), set_row.count("|")), (18, 18, 18))
+        untraced = report.markdown_report({
+            "run": {"tag": "fixture", "status": "complete", "duration_seconds_per_set": 30},
+            "profile": benchmark_profile(), "sets": [benchmark_measurement("Benchmark_Zero")], "generated_at": "fixture",
+        })
+        self.assertNotIn("## Interface crossings", untraced)
+        self.assertIn("- Trace: `off`", untraced)
+
+    def test_compare_refuses_trace_mode_mismatch(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            before, after = root / "before", root / "after"
+            write_benchmark_run(before)
+            write_benchmark_run(after, trace_mode="interface", tracer="wine-trace/1")
+            with self.assertRaisesRegex(ValueError, "trace mode mismatch: before=off, after=interface"):
+                report.comparison_report(report.load_completed_run(before), report.load_completed_run(after))
+            args = type("Args", (), {"before": str(before), "after": str(after), "output": str(root / "comparison")})()
+            with mock.patch("builtins.print"):
+                self.assertEqual(report.compare(args), 2)
+            self.assertFalse((root / "comparison").exists())
+
+    def test_compare_flags_tracer_identity_and_set_file(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            before, after = root / "before", root / "after"
+            write_benchmark_run(before, trace_mode="interface", tracer="wine-trace/1")
+            write_benchmark_run(after, trace_mode="interface", tracer="wine-trace/2")
+            path = next((after / "sets").glob("*-Benchmark_VSTs/measurement.json"))
+            measurement = json.loads(path.read_text())
+            measurement["set_file"] = {"path": "/sets/Benchmark_VSTs.als", "sha256": "b" * 64}
+            path.write_text(json.dumps(measurement))
+            result = report.comparison_report(report.load_completed_run(before), report.load_completed_run(after))
+            self.assertIn("identity:trace:different", result["identity_confounders"])
+            self.assertEqual(result["structure"]["trace_mode"], "interface")
+            self.assertIn("set-identity:set-file", result["sets"][4]["confounders"])
+            self.assertNotIn("set-identity:set-file", result["sets"][0]["confounders"])
+            self.assertIsNone(result["sets"][0]["interface"])
+            untraced = report.comparison_report(*(report.load_completed_run(path) for path in (before, before)))
+            self.assertNotIn("identity:trace:different", untraced["identity_confounders"])
+
+    def test_compare_joins_interface_call_sites(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            before, after = root / "before", root / "after"
+            write_benchmark_run(before, trace_mode="interface", tracer="wine-trace/1")
+            write_benchmark_run(after, trace_mode="interface", tracer="wine-trace/1")
+            improved = fixture_interface_section()
+            improved["blocks"]["late"] = 1
+            improved["lost_slack"]["total_ns"] = 400_000
+            improved["call_sites"][0]["share_of_lost_slack"] = 0.4
+            improved["call_sites"][0]["total_ns_in_late_blocks"] = 200_000
+            improved["call_sites"][1]["key"] = "syscall|NtDelayExecution|unsampled"
+            for directory, section in ((before, fixture_interface_section()), (after, improved)):
+                path = next((directory / "sets").glob("*-Benchmark_Empty/measurement.json"))
+                measurement = json.loads(path.read_text())
+                measurement["interface"] = section
+                path.write_text(json.dumps(measurement))
+            result = report.comparison_report(report.load_completed_run(before), report.load_completed_run(after))
+            interface = result["sets"][1]["interface"]
+            late = interface["metrics"]["late_blocks"]
+            self.assertEqual((late["before"], late["after"], late["delta"]), (2, 1, -1))
+            self.assertEqual(interface["metrics"]["lost_slack_total_ns"]["delta"], -461_000)
+            self.assertEqual(interface["metrics"]["tracer_lost_events"]["comparison_status"], "comparable")
+            self.assertEqual(interface["call_sites"][0]["key"], SITE_A_KEY)
+            self.assertEqual(interface["call_sites"][0]["delta_share"], -0.3542)
+            self.assertEqual(interface["call_sites"][0]["delta_total_ns_in_late_blocks"], -600_000)
+            self.assertEqual(interface["appeared"], ["syscall|NtDelayExecution|unsampled"])
+            self.assertEqual(interface["disappeared"], [SITE_B_KEY])
+            disappeared = next(item for item in interface["call_sites"] if item["key"] == SITE_B_KEY)
+            self.assertIsNone(disappeared["after"])
+            self.assertEqual(disappeared["delta_share"], -0.0612)
+            markdown = report.comparison_markdown(result)
+            self.assertIn("## Interface crossings", markdown)
+            self.assertIn("### Benchmark_Empty", markdown)
+            self.assertIn("| ntsync_wait NtWaitForSingleObject |", markdown)
+            self.assertIn("- Late audio blocks: 2", markdown)
+
+    def test_virtualization_identity_and_banner(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            raw = root / "raw"
+            raw.mkdir()
+            (raw / "virt.stdout.txt").write_text("vmware\n")
+            dmi = root / "product_name"
+            dmi.write_text("VMware20,1\n")
+            record = report.virtualization_record(raw, dmi)
+            self.assertEqual(record, {
+                "detector": "systemd-detect-virt", "value": "vmware", "dmi_product": "VMware20,1",
+                "timing_claims_allowed": False,
+            })
+            (raw / "virt.stdout.txt").write_text("")
+            self.assertEqual(report.virtualization_record(raw, root / "absent")["value"], "unknown")
+            (raw / "virt.stdout.txt").write_text("none\n")
+            self.assertTrue(report.virtualization_record(raw, dmi)["timing_claims_allowed"])
+            virtual, metal = benchmark_profile(), benchmark_profile()
+            virtual["system"]["virtualization"] = record
+            metal["system"]["virtualization"] = report.virtualization_record(raw, dmi)
+            before, after = root / "before", root / "after"
+            write_benchmark_run(before, profile=virtual)
+            write_benchmark_run(after, profile=metal)
+            result = report.comparison_report(report.load_completed_run(before), report.load_completed_run(after))
+            self.assertIn("identity:virtualization:different", result["identity_confounders"])
+            self.assertIn("> NO TIMING CLAIMS: this run executed under vmware; use it for mechanism and tooling evidence only.", report.comparison_markdown(result))
+            banner = report.markdown_report({
+                "run": {"tag": "fixture", "status": "complete", "duration_seconds_per_set": 30},
+                "profile": virtual, "sets": [], "generated_at": "fixture",
+            })
+            self.assertIn("> NO TIMING CLAIMS: this run executed under vmware;", banner)
+            clean = report.markdown_report({
+                "run": {"tag": "fixture", "status": "complete", "duration_seconds_per_set": 30},
+                "profile": metal, "sets": [], "generated_at": "fixture",
+            })
+            self.assertNotIn("NO TIMING CLAIMS", clean)
+            self.assertNotIn("NO TIMING CLAIMS", report.markdown_report({
+                "run": {}, "profile": benchmark_profile(), "sets": [], "generated_at": "fixture",
+            }))
+
+    def test_scenario_mode_skips_playback_state_confounder(self):
+        parsed = report.parse_osc("0.2\t1700000000.250 /abl/bench/playing 0\n0.3\t1700000001.000 /abl/bench/cpu 20 31\n")
+        self.assertEqual(parsed["addresses"]["/abl/bench/playing"], 1)
+        self.assertEqual(report.playback_state_confounder("playback", parsed)["kind"], "playback-state-changed")
+        self.assertIsNone(report.playback_state_confounder("scenario", parsed))
+
+    def test_scenario_collector_appears_only_when_a_scenario_ran(self):
+        plain = benchmark_measurement("Benchmark_Inbuilts")
+        self.assertEqual(report.measurement_collectors(plain), report.COLLECTORS)
+        self.assertNotIn("scenario_coverage_seconds", report.set_metric_values(plain))
+        self.assertFalse(any("scenario" in item for item in report.measurement_confounders(plain, "before")))
+        scenario = benchmark_measurement("Benchmark_Inbuilts", mode="scenario")
+        scenario["scenario"] = {"name": "clip-launch-storm", "kind": "benchmark", "file": "/scenarios/clip-launch-storm.json",
+                                "sha256": "a" * 64, "markers": [{"name": "end", "offset_seconds": 29.9}], "operations": 60}
+        scenario["capture_commands"]["scenario"] = {"available": True, "timing": scenario["capture_commands"]["osc"]["timing"]}
+        self.assertEqual(report.measurement_collectors(scenario), report.COLLECTORS + ("scenario",))
+        self.assertEqual(report.set_metric_values(scenario)["scenario_coverage_seconds"][2], 30.0)
+        self.assertNotIn("before:scenario-collector-unusable", report.measurement_confounders(scenario, "before"))
+        scenario["capture_commands"]["scenario"] = {"available": True, "timing": {"supervision_interval_seconds": 3.0, "output_line_count": 2}}
+        self.assertIn("before:scenario-collector-unusable", report.measurement_confounders(scenario, "before"))
+
+    def test_scenario_log_and_set_file_parsers(self):
+        parsed = report.parse_scenario(
+            "0.500000\t0.4990\tmarker\tsetup-done\n"
+            "1.000000\t0.9990\top\tfire_scene\t0\n"
+            "junk line\n"
+            "30.000000\t29.9990\tmarker\tend\n"
+        )
+        self.assertEqual(parsed["operations"], 1)
+        self.assertEqual(parsed["markers"], [
+            {"name": "setup-done", "offset_seconds": 0.5, "scenario_offset_seconds": 0.499},
+            {"name": "end", "offset_seconds": 30.0, "scenario_offset_seconds": 29.999},
+        ])
+        self.assertEqual(report.set_file_record("ABCDEF  /sets/Benchmark_VSTs.als"), {"path": "/sets/Benchmark_VSTs.als", "sha256": "abcdef"})
+        self.assertEqual(report.set_file_record("abcdef"), {"path": None, "sha256": "abcdef"})
+        self.assertEqual(report.set_file_record(None), {"path": None, "sha256": None})
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "scenarios").mkdir()
+            (root / "control").mkdir()
+            (root / "scenarios/view-flip.json").write_text(json.dumps({"name": "view-flip", "kind": "diagnostic"}))
+            record = report.scenario_record("view-flip", str(root / "control/scenario-run.py"), parsed)
+            self.assertEqual((record["name"], record["kind"], record["operations"]), ("view-flip", "diagnostic", 1))
+            self.assertEqual(len(record["sha256"]), 64)
+            self.assertIsNone(report.scenario_record("absent", str(root / "control/scenario-run.py"), parsed)["sha256"])
+
+    def test_osc_decode_handles_bool_nil_blob_and_wide_tags(self):
+        packet = (
+            osc.pad(b"/live/song/get/is_playing") + osc.pad(b",TFNIhdb")
+            + struct.pack(">q", 2**40) + struct.pack(">d", 2.5) + struct.pack(">i", 3) + b"abc\x00"
+        )
+        address, arguments = osc.decode(packet)
+        self.assertEqual(address, "/live/song/get/is_playing")
+        self.assertEqual(arguments, [True, False, None, float("inf"), 2**40, 2.5, b"abc"])
+        aligned = osc.pad(b"/x") + osc.pad(b",bis") + struct.pack(">i", 4) + b"abcd" + struct.pack(">i", 7) + osc.pad(b"ok")
+        self.assertEqual(osc.decode(aligned), ("/x", [b"abcd", 7, "ok"]))
+        with self.assertRaisesRegex(ValueError, "unsupported OSC type tag 'm'"):
+            osc.decode(osc.pad(b"/x") + osc.pad(b",m") + b"\x00\x90\x3c\x40")
+        with self.assertRaisesRegex(ValueError, "truncated OSC blob"):
+            osc.decode(osc.pad(b"/x") + osc.pad(b",b") + struct.pack(">i", 9) + b"abc\x00")
+
+    def test_compare_diagnostic_structure_accepts_two_sets_and_refuses_other_scenarios(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            sets = ["Benchmark_Zero", "Benchmark_VSTs"]
+            modes = {"Benchmark_VSTs": "scenario"}
+            before, after, other = root / "before", root / "after", root / "other"
+            for directory, scenario in ((before, "clip-launch-storm"), (after, "clip-launch-storm"), (other, "tempo-ramp")):
+                write_benchmark_run(directory, sets=sets, structure="diagnostic", scenario=scenario, modes=modes)
+            loaded = report.load_completed_run(before, "diagnostic")
+            self.assertEqual([item["set"] for item in loaded["sets"]], sets)
+            with self.assertRaisesRegex(ValueError, "diagnostic"):
+                report.load_completed_run(before)
+            with self.assertRaisesRegex(ValueError, "scenario mismatch"):
+                report.comparison_report(loaded, report.load_completed_run(other, "diagnostic"), "diagnostic")
+            canonical = root / "canonical"
+            write_benchmark_run(canonical)
+            with self.assertRaisesRegex(ValueError, "set order mismatch"):
+                report.comparison_report(loaded, report.load_completed_run(canonical, "diagnostic"), "diagnostic")
+            short = root / "short"
+            write_benchmark_run(short, sets=sets, structure="diagnostic", scenario="clip-launch-storm", modes=modes, duration=5)
+            with self.assertRaisesRegex(ValueError, "at least 10 seconds"):
+                report.load_completed_run(short, "diagnostic")
+            args = type("Args", (), {
+                "before": str(before), "after": str(after), "output": str(root / "comparison"), "structure": "diagnostic",
+            })()
+            self.assertEqual(report.compare(args), 0)
+            result = json.loads((root / "comparison/comparison.json").read_text())
+            self.assertEqual(result["structure"]["name"], "diagnostic")
+            self.assertEqual(result["structure"]["set_order"], sets)
+            self.assertEqual([item["mode"] for item in result["sets"]], ["idle-no-controller", "scenario"])
+            self.assertIn("- Structure: `diagnostic`; trace `off`; scenario `clip-launch-storm`", (root / "comparison/comparison.md").read_text(encoding="utf-8"))
+
+    def test_init_run_records_structure_trace_and_scenario(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            args = type("Args", (), {
+                "output": str(root / "run.json"), "tag": "fixture", "duration": 30, "set": ["Benchmark_Zero"],
+                "structure": "diagnostic", "trace_mode": "interface", "scenario": "view-flip",
+                "tracer": "/opt/profiler/bin/wine-trace", "privilege": "root-helper",
+            })()
+            with mock.patch.object(report, "load_benchmark_machine_id", return_value=FIXTURE_MACHINE_ID):
+                self.assertEqual(report.init_run(args), 0)
+                run = json.loads((root / "run.json").read_text())
+                self.assertEqual((run["structure"], run["scenario"]), ("diagnostic", "view-flip"))
+                self.assertEqual(run["trace"], {"mode": "interface", "tracer": "/opt/profiler/bin/wine-trace", "privilege": "root-helper"})
+                plain = type("Args", (), {"output": str(root / "plain.json"), "tag": "fixture", "duration": 30, "set": ["Benchmark_Zero"]})()
+                self.assertEqual(report.init_run(plain), 0)
+            run = json.loads((root / "plain.json").read_text())
+            self.assertEqual((run["structure"], run["scenario"], run["trace"]["mode"]), ("benchmark", None, "off"))
+
+    def test_interface_drilldown_lists_blocks_with_the_least_slack(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = Path(temporary) / "run"
+            write_benchmark_run(run_dir, trace_mode="drilldown")
+            set_dir = next((run_dir / "sets").glob("*-Benchmark_Empty"))
+            directory = write_interface_files(set_dir)
+            (directory / "stacks.jsonl").write_text(json.dumps({
+                "seq": 3, "tid": 4301, "kind": "syscall", "id": "NtReleaseSemaphore",
+                "frames": ["ntdll.dll!NtReleaseSemaphore+0x14", "Ableton Live 12 Trial.exe+0x77"],
+            }) + "\n")
+            output = Path(temporary) / "drilldown.md"
+            args = type("Args", (), {"run_dir": str(run_dir), "set": "Benchmark_Empty", "top": 3, "output": str(output)})()
+            self.assertEqual(report.interface_drilldown(args), 0)
+            text = output.read_text()
+            lines = text.splitlines()
+            self.assertEqual(lines[0], "# Interface drill-down: Benchmark_Empty")
+            headings = [line for line in lines if line.startswith("## Block")]
+            self.assertEqual(headings, [
+                "## Block 2: slack -210000 ns (late)", "## Block 3: slack -50000 ns (late)",
+                "## Block 4: slack 50000 ns (near-late)",
+            ])
+            self.assertIn("- Blocks in window: 10; late 2; near-late 3; showing the 3 with the least slack", lines)
+            self.assertIn("| 4242 | pipeasio_callback | ntsync_wait | NtWaitForSingleObject | 4 | 300000 | 210000 |", text)
+            self.assertIn(f"- tid 4242 ntsync_wait NtWaitForSingleObject: {' <- '.join(FIXTURE_FRAMES)} (stop: max_frames)", lines)
+            self.assertIn("- tid 4301 syscall NtReleaseSemaphore: ntdll.dll!NtReleaseSemaphore+0x14 <- Ableton Live 12 Trial.exe+0x77", lines)
+            self.assertLess(lines.index("## Block 2: slack -210000 ns (late)"), lines.index("- Window offset 0.400000 s; elapsed 1540000 ns; period 1333333 ns; near-late threshold 200000 ns; lost slack 410000 ns; missed cycles 1"))
+            with mock.patch("builtins.print") as printed:
+                args.output = None
+                self.assertEqual(report.interface_drilldown(args), 0)
+                self.assertTrue(printed.call_args[0][0].startswith("# Interface drill-down"))
+            missing = type("Args", (), {"run_dir": str(run_dir), "set": "Benchmark_Zero", "top": 3, "output": None})()
+            with mock.patch("builtins.print"):
+                self.assertEqual(report.interface_drilldown(missing), 2)
 
 
 if __name__ == "__main__":

@@ -10,9 +10,9 @@ SERIES="$root/patches/SERIES.sha256"
 say()  { printf '%s\n' "$*"; }
 fail() { printf '!! %s\n' "$*" >&2; exit 1; }
 
-readonly REQUIRED_WINE_TAIL='0107-win32u-restore-offscreen-client-content-on-expose.patch'
+readonly REQUIRED_WINE_TAIL='0108-ntdll-add-static-trace-points.patch'
 readonly REQUIRED_PERFORMANCE_TAIL='performance/0001-ntdll-alertable-sleep-fast-path.patch'
-readonly REQUIRED_PIPEASIO_TAIL='pipeasio/0016-classify-pipeasio-forcers-by-bound-node-id.patch'
+readonly REQUIRED_PIPEASIO_TAIL='pipeasio/0017-usdt-block-markers.patch'
 
 check_required_series_tails()
 {
@@ -395,6 +395,7 @@ FINGERPRINTS='
 0105|ascii|lib/wine/x86_64-windows/winmm.dll|Out of memory refreshing %s mappings
 0106|ascii|lib/wine/x86_64-windows/libusb-1.0.dll|Operation not supported or unimplemented on this platform
 0107|ascii|lib/wine/x86_64-unix/win32u.so|restoring %s after whole-client expose of %p
+0108|ascii|lib/wine/x86_64-unix/ntdll.so|WINE_USDT_V1
 performance/0001|ascii|lib/wine/x86_64-unix/ntdll.so|WINE_APC_FASTPATH
 pipeasio/0001|ascii|lib/wine/x86_64-unix/pipeasio.dll.so|pipeasio-clamp-sample-rate
 pipeasio/0002|ascii|lib/wine/x86_64-unix/pipeasio.dll.so|pipeasio-midi-timebase
@@ -410,6 +411,7 @@ pipeasio/0012|ascii|lib/wine/x86_64-unix/pipeasio.dll.so|pipeasio-reliable-hotpl
 pipeasio/0014|ascii|lib/wine/x86_64-unix/pipeasio.dll.so|enabled for 64-bit host; capacity=%u, interval_ms=1000
 pipeasio/0015|ascii|lib/wine/x86_64-unix/pipeasio.dll.so|PIPEASIO_TELEMETRY could not open a nonblocking report descriptor
 pipeasio/0016|ascii|lib/wine/x86_64-unix/pipeasio.dll.so|pipeasio-node-arbitration
+pipeasio/0017|ascii|lib/wine/x86_64-unix/pipeasio.dll.so|block_range=
 '
 # 0010's source marker (pipeasio-any-buffer-size-panel) is a comment and does
 # not reach the panel binary; its fingerprint is the tooltip literal above,
@@ -420,7 +422,10 @@ PIPEASIO_MARKER_TODO='
 '
 # pipeasio's code is in the unix .so; the PE pipeasio64.dll is a codeless fake module.
 # Wine loads the unix half under the spec-file name pipeasio.dll.so, so the
-# fingerprints (and the readelf checks below) aim at that file.
+# fingerprints (and the readelf checks below) aim at that file. The USDT
+# note check (must_usdt) aims at pipeasio64.dll.so instead: that is the
+# file behind the alias, the path /proc/PID/maps reports and the one the
+# interface tracer attaches to.
 STAMP_ONLY='
 0081|logic-only (subpixel rasterisation for ClearType glyph textures; adds no string literal)
 0082|logic-only (per-channel blend passes for ClearType runs; adds no string literal)
@@ -555,6 +560,34 @@ done
 # --- [4/4] structural invariants of the packaged tree --------------------------
 say "== [4/4] structural invariants =="
 must() { [ -s "$tree/$1" ] && ok "$1" "present" || bad "$1" "missing/empty"; }
+# USDT trace points (0108 in ntdll.so, pipeasio/0017 in pipeasio64.dll.so):
+# every probe site is one 5-byte nop plus a SystemTap SDT descriptor in the
+# non-allocated .note.stapsdt section, and the interface tracer attaches by
+# provider and probe name. Finding the descriptors proves they survived the
+# container's strip --strip-unneeded. Distinct names are counted, not note
+# entries: gcc may inline a probe's enclosing function into several callers
+# and emit one descriptor per copy (a tracer attaches to every copy). The
+# nops are no measure either, gcc pads alignment with the same nopl form.
+usdt_probe_names() {   # <file> <provider> -> distinct probe names, one per line
+    # || true: readelf exits non-zero on a file it cannot parse, and under
+    # pipefail that would end the audit inside the caller's assignment.
+    readelf -n "$1" 2>/dev/null | awk -v want="$2" '
+        /^ *Provider: / { provider = $2; next }
+        /^ *Name: /     { if (provider == want) print $2; provider = "" }' \
+        | sort -u || true
+}
+must_usdt() {   # <tree-relative .so> <provider> <expected distinct probe count>
+    local label="$1 usdt" file="$tree/$1" names count
+    [ -f "$file" ] || { bad "$label" "missing: $file"; return 0; }
+    names="$(usdt_probe_names "$file" "$2")"
+    count="$(printf '%s\n' "$names" | grep -c . || true)"
+    names="${names//$'\n'/ }"
+    if [ "$count" -eq "$3" ]; then
+        ok "$label" "$3 $2: probes ($names)"
+    else
+        bad "$label" "expected $3 $2: probes, found $count${names:+ ($names)}"
+    fi
+}
 must bin/wine
 must bin/wineserver
 must lib/wine/x86_64-unix/winealsa.so
@@ -722,6 +755,12 @@ if command -v readelf >/dev/null; then
         | grep -qF 'Shared library: [libgstreamer-1.0.so.0]' \
         && ok "winegstreamer.so DT_NEEDED" "host libgstreamer-1.0.so.0" \
         || bad "winegstreamer.so DT_NEEDED" "host libgstreamer-1.0.so.0 not linked"
+    # 0108: syscall_entry/exit, unixcall_entry/exit, server_req_start/end,
+    # server_wait_start/end. pipeasio/0017: cycle_start/end, block_start,
+    # block_before_live, block_after_live, block_end (the two block_*_live
+    # probes sit in both branches of pipeasio_host_call_process: 8 sites).
+    must_usdt lib/wine/x86_64-unix/ntdll.so wine 8
+    must_usdt lib/wine/x86_64-unix/pipeasio64.dll.so pipeasio 6
 else
     bad "readelf" "binutils missing — cannot verify bridge DT_NEEDED (install binutils)"
 fi

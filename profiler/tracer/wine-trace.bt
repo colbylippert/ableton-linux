@@ -1,0 +1,277 @@
+// wine-trace.bt -- prototype USDT tracer for the Wine interface profiler (design B, section 3a).
+// Target: bpftrace 0.27 on the CachyOS VM (kernel 7.2.x, BTF, module BTF for ntsync).
+//
+// This file is a TEMPLATE.  profiler/bin/wine-trace copies it to <out>/wine-trace.bt and
+//   * replaces @NTDLL@ and @PIPEASIO@ with the absolute paths of ntdll.so / pipeasio64.dll.so,
+//   * replaces @FILTER@ with "@pids[pid]" (traced pids only) or "1" (--no-pid-filter),
+//   * replaces @PIDS_INIT@ with one "@pids[(uint32)N] = 1;" statement per traced pid,
+//   * strips the optional sections between "// @@SECTION <name> BEGIN/END" markers
+//     (ntsync: --no-ntsync or no fentry support; sched: unless --sched; follow: --no-follow),
+//   * strips every probe block (a line starting with usdt:/fentry:/fexit:/tracepoint: up to the
+//     next line that is exactly "}") whose probe is not listed by bpftrace -l (for example the
+//     pipeasio:cycle_* probes of a PipeASIO built without them).
+// Never run the template itself.
+//
+// Output: one text line per event on stdout; the format is documented in
+// profiler/tracer/README.md and consumed by profiler/tracer/reduce.py.  Timestamps are nsecs
+// (bpf_ktime_get_ns = CLOCK_MONOTONIC, the same base as the suite's time.monotonic_ns() and
+// PipeWire's clock.nsec).  Entry/exit lines are NOT paired here: nesting (user-mode callbacks
+// inside win32u syscalls, NtContinue, the unix-call slow path) makes a depth-1 map lose events,
+// so every line carries the frame pointer and reduce.py pairs per tid in LIFO order.
+// -4@ arguments arrive sign-extended: always cast them to (uint32)/(int32).
+//
+// Block association (design B, section 3b): @seq is the block in progress (set by
+// pipeasio:block_start, cleared by block_end).  Every entry line prints @seq as it was at entry
+// time; 0 means "no block in progress" (window bucket / between_blocks for the callback thread).
+
+// @@SECTION ntsync BEGIN
+// vendor/ntsync-uapi/linux/ntsync.h (ioctl numbers: _IOC(dir,'N',nr,size), 'N' = 0x4e)
+//   NTSYNC_IOC_WAIT_ANY     _IOWR('N', 0x82, struct ntsync_wait_args[40])  = 0xc0284e82
+//   NTSYNC_IOC_WAIT_ALL     _IOWR('N', 0x83, struct ntsync_wait_args[40])  = 0xc0284e83
+//   NTSYNC_IOC_SEM_RELEASE  _IOWR('N', 0x81, __u32)                        = 0xc0044e81
+//   NTSYNC_IOC_MUTEX_UNLOCK _IOWR('N', 0x85, struct ntsync_mutex_args[8])  = 0xc0084e85
+//   NTSYNC_IOC_EVENT_SET    _IOR ('N', 0x88, __u32)                        = 0x80044e88
+//   NTSYNC_IOC_EVENT_PULSE  _IOR ('N', 0x8a, __u32)                        = 0x80044e8a
+struct ntsync_wait_args {
+	unsigned long long timeout;
+	unsigned long long objs;
+	unsigned int count;
+	unsigned int index;
+	unsigned int flags;
+	unsigned int owner;
+	unsigned int alert;
+	unsigned int pad;
+};
+// @@SECTION ntsync END
+
+BEGIN
+{
+	@PIDS_INIT@
+	@seq = (uint64)0;
+	@cb = (uint32)0;
+	printf("hdr mono_start_ns=%llu format=1\n", nsecs);
+}
+
+// ---- ntdll.so: dispatcher probes (patch 0108) ---------------------------------------------
+
+// syscall_entry(id, frame, user_rsp, user_rip): -4@176(%rcx) 8@%rcx 8@136(%rcx) 8@112(%rcx)
+usdt:@NTDLL@:wine:syscall_entry
+/@FILTER@/
+{
+	if (@tids[tid] == 0) {
+		@tids[tid] = 1;
+		printf("T %llu %d %d comm=%s\n", nsecs, tid, pid, comm);
+	}
+	printf("E %llu %d syscall %x fr=%llx seq=%llu rsp=%llx rip=%llx\n",
+	       nsecs, tid, (uint32)arg0, arg1, @seq, arg2, arg3);
+}
+
+// syscall_exit(status, frame, id, restore_flags): -4@%eax 8@%rcx -4@176(%rcx) -4@180(%rcx)
+usdt:@NTDLL@:wine:syscall_exit
+/@FILTER@/
+{
+	printf("X %llu %d syscall %x fr=%llx st=%x rf=%x\n",
+	       nsecs, tid, (uint32)arg2, arg1, (uint32)arg0, (uint32)arg3);
+}
+
+// unixcall_entry(handle, code, frame, caller_rip): 8@%r10 -4@%edx 8@%rsp 8@112(%rsp)
+usdt:@NTDLL@:wine:unixcall_entry
+/@FILTER@/
+{
+	if (@tids[tid] == 0) {
+		@tids[tid] = 1;
+		printf("T %llu %d %d comm=%s\n", nsecs, tid, pid, comm);
+	}
+	printf("E %llu %d unixcall %llx:%u fr=%llx seq=%llu rip=%llx\n",
+	       nsecs, tid, arg0, (uint32)arg1, arg2, @seq, arg3);
+}
+
+// unixcall_exit(status, frame): -4@%eax 8@%rcx
+usdt:@NTDLL@:wine:unixcall_exit
+/@FILTER@/
+{
+	printf("X %llu %d unixcall fr=%llx st=%x\n", nsecs, tid, arg1, (uint32)arg0);
+}
+
+// server_req_start(req_type) / server_req_end(req_type, status): one request at a time per
+// thread, so the start timestamp and the entry-time @seq live in per-tid maps.
+usdt:@NTDLL@:wine:server_req_start
+/@FILTER@/
+{
+	if (@tids[tid] == 0) {
+		@tids[tid] = 1;
+		printf("T %llu %d %d comm=%s\n", nsecs, tid, pid, comm);
+	}
+	@sr[tid] = nsecs;
+	@srq[tid] = @seq;
+}
+
+usdt:@NTDLL@:wine:server_req_end
+/@FILTER@/
+{
+	if (@sr[tid]) {
+		printf("S %llu %d req %d dur=%llu st=%x seq=%llu\n",
+		       nsecs, tid, (int32)arg0, nsecs - @sr[tid], (uint32)arg1, @srq[tid]);
+		delete(@sr, tid);
+		delete(@srq, tid);
+	}
+}
+
+// server_wait_start(flags) / server_wait_end(ret): where non-NTSync and APC-alertable waits block.
+usdt:@NTDLL@:wine:server_wait_start
+/@FILTER@/
+{
+	@sw[tid] = nsecs;
+	@swf[tid] = (uint32)arg0;
+	@swq[tid] = @seq;
+}
+
+usdt:@NTDLL@:wine:server_wait_end
+/@FILTER@/
+{
+	if (@sw[tid]) {
+		printf("S %llu %d wait %x dur=%llu st=%x seq=%llu\n",
+		       nsecs, tid, @swf[tid], nsecs - @sw[tid], (uint32)arg0, @swq[tid]);
+		delete(@sw, tid);
+		delete(@swf, tid);
+		delete(@swq, tid);
+	}
+}
+
+// ---- pipeasio64.dll.so: block markers (patch pipeasio/0017) --------------------------------
+
+// block_start(seq, nframes, rate, clock_nsec, deadline_ns, flags); the flags (bit0 admitted) are
+// repeated by block_end, which also carries bit1 time_info and bit2 muted.
+usdt:@PIPEASIO@:pipeasio:block_start
+/@FILTER@/
+{
+	if (@tids[tid] == 0) {
+		@tids[tid] = 1;
+		printf("T %llu %d %d comm=%s\n", nsecs, tid, pid, comm);
+	}
+	@seq = (uint64)arg0;
+	@cb = tid;
+	printf("B %llu %d start seq=%llu n=%u rate=%u clk=%llu dl=%llu\n",
+	       nsecs, tid, arg0, (uint32)arg1, (uint32)arg2, arg3, arg4);
+}
+
+usdt:@PIPEASIO@:pipeasio:block_before_live
+/@FILTER@/
+{
+	printf("B %llu %d before seq=%llu\n", nsecs, tid, arg0);
+}
+
+usdt:@PIPEASIO@:pipeasio:block_after_live
+/@FILTER@/
+{
+	printf("B %llu %d after seq=%llu\n", nsecs, tid, arg0);
+}
+
+// block_end(seq, flags, missed)
+usdt:@PIPEASIO@:pipeasio:block_end
+/@FILTER@/
+{
+	printf("B %llu %d end seq=%llu fl=%x missed=%u\n",
+	       nsecs, tid, arg0, (uint32)arg1, (uint32)arg2);
+	@seq = (uint64)0;
+}
+
+// cycle_start(clock_nsec, next_nsec, duration, position, flags) / cycle_end(missed, delivered):
+// the full PipeWire cycle around the block (dequeue/queue overhead).
+usdt:@PIPEASIO@:pipeasio:cycle_start
+/@FILTER@/
+{
+	printf("C %llu %d start clk=%llu next=%llu dur=%u pos=%llu fl=%x\n",
+	       nsecs, tid, arg0, arg1, (uint32)arg2, arg3, (uint32)arg4);
+}
+
+usdt:@PIPEASIO@:pipeasio:cycle_end
+/@FILTER@/
+{
+	printf("C %llu %d end missed=%u delivered=%u\n", nsecs, tid, (uint32)arg0, (uint32)arg1);
+}
+
+// @@SECTION ntsync BEGIN
+// ---- kernel side: NTSync waits and wakes (no Wine patch; needs /sys/kernel/btf/ntsync) ------
+// ntsync_char_ioctl(file, cmd, parm) serves WAIT_ANY/WAIT_ALL on the device fd; the user
+// struct ntsync_wait_args at parm gives count/alert/owner on entry and index on exit.
+fentry:ntsync:ntsync_char_ioctl
+/@FILTER@ && (args.cmd == 0xc0284e82 || args.cmd == 0xc0284e83)/
+{
+	$w = uptr((struct ntsync_wait_args *)args.parm);
+	if (@tids[tid] == 0) {
+		@tids[tid] = 1;
+		printf("T %llu %d %d comm=%s\n", nsecs, tid, pid, comm);
+	}
+	printf("W %llu %d cmd=%x count=%u alert=%u owner=%u seq=%llu\n",
+	       nsecs, tid, args.cmd, $w->count, $w->alert, $w->owner, @seq);
+}
+
+fexit:ntsync:ntsync_char_ioctl
+/@FILTER@ && (args.cmd == 0xc0284e82 || args.cmd == 0xc0284e83)/
+{
+	$w = uptr((struct ntsync_wait_args *)args.parm);
+	printf("w %llu %d ret=%d idx=%u\n", nsecs, tid, (int32)retval, $w->index);
+}
+
+// ntsync_obj_ioctl(file, cmd, parm) on an object fd: EVENT_SET / EVENT_PULSE / SEM_RELEASE /
+// MUTEX_UNLOCK are the wakes; the current task is the waker (wineserver or a Wine thread).
+fentry:ntsync:ntsync_obj_ioctl
+/@FILTER@ && (args.cmd == 0x80044e88 || args.cmd == 0x80044e8a || args.cmd == 0xc0044e81 || args.cmd == 0xc0084e85)/
+{
+	if (@tids[tid] == 0) {
+		@tids[tid] = 1;
+		printf("T %llu %d %d comm=%s\n", nsecs, tid, pid, comm);
+	}
+	printf("K %llu %d %d cmd=%x seq=%llu\n", nsecs, tid, pid, args.cmd, @seq);
+}
+// @@SECTION ntsync END
+
+// @@SECTION follow BEGIN
+// ---- children (Max.exe, msedgewebview2.exe, plugin hosts): add exec'd children of traced pids --
+tracepoint:sched:sched_process_exec
+/@pids[(uint32)curtask->real_parent->tgid] || @pids[pid]/
+{
+	@pids[pid] = 1;
+	printf("P %llu %d parent=%d comm=%s\n", nsecs, pid, (uint32)curtask->real_parent->tgid, comm);
+}
+
+// Wine 11.13 writes SetThreadDescription names to /proc/PID/task/TID/comm: args.pid is the
+// renamed task, the writer may be another thread of the same process.
+tracepoint:task:task_rename
+/@FILTER@/
+{
+	printf("N %llu %d comm=%s\n", nsecs, (uint32)args.pid, args.newcomm);
+}
+// @@SECTION follow END
+
+// @@SECTION sched BEGIN
+// ---- scheduler: off-CPU intervals and wakers of traced threads (--sched) -------------------
+tracepoint:sched:sched_waking
+/@tids[(uint32)args.pid]/
+{
+	@wk[(uint32)args.pid] = nsecs;
+	printf("U %llu %d %d wakee=%d\n", nsecs, tid, pid, (uint32)args.pid);
+}
+
+tracepoint:sched:sched_switch
+/@tids[(uint32)args.prev_pid] || @tids[(uint32)args.next_pid]/
+{
+	if (@tids[(uint32)args.prev_pid]) {
+		@off[(uint32)args.prev_pid] = nsecs;
+		@ofs[(uint32)args.prev_pid] = (int64)args.prev_state;
+	}
+	if (@tids[(uint32)args.next_pid] && @off[(uint32)args.next_pid]) {
+		printf("O %llu %d off=%llu wake=%llu st=%d\n", nsecs, (uint32)args.next_pid,
+		       @off[(uint32)args.next_pid], @wk[(uint32)args.next_pid], @ofs[(uint32)args.next_pid]);
+		delete(@off, (uint32)args.next_pid);
+		delete(@wk, (uint32)args.next_pid);
+		delete(@ofs, (uint32)args.next_pid);
+	}
+}
+// @@SECTION sched END
+
+END
+{
+	printf("end mono_end_ns=%llu\n", nsecs);
+}

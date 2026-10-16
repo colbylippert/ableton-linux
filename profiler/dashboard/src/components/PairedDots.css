@@ -1,0 +1,132 @@
+/* PairedDots — dumbbells per ABAB pair; ordinal before/after pair, text in text tokens. */
+
+.svg-chart {
+  position: relative;
+  width: 100%;
+  min-width: 0;
+}
+
+.svg-chart svg {
+  display: block;
+  max-width: 100%;
+  font-family: var(--font);
+}
+
+.svg-tooltip {
+  position: absolute;
+  z-index: 2;
+  pointer-events: none;
+  white-space: nowrap;
+}
+
+.pd-grid {
+  stroke: var(--grid);
+  stroke-width: 1;
+}
+
+.pd-axis {
+  stroke: var(--axis);
+  stroke-width: 1;
+}
+
+.pd-tick {
+  fill: var(--text-muted);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.pd-label {
+  fill: var(--text-secondary);
+  font-size: 12px;
+}
+
+.pd-delta {
+  fill: var(--text-primary);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.pd-glyph-good {
+  fill: var(--status-good);
+  color: var(--status-good);
+}
+
+.pd-glyph-critical {
+  fill: var(--status-critical);
+  color: var(--status-critical);
+}
+
+.pd-glyph-none {
+  fill: var(--text-muted);
+  color: var(--text-muted);
+}
+
+.pd-wash {
+  fill: var(--ord-before);
+  fill-opacity: 0.1;
+}
+
+.pd-connector {
+  stroke: var(--ord-before);
+  stroke-width: 2;
+  stroke-linecap: round;
+}
+
+.pd-dot {
+  stroke: var(--surface-1);
+  stroke-width: 2;
+}
+
+.pd-dot-a {
+  fill: var(--ord-before);
+}
+
+.pd-dot-b {
+  fill: var(--ord-after);
+}
+
+/* 24 px hit target: invisible, but it is what receives hover and focus */
+.pd-hit {
+  fill: transparent;
+  cursor: default;
+  outline: none;
+}
+
+.pd-hit:focus-visible {
+  stroke: var(--focus);
+  stroke-width: 2;
+}
+
+.pd-hit:hover + .pd-dot,
+.pd-row:hover .pd-dot {
+  stroke-width: 3;
+}
+
+.pd-key-dot {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  box-shadow: 0 0 0 2px var(--surface-1);
+}
+
+.pd-key-a {
+  background: var(--ord-before);
+}
+
+.pd-key-b {
+  background: var(--ord-after);
+}
+
+.pd-key-wash {
+  background: var(--ord-before);
+}
+
+.pd-key-delta {
+  font-size: 10px;
+  color: var(--text-muted);
+}
+
+.pd-empty {
+  padding: 16px;
+}

@@ -1,0 +1,37 @@
+{
+  "schema": "ableton-linux-scenario/v1",
+  "name": "idle-playing",
+  "kind": "benchmark",
+  "base_set": "any",
+  "description": "The canonical protocol as a scenario: stop, rewind, play before the window, a marker every 5 s inside it, stop afterwards. Runs on every set.",
+  "requires": {
+    "control_surface": true,
+    "max_for_live": false,
+    "plugins": []
+  },
+  "setup": [
+    {
+      "op": "stop"
+    },
+    {
+      "op": "rewind"
+    },
+    {
+      "op": "play"
+    },
+    {
+      "op": "marker",
+      "name": "setup-done"
+    }
+  ],
+  "timeline": {
+    "repeat": false,
+    "marker_every_s": 5.0,
+    "steps": []
+  },
+  "teardown": [
+    {
+      "op": "stop"
+    }
+  ]
+}

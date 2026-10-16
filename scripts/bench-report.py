@@ -9,10 +9,12 @@ also manages the Wine session.
 from __future__ import annotations
 
 import argparse
+import collections
 import csv
 import datetime as dt
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -46,6 +48,36 @@ CANONICAL_MODES = {
     "Benchmark_Max4Live": "playback",
     "Benchmark_VSTs": "playback",
 }
+CAPTURE_MODES = ("idle-no-controller", "playback", "scenario")
+STRUCTURES = ("benchmark", "diagnostic")
+TRACE_MODES = ("off", "interface", "drilldown")
+# Timed tools started by capture. A scenario driver joins the list when one ran.
+COLLECTORS = ("pw-top", "pw-metadata", "osc")
+INTERFACE_SCHEMA = "ableton-linux-interface/v1"
+INTERFACE_DIRECTORY = "raw/interface"
+NEAR_LATE_FRACTION = 0.15
+INTERFACE_TOP = 20
+CALL_SITE_DEPTH = 3
+AUDIO_ROLES = frozenset({"pipeasio_callback", "audio_worker", "pipeasio_rt"})
+INTERFACE_KINDS = ("syscall", "unixcall", "server_req", "ntsync_wait")
+INTERFACE_CONFOUNDERS = {
+    "interface-tracer-coverage-incomplete": (
+        "The interface tracer did not run for the whole measurement window."
+    ),
+    "interface-lost-events": (
+        "The interface tracer lost events, so crossing counts and lost-slack shares are lower bounds."
+    ),
+    "interface-tracer-output-missing": (
+        "The measurement requested tracing but the tracer output is missing."
+    ),
+}
+INTERFACE_METRIC_SPECS = (
+    ("late_blocks", "Late audio blocks", "blocks", ("blocks", "late")),
+    ("near_late_blocks", "Near-late audio blocks", "blocks", ("blocks", "near_late")),
+    ("slack_p01_ns", "Block slack 1st percentile", "nanoseconds", ("blocks", "slack_ns", "p01")),
+    ("lost_slack_total_ns", "Lost slack", "nanoseconds", ("lost_slack", "total_ns")),
+    ("tracer_lost_events", "Tracer lost events", "events", ("tracer", "lost_events")),
+)
 # The report records the Wine CPU and audio settings used by the project.
 # Paths and other WINE_* values stay outside the report.
 BENCHMARK_WINE_ENV_KEYS = (
@@ -747,6 +779,53 @@ def playback_state_confounder(mode: str, osc: dict[str, Any]) -> dict[str, str] 
             "so the set did not remain in its prepared playback state."
         ),
     }
+
+
+def parse_scenario(text: str) -> dict[str, Any]:
+    """Parse the scenario driver log: capture offset, driver offset, kind, name."""
+    markers: list[dict[str, Any]] = []
+    operations = 0
+    for raw_line in text.splitlines():
+        fields = raw_line.split("\t")
+        if len(fields) < 4:
+            continue
+        try:
+            offset, driver_offset = float(fields[0]), float(fields[1])
+        except ValueError:
+            continue
+        if fields[2] == "marker":
+            markers.append({
+                "name": fields[3], "offset_seconds": round(offset, 6),
+                "scenario_offset_seconds": driver_offset,
+            })
+        elif fields[2] == "op":
+            operations += 1
+    return {"markers": markers, "operations": operations}
+
+
+def scenario_record(name: str, tool: str, log: dict[str, Any]) -> dict[str, Any]:
+    # Scenario files live beside the control tool: profiler/control/<tool> and
+    # profiler/scenarios/<name>.json.
+    path = Path(tool).resolve().parent.parent / "scenarios" / f"{name}.json"
+    record = sha256_file(path)
+    kind = None
+    if record.get("exists"):
+        try:
+            kind = load_json_object(path).get("kind")
+        except ValueError:
+            kind = None
+    return {
+        "name": name, "kind": kind, "file": str(path), "sha256": record.get("sha256"),
+        "markers": log["markers"], "operations": log["operations"],
+    }
+
+
+def set_file_record(value: str | None) -> dict[str, Any]:
+    """Accept a bare digest or a sha256sum line (digest, two spaces, path)."""
+    if not value:
+        return {"path": None, "sha256": None}
+    digest, _, path = value.strip().partition(" ")
+    return {"path": path.lstrip(" *") or None, "sha256": digest.lower() or None}
 
 
 def parse_proc_stat(text: str) -> dict[str, Any] | None:
@@ -1759,6 +1838,9 @@ def process_groups(delta: dict[str, Any], prefix: Path, wine_root: Path) -> dict
 
 
 def capture(args: argparse.Namespace) -> int:
+    if getattr(args, "scenario", None) and not getattr(args, "scenario_tool", None):
+        print("capture: --scenario needs --scenario-tool", file=sys.stderr)
+        return 2
     output = Path(args.output).resolve()
     raw = output / "raw"
     raw.mkdir(parents=True, exist_ok=True)
@@ -1808,6 +1890,16 @@ def capture(args: argparse.Namespace) -> int:
     else:
         (raw / "osc.tsv").write_text("")
         (raw / "osc.stderr.txt").write_text("OSC mode: controller-free measurement\n")
+    scenario_name = getattr(args, "scenario", None)
+    collectors = COLLECTORS + (("scenario",) if scenario_name else ())
+    if scenario_name:
+        # The driver logs one "offset<TAB>marker<TAB>NAME" line per scenario step.
+        commands.append(TimedCommand(
+            "scenario",
+            [sys.executable, args.scenario_tool, "run", "--scenario", scenario_name,
+             "--duration", str(args.duration)],
+            raw, start_ns,
+        ))
     for command in commands:
         command.start()
     deadline_ns = start_ns + int(args.duration * 1_000_000_000)
@@ -1885,7 +1977,7 @@ def capture(args: argparse.Namespace) -> int:
     playback_confounder = playback_state_confounder(args.mode, osc)
     if playback_confounder:
         confounders.append(playback_confounder)
-    for name in ("pw-top", "pw-metadata", "osc"):
+    for name in collectors:
         intentionally_off = name == "osc" and args.osc == "off"
         if not intentionally_off and not collector_command_usable(
             command_results.get(name, {}), args.duration, name,
@@ -1985,6 +2077,14 @@ def capture(args: argparse.Namespace) -> int:
         "logs": logs,
         "live": live_identity,
         "crackle": crackle,
+        "scenario": (
+            scenario_record(scenario_name, args.scenario_tool, parse_scenario(read_text(raw / "scenario.tsv")))
+            if scenario_name else None
+        ),
+        "set_file": set_file_record(getattr(args, "set_sha256", None)),
+        # The tracer is started by the shell suite; the interface subcommand fills this in.
+        "trace": {"mode": getattr(args, "trace_mode", None) or "off", "directory": INTERFACE_DIRECTORY},
+        "interface": None,
         "confounders": confounders,
         "capture_commands": command_results,
         "evidence": {
@@ -2009,6 +2109,10 @@ def capture(args: argparse.Namespace) -> int:
             "osc": "raw/osc.tsv",
         },
     }
+    if scenario_name:
+        measurement["evidence"]["scenario"] = "raw/scenario.tsv"
+    if measurement["trace"]["mode"] != "off":
+        measurement["evidence"].update(interface_evidence())
     dump_json(output / "measurement.json", measurement)
     return 0
 
@@ -2095,6 +2199,20 @@ def live_inventory(prefix: Path) -> dict[str, Any]:
     return {"preferences": preferences, "executables": executables}
 
 
+def virtualization_record(
+    raw_dir: Path, dmi_path: Path = Path("/sys/class/dmi/id/product_name"),
+) -> dict[str, Any]:
+    # systemd-detect-virt prints "none" and exits 1 on bare metal. The exit
+    # code stays in the command record; timing claims need "none".
+    value = read_text(raw_dir / "virt.stdout.txt").strip() or "unknown"
+    return {
+        "detector": "systemd-detect-virt",
+        "value": value,
+        "dmi_product": read_text(dmi_path).strip() or None,
+        "timing_claims_allowed": value == "none",
+    }
+
+
 def refresh_live(args: argparse.Namespace) -> int:
     """Replace only the launch-written Live inventory in a pre-launch profile."""
     path = Path(args.profile).resolve()
@@ -2149,6 +2267,7 @@ def profile(args: argparse.Namespace) -> int:
         "pipewire-version": ["pipewire", "--version"],
         "wireplumber-version": ["wireplumber", "--version"],
         "power-profile": ["powerprofilesctl", "get"],
+        "virt": ["systemd-detect-virt"],
     }
     results = {name: command_capture(name, argv, raw, 20 if name == "pw-dump" else 10) for name, argv in commands.items()}
     static_files = {
@@ -2228,6 +2347,7 @@ def profile(args: argparse.Namespace) -> int:
                 "requests at both CPU samples."
             ),
             "audio_kernel": kernel_audio,
+            "virtualization": virtualization_record(raw),
         },
         "pipewire": {
             "versions": {
@@ -2323,6 +2443,13 @@ def init_run(args: argparse.Namespace) -> int:
         "tag": args.tag,
         "duration_seconds_per_set": args.duration,
         "set_order": args.set,
+        "structure": getattr(args, "structure", None) or "benchmark",
+        "scenario": getattr(args, "scenario", None),
+        "trace": {
+            "mode": getattr(args, "trace_mode", None) or "off",
+            "tracer": getattr(args, "tracer", None),
+            "privilege": getattr(args, "privilege", None),
+        },
         "suite_log": "suite.log",
         "harness": {
             "files": harness_records,
@@ -2353,6 +2480,617 @@ def update_run(args: argparse.Namespace) -> int:
     return 0
 
 
+def interface_evidence() -> dict[str, str]:
+    return {
+        "interface_tracer": f"{INTERFACE_DIRECTORY}/tracer.json",
+        "interface_blocks": f"{INTERFACE_DIRECTORY}/blocks.jsonl",
+        "interface_threads": f"{INTERFACE_DIRECTORY}/threads.jsonl",
+    }
+
+
+def is_number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def read_jsonl(path: Path) -> list[dict[str, Any]]:
+    records = []
+    with path.open(errors="replace") as source:
+        for number, line in enumerate(source, 1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                value = json.loads(line)
+            except json.JSONDecodeError as error:
+                raise ValueError(f"{path}:{number}: {error}") from error
+            if isinstance(value, dict):
+                records.append(value)
+    return records
+
+
+def percentile(values: list[Any], fraction: float) -> Any:
+    """Nearest-rank percentile of a sorted list."""
+    if not values:
+        return None
+    rank = min(len(values), max(1, math.ceil(fraction * len(values))))
+    return values[rank - 1]
+
+
+def common_value(values: list[int]) -> int | None:
+    """Most frequent value; the smallest wins a tie."""
+    if not values:
+        return None
+    counts = collections.Counter(values)
+    return sorted(counts, key=lambda value: (-counts[value], value))[0]
+
+
+def measurement_window(measurement: dict[str, Any]) -> tuple[int, int]:
+    window = measurement.get("window")
+    start_ns = window.get("monotonic_start_ns") if isinstance(window, dict) else None
+    deadline_ns = window.get("monotonic_deadline_ns") if isinstance(window, dict) else None
+    if not is_number(start_ns) or not is_number(deadline_ns) or deadline_ns <= start_ns:
+        raise ValueError("measurement lacks monotonic window evidence")
+    return int(start_ns), int(deadline_ns)
+
+
+def load_tracer_records(path: Path, tracer: dict[str, Any]) -> tuple[int | None, list[dict[str, Any]]]:
+    """Return the tracer time base and the data records of one JSON lines file."""
+    base_ns = None
+    records = []
+    for record in read_jsonl(path):
+        if record.get("type") == "header":
+            if is_number(record.get("monotonic_start_ns")):
+                base_ns = int(record["monotonic_start_ns"])
+            continue
+        records.append(record)
+    if base_ns is None and is_number(tracer.get("started_monotonic_ns")):
+        base_ns = int(tracer["started_monotonic_ns"])
+    return base_ns, records
+
+
+def records_in_window(
+    records: list[dict[str, Any]], field: str, base_ns: int, start_ns: int, deadline_ns: int,
+) -> list[dict[str, Any]]:
+    """Keep records whose offset time lies inside the measurement window."""
+    selected = []
+    for record in records:
+        if not is_number(record.get(field)):
+            continue
+        absolute_ns = base_ns + int(round(record[field] * 1_000_000_000))
+        if start_ns <= absolute_ns < deadline_ns:
+            selected.append(record)
+    return selected
+
+
+def classify_blocks(blocks: list[dict[str, Any]], near_late_fraction: float) -> list[dict[str, Any]]:
+    """Mark each block late or near-late and compute its lost slack."""
+    periods = [int(block["period_ns"]) for block in blocks if is_number(block.get("period_ns"))]
+    period_mode = common_value(periods)
+    classified = []
+    for block in blocks:
+        if not is_number(block.get("slack_ns")):
+            continue
+        period = int(block["period_ns"]) if is_number(block.get("period_ns")) else period_mode
+        threshold = int(round(near_late_fraction * period)) if period else 0
+        slack = int(block["slack_ns"])
+        late = slack < 0
+        near_late = not late and slack < threshold
+        elapsed = None
+        if is_number(block.get("t_start")) and is_number(block.get("t_end")):
+            elapsed = int(round((block["t_end"] - block["t_start"]) * 1_000_000_000))
+        classified.append({
+            "block": block, "slack_ns": slack, "period_ns": period, "threshold_ns": threshold,
+            "late": late, "near_late": near_late, "elapsed_ns": elapsed,
+            "lost_ns": threshold - slack if late or near_late else 0,
+        })
+    return classified
+
+
+def stack_caller(frames: Any) -> str:
+    if not isinstance(frames, list) or not frames:
+        return "unsampled"
+    return " <- ".join(str(frame) for frame in frames[:CALL_SITE_DEPTH])
+
+
+def block_sites(block: dict[str, Any]) -> list[dict[str, Any]]:
+    """Split each crossing aggregate across the callers sampled for its thread, kind and id."""
+    samples: dict[tuple[Any, Any, Any], collections.Counter] = {}
+    for stack in block.get("stacks") or []:
+        if isinstance(stack, dict):
+            key = (stack.get("tid"), stack.get("kind"), stack.get("id"))
+            samples.setdefault(key, collections.Counter())[stack_caller(stack.get("frames"))] += 1
+    sites = []
+    for crossing in block.get("crossings") or []:
+        if not isinstance(crossing, dict):
+            continue
+        kind, name = str(crossing.get("kind")), str(crossing.get("id"))
+        count = crossing.get("n") if is_number(crossing.get("n")) else 0
+        total_ns = crossing.get("total_ns") if is_number(crossing.get("total_ns")) else 0
+        max_ns = crossing.get("max_ns") if is_number(crossing.get("max_ns")) else 0
+        callers = samples.get((crossing.get("tid"), crossing.get("kind"), crossing.get("id")))
+        if not callers:
+            callers = collections.Counter({"unsampled": 1})
+        sampled = sum(callers.values())
+        for caller, hits in callers.items():
+            fraction = hits / sampled
+            sites.append({
+                "key": f"{kind}|{name}|{caller}", "kind": kind, "name": name, "caller": caller,
+                "role": crossing.get("role"), "n": count * fraction, "total_ns": total_ns * fraction,
+                "max_ns": max_ns, "woken_by": crossing.get("woken_by"),
+            })
+    return sites
+
+
+def wake_counts(woken_by: Any, count: float) -> list[tuple[tuple[Any, Any], float]]:
+    """Read a crossing's woken_by value: one waker (counted once per crossing) or a list."""
+    if isinstance(woken_by, dict):
+        hits = woken_by["count"] if is_number(woken_by.get("count")) else count
+        return [((woken_by.get("tid"), woken_by.get("role")), hits)]
+    if isinstance(woken_by, list):
+        return [
+            ((entry.get("tid"), entry.get("role")), entry["count"] if is_number(entry.get("count")) else 1)
+            for entry in woken_by if isinstance(entry, dict)
+        ]
+    return []
+
+
+def interface_call_sites(
+    classified: list[dict[str, Any]], top: int,
+) -> tuple[list[dict[str, Any]], int, list[dict[str, Any]]]:
+    """Rank crossing sites by their time in late and near-late blocks.
+
+    Each block's lost slack is shared among its crossings in proportion to
+    their time, so a site's share never exceeds the block's lost slack.
+    """
+    sites: dict[str, dict[str, Any]] = {}
+    hotspots: dict[tuple[str, str, str], dict[str, Any]] = {}
+    attributed_total = 0.0
+    lost_total = sum(item["lost_ns"] for item in classified)
+    for item in classified:
+        block_site_list = block_sites(item["block"])
+        stressed = item["late"] or item["near_late"]
+        weight = 0.0
+        if stressed:
+            crossing_total = sum(site["total_ns"] for site in block_site_list)
+            weight = min(1.0, item["lost_ns"] / crossing_total) if crossing_total > 0 else 0.0
+            attributed_total += min(item["lost_ns"], crossing_total)
+        counted: set[str] = set()
+        for site in block_site_list:
+            record = sites.get(site["key"])
+            if record is None:
+                record = sites[site["key"]] = {
+                    "key": site["key"], "kind": site["kind"], "name": site["name"], "caller": site["caller"],
+                    "late_blocks": 0, "near_late_blocks": 0, "n_in_late_blocks": 0.0,
+                    "total_ns_in_late_blocks": 0.0, "max_ns": 0, "attributed_ns": 0.0,
+                    "n_all_blocks": 0.0, "total_ns_all_blocks": 0.0, "woken_by": collections.Counter(),
+                }
+            record["n_all_blocks"] += site["n"]
+            record["total_ns_all_blocks"] += site["total_ns"]
+            record["max_ns"] = max(record["max_ns"], site["max_ns"])
+            for waker, hits in wake_counts(site["woken_by"], site["n"]):
+                record["woken_by"][waker] += hits
+            if stressed:
+                record["n_in_late_blocks"] += site["n"]
+                record["total_ns_in_late_blocks"] += site["total_ns"]
+                record["attributed_ns"] += site["total_ns"] * weight
+                if site["key"] not in counted:
+                    counted.add(site["key"])
+                    record["late_blocks" if item["late"] else "near_late_blocks"] += 1
+            role = site["role"]
+            if isinstance(role, str) and role and role not in AUDIO_ROLES:
+                hotspot = hotspots.setdefault((role, site["kind"], site["caller"]), {
+                    "role": role, "kind": site["kind"], "caller": site["caller"], "n": 0.0, "total_ns": 0.0,
+                })
+                hotspot["n"] += site["n"]
+                hotspot["total_ns"] += site["total_ns"]
+    ranked = sorted(sites.values(), key=lambda record: (
+        -record["total_ns_in_late_blocks"], -record["n_in_late_blocks"], record["key"],
+    ))
+    call_sites = []
+    for rank, record in enumerate(ranked[:top], 1):
+        stressed_blocks = record["late_blocks"] + record["near_late_blocks"]
+        wakers = sorted(record["woken_by"].items(), key=lambda entry: (-entry[1], str(entry[0])))
+        call_sites.append({
+            "rank": rank, "key": record["key"], "kind": record["kind"], "name": record["name"],
+            "caller": record["caller"],
+            "late_blocks": record["late_blocks"], "near_late_blocks": record["near_late_blocks"],
+            "n_in_late_blocks": int(round(record["n_in_late_blocks"])),
+            "per_late_block": (
+                round(record["n_in_late_blocks"] / stressed_blocks, 4) if stressed_blocks else None
+            ),
+            "total_ns_in_late_blocks": int(round(record["total_ns_in_late_blocks"])),
+            "max_ns": int(round(record["max_ns"])),
+            "share_of_lost_slack": round(record["attributed_ns"] / lost_total, 4) if lost_total > 0 else None,
+            "n_all_blocks": int(round(record["n_all_blocks"])),
+            "total_ns_all_blocks": int(round(record["total_ns_all_blocks"])),
+            "woken_by": [
+                {"tid": tid, "role": role, "count": int(round(hits))}
+                for (tid, role), hits in wakers[:5] if int(round(hits)) > 0
+            ],
+        })
+    hotspot_list = sorted(hotspots.values(), key=lambda item: (
+        -item["total_ns"], -item["n"], item["role"], item["kind"], item["caller"],
+    ))[:top]
+    hotspot_list = [
+        {**item, "n": int(round(item["n"])), "total_ns": int(round(item["total_ns"]))} for item in hotspot_list
+    ]
+    return call_sites, int(round(attributed_total)), hotspot_list
+
+
+def interface_kinds(classified: list[dict[str, Any]]) -> dict[str, dict[str, int]]:
+    kinds = {kind: {"n": 0, "total_ns": 0} for kind in INTERFACE_KINDS}
+    for item in classified:
+        for crossing in item["block"].get("crossings") or []:
+            if not isinstance(crossing, dict):
+                continue
+            record = kinds.setdefault(str(crossing.get("kind")), {"n": 0, "total_ns": 0})
+            for key in ("n", "total_ns"):
+                if is_number(crossing.get(key)):
+                    record[key] += int(round(crossing[key]))
+    return kinds
+
+
+def interface_roles(records: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Per-role crossing load from the 100 ms thread bins inside the window."""
+    per_role: dict[str, list[tuple[int, int]]] = {}
+    for record in records:
+        role = record.get("role")
+        crossings = record.get("crossings")
+        if not isinstance(role, str) or not isinstance(crossings, dict):
+            continue
+        values = [value for value in crossings.values() if isinstance(value, dict)]
+        count = sum(int(round(value["n"])) for value in values if is_number(value.get("n")))
+        total = sum(int(round(value["total_ns"])) for value in values if is_number(value.get("total_ns")))
+        per_role.setdefault(role, []).append((count, total))
+    roles = {}
+    for role, values in sorted(per_role.items()):
+        counts = sorted(count for count, _ in values)
+        totals = sorted(total for _, total in values)
+        roles[role] = {
+            "bins": len(values),
+            "crossings_per_100ms": {"p50": percentile(counts, 0.5), "p99": percentile(counts, 0.99)},
+            "total_ns_per_100ms": {"p50": percentile(totals, 0.5), "p99": percentile(totals, 0.99)},
+        }
+    return roles
+
+
+def interface_tracer(
+    tracer: dict[str, Any], summary: dict[str, Any], start_ns: int, deadline_ns: int,
+) -> dict[str, Any]:
+    duration = (deadline_ns - start_ns) / 1_000_000_000
+    started, stopped = tracer.get("started_monotonic_ns"), tracer.get("stopped_monotonic_ns")
+    started_offset = round((started - start_ns) / 1_000_000_000, 6) if is_number(started) else None
+    stopped_offset = round((stopped - start_ns) / 1_000_000_000, 6) if is_number(stopped) else None
+    lost = tracer.get("lost_events")
+    overhead: dict[str, Any] = {
+        "estimate_ns_per_block": tracer.get("overhead_estimate_ns_per_block"),
+        "probe_hits": tracer.get("probe_hits") if isinstance(tracer.get("probe_hits"), dict) else {},
+    }
+    for key in ("unmatched_exits", "abandoned_entries", "ringbuf_drops"):
+        value = summary.get(key, tracer.get(key))
+        if is_number(value):
+            overhead[key] = value
+    return {
+        "version": tracer.get("version"),
+        "mode": tracer.get("mode"),
+        "sample_rate": tracer.get("sample_rate"),
+        "attach": tracer.get("attach") if isinstance(tracer.get("attach"), list) else [],
+        "lost_events": int(lost) if is_number(lost) else None,
+        "overhead": overhead,
+        "started_offset_seconds": started_offset,
+        "stopped_offset_seconds": stopped_offset,
+        "coverage_complete": bool(
+            started_offset is not None and stopped_offset is not None
+            and started_offset <= 0 and stopped_offset >= duration
+        ),
+    }
+
+
+def interface_section(
+    measurement: dict[str, Any],
+    tracer: dict[str, Any],
+    summary: dict[str, Any],
+    blocks: list[dict[str, Any]],
+    base_ns: int,
+    threads: list[dict[str, Any]],
+    threads_base_ns: int,
+    *,
+    near_late_fraction: float = NEAR_LATE_FRACTION,
+    top: int = INTERFACE_TOP,
+) -> dict[str, Any]:
+    """Summarise the tracer output for the blocks inside the measurement window."""
+    start_ns, deadline_ns = measurement_window(measurement)
+    duration = (deadline_ns - start_ns) / 1_000_000_000
+    selected = records_in_window(blocks, "t_start", base_ns, start_ns, deadline_ns)
+    classified = classify_blocks(selected, near_late_fraction)
+    tracer_value = interface_tracer(tracer, summary, start_ns, deadline_ns)
+    slack = sorted(item["slack_ns"] for item in classified)
+    elapsed = sorted(item["elapsed_ns"] for item in classified if item["elapsed_ns"] is not None)
+    periods = [item["period_ns"] for item in classified if item["period_ns"]]
+    period_mode = common_value(periods)
+    late = sum(item["late"] for item in classified)
+    near_late = sum(item["near_late"] for item in classified)
+    lost_total = sum(item["lost_ns"] for item in classified)
+    call_sites, attributed, hotspots = interface_call_sites(classified, top)
+    mode = nested(measurement, "trace", "mode")
+    if mode in (None, "off"):
+        mode = "drilldown" if tracer.get("mode") == "drilldown" else "interface"
+    confounders = []
+    if not tracer_value["coverage_complete"]:
+        confounders.append("interface-tracer-coverage-incomplete")
+    if tracer_value["lost_events"]:
+        confounders.append("interface-lost-events")
+    return {
+        "schema": INTERFACE_SCHEMA,
+        "mode": mode,
+        "tracer": tracer_value,
+        "evidence": {
+            "blocks": f"{INTERFACE_DIRECTORY}/blocks.jsonl",
+            "threads": f"{INTERFACE_DIRECTORY}/threads.jsonl",
+            "tracer": f"{INTERFACE_DIRECTORY}/tracer.json",
+            "stacks": f"{INTERFACE_DIRECTORY}/stacks.jsonl",
+        },
+        "window": {"blocks_in_file": len(blocks), "blocks_in_window": len(selected)},
+        "thresholds": {
+            "near_late_fraction": near_late_fraction,
+            "deadline_ns_mode": period_mode,
+            "near_late_slack_ns": int(round(near_late_fraction * period_mode)) if period_mode else None,
+        },
+        "blocks": {
+            "count": len(classified),
+            "late": late,
+            "near_late": near_late,
+            "late_per_minute": round(late / (duration / 60), 3) if duration else None,
+            "slack_ns": {
+                "min": slack[0] if slack else None, "p01": percentile(slack, 0.01),
+                "p50": percentile(slack, 0.5), "p99": percentile(slack, 0.99),
+            },
+            "elapsed_ns": {
+                "p50": percentile(elapsed, 0.5), "p99": percentile(elapsed, 0.99),
+                "max": elapsed[-1] if elapsed else None,
+            },
+            "deadline_ns": {"min": min(periods) if periods else None, "max": max(periods) if periods else None},
+        },
+        "lost_slack": {
+            "definition": "sum over late and near-late blocks of (near_late_slack_ns - slack_ns)",
+            "total_ns": lost_total,
+            "attributed_ns": attributed,
+            "unattributed_ns": lost_total - attributed,
+        },
+        "call_sites": call_sites,
+        "kinds": interface_kinds(classified),
+        "roles": interface_roles(records_in_window(threads, "t", threads_base_ns, start_ns, deadline_ns)),
+        "hotspots_non_audio": hotspots,
+        "confounders": confounders,
+    }
+
+
+def interface(args: argparse.Namespace) -> int:
+    """Rewrite measurement.json with the interface section for one set."""
+    try:
+        set_dir = Path(args.set_dir).resolve()
+        measurement_path = set_dir / "measurement.json"
+        measurement = load_json_object(measurement_path)
+        measurement_window(measurement)
+        mode = nested(measurement, "trace", "mode") or "off"
+        directory = set_dir / INTERFACE_DIRECTORY
+        missing = [name for name in ("tracer.json", "blocks.jsonl") if not (directory / name).is_file()]
+        confounders = [
+            item for item in measurement.get("confounders", [])
+            if not str(item.get("kind", "")).startswith("interface-")
+        ]
+        if missing:
+            if mode == "off":
+                print(f"interface: trace mode off and no tracer output in {directory}; nothing to do", file=sys.stderr)
+                return 0
+            kind = "interface-tracer-output-missing"
+            confounders.append({"kind": kind, "effect": f"{INTERFACE_CONFOUNDERS[kind]} Missing: {', '.join(missing)}."})
+            measurement["confounders"] = confounders
+            measurement["interface"] = None
+            dump_json(measurement_path, measurement)
+            raise ValueError(f"{directory}: missing {', '.join(missing)} while trace mode is {mode}")
+        tracer = load_json_object(directory / "tracer.json")
+        summary_path = directory / "summary.json"
+        summary = load_json_object(summary_path) if summary_path.is_file() else {}
+        base_ns, blocks = load_tracer_records(directory / "blocks.jsonl", tracer)
+        if base_ns is None:
+            raise ValueError(f"{directory / 'blocks.jsonl'}: no monotonic_start_ns in the header or tracer.json")
+        threads_path = directory / "threads.jsonl"
+        threads_base_ns, threads = (
+            load_tracer_records(threads_path, tracer) if threads_path.is_file() else (base_ns, [])
+        )
+        section = interface_section(
+            measurement, tracer, summary, blocks, base_ns, threads, threads_base_ns or base_ns,
+            near_late_fraction=args.near_late_fraction, top=args.top,
+        )
+        for kind in section["confounders"]:
+            confounders.append({"kind": kind, "effect": INTERFACE_CONFOUNDERS[kind]})
+        measurement["confounders"] = confounders
+        measurement["interface"] = section
+        evidence = measurement.get("evidence")
+        measurement["evidence"] = {**(evidence if isinstance(evidence, dict) else {}), **interface_evidence()}
+        dump_json(measurement_path, measurement)
+        return 0
+    except (ValueError, OSError) as error:
+        print(f"interface: {error}", file=sys.stderr)
+        return 2
+
+
+def drilldown_markdown(
+    set_name: str,
+    measurement: dict[str, Any],
+    classified: list[dict[str, Any]],
+    base_ns: int,
+    start_ns: int,
+    top: int,
+    extra_stacks: dict[Any, list[dict[str, Any]]],
+) -> str:
+    latest = sorted(classified, key=lambda item: (item["slack_ns"], item["block"].get("t_start", 0)))[:top]
+    lines = [
+        f"# Interface drill-down: {set_name}",
+        "",
+        f"- Run: `{measurement.get('run_id', 'pending')}`; trace mode `{nested(measurement, 'trace', 'mode') or 'off'}`",
+        f"- Blocks in window: {len(classified)}; late {sum(item['late'] for item in classified)}; "
+        f"near-late {sum(item['near_late'] for item in classified)}; showing the {len(latest)} with the least slack",
+    ]
+    for item in latest:
+        block = item["block"]
+        state = "late" if item["late"] else ("near-late" if item["near_late"] else "on time")
+        offset = (base_ns + int(round(block["t_start"] * 1_000_000_000)) - start_ns) / 1_000_000_000
+        lines.extend([
+            "",
+            f"## Block {block.get('seq', 'pending')}: slack {item['slack_ns']} ns ({state})",
+            "",
+            f"- Window offset {offset:.6f} s; elapsed {markdown_cell(item['elapsed_ns'])} ns; "
+            f"period {markdown_cell(item['period_ns'])} ns; near-late threshold {item['threshold_ns']} ns; "
+            f"lost slack {item['lost_ns']} ns; missed cycles {markdown_cell(block.get('missed_cycles'))}",
+            "",
+            "| Thread | Role | Kind | Id | Count | Total ns | Max ns | Woken by |",
+            "|---:|---|---|---|---:|---:|---:|---|",
+        ])
+        crossings = [item for item in block.get("crossings") or [] if isinstance(item, dict)]
+        crossings.sort(key=lambda crossing: -(crossing.get("total_ns") if is_number(crossing.get("total_ns")) else 0))
+        for crossing in crossings:
+            woken_by = crossing.get("woken_by")
+            lines.append(
+                f"| {markdown_cell(crossing.get('tid'))} | {markdown_cell(crossing.get('role'))} | "
+                f"{markdown_cell(crossing.get('kind'))} | {markdown_cell(crossing.get('id'))} | "
+                f"{markdown_cell(crossing.get('n'))} | {markdown_cell(crossing.get('total_ns'))} | "
+                f"{markdown_cell(crossing.get('max_ns'))} | "
+                f"{markdown_cell(json.dumps(woken_by, sort_keys=True)) if woken_by else ''} |"
+            )
+        stacks = [stack for stack in (block.get("stacks") or []) + extra_stacks.get(block.get("seq"), [])
+                  if isinstance(stack, dict)]
+        if stacks:
+            lines.extend(["", "Stacks:", ""])
+            for stack in stacks:
+                frames = stack.get("frames") if isinstance(stack.get("frames"), list) else []
+                stop = f" (stop: {stack['stop']})" if stack.get("stop") else ""
+                lines.append(
+                    f"- tid {stack.get('tid')} {stack.get('kind')} {stack.get('id')}: "
+                    f"{' <- '.join(str(frame) for frame in frames) or 'no frames'}{stop}"
+                )
+    lines.append("")
+    return "\n".join(lines)
+
+
+def interface_drilldown(args: argparse.Namespace) -> int:
+    """List the blocks with the least slack and their crossings for one set."""
+    try:
+        run_dir = Path(args.run_dir).resolve()
+        matches = sorted((run_dir / "sets").glob(f"*-{args.set}/measurement.json"))
+        if len(matches) != 1:
+            raise ValueError(f"expected one {args.set} measurement, found {len(matches)}")
+        measurement = load_json_object(matches[0])
+        start_ns, deadline_ns = measurement_window(measurement)
+        directory = matches[0].parent / INTERFACE_DIRECTORY
+        tracer_path, blocks_path = directory / "tracer.json", directory / "blocks.jsonl"
+        if not blocks_path.is_file():
+            raise ValueError(f"{blocks_path}: no tracer output for {args.set}")
+        tracer = load_json_object(tracer_path) if tracer_path.is_file() else {}
+        base_ns, blocks = load_tracer_records(blocks_path, tracer)
+        if base_ns is None:
+            raise ValueError(f"{blocks_path}: no monotonic_start_ns in the header or tracer.json")
+        classified = classify_blocks(
+            records_in_window(blocks, "t_start", base_ns, start_ns, deadline_ns),
+            nested(measurement, "interface", "thresholds", "near_late_fraction") or NEAR_LATE_FRACTION,
+        )
+        extra_stacks: dict[Any, list[dict[str, Any]]] = {}
+        stacks_path = directory / "stacks.jsonl"
+        if stacks_path.is_file():
+            for record in load_tracer_records(stacks_path, tracer)[1]:
+                extra_stacks.setdefault(record.get("seq"), []).append(record)
+        text = drilldown_markdown(args.set, measurement, classified, base_ns, start_ns, args.top, extra_stacks)
+        if args.output:
+            Path(args.output).write_text(text)
+        else:
+            print(text, end="")
+        return 0
+    except (ValueError, OSError) as error:
+        print(f"interface drill-down: {error}", file=sys.stderr)
+        return 2
+
+
+def markdown_cell(value: Any) -> str:
+    """Render a table cell without truncation."""
+    return "pending" if value is None else str(value).replace("|", "\\|").replace("\n", " ")
+
+
+def markdown_number(value: Any, digits: int = 2) -> str:
+    return f"{value:.{digits}f}" if is_number(value) else "pending"
+
+
+def markdown_percent(fraction: Any) -> str:
+    return f"{fraction * 100:.1f}%" if is_number(fraction) else "pending"
+
+
+def virtualization_banner(*values: Any) -> list[str]:
+    """Return the no-timing-claims banner when any run was virtualised."""
+    labels = list(dict.fromkeys(str(value) for value in values if value_present(value) and value != "none"))
+    if not labels:
+        return []
+    return [
+        "",
+        f"> NO TIMING CLAIMS: this run executed under {' and '.join(labels)}; "
+        "use it for mechanism and tooling evidence only.",
+    ]
+
+
+def interface_markdown(report: dict[str, Any]) -> list[str]:
+    sets = report.get("sets", [])
+    trace_mode = nested(report["run"], "trace", "mode") or "off"
+    if trace_mode == "off" and not any(isinstance(item.get("interface"), dict) for item in sets):
+        return []
+    lines = [
+        "",
+        "## Interface crossings",
+        "",
+        "Late blocks ended after their deadline. Near-late blocks kept less slack than the near-late "
+        "fraction of the block period. Site values sum over late and near-late blocks. Each block's lost "
+        "slack is shared among its crossings in proportion to their time, so shares never exceed one.",
+    ]
+    for item in sets:
+        interface_value = item.get("interface")
+        lines.extend(["", f"### {item.get('set')}", ""])
+        if not isinstance(interface_value, dict):
+            lines.append("- Interface data unavailable; see the measurement confounders.")
+            continue
+        blocks = interface_value.get("blocks", {})
+        lost = interface_value.get("lost_slack", {})
+        tracer = interface_value.get("tracer", {})
+        attributed, total = lost.get("attributed_ns"), lost.get("total_ns")
+        if is_number(attributed) and is_number(total) and total > 0:
+            attributed_label = f"{attributed / total * 100:.1f}%"
+        else:
+            attributed_label = "none lost" if total == 0 else "pending"
+        lines.append(
+            f"- Blocks {markdown_cell(blocks.get('count'))}, late {markdown_cell(blocks.get('late'))}, "
+            f"near-late {markdown_cell(blocks.get('near_late'))}, slack p01 "
+            f"{markdown_cell(nested(blocks, 'slack_ns', 'p01'))} ns, lost slack attributed {attributed_label}; "
+            f"tracer `{tracer.get('mode') or 'pending'}` coverage "
+            f"{'complete' if tracer.get('coverage_complete') else 'incomplete'}, "
+            f"lost events {markdown_cell(tracer.get('lost_events'))}"
+        )
+        if interface_value.get("confounders"):
+            lines.append(f"- Confounders: {', '.join(interface_value['confounders'])}")
+        call_sites = interface_value.get("call_sites") or []
+        if not call_sites:
+            lines.append("- No crossings were recorded in late or near-late blocks.")
+            continue
+        lines.extend([
+            "",
+            "| Rank | Crossing | Caller | Per late block | Share of lost slack |",
+            "|---:|---|---|---:|---:|",
+        ])
+        for site in call_sites:
+            lines.append(
+                f"| {site.get('rank')} | {markdown_cell(site.get('kind'))} {markdown_cell(site.get('name'))} | "
+                f"{markdown_cell(site.get('caller'))} | {markdown_number(site.get('per_late_block'))} | "
+                f"{markdown_percent(site.get('share_of_lost_slack'))} |"
+            )
+    return lines
+
+
 def markdown_report(report: dict[str, Any]) -> str:
     run = report["run"]
     profile_value = report.get("profile", {})
@@ -2362,6 +3100,9 @@ def markdown_report(report: dict[str, Any]) -> str:
         f"- Tag: `{run.get('tag', 'pending')}`",
         f"- Status: `{run.get('status', 'pending')}`",
         f"- Measurement time: {run.get('duration_seconds_per_set', 'pending')} seconds per set",
+        f"- Structure: `{run.get('structure') or 'benchmark'}`",
+        f"- Trace: `{nested(run, 'trace', 'mode') or 'off'}`",
+        f"- Scenario: `{run.get('scenario') or 'none'}`",
         f"- Benchmark files SHA-256: `{run.get('harness', {}).get('identity_hash', 'pending')}`",
         f"- Generated: {report['generated_at']}",
     ]
@@ -2370,6 +3111,7 @@ def markdown_report(report: dict[str, Any]) -> str:
             f"- Report source ID: `{report['csv'].get('machine_id', 'pending')}`",
             f"- CSV file: `{report['csv'].get('filename', 'pending')}`",
         ])
+    lines.extend(virtualization_banner(nested(profile_value, "system", "virtualization", "value")))
     lines.extend([
         "",
         "## Results",
@@ -2440,6 +3182,7 @@ def markdown_report(report: dict[str, Any]) -> str:
             f"{pw.get('err_delta', 'pending')} | {number(dsp.get('average_percent'))} / "
             f"{number(dsp.get('peak_percent'))} | {transition_label} | {item.get('crackle', {}).get('status', 'unknown')} |"
         )
+    lines.extend(interface_markdown(report))
     runtime = profile_value.get("runtime", {})
     prefix = profile_value.get("prefix", {})
     live_inventory_value = profile_value.get("live", {})
@@ -2563,21 +3306,41 @@ def load_json_object(path: Path) -> dict[str, Any]:
     return value
 
 
-def load_completed_run(path: Path) -> dict[str, Any]:
-    """Load run details and measurements from a finished run."""
+def load_completed_run(path: Path, structure: str = "benchmark") -> dict[str, Any]:
+    """Load run details and measurements from a finished run.
+
+    The benchmark structure keeps the canonical five-set, 30-second protocol.
+    The diagnostic structure accepts any set list and any duration from the
+    capture floor; comparison_report checks that both runs match.
+    """
     run_dir = path.resolve()
     run = load_json_object(run_dir / "run.json")
     if (run.get("schema"), run.get("kind")) != (SCHEMA, "benchmark-run"):
         raise ValueError(f"{run_dir}: incompatible run schema/kind")
     if run.get("status") != "complete":
         raise ValueError(f"{run_dir}: run status is {run.get('status')!r}, expected 'complete'")
-    if run.get("set_order") != list(CANONICAL_SETS):
-        raise ValueError(f"{run_dir}: set_order is not the canonical five-set order")
     duration = run.get("duration_seconds_per_set")
     if not isinstance(duration, (int, float)) or isinstance(duration, bool) or duration <= 0:
         raise ValueError(f"{run_dir}: invalid duration_seconds_per_set")
-    if duration != 30:
-        raise ValueError(f"{run_dir}: comparison requires the canonical 30-second protocol")
+    set_order = run.get("set_order")
+    if structure == "benchmark":
+        if run.get("structure", "benchmark") != "benchmark" or run.get("scenario"):
+            raise ValueError(f"{run_dir}: run structure is diagnostic; compare it with --structure diagnostic")
+        if set_order != list(CANONICAL_SETS):
+            raise ValueError(f"{run_dir}: set_order is not the canonical five-set order")
+        if duration != 30:
+            raise ValueError(f"{run_dir}: comparison requires the canonical 30-second protocol")
+    else:
+        if (
+            not isinstance(set_order, list) or not set_order
+            or not all(isinstance(name, str) and name for name in set_order)
+            or len(set(set_order)) != len(set_order)
+        ):
+            raise ValueError(f"{run_dir}: set_order must list distinct set names")
+        if duration < MIN_BENCH_DURATION_SECONDS:
+            raise ValueError(
+                f"{run_dir}: diagnostic comparison needs sets of at least {MIN_BENCH_DURATION_SECONDS} seconds"
+            )
     profile_path = run_dir / "profile/profile.json"
     profile_value = load_json_object(profile_path)
     if (profile_value.get("schema"), profile_value.get("kind")) != (SCHEMA, "system-profile"):
@@ -2586,7 +3349,7 @@ def load_completed_run(path: Path) -> dict[str, Any]:
     if csv_contract and nested(profile_value, "machine", "id") != csv_contract[0]:
         raise ValueError(f"{profile_path}: report source ID must match run.json")
     sets = []
-    for name in CANONICAL_SETS:
+    for name in set_order:
         matches = sorted((run_dir / "sets").glob(f"*-{name}/measurement.json"))
         if len(matches) != 1:
             raise ValueError(f"{run_dir}: expected one {name} measurement, found {len(matches)}")
@@ -2595,8 +3358,9 @@ def load_completed_run(path: Path) -> dict[str, Any]:
             raise ValueError(f"{matches[0]}: incompatible measurement schema/kind")
         if measurement.get("set") != name:
             raise ValueError(f"{matches[0]}: embedded set name does not match directory")
-        if measurement.get("mode") != CANONICAL_MODES[name]:
-            raise ValueError(f"{matches[0]}: unexpected mode {measurement.get('mode')!r}")
+        mode = measurement.get("mode")
+        if mode not in CAPTURE_MODES or (structure == "benchmark" and mode != CANONICAL_MODES[name]):
+            raise ValueError(f"{matches[0]}: unexpected mode {mode!r}")
         if measurement.get("duration_seconds") != duration:
             raise ValueError(f"{matches[0]}: measurement duration differs from run duration")
         window = measurement.get("window")
@@ -2690,6 +3454,7 @@ IDENTITY_SPECS = (
     ("pipeasio_config", "PipeASIO settings path and hash", ("configuration", "pipeasio_effective_config"), False),
     ("benchmark_gates", "Wine, PipeASIO, and launcher CPU settings", ("configuration", "benchmark_gates"), True),
     ("power_profile", "Power profile before Live starts", ("system", "power_profile"), True),
+    ("virtualization", "Virtualization", ("system", "virtualization", "value"), True),
 )
 
 
@@ -2803,6 +3568,13 @@ def task_churn_counts(measurement: dict[str, Any]) -> dict[str, int | None]:
     return counts
 
 
+def measurement_collectors(measurement: dict[str, Any]) -> tuple[str, ...]:
+    """Timed tools expected in a measurement; the scenario driver only when one ran."""
+    if isinstance(measurement.get("scenario"), dict):
+        return COLLECTORS + ("scenario",)
+    return COLLECTORS
+
+
 def measurement_confounders(measurement: dict[str, Any], side: str) -> list[str]:
     values = [f"{side}:{item.get('kind', 'unspecified')}" for item in measurement.get("confounders", [])]
     accounting = nested(measurement, "process", "details", "accounting") or {}
@@ -2817,7 +3589,7 @@ def measurement_confounders(measurement: dict[str, Any], side: str) -> list[str]
         values.append(f"{side}:pipewire-settings-transition")
     if quantum_transition_count(measurement):
         values.append(f"{side}:quantum-transition")
-    for name in ("pw-top", "pw-metadata", "osc"):
+    for name in measurement_collectors(measurement):
         intentionally_off = name == "osc" and measurement.get("set") == "Benchmark_Zero"
         if not intentionally_off and not collector_observed(measurement, name):
             values.append(f"{side}:{name}-collector-unusable")
@@ -2912,7 +3684,7 @@ def set_metric_values(measurement: dict[str, Any]) -> dict[str, tuple[str, str, 
         ("total", "Process and thread changes"),
     ):
         values[f"task_churn_{key}"] = (label, "tasks", churn[key])
-    for collector in ("pw-top", "pw-metadata", "osc"):
+    for collector in measurement_collectors(measurement):
         timing = nested(measurement, "capture_commands", collector, "timing") or {}
         safe = collector.replace("-", "_")
         values[f"{safe}_coverage_seconds"] = (
@@ -2927,26 +3699,107 @@ def set_metric_values(measurement: dict[str, Any]) -> dict[str, tuple[str, str, 
     return values
 
 
-def comparison_report(before: dict[str, Any], after: dict[str, Any]) -> dict[str, Any]:
-    before_duration = before["run"]["duration_seconds_per_set"]
-    after_duration = after["run"]["duration_seconds_per_set"]
+def call_site_summary(site: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(site, dict):
+        return None
+    return {key: site.get(key) for key in (
+        "rank", "kind", "name", "caller", "late_blocks", "near_late_blocks", "n_in_late_blocks",
+        "total_ns_in_late_blocks", "share_of_lost_slack",
+    )}
+
+
+def interface_comparison(
+    first: dict[str, Any], last: dict[str, Any], confounders: list[str],
+) -> dict[str, Any] | None:
+    """Compare the interface sections of one set; None when neither run was traced."""
+    before, after = first.get("interface"), last.get("interface")
+    if not isinstance(before, dict) and not isinstance(after, dict):
+        return None
+    before = before if isinstance(before, dict) else {}
+    after = after if isinstance(after, dict) else {}
+    metrics = {
+        identifier: metric_comparison(label, unit, nested(before, *path), nested(after, *path), confounders)
+        for identifier, label, unit, path in INTERFACE_METRIC_SPECS
+    }
+    sites = lambda value: {  # noqa: E731
+        site["key"]: site for site in value.get("call_sites") or []
+        if isinstance(site, dict) and isinstance(site.get("key"), str)
+    }
+    first_sites, last_sites = sites(before), sites(after)
+    call_sites = []
+    for key in sorted(set(first_sites) | set(last_sites)):
+        site_before, site_after = first_sites.get(key), last_sites.get(key)
+        # A site outside one run's top list counts as zero on that side.
+        value = lambda site, field: (  # noqa: E731
+            site[field] if isinstance(site, dict) and is_number(site.get(field)) else 0
+        )
+        call_sites.append({
+            "key": key,
+            "before": call_site_summary(site_before),
+            "after": call_site_summary(site_after),
+            "delta_total_ns_in_late_blocks": (
+                value(site_after, "total_ns_in_late_blocks") - value(site_before, "total_ns_in_late_blocks")
+            ),
+            "delta_share": round(
+                value(site_after, "share_of_lost_slack") - value(site_before, "share_of_lost_slack"), 4,
+            ),
+        })
+    call_sites.sort(key=lambda item: (-abs(item["delta_share"]), item["key"]))
+    return {
+        "metrics": metrics,
+        "call_sites": call_sites,
+        "appeared": sorted(set(last_sites) - set(first_sites)),
+        "disappeared": sorted(set(first_sites) - set(last_sites)),
+    }
+
+
+def comparison_report(
+    before: dict[str, Any], after: dict[str, Any], structure: str = "benchmark",
+) -> dict[str, Any]:
+    before_run, after_run = before["run"], after["run"]
+    before_duration = before_run["duration_seconds_per_set"]
+    after_duration = after_run["duration_seconds_per_set"]
     if before_duration != after_duration:
         raise ValueError(
             f"duration mismatch: before={before_duration}, after={after_duration}; rerun with one common duration"
         )
+    before_trace = nested(before_run, "trace", "mode") or "off"
+    after_trace = nested(after_run, "trace", "mode") or "off"
+    if before_trace != after_trace:
+        raise ValueError(
+            f"trace mode mismatch: before={before_trace}, after={after_trace}; "
+            "traced and untraced runs are not comparable"
+        )
+    if structure != "benchmark":
+        if before_run.get("set_order") != after_run.get("set_order"):
+            raise ValueError("set order mismatch: diagnostic comparison needs identical sets in one order")
+        if before_run.get("scenario") != after_run.get("scenario"):
+            raise ValueError(
+                f"scenario mismatch: before={before_run.get('scenario')!r}, after={after_run.get('scenario')!r}; "
+                "diagnostic comparison needs one scenario"
+            )
     identities = [identity_comparison(
         "harness", "Benchmark tool files",
-        nested(before["run"], "harness", "identity_hash"),
-        nested(after["run"], "harness", "identity_hash"),
+        nested(before_run, "harness", "identity_hash"),
+        nested(after_run, "harness", "identity_hash"),
+    ), identity_comparison(
+        "trace", "Interface tracer", before_run.get("trace"), after_run.get("trace"), allow_empty=True,
     ), *profile_identity_checks(before, after)]
     global_confounders = [
         f"identity:{item['id']}:{item['status']}" for item in identities if item["confounder"]
     ]
     sets = []
     for first, last in zip(before["sets"], after["sets"]):
+        if structure != "benchmark" and first.get("mode") != last.get("mode"):
+            raise ValueError(
+                f"mode mismatch for {first.get('set')}: before={first.get('mode')!r}, after={last.get('mode')!r}"
+            )
         confounders = global_confounders + measurement_confounders(first, "before") + measurement_confounders(last, "after")
         if first.get("live") != last.get("live"):
             confounders.append("set-identity:Live-log-runtime/audio-identity")
+        first_sha, last_sha = nested(first, "set_file", "sha256"), nested(last, "set_file", "sha256")
+        if (first_sha or last_sha) and first_sha != last_sha:
+            confounders.append("set-identity:set-file")
         if nested(first, "process", "summary", "live", "audio_worker_count") != nested(
             last, "process", "summary", "live", "audio_worker_count"
         ):
@@ -2984,6 +3837,7 @@ def comparison_report(before: dict[str, Any], after: dict[str, Any]) -> dict[str
             "set": first["set"], "mode": first["mode"], "confounded": bool(confounders),
             "confounders": confounders, "metrics": metrics,
             "kernel_counters": {"before": first.get("kernel_counters"), "after": last.get("kernel_counters")},
+            "interface": interface_comparison(first, last, confounders),
         })
     return {
         "schema": SCHEMA,
@@ -2993,8 +3847,9 @@ def comparison_report(before: dict[str, Any], after: dict[str, Any]) -> dict[str
             "One before and one after run describe one pair. Repeat pairs to measure normal variation. "
             "Use tool and listener reports for audio results."
         ),
-        "structure": {"compatible": True, "canonical_set_order": list(CANONICAL_SETS),
-                      "duration_seconds_per_set": before_duration},
+        "structure": {"compatible": True, "name": structure, "canonical_set_order": list(CANONICAL_SETS),
+                      "set_order": before_run.get("set_order"), "scenario": before_run.get("scenario"),
+                      "trace_mode": before_trace, "duration_seconds_per_set": before_duration},
         "before": {"directory": before["directory"], "tag": before["run"].get("tag")},
         "after": {"directory": after["directory"], "tag": after["run"].get("tag")},
         "identity": identities,
@@ -3028,14 +3883,58 @@ def markdown_metric(metric: dict[str, Any]) -> str:
     return f"{before} → {after} ({change})"
 
 
+def comparison_interface_markdown(report: dict[str, Any]) -> list[str]:
+    traced = [item for item in report["sets"] if isinstance(item.get("interface"), dict)]
+    if not traced:
+        return []
+    lines = [
+        "",
+        "## Interface crossings",
+        "",
+        "Shares are shares of lost slack. A site outside one run's top list counts as zero on that side.",
+    ]
+    for item in traced:
+        interface_value = item["interface"]
+        lines.extend(["", f"### {item['set']}", ""])
+        for identifier, _, _, _ in INTERFACE_METRIC_SPECS:
+            metric = interface_value["metrics"][identifier]
+            lines.append(f"- {metric['label']}: {markdown_metric(metric)}")
+        lines.append(
+            f"- Sites appeared {len(interface_value.get('appeared', []))}, "
+            f"disappeared {len(interface_value.get('disappeared', []))}"
+        )
+        if not interface_value["call_sites"]:
+            continue
+        lines.extend([
+            "",
+            "| Crossing | Caller | Share before | Share after | Share change | Time change in late blocks |",
+            "|---|---|---:|---:|---:|---:|",
+        ])
+        for site in interface_value["call_sites"][:INTERFACE_TOP]:
+            record = site.get("after") or site.get("before") or {}
+            lines.append(
+                f"| {markdown_cell(record.get('kind'))} {markdown_cell(record.get('name'))} | "
+                f"{markdown_cell(record.get('caller'))} | "
+                f"{markdown_percent(nested(site, 'before', 'share_of_lost_slack'))} | "
+                f"{markdown_percent(nested(site, 'after', 'share_of_lost_slack'))} | "
+                f"{site['delta_share'] * 100:+.1f} points | {site['delta_total_ns_in_late_blocks']:+d} ns |"
+            )
+    return lines
+
+
 def comparison_markdown(report: dict[str, Any]) -> str:
+    structure = report["structure"]
+    virtualization = next((item for item in report["identity"] if item["id"] == "virtualization"), {})
     lines = [
         "# Ableton Linux benchmark comparison",
         "",
         f"- Before: `{report['before'].get('tag') or 'pending'}` at `{report['before']['directory']}`",
         f"- After: `{report['after'].get('tag') or 'pending'}` at `{report['after']['directory']}`",
-        f"- Measurement time: {report['structure']['duration_seconds_per_set']} seconds per set",
+        f"- Measurement time: {structure['duration_seconds_per_set']} seconds per set",
+        f"- Structure: `{structure.get('name', 'benchmark')}`; trace `{structure.get('trace_mode', 'off')}`; "
+        f"scenario `{structure.get('scenario') or 'none'}`",
         f"- Run detail differences: {len(report['identity_confounders'])}",
+        *virtualization_banner(virtualization.get("before"), virtualization.get("after")),
         "",
         "> One pair describes one result. Repeat pairs to measure normal variation. Use tool and listener reports for audio results.",
         "",
@@ -3063,6 +3962,7 @@ def comparison_markdown(report: dict[str, Any]) -> str:
         lines.append(f"| {item['set']} | " + " | ".join(
             markdown_metric(item["metrics"][name]) for name in summary_metrics
         ) + f" | {len(item['confounders'])} |")
+    lines.extend(comparison_interface_markdown(report))
     lines.extend([
         "",
         "`comparison.json` contains context switches, scheduler values, process changes, tool timing, power settings, CPU policy, interrupts, and zero starting values.",
@@ -3294,10 +4194,11 @@ def write_benchmark_csv(path: Path, rows: list[dict[str, Any]]) -> None:
 
 
 def compare(args: argparse.Namespace) -> int:
+    structure = getattr(args, "structure", None) or "benchmark"
     try:
-        before = load_completed_run(Path(args.before))
-        after = load_completed_run(Path(args.after))
-        result = comparison_report(before, after)
+        before = load_completed_run(Path(args.before), structure)
+        after = load_completed_run(Path(args.after), structure)
+        result = comparison_report(before, after, structure)
         output = Path(args.output).resolve()
         if output.exists():
             raise ValueError(f"output already exists: {output}")
@@ -3407,13 +4308,23 @@ def positive_duration(value: str) -> int:
     return result
 
 
+def near_late_fraction(value: str) -> float:
+    try:
+        result = float(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("near-late fraction must be a number") from error
+    if not 0 <= result < 1:
+        raise argparse.ArgumentTypeError("near-late fraction must be at least 0 and below 1")
+    return result
+
+
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(description=__doc__)
     commands = root.add_subparsers(dest="command", required=True)
     capture_parser = commands.add_parser("capture", help="measure one set for the selected time")
     capture_parser.add_argument("--output", required=True)
     capture_parser.add_argument("--set-name", required=True)
-    capture_parser.add_argument("--mode", choices=("idle-no-controller", "playback"), required=True)
+    capture_parser.add_argument("--mode", choices=CAPTURE_MODES, required=True)
     capture_parser.add_argument("--run-id", required=True)
     capture_parser.add_argument("--duration", type=positive_duration, default=30)
     capture_parser.add_argument("--prefix", required=True)
@@ -3426,7 +4337,24 @@ def parser() -> argparse.ArgumentParser:
     capture_parser.add_argument(
         "--manual-crackle", choices=("heard", "not-heard", "not-provided", "unknown"), default="not-provided"
     )
+    capture_parser.add_argument("--scenario", help="scenario name driven during the window")
+    capture_parser.add_argument("--scenario-tool", help="scenario driver started beside the collectors")
+    capture_parser.add_argument("--set-sha256", help="digest or sha256sum line of the measured set file")
+    capture_parser.add_argument("--trace-mode", choices=TRACE_MODES, default="off")
     capture_parser.set_defaults(func=capture)
+
+    interface_parser = commands.add_parser("interface", help="summarise the tracer output of one set")
+    interface_parser.add_argument("--set-dir", required=True, help="set folder holding measurement.json")
+    interface_parser.add_argument("--near-late-fraction", type=near_late_fraction, default=NEAR_LATE_FRACTION)
+    interface_parser.add_argument("--top", type=int, default=INTERFACE_TOP, help="call sites to keep")
+    interface_parser.set_defaults(func=interface)
+
+    drilldown_parser = commands.add_parser("interface-drilldown", help="list the blocks with the least slack")
+    drilldown_parser.add_argument("--run-dir", required=True)
+    drilldown_parser.add_argument("--set", required=True, help="set name")
+    drilldown_parser.add_argument("--top", type=int, default=10, help="blocks to list")
+    drilldown_parser.add_argument("--output", help="Markdown file; stdout when absent")
+    drilldown_parser.set_defaults(func=interface_drilldown)
 
     profile_parser = commands.add_parser("profile", help="record system and software details")
     profile_parser.add_argument("--output", required=True)
@@ -3448,6 +4376,11 @@ def parser() -> argparse.ArgumentParser:
     init_parser.add_argument("--tag", required=True)
     init_parser.add_argument("--duration", type=positive_duration, default=30)
     init_parser.add_argument("--set", action="append", required=True)
+    init_parser.add_argument("--structure", choices=STRUCTURES, default="benchmark")
+    init_parser.add_argument("--trace-mode", choices=TRACE_MODES, default="off")
+    init_parser.add_argument("--scenario", help="scenario name driven in every set")
+    init_parser.add_argument("--tracer", help="tracer command recorded for run identity")
+    init_parser.add_argument("--privilege", help="privilege route used to start the tracer")
     init_parser.set_defaults(func=init_run)
 
     update_parser = commands.add_parser("update-run", help="record the final run status")
@@ -3465,6 +4398,10 @@ def parser() -> argparse.ArgumentParser:
     compare_parser.add_argument("--before", required=True, help="before run folder")
     compare_parser.add_argument("--after", required=True, help="after run folder")
     compare_parser.add_argument("--output", required=True, help="new comparison folder")
+    compare_parser.add_argument(
+        "--structure", choices=STRUCTURES, default="benchmark",
+        help="diagnostic accepts any identical set list and scenario",
+    )
     compare_parser.set_defaults(func=compare)
 
     annotate_parser = commands.add_parser("annotate", help="add a listener crackle report")
