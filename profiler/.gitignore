@@ -1,7 +1,7 @@
 # Runtime output never lives in the repo: build.sh snapshots every non-ignored file
 # into /tmp and aborts if the tree changes during a build.
 *.log
-runs/
+/runs/
 scratch/
 __pycache__/
 *.pyc
