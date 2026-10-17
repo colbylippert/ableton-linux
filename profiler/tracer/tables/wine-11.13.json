@@ -2,7 +2,7 @@
  "schema": "ableton-linux-wine-tables/v1",
  "wine_version": "11.13",
  "generated_from": {
-  "wine_src": "wine-src (vendor/wine-base-5c23dd1c + patches, tag series-aceb236)",
+  "wine_src": "wine-src (vendor/wine-base-5c23dd1c + patches through 0108, tag series-aceb236)",
   "files": [
    "dlls/ntdll/ntsyscalls.h",
    "dlls/win32u/win32syscalls.h",
@@ -10,8 +10,8 @@
    "dlls/*/unixlib.h"
   ],
   "generator": "profiler/tracer/gen_tables.py",
-  "git_head": "46ba4ec22c38505a971e5e5190133df39136e196",
-  "git_describe": "series-aceb236"
+  "git_head": "dce595918404f3e26325f35b94bc34646d3ef6c2",
+  "git_describe": "series-aceb236-1-gdce5959"
  },
  "server_protocol_version": 957,
  "counts": {
@@ -19,7 +19,7 @@
   "syscalls_win32u": 1540,
   "requests": 307,
   "unixcall_modules": 30,
-  "unixcall_codes": 3719
+  "unixcall_codes": 3721
  },
  "syscalls": {
   "0x0000": "NtAccessCheck",
@@ -2173,6 +2173,7 @@
    "2": "create_font_object",
    "3": "release_font_object",
    "4": "get_glyph_outline",
+   "5": "get_glyph_count",
    "6": "get_glyph_advance",
    "7": "get_glyph_bbox",
    "8": "get_glyph_bitmap",
@@ -5758,6 +5759,7 @@
    "4": "wg_parser_disconnect",
    "5": "wg_parser_get_next_read_offset",
    "6": "wg_parser_push_data",
+   "7": "wg_parser_get_stream_count",
    "8": "wg_parser_get_stream",
    "9": "wg_parser_stream_get_current_format",
    "10": "wg_parser_stream_get_codec_format",
@@ -5951,7 +5953,7 @@
    "so": "dwrite.so",
    "header": "dlls/dwrite/unixlib.h",
    "enum": "font_backend_funcs",
-   "count": 9
+   "count": 10
   },
   "gphoto2": {
    "dll": "gphoto2.ds",
@@ -6077,7 +6079,7 @@
    "so": "winegstreamer.so",
    "header": "dlls/winegstreamer/unixlib.h",
    "enum": "unix_funcs",
-   "count": 36
+   "count": 37
   },
   "winemac": {
    "dll": "winemac.drv",

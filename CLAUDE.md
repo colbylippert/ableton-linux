@@ -10,7 +10,7 @@ This is a local fork of shibco/ableton-linux (base `aceb236`, branch `profiler`)
 - `tools/` — PE probe programs (PASS/FAIL/SKIP lines, exit code = FAIL count), built like `tools/build_apcprobe.sh`.
 - `notes/` — one note per investigation (Result / Scope / Verification).
 - `profiler/setup/` — `setup-machine.sh --profile vm|baremetal` (idempotent phases, colourful log, `--dry-run`), `verify.sh`, root helper, templates.
-- `profiler/bin/` — `with-session-env`, `state` (golden prefix snapshot/restore), `bench` (suite wrapper), `wine-trace`, `trace-prereqs`, `profile-app`, `history-add`, `ledger-report`.
+- `profiler/bin/` — `with-session-env`, `state` (golden prefix snapshot/restore), `bench` (suite wrapper), `wine-trace`, `trace-prereqs`, `history-add`, `ledger-report` (`profile-app` is planned, not delivered yet).
 - `profiler/dev/` — `wine-dev.sh` (persistent `wine-dev` podman container: `init|apply|build|sync|format-patch`), `build-official.sh` (the "keep" gate: full `build.sh` + `installer.sh runtime install --yes`).
 - `profiler/tracer/`, `profiler/control/`, `profiler/scenarios/`, `profiler/dashboard/`, `profiler/history/`, `profiler/ledger.jsonl` — see the plan.
 
@@ -30,7 +30,7 @@ python3 scripts/bench-report.py compare --before <run>/bench --after <run>/bench
 python3 scripts/bench-report.py interface-drilldown --run-dir <run>/bench --set <Set> --top 10   # the latest blocks and their crossings
 profiler/bin/history-add <run> [--trial T0007 --arm A|B|AA] [--baseline]   # after every suite run (profiler/history/README.md)
 profiler/bin/ledger-report [--output FILE]          # validate profiler/ledger.jsonl (exit 2 on a bad line), open hotspots
-make test && make test-profiler
+make test                                           # includes test-bench and test-profiler
 ```
 
 Log every long command: `set -o pipefail; <cmd> 2>&1 | tee ~/.local/state/profiler/logs/<ts>-<what>.log`.

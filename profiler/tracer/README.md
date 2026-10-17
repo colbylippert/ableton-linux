@@ -15,7 +15,7 @@ wrapper already prefers it when the binary exists.
 | `wine-trace.bt` | bpftrace 0.27 template: one text line per event (USDT probes of patch 0108 / pipeasio 0017, kernel-side NTSync `fentry`, optional scheduler and child-follow probes). Never run directly: `profiler/bin/wine-trace` rewrites it. |
 | `reduce.py` | Offline join of the event lines into `blocks.jsonl`, `threads.jsonl`, `summary.json` (+ `events.jsonl` in drilldown); updates `tracer.json`. |
 | `gen_tables.py` | Generates `tables/wine-<ver>.json` (syscall ids, wineserver request numbers, unix-call codes) from a patched Wine tree. |
-| `tables/wine-11.13.json` | Generated from the 11.13 base + the 96-patch series (`series-aceb236`, protocol 957). |
+| `tables/wine-11.13.json` | Generated from the 11.13 base + the 96-patch series (`series-aceb236`) + 0108 (table inputs unchanged by 0108), protocol 957. |
 | `tests/test_reduce.py`, `tests/test_gen_tables.py` | `python3 -I -m unittest discover -s profiler/tracer/tests -v` from the repo root. |
 | `../bin/wine-trace` | The CLI (`start`/`stop`/`run`/`status`) shared with the suite and the root helper. |
 
@@ -140,7 +140,7 @@ python3 -I profiler/tracer/reduce.py --in DIR [--mode drilldown] [--near-late-fr
 
 ```bash
 python3 -I profiler/tracer/gen_tables.py --wine-src ~/wine-dev/work/wine-src \
-    --out profiler/tracer/tables/wine-11.13.json --label "wine-src (series-aceb236)"
+    --out profiler/tracer/tables/wine-11.13.json --label "wine-src (vendor/wine-base-5c23dd1c + patches through 0108, tag series-aceb236)"
 ```
 
 Sources: `dlls/ntdll/ntsyscalls.h` and `dlls/win32u/win32syscalls.h` (the `#ifdef _WIN64`

@@ -263,8 +263,10 @@ def interface_tracer(stopped_ns=31_400_000_000, lost_events=0, version="wine-tra
     }
 
 
-def interface_crossing(tid, role, kind, identifier, n, total_ns, max_ns, woken_by=None):
+def interface_crossing(tid, role, kind, identifier, n, total_ns, max_ns, woken_by=None, caller=None):
     crossing = {"tid": tid, "role": role, "kind": kind, "id": identifier, "n": n, "total_ns": total_ns, "max_ns": max_ns}
+    if caller:
+        crossing["caller"] = caller
     if woken_by:
         crossing["woken_by"] = woken_by
     return crossing
@@ -334,12 +336,17 @@ def write_interface_files(set_dir, tracer=None, blocks=None, threads=None):
 def fixture_interface_section(**options):
     measurement = benchmark_measurement("Benchmark_Empty")
     measurement["trace"] = {"mode": "interface", "directory": report.INTERFACE_DIRECTORY}
-    blocks = [item for item in interface_blocks() if item.get("type") != "header"]
+    blocks = options.pop("blocks", None) or [item for item in interface_blocks() if item.get("type") != "header"]
     threads = [item for item in interface_threads() if item.get("type") != "header"]
     return report.interface_section(
-        measurement, options.pop("tracer", interface_tracer()), {}, blocks, FIXTURE_TRACER_START_NS,
-        threads, FIXTURE_TRACER_START_NS, **options,
+        measurement, options.pop("tracer", interface_tracer()), options.pop("summary", {}), blocks,
+        FIXTURE_TRACER_START_NS, threads, FIXTURE_TRACER_START_NS, **options,
     )
+
+
+def load_reduce_fixture():
+    """profiler/tracer/tests/test_reduce.py: the reducer's synthetic trace and runner."""
+    return load("tracer_test_reduce", "../profiler/tracer/tests/test_reduce.py")
 
 
 class ParserTests(unittest.TestCase):
@@ -1265,10 +1272,93 @@ class ProfilerTests(unittest.TestCase):
         })
         self.assertEqual(section["roles"]["main"]["bins"], 1)
         self.assertEqual(section["hotspots_non_audio"], [
-            {"role": "main", "kind": "server_req", "caller": "unsampled", "n": 5, "total_ns": 90_000},
+            {"role": "main", "kind": "server_req", "name": "select", "caller": "unsampled", "n": 5, "total_ns": 90_000},
         ])
+        self.assertEqual(section["hotspots_non_audio_source"], "blocks-in-window")
         self.assertEqual(section["confounders"], [])
-        self.assertEqual(section["evidence"]["blocks"], "raw/interface/blocks.jsonl")
+        self.assertEqual(section["evidence"], {
+            "blocks": "raw/interface/blocks.jsonl", "threads": "raw/interface/threads.jsonl",
+            "tracer": "raw/interface/tracer.json",
+        })
+
+    def test_interface_call_sites_use_the_callers_recorded_on_crossings(self):
+        caller = "ntdll.dll!NtWaitForSingleObject+0x14"
+        stack = {"tid": 4242, "kind": "ntsync_wait", "id": "NtWaitForSingleObject", "frames": FIXTURE_FRAMES}
+        wait = lambda n, total: interface_crossing(  # noqa: E731
+            4242, "pipeasio_callback", "ntsync_wait", "NtWaitForSingleObject", n, total, total, caller=caller,
+        )
+        blocks = [
+            interface_block(1, 1.0, -100_000, [wait(2, 200_000)]),
+            interface_block(2, 2.0, 50_000, [wait(1, 100_000)], [stack]),
+            interface_block(3, 3.0, 900_000, [
+                interface_crossing(4400, "plugin:Dexed.vst3", "syscall", "NtDelayExecution", 1, 9_000, 9_000, caller="pe!0x1"),
+                interface_crossing(4302, "pipeasio_worker", "syscall", "NtYieldExecution", 1, 8_000, 8_000, caller="none"),
+                interface_crossing(4310, "live:MIDI", "server_req", "select", 2, 7_000, 4_000,
+                                   caller="ntdll.dll!NtWaitForMultipleObjects+0x14"),
+            ]),
+        ]
+        section = fixture_interface_section(blocks=blocks)
+        first = section["call_sites"][0]
+        self.assertEqual(first["key"], f"ntsync_wait|NtWaitForSingleObject|{caller}")
+        self.assertEqual((first["caller"], first["late_blocks"], first["near_late_blocks"]), (caller, 1, 1))
+        self.assertEqual(first["total_ns_in_late_blocks"], 300_000)
+        self.assertNotIn("unsampled", [site["caller"] for site in section["call_sites"]])
+        self.assertEqual(section["hotspots_non_audio"], [{
+            "role": "live:MIDI", "kind": "server_req", "name": "select",
+            "caller": "ntdll.dll!NtWaitForMultipleObjects+0x14", "n": 2, "total_ns": 7_000,
+        }])
+        whole_trace = [{"role": "main", "kind": "syscall", "name": "NtUserMsgWaitForMultipleObjectsEx",
+                        "caller": "win32u.dll!NtUserMsgWaitForMultipleObjectsEx+0x14", "n": 1, "total_ns": 25_000_000}]
+        traced = fixture_interface_section(blocks=blocks, summary={"hotspots_non_audio": whole_trace})
+        self.assertEqual(traced["hotspots_non_audio"], whole_trace)
+        self.assertEqual(traced["hotspots_non_audio_source"], "summary-whole-trace")
+        self.assertEqual(traced["evidence"]["summary"], "raw/interface/summary.json")
+        self.assertTrue(report.is_audio_role("plugin:Dexed.vst3"))
+        self.assertTrue(report.is_audio_role("pipeasio_worker"))
+        self.assertFalse(report.is_audio_role("main"))
+
+    def test_interface_reads_the_reducer_output(self):
+        fixture = load_reduce_fixture()
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = Path(temporary) / "run"
+            write_benchmark_run(run_dir, trace_mode="drilldown")
+            set_dir = next((run_dir / "sets").glob("*-Benchmark_Empty"))
+            directory = set_dir / "raw/interface"
+            directory.mkdir(parents=True)
+            fixture.write_run(str(directory), fixture.build_fixture(), mode="drilldown")
+            tracer_out = fixture.run_reduce(str(directory), mode="drilldown")
+            measurement = json.loads((set_dir / "measurement.json").read_text())
+            measurement["window"]["monotonic_start_ns"] = fixture.S0
+            measurement["window"]["monotonic_deadline_ns"] = fixture.S0 + 10_000_000_000
+            (set_dir / "measurement.json").write_text(json.dumps(measurement))
+            args = type("Args", (), {"set_dir": str(set_dir), "near_late_fraction": 0.15, "top": 20})()
+            self.assertEqual(report.interface(args), 0)
+            section = json.loads((set_dir / "measurement.json").read_text())["interface"]
+            summary = tracer_out["summary"]
+            self.assertEqual(section["lost_slack"]["total_ns"], summary["lost_slack"]["total_ns"])
+            ours = {site["key"]: site for site in section["call_sites"]}
+            for site in summary["call_sites"]:
+                self.assertIn(site["key"], ours)
+                self.assertEqual(ours[site["key"]]["total_ns_in_late_blocks"], site["total_ns_in_late_blocks"])
+            self.assertNotIn("unsampled", [site["caller"] for site in section["call_sites"]])
+            self.assertEqual(section["hotspots_non_audio"], summary["hotspots_non_audio"])
+            self.assertEqual(section["evidence"]["events"], "raw/interface/events.jsonl")
+            output = Path(temporary) / "drilldown.md"
+            drill = type("Args", (), {"run_dir": str(run_dir), "set": "Benchmark_Empty", "top": 3, "output": str(output)})()
+            self.assertEqual(report.interface_drilldown(drill), 0)
+            text = output.read_text()
+            self.assertIn("Crossings in order (events.jsonl):", text)
+            self.assertIn("ntdll.dll!NtWaitForSingleObject+0x14", text)
+            symbolized = [json.loads(line) for line in (directory / "blocks.jsonl").read_text().splitlines()]
+            for record in symbolized:
+                for crossing in record.get("crossings", []):
+                    crossing["caller"] = "symbolized!" + crossing["caller"]
+            (directory / "blocks.symbolized.jsonl").write_text("".join(json.dumps(item) + "\n" for item in symbolized))
+            self.assertEqual(report.interface(args), 0)
+            measurement = json.loads((set_dir / "measurement.json").read_text())
+            self.assertTrue(all(site["caller"].startswith("symbolized!") for site in measurement["interface"]["call_sites"]))
+            self.assertEqual(measurement["interface"]["evidence"]["blocks"], "raw/interface/blocks.symbolized.jsonl")
+            self.assertEqual(measurement["evidence"]["interface_blocks"], "raw/interface/blocks.symbolized.jsonl")
 
     def test_interface_ranking_and_lost_slack_shares(self):
         section = fixture_interface_section()
@@ -1605,10 +1695,14 @@ class ProfilerTests(unittest.TestCase):
             write_benchmark_run(run_dir, trace_mode="drilldown")
             set_dir = next((run_dir / "sets").glob("*-Benchmark_Empty"))
             directory = write_interface_files(set_dir)
-            (directory / "stacks.jsonl").write_text(json.dumps({
-                "seq": 3, "tid": 4301, "kind": "syscall", "id": "NtReleaseSemaphore",
-                "frames": ["ntdll.dll!NtReleaseSemaphore+0x14", "Ableton Live 12 Trial.exe+0x77"],
-            }) + "\n")
+            event = lambda t, seq: {  # noqa: E731
+                "t": t, "tid": 4301, "role": "audio_worker", "kind": "syscall", "id": "NtReleaseSemaphore",
+                "caller": "ntdll.dll!NtReleaseSemaphore+0x14", "dur_ns": 500, "status": "0x0", "seq": seq,
+            }
+            (directory / "events.jsonl").write_text("".join(json.dumps(item) + "\n" for item in (
+                {"type": "header", "monotonic_start_ns": FIXTURE_TRACER_START_NS},
+                event(2.0001, 3), event(1.9999, 0),
+            )))
             output = Path(temporary) / "drilldown.md"
             args = type("Args", (), {"run_dir": str(run_dir), "set": "Benchmark_Empty", "top": 3, "output": str(output)})()
             self.assertEqual(report.interface_drilldown(args), 0)
@@ -1623,7 +1717,8 @@ class ProfilerTests(unittest.TestCase):
             self.assertIn("- Blocks in window: 10; late 2; near-late 3; showing the 3 with the least slack", lines)
             self.assertIn("| 4242 | pipeasio_callback | ntsync_wait | NtWaitForSingleObject | 4 | 300000 | 210000 |", text)
             self.assertIn(f"- tid 4242 ntsync_wait NtWaitForSingleObject: {' <- '.join(FIXTURE_FRAMES)} (stop: max_frames)", lines)
-            self.assertIn("- tid 4301 syscall NtReleaseSemaphore: ntdll.dll!NtReleaseSemaphore+0x14 <- Ableton Live 12 Trial.exe+0x77", lines)
+            self.assertIn("- 1.400100 s tid 4301 syscall NtReleaseSemaphore: 500 ns, caller ntdll.dll!NtReleaseSemaphore+0x14", lines)
+            self.assertEqual(sum(line.startswith("- 1.399900 s") for line in lines), 0)
             self.assertLess(lines.index("## Block 2: slack -210000 ns (late)"), lines.index("- Window offset 0.400000 s; elapsed 1540000 ns; period 1333333 ns; near-late threshold 200000 ns; lost slack 410000 ns; missed cycles 1"))
             with mock.patch("builtins.print") as printed:
                 args.output = None

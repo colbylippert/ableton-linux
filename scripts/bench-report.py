@@ -58,7 +58,13 @@ INTERFACE_DIRECTORY = "raw/interface"
 NEAR_LATE_FRACTION = 0.15
 INTERFACE_TOP = 20
 CALL_SITE_DEPTH = 3
-AUDIO_ROLES = frozenset({"pipeasio_callback", "audio_worker", "pipeasio_rt"})
+# The tracer's audio roles (profiler/tracer/roles.toml audio_roles); plug-in threads are "plugin:<module>".
+AUDIO_ROLES = frozenset({"pipeasio_callback", "audio_worker", "pipeasio_rt", "pipeasio_worker"})
+AUDIO_ROLE_PREFIXES = ("plugin:",)
+# The tracer writes blocks.jsonl; wine-trace stop adds blocks.symbolized.jsonl (resolved callers)
+# when symbolize.py ran, and reduce.py --mode drilldown adds events.jsonl (every crossing).
+INTERFACE_BLOCK_FILES = ("blocks.symbolized.jsonl", "blocks.jsonl")
+DRILLDOWN_EVENTS_PER_BLOCK = 50
 INTERFACE_KINDS = ("syscall", "unixcall", "server_req", "ntsync_wait")
 INTERFACE_CONFOUNDERS = {
     "interface-tracer-coverage-incomplete": (
@@ -2586,6 +2592,18 @@ def classify_blocks(blocks: list[dict[str, Any]], near_late_fraction: float) -> 
     return classified
 
 
+def is_audio_role(role: Any) -> bool:
+    return isinstance(role, str) and (role in AUDIO_ROLES or role.startswith(AUDIO_ROLE_PREFIXES))
+
+
+def interface_blocks_path(directory: Path) -> Path:
+    """The symbolized blocks when wine-trace wrote them, else the reducer's blocks.jsonl."""
+    for name in INTERFACE_BLOCK_FILES:
+        if (directory / name).is_file():
+            return directory / name
+    return directory / INTERFACE_BLOCK_FILES[-1]
+
+
 def stack_caller(frames: Any) -> str:
     if not isinstance(frames, list) or not frames:
         return "unsampled"
@@ -2593,7 +2611,11 @@ def stack_caller(frames: Any) -> str:
 
 
 def block_sites(block: dict[str, Any]) -> list[dict[str, Any]]:
-    """Split each crossing aggregate across the callers sampled for its thread, kind and id."""
+    """One site per crossing aggregate, keyed by the caller the tracer recorded on it.
+
+    reduce.py puts a ``caller`` on every crossing (and leaves ``stacks`` empty). Only a crossing
+    without one is split across the stack samples of its thread, kind and id, if any.
+    """
     samples: dict[tuple[Any, Any, Any], collections.Counter] = {}
     for stack in block.get("stacks") or []:
         if isinstance(stack, dict):
@@ -2607,7 +2629,11 @@ def block_sites(block: dict[str, Any]) -> list[dict[str, Any]]:
         count = crossing.get("n") if is_number(crossing.get("n")) else 0
         total_ns = crossing.get("total_ns") if is_number(crossing.get("total_ns")) else 0
         max_ns = crossing.get("max_ns") if is_number(crossing.get("max_ns")) else 0
-        callers = samples.get((crossing.get("tid"), crossing.get("kind"), crossing.get("id")))
+        recorded = crossing.get("caller")
+        if isinstance(recorded, str) and recorded:
+            callers = collections.Counter({recorded: 1})
+        else:
+            callers = samples.get((crossing.get("tid"), crossing.get("kind"), crossing.get("id")))
         if not callers:
             callers = collections.Counter({"unsampled": 1})
         sampled = sum(callers.values())
@@ -2643,7 +2669,7 @@ def interface_call_sites(
     their time, so a site's share never exceeds the block's lost slack.
     """
     sites: dict[str, dict[str, Any]] = {}
-    hotspots: dict[tuple[str, str, str], dict[str, Any]] = {}
+    hotspots: dict[tuple[str, str, str, str], dict[str, Any]] = {}
     attributed_total = 0.0
     lost_total = sum(item["lost_ns"] for item in classified)
     for item in classified:
@@ -2677,9 +2703,10 @@ def interface_call_sites(
                     counted.add(site["key"])
                     record["late_blocks" if item["late"] else "near_late_blocks"] += 1
             role = site["role"]
-            if isinstance(role, str) and role and role not in AUDIO_ROLES:
-                hotspot = hotspots.setdefault((role, site["kind"], site["caller"]), {
-                    "role": role, "kind": site["kind"], "caller": site["caller"], "n": 0.0, "total_ns": 0.0,
+            if isinstance(role, str) and role and not is_audio_role(role):
+                hotspot = hotspots.setdefault((role, site["kind"], site["name"], site["caller"]), {
+                    "role": role, "kind": site["kind"], "name": site["name"], "caller": site["caller"],
+                    "n": 0.0, "total_ns": 0.0,
                 })
                 hotspot["n"] += site["n"]
                 hotspot["total_ns"] += site["total_ns"]
@@ -2709,7 +2736,7 @@ def interface_call_sites(
             ],
         })
     hotspot_list = sorted(hotspots.values(), key=lambda item: (
-        -item["total_ns"], -item["n"], item["role"], item["kind"], item["caller"],
+        -item["total_ns"], -item["n"], item["role"], item["kind"], item["name"], item["caller"],
     ))[:top]
     hotspot_list = [
         {**item, "n": int(round(item["n"])), "total_ns": int(round(item["total_ns"]))} for item in hotspot_list
@@ -2797,8 +2824,15 @@ def interface_section(
     *,
     near_late_fraction: float = NEAR_LATE_FRACTION,
     top: int = INTERFACE_TOP,
+    blocks_file: str = "blocks.jsonl",
+    has_events: bool = False,
 ) -> dict[str, Any]:
-    """Summarise the tracer output for the blocks inside the measurement window."""
+    """Summarise the tracer output for the blocks inside the measurement window.
+
+    ``hotspots_non_audio`` is the tracer's whole-trace list from summary.json (non-audio threads
+    cross mostly between blocks); without summary.json it falls back to the crossings recorded
+    inside the window's blocks.
+    """
     start_ns, deadline_ns = measurement_window(measurement)
     duration = (deadline_ns - start_ns) / 1_000_000_000
     selected = records_in_window(blocks, "t_start", base_ns, start_ns, deadline_ns)
@@ -2812,6 +2846,19 @@ def interface_section(
     near_late = sum(item["near_late"] for item in classified)
     lost_total = sum(item["lost_ns"] for item in classified)
     call_sites, attributed, hotspots = interface_call_sites(classified, top)
+    hotspots_source = "blocks-in-window"
+    if isinstance(summary.get("hotspots_non_audio"), list):
+        hotspots = [item for item in summary["hotspots_non_audio"] if isinstance(item, dict)][:top]
+        hotspots_source = "summary-whole-trace"
+    evidence = {
+        "blocks": f"{INTERFACE_DIRECTORY}/{blocks_file}",
+        "threads": f"{INTERFACE_DIRECTORY}/threads.jsonl",
+        "tracer": f"{INTERFACE_DIRECTORY}/tracer.json",
+    }
+    if summary:
+        evidence["summary"] = f"{INTERFACE_DIRECTORY}/summary.json"
+    if has_events:
+        evidence["events"] = f"{INTERFACE_DIRECTORY}/events.jsonl"
     mode = nested(measurement, "trace", "mode")
     if mode in (None, "off"):
         mode = "drilldown" if tracer.get("mode") == "drilldown" else "interface"
@@ -2824,12 +2871,7 @@ def interface_section(
         "schema": INTERFACE_SCHEMA,
         "mode": mode,
         "tracer": tracer_value,
-        "evidence": {
-            "blocks": f"{INTERFACE_DIRECTORY}/blocks.jsonl",
-            "threads": f"{INTERFACE_DIRECTORY}/threads.jsonl",
-            "tracer": f"{INTERFACE_DIRECTORY}/tracer.json",
-            "stacks": f"{INTERFACE_DIRECTORY}/stacks.jsonl",
-        },
+        "evidence": evidence,
         "window": {"blocks_in_file": len(blocks), "blocks_in_window": len(selected)},
         "thresholds": {
             "near_late_fraction": near_late_fraction,
@@ -2861,6 +2903,7 @@ def interface_section(
         "kinds": interface_kinds(classified),
         "roles": interface_roles(records_in_window(threads, "t", threads_base_ns, start_ns, deadline_ns)),
         "hotspots_non_audio": hotspots,
+        "hotspots_non_audio_source": hotspots_source,
         "confounders": confounders,
     }
 
@@ -2892,9 +2935,10 @@ def interface(args: argparse.Namespace) -> int:
         tracer = load_json_object(directory / "tracer.json")
         summary_path = directory / "summary.json"
         summary = load_json_object(summary_path) if summary_path.is_file() else {}
-        base_ns, blocks = load_tracer_records(directory / "blocks.jsonl", tracer)
+        blocks_path = interface_blocks_path(directory)
+        base_ns, blocks = load_tracer_records(blocks_path, tracer)
         if base_ns is None:
-            raise ValueError(f"{directory / 'blocks.jsonl'}: no monotonic_start_ns in the header or tracer.json")
+            raise ValueError(f"{blocks_path}: no monotonic_start_ns in the header or tracer.json")
         threads_path = directory / "threads.jsonl"
         threads_base_ns, threads = (
             load_tracer_records(threads_path, tracer) if threads_path.is_file() else (base_ns, [])
@@ -2902,13 +2946,17 @@ def interface(args: argparse.Namespace) -> int:
         section = interface_section(
             measurement, tracer, summary, blocks, base_ns, threads, threads_base_ns or base_ns,
             near_late_fraction=args.near_late_fraction, top=args.top,
+            blocks_file=blocks_path.name, has_events=(directory / "events.jsonl").is_file(),
         )
         for kind in section["confounders"]:
             confounders.append({"kind": kind, "effect": INTERFACE_CONFOUNDERS[kind]})
         measurement["confounders"] = confounders
         measurement["interface"] = section
         evidence = measurement.get("evidence")
-        measurement["evidence"] = {**(evidence if isinstance(evidence, dict) else {}), **interface_evidence()}
+        measurement["evidence"] = {
+            **(evidence if isinstance(evidence, dict) else {}), **interface_evidence(),
+            "interface_blocks": section["evidence"]["blocks"],
+        }
         dump_json(measurement_path, measurement)
         return 0
     except (ValueError, OSError) as error:
@@ -2923,7 +2971,7 @@ def drilldown_markdown(
     base_ns: int,
     start_ns: int,
     top: int,
-    extra_stacks: dict[Any, list[dict[str, Any]]],
+    events: dict[Any, list[dict[str, Any]]],
 ) -> str:
     latest = sorted(classified, key=lambda item: (item["slack_ns"], item["block"].get("t_start", 0)))[:top]
     lines = [
@@ -2945,8 +2993,8 @@ def drilldown_markdown(
             f"period {markdown_cell(item['period_ns'])} ns; near-late threshold {item['threshold_ns']} ns; "
             f"lost slack {item['lost_ns']} ns; missed cycles {markdown_cell(block.get('missed_cycles'))}",
             "",
-            "| Thread | Role | Kind | Id | Count | Total ns | Max ns | Woken by |",
-            "|---:|---|---|---|---:|---:|---:|---|",
+            "| Thread | Role | Kind | Id | Count | Total ns | Max ns | Woken by | Caller |",
+            "|---:|---|---|---|---:|---:|---:|---|---|",
         ])
         crossings = [item for item in block.get("crossings") or [] if isinstance(item, dict)]
         crossings.sort(key=lambda crossing: -(crossing.get("total_ns") if is_number(crossing.get("total_ns")) else 0))
@@ -2957,10 +3005,10 @@ def drilldown_markdown(
                 f"{markdown_cell(crossing.get('kind'))} | {markdown_cell(crossing.get('id'))} | "
                 f"{markdown_cell(crossing.get('n'))} | {markdown_cell(crossing.get('total_ns'))} | "
                 f"{markdown_cell(crossing.get('max_ns'))} | "
-                f"{markdown_cell(json.dumps(woken_by, sort_keys=True)) if woken_by else ''} |"
+                f"{markdown_cell(json.dumps(woken_by, sort_keys=True)) if woken_by else ''} | "
+                f"{markdown_cell(crossing.get('caller')) if crossing.get('caller') else ''} |"
             )
-        stacks = [stack for stack in (block.get("stacks") or []) + extra_stacks.get(block.get("seq"), [])
-                  if isinstance(stack, dict)]
+        stacks = [stack for stack in block.get("stacks") or [] if isinstance(stack, dict)]
         if stacks:
             lines.extend(["", "Stacks:", ""])
             for stack in stacks:
@@ -2970,6 +3018,20 @@ def drilldown_markdown(
                     f"- tid {stack.get('tid')} {stack.get('kind')} {stack.get('id')}: "
                     f"{' <- '.join(str(frame) for frame in frames) or 'no frames'}{stop}"
                 )
+        timeline = sorted(
+            (event for event in events.get(block.get("seq"), []) if is_number(event.get("t"))),
+            key=lambda event: event["t"],
+        )
+        if timeline:
+            lines.extend(["", "Crossings in order (events.jsonl):", ""])
+            for event in timeline[:DRILLDOWN_EVENTS_PER_BLOCK]:
+                event_offset = (base_ns + int(round(event["t"] * 1_000_000_000)) - start_ns) / 1_000_000_000
+                lines.append(
+                    f"- {event_offset:.6f} s tid {event.get('tid')} {event.get('kind')} {event.get('id')}: "
+                    f"{markdown_cell(event.get('dur_ns'))} ns, caller {event.get('caller') or 'none'}"
+                )
+            if len(timeline) > DRILLDOWN_EVENTS_PER_BLOCK:
+                lines.append(f"- ... {len(timeline) - DRILLDOWN_EVENTS_PER_BLOCK} more")
     lines.append("")
     return "\n".join(lines)
 
@@ -2984,7 +3046,7 @@ def interface_drilldown(args: argparse.Namespace) -> int:
         measurement = load_json_object(matches[0])
         start_ns, deadline_ns = measurement_window(measurement)
         directory = matches[0].parent / INTERFACE_DIRECTORY
-        tracer_path, blocks_path = directory / "tracer.json", directory / "blocks.jsonl"
+        tracer_path, blocks_path = directory / "tracer.json", interface_blocks_path(directory)
         if not blocks_path.is_file():
             raise ValueError(f"{blocks_path}: no tracer output for {args.set}")
         tracer = load_json_object(tracer_path) if tracer_path.is_file() else {}
@@ -2995,12 +3057,15 @@ def interface_drilldown(args: argparse.Namespace) -> int:
             records_in_window(blocks, "t_start", base_ns, start_ns, deadline_ns),
             nested(measurement, "interface", "thresholds", "near_late_fraction") or NEAR_LATE_FRACTION,
         )
-        extra_stacks: dict[Any, list[dict[str, Any]]] = {}
-        stacks_path = directory / "stacks.jsonl"
-        if stacks_path.is_file():
-            for record in load_tracer_records(stacks_path, tracer)[1]:
-                extra_stacks.setdefault(record.get("seq"), []).append(record)
-        text = drilldown_markdown(args.set, measurement, classified, base_ns, start_ns, args.top, extra_stacks)
+        events: dict[Any, list[dict[str, Any]]] = {}
+        events_path = directory / "events.jsonl"
+        if events_path.is_file():
+            events_base_ns, records = load_tracer_records(events_path, tracer)
+            shift = (events_base_ns - base_ns) / 1_000_000_000 if events_base_ns is not None else 0.0
+            for record in records:
+                if record.get("seq") and is_number(record.get("t")):
+                    events.setdefault(record["seq"], []).append({**record, "t": record["t"] + shift})
+        text = drilldown_markdown(args.set, measurement, classified, base_ns, start_ns, args.top, events)
         if args.output:
             Path(args.output).write_text(text)
         else:

@@ -49,7 +49,10 @@ test-bench:                    ## run benchmark report and run checks
 
 # The profiler workbench (local fork) keeps its tests beside its code. They
 # run through python3 -I so a planted module next to the test cannot load.
-test-profiler: test-bench      ## run profiler workbench checks (control layer, scenarios, tracer, ledger, history)
+# `make test` already runs the test-bench scripts before it recurses here, so
+# test-profiler does not depend on test-bench (`make test-bench test-profiler`
+# runs both on their own).
+test-profiler:                 ## run profiler workbench checks (control layer, scenarios, tracer, ledger, history)
 	./profiler/control/vendor.sh --check
 	python3 -I ./profiler/control/tests/test_bench_handler.py
 	python3 -I ./profiler/control/tests/test_liveosc.py

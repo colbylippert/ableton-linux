@@ -186,6 +186,13 @@ class SyntheticTreeTest(unittest.TestCase):
         self.assertIn("SOME_MACRO", warnings)
         self.assertIn("dlls/nothing/unixlib.h", warnings)
 
+    def test_only_the_trailing_sentinel_is_dropped(self):
+        items = [("unix_get_glyph_count", 0), ("unix_wg_parser_get_stream_count", 1), ("unix_funcs_count", 2)]
+        self.assertEqual(gen.strip_sentinel(items), items[:2])
+        self.assertEqual(gen.strip_sentinel(items[:2]), items[:2])
+        self.assertEqual(gen.strip_sentinel([("waylanddrv_unix_func_count", 0)]), [])
+        self.assertEqual(gen.strip_sentinel([]), [])
+
     def test_write_json_is_lf_and_round_trips(self):
         out = os.path.join(self.tmp.name, "out", "table.json")
         gen.write_json(self.data, out)
@@ -212,7 +219,9 @@ class CommittedTableTest(unittest.TestCase):
         self.assertEqual(self.table["schema"], gen.SCHEMA)
         self.assertEqual(self.table["wine_version"], "11.13")
         self.assertEqual(self.table["server_protocol_version"], 957)
-        self.assertEqual(self.table["generated_from"]["git_describe"], "series-aceb236")
+        # series-aceb236 (or a descendant: the profiler's own patches from 0108 do not touch the
+        # table inputs).
+        self.assertTrue(self.table["generated_from"]["git_describe"].startswith("series-aceb236"))
 
     def test_known_syscalls(self):
         syscalls = self.table["syscalls"]
@@ -240,6 +249,9 @@ class CommittedTableTest(unittest.TestCase):
         self.assertEqual(unix["winscard"]["0"], "scard_establish_context")
         self.assertEqual(unix["dwrite"]["0"], "process_attach")
         self.assertIn("get_glyph_outline", unix["dwrite"].values())
+        # Real codes whose names end in _count (only the trailing table-size sentinel is dropped).
+        self.assertEqual(unix["dwrite"]["5"], "get_glyph_count")
+        self.assertEqual(unix["winegstreamer"]["7"], "wg_parser_get_stream_count")
         self.assertEqual(unix["winealsa"], unix["mmdevapi"])
         self.assertEqual(unix["ntdll"]["3"], "wine_server_call")
         self.assertIn("opengl32", unix)

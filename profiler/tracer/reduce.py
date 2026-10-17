@@ -430,7 +430,9 @@ class Reducer:
             role = "push2"
         elif tid == pid and image.endswith(".exe"):
             role = "main"
-        elif image.startswith("ableton live") and comm and comm != self.pid_comm.get(pid):
+        elif (image.startswith("ableton live") and comm and self.pid_comm.get(pid) is not None
+              and comm != self.pid_comm[pid]):
+            # Named Live threads only; like roles.toml's `named`, this needs the process comm.
             role = "live:%s" % comm
         else:
             role = "unknown:%s" % (comm or tid)
@@ -1094,7 +1096,12 @@ class Reducer:
         data["stopped_monotonic_ns"] = self.mono_end_ns or self.opt.stopped_monotonic_ns
         data["lost_events"] = self.lost_events + self.opt.lost_events_extra
         data["probe_hits"] = dict(sorted(self.probe_hits.items()))
-        data["counters"] = summary["counters"]["all"]
+        # The Counter holds only keys that were incremented; validate.py needs the pairing counters
+        # even when they are zero (design B section 7: abandoned_entries == 0).
+        counters = dict(summary["counters"]["all"])
+        for key in ("unmatched_exits", "unmatched_exits_first_on_tid", "abandoned_entries"):
+            counters.setdefault(key, summary["counters"][key])
+        data["counters"] = counters
         data["blocks"] = {"count": summary["blocks"]["count"], "late": summary["blocks"]["late"],
                           "near_late": summary["blocks"]["near_late"]}
         data["overhead_estimate_ns_per_block"] = summary["tracer"]["overhead_estimate_ns_per_block"]

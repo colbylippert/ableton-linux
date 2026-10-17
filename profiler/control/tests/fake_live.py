@@ -212,6 +212,10 @@ class Component(object):
     def __init__(self, *args, **kwargs):
         provider = Component.song_provider
         self._song = provider.song() if provider is not None else None
+        self.disconnected = False
+
+    def disconnect(self):
+        self.disconnected = True
 
     @property
     def song(self):

@@ -89,6 +89,8 @@ dry_output="$base/dry-report"
     || fail "the dry-run order is not canonical"
 grep -q $'^1\tBenchmark_Zero\tidle-no-controller\t30s$' "$base/default.out" \
     || fail "Benchmark_Zero is not explicitly an idle/no-controller run"
+grep -q '^osc send=19001 recv=19002 control=m4l$' "$base/default.out" \
+    || fail "a run without a scenario does not default to the M4L device ports"
 grep -q '^trace=off privilege=none structure=benchmark scenario=none$' "$base/default.out" \
     || fail "the default plan is not an untraced benchmark without a scenario"
 ok "dry-run is mutation-free and fixes every set to the default 30-second window"
@@ -215,6 +217,19 @@ ok "--sets plans the chosen sets in order and marks a non-canonical run diagnost
     || fail "scenario dry-run failed: $(cat "$base/scenario.err")"
 grep -q '^trace=off privilege=none structure=diagnostic scenario=clip-launch-storm$' "$base/scenario.out" \
     || fail "a scenario run is not marked diagnostic with its name"
+grep -q '^osc send=11000 recv=11001 control=abletonosc$' "$base/scenario.out" \
+    || fail "a scenario run without ABL_BENCH_OSC_* does not default every OSC use to AbletonOSC"
+"${fixture_env[@]}" ABL_BENCH_OSC_SEND=12000 ABL_BENCH_OSC_RECV=12001 "$here/bench-suite.sh" --dry-run \
+    --scenario clip-launch-storm --tag fixture --output "$base/scenario-ports-report" \
+    > "$base/scenario-ports.out" 2> "$base/scenario-ports.err" \
+    || fail "scenario dry-run with explicit ports failed: $(cat "$base/scenario-ports.err")"
+grep -q '^osc send=12000 recv=12001 control=abletonosc$' "$base/scenario-ports.out" \
+    || fail "explicit ABL_BENCH_OSC_* ports were not kept for a scenario run"
+if "${fixture_env[@]}" ABL_BENCH_OSC_SEND=11000 ABL_BENCH_OSC_RECV=11000 "$here/bench-suite.sh" --dry-run \
+    --tag fixture --output "$base/same-ports-report" > "$base/same-ports.out" 2> "$base/same-ports.err"; then
+    fail "identical send and receive ports were accepted"
+fi
+grep -q 'must differ' "$base/same-ports.err" || fail "identical port refusal was not precise"
 [ "$(awk -F '\t' '$1 ~ /^[1-5]$/ && $3 == "scenario" && $4 == "30s" {count++} END {print count+0}' "$base/scenario.out")" -eq 5 ] \
     || fail "the scenario does not drive every planned set"
 "${fixture_env[@]}" ABLETON_BENCH_SCENARIO=clip-launch-storm "$here/bench-suite.sh" --dry-run --sets Inbuilts \
@@ -240,7 +255,7 @@ if "${fixture_env[@]}" ABLETON_BENCH_SCENARIO_TOOL=/nonexistent "$here/bench-sui
     fail "preflight accepted a missing scenario tool"
 fi
 grep -q 'scenario tool is missing: /nonexistent' "$base/no-tool.err" || fail "missing scenario tool refusal was not precise"
-ok "a scenario drives every planned set and only a validated scenario runs"
+ok "a scenario drives every planned set on the AbletonOSC ports and only a validated scenario runs"
 
 if "${fixture_env[@]}" "$here/bench-run.sh" --mode scenario --scenario clip-launch-storm \
     --output-dir "$base/scenario-run" > "$base/scenario-run.out" 2> "$base/scenario-run.err"; then

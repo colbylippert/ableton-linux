@@ -11,6 +11,7 @@ Every callback runs on Live's main thread inside Manager.tick(). A failing
 Live API call is logged as "bench: ..." which the manager relays to
 /live/error; it never stops the tick loop or the periodic CPU report.
 """
+import collections
 import os
 import sys
 import traceback
@@ -46,6 +47,7 @@ class BenchHandler(AbletonOSCHandler):
         self.generation = 0
         self.playing_listener = None
         self.browser_index = {}
+        self.browser_pending = {}
         self.cpu_attribute_ok = False
 
         self._add("ping", self._ping)
@@ -76,6 +78,13 @@ class BenchHandler(AbletonOSCHandler):
                 self.logger.info("bench: is_playing listener already removed: %s" % e)
             self.playing_listener = None
         super().clear_api()
+
+    def disconnect(self):
+        # Manager.disconnect() (Set closed, surface deselected, Live quitting)
+        # shuts the OSC socket and never calls clear_api(): drop the listener
+        # and the CPU chain here so nothing reports through the closed socket.
+        self.clear_api()
+        super().disconnect()
 
     #--------------------------------------------------------------------------------
     # Registration, reports, errors
@@ -240,6 +249,7 @@ class BenchHandler(AbletonOSCHandler):
         except Exception:
             # A cached item can be stale after a browser rescan: forget the index.
             self.browser_index.pop(kind, None)
+            self.browser_pending.pop(kind, None)
             raise
         self._report("/abl/bench/load-device", (name, "ok"))
 
@@ -248,16 +258,25 @@ class BenchHandler(AbletonOSCHandler):
             raise ValueError("unknown browser root %r; expected one of %s" % (kind, ", ".join(BROWSER_ROOTS)))
         index = self.browser_index.get(kind)
         if index is None:
-            # Depth-first, in browser order; the first loadable item with a name wins.
-            index = {}
-            stack = [getattr(Live.Application.get_application().browser, kind)]
-            while stack:
-                item = stack.pop()
-                if item.is_loadable and item.name not in index:
-                    index[item.name] = item
-                stack.extend(reversed(list(item.children)))
-            self.browser_index[kind] = index
-        return index.get(name)
+            index = self.browser_index[kind] = {}
+            self.browser_pending[kind] = collections.deque(
+                [getattr(Live.Application.get_application().browser, kind)])
+        if name in index:
+            return index[name]
+        # Breadth-first, in browser order, and only until the name turns up:
+        # this runs on Live's main thread, and the preset trees below the
+        # devices are large. The shallowest loadable item with a name wins, so
+        # a top-level device is never shadowed by a same-named preset. The
+        # walk resumes where it stopped for the next name.
+        pending = self.browser_pending[kind]
+        while pending:
+            item = pending.popleft()
+            pending.extend(item.children)
+            if item.is_loadable and item.name not in index:
+                index[item.name] = item
+                if item.name == name:
+                    return item
+        return None
 
     def _subscribe(self, params):
         self.subscribers.add(("127.0.0.1", int(params[0])))

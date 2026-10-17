@@ -62,6 +62,14 @@ it only with --structure diagnostic. Tracing runs the tracer as root through
 profiler-root-helper on PATH or passwordless sudo. ABLETON_BENCH_TRACE,
 ABLETON_BENCH_SCENARIO, ABLETON_BENCH_TRACER, ABLETON_BENCH_ROOT_HELPER,
 ABLETON_BENCH_SUDO, and ABLETON_BENCH_SCENARIO_TOOL set the defaults.
+
+OSC ports: ABL_BENCH_OSC_SEND (commands to Live) and ABL_BENCH_OSC_RECV
+(reports from Live) apply to every OSC use of the run: the probe, the
+measurement, the stop and the scenario driver. A run without a scenario
+defaults to 19001/19002 (the M4L device in the standard sets). A scenario run
+defaults to 11000/11001 (the AbletonOSC Control Surface with the bench
+handler, the only endpoint that serves scenario markers); profiler/bin/bench
+exports the same pair for every run.
 EOF
 }
 
@@ -142,6 +150,24 @@ done
 # benchmark. Everything else is a diagnostic run.
 structure=diagnostic
 [ -n "$scenario" ] || [ "${sets[*]}" != "${canonical_sets[*]}" ] || structure=benchmark
+# One OSC endpoint per run: bench-osc.py (probe, measurement, stop) defaults to
+# the M4L device ports and scenario-run.py to the AbletonOSC ports, so the suite
+# fixes both for its children. Only AbletonOSC serves scenario markers.
+control=m4l
+osc_default_send=19001
+osc_default_recv=19002
+if [ -n "$scenario" ]; then control=abletonosc; osc_default_send=11000; osc_default_recv=11001; fi
+export ABL_BENCH_OSC_SEND="${ABL_BENCH_OSC_SEND:-$osc_default_send}"
+export ABL_BENCH_OSC_RECV="${ABL_BENCH_OSC_RECV:-$osc_default_recv}"
+case "$ABL_BENCH_OSC_SEND:$ABL_BENCH_OSC_RECV" in
+    *[!0-9:]*|:*|*:) fail "ABL_BENCH_OSC_SEND and ABL_BENCH_OSC_RECV must be UDP port numbers" ;;
+esac
+[ "$ABL_BENCH_OSC_SEND" != "$ABL_BENCH_OSC_RECV" ] || fail "ABL_BENCH_OSC_SEND and ABL_BENCH_OSC_RECV must differ"
+if [ "$control" = abletonosc ]; then
+    control_hint="the AbletonOSC Control Surface with the bench handler must be active (profiler/control/install.sh)"
+else
+    control_hint="the set's M4L device or the AbletonOSC Control Surface must be active"
+fi
 trace_tool_mode=summary
 [ "$trace" != drilldown ] || trace_tool_mode=drilldown
 case "$tag" in ''|*$'\n'*|*$'\r'*) fail "tag must be one non-empty line" ;; esac
@@ -226,9 +252,9 @@ preflight()
     prefix_pids="$(ableton_prefix_pids)"
     [ -z "$prefix_pids" ] || fail "the configured Wine prefix is already active (pid(s): $(printf '%s' "$prefix_pids" | tr '\n' ' ')); close it first"
     if [ "$dry_run" -ne 1 ] || [ "${ABLETON_BENCH_TESTING:-0}" != 1 ]; then
-        python3 "$here/bench-report.py" check-udp --port "${ABL_BENCH_OSC_RECV:-19002}" \
+        python3 "$here/bench-report.py" check-udp --port "$ABL_BENCH_OSC_RECV" \
             || fail "the benchmark OSC receive port is already in use"
-        python3 "$here/bench-report.py" check-udp --port "${ABL_BENCH_OSC_SEND:-19001}" \
+        python3 "$here/bench-report.py" check-udp --port "$ABL_BENCH_OSC_SEND" \
             || fail "the Live control port is already in use; the control device could not listen"
     fi
     if [ "$trace" != off ]; then
@@ -261,6 +287,7 @@ preflight
 if [ "$dry_run" -eq 1 ]; then
     printf 'benchmark plan: duration=%ss output=%s\n' "$duration" "$output"
     printf 'trace=%s privilege=%s structure=%s scenario=%s\n' "$trace" "$privilege" "$structure" "${scenario:-none}"
+    printf 'osc send=%s recv=%s control=%s\n' "$ABL_BENCH_OSC_SEND" "$ABL_BENCH_OSC_RECV" "$control"
     for index in "${!sets[@]}"; do
         set_name="${sets[index]}"
         mode=playback
@@ -483,7 +510,7 @@ for index in "${!sets[@]}"; do
     if [ "$osc" = on ]; then
         python3 "$here/bench-osc.py" probe --timeout "$launch_timeout" \
             > "$set_dir/raw/osc-probe.txt" 2> "$set_dir/raw/osc-probe.stderr.txt" \
-            || fail "$set_name control device did not answer (no /abl/bench/pong on UDP ${ABL_BENCH_OSC_RECV:-19002} within ${launch_timeout}s; the set's M4L device or the AbletonOSC Control Surface must be active)"
+            || fail "$set_name control device did not answer (no /abl/bench/pong on UDP $ABL_BENCH_OSC_RECV within ${launch_timeout}s; $control_hint)"
         wait_log_quiet || fail "$set_name log did not settle within ${launch_timeout}s"
         if [ "$mode" = scenario ]; then
             python3 "$scenario_tool" setup --scenario "$scenario" \

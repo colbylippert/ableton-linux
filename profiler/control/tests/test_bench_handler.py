@@ -191,7 +191,7 @@ class HandlerCase(unittest.TestCase):
         self.assertEqual(self.application.view.focused, ["Detail/Clip"])
         self.assertEqual(self.reports("/abl/bench/view"), [(("Arranger", 1), None), (("Detail/Clip", 1), None)])
 
-    def test_load_device_selects_track_and_searches_depth_first(self):
+    def test_load_device_selects_track_and_searches_breadth_first(self):
         handler = self.make_handler()
         browser = self.application.browser
         self.server.dispatch("/abl/bench/load-device", "instruments", "Drum Rack", 1)
@@ -209,6 +209,21 @@ class HandlerCase(unittest.TestCase):
         self.assertTrue(any("unknown browser root" in line for line in logged.output))
         self.assertEqual(len(self.reports("/abl/bench/load-device")), 3)
 
+    def test_load_device_stops_at_the_first_match_and_prefers_shallow_items(self):
+        handler = self.make_handler()
+        operator = self.application.browser.instruments.children[1]
+        operator.children = [fake_live.FakeBrowserItem("Operator", is_loadable=True)]
+        self.application.browser.instruments.children.insert(0, fake_live.FakeBrowserItem("Racks", [
+            fake_live.FakeBrowserItem("Operator", is_loadable=True),
+        ]))
+        self.server.dispatch("/abl/bench/load-device", "instruments", "Operator")
+        self.assertIs(self.application.browser.loaded[-1], operator)
+        # The walk stopped at depth one: nothing below the top-level items is indexed yet.
+        self.assertEqual(sorted(handler.browser_index["instruments"]), ["Operator"])
+        self.server.dispatch("/abl/bench/load-device", "instruments", "Drum Rack")
+        self.assertEqual(self.application.browser.loaded[-1].name, "Drum Rack")
+        self.assertIn("Wavetable", handler.browser_index["instruments"])
+
     def test_load_device_failure_drops_the_cached_index(self):
         handler = self.make_handler()
         self.server.dispatch("/abl/bench/load-device", "instruments", "Operator")
@@ -218,6 +233,7 @@ class HandlerCase(unittest.TestCase):
             self.server.dispatch("/abl/bench/load-device", "instruments", "Operator")
         self.assertTrue(any("bench: load-device failed: stale browser item" in line for line in logged.output))
         self.assertNotIn("instruments", handler.browser_index)
+        self.assertNotIn("instruments", handler.browser_pending)
 
     def test_subscribe_fans_out_every_report(self):
         handler = self.make_handler()
@@ -274,6 +290,18 @@ class HandlerCase(unittest.TestCase):
         self.assertEqual(self.reports("/abl/bench/cpu"), [])
         # A second clear_api (upstream calls it on every reload) is harmless.
         handler.clear_api()
+
+    def test_disconnect_removes_listener_and_cancels_period(self):
+        handler = self.make_handler()
+        handler.disconnect()
+        self.assertTrue(handler.disconnected)
+        self.assertEqual(self.song.listeners["is_playing"], [])
+        self.assertIsNone(handler.playing_listener)
+        self.assertEqual(handler.period_ticks, 0)
+        self.song.start_playing()
+        self.manager.advance(10)
+        self.assertEqual(self.reports("/abl/bench/playing"), [])
+        self.assertEqual(self.reports("/abl/bench/cpu"), [])
 
     def test_reports_carry_only_int_float_str(self):
         self.make_handler()

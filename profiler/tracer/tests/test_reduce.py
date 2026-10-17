@@ -505,6 +505,39 @@ class ReduceTest(unittest.TestCase):
             self.assertEqual(self.out["blocks_header"]["roles"], "roles.toml")
             self.assertEqual(self.out["summary"]["roles"].keys(), out["summary"]["roles"].keys())
 
+    def test_unnamed_live_threads_agree_between_classifiers(self):
+        reducer = reduce_mod.Reducer(None)
+        reducer.pid_image.update({PID_LIVE: "Ableton Live 12 Trial.exe", 4400: "Ableton Live 12 Trial.exe"})
+        reducer.pid_comm[PID_LIVE] = "Ableton Live 12"
+        threads = {
+            4201: (PID_LIVE, "Ableton Live 12"),  # unnamed: the process comm
+            TID_MIDI: (PID_LIVE, "MIDI"),  # named
+            4401: (4400, "Worker"),  # process comm never seen
+        }
+        for tid, (pid, comm) in threads.items():
+            reducer.tid_pid[tid] = pid
+            reducer.names[tid] = comm
+        builtin = {tid: reducer.builtin_role(tid) for tid in threads}
+        self.assertEqual(builtin, {4201: "unknown:Ableton Live 12", TID_MIDI: "live:MIDI", 4401: "unknown:Worker"})
+        reducer.roles = reduce_mod.load_role_table(None, reducer.warnings)
+        if reducer.roles is not None:
+            self.assertEqual({tid: reducer.role_of(tid) for tid in threads}, builtin)
+
+    def test_tracer_json_keeps_zero_pairing_counters(self):
+        clean_dir = os.path.join(self.tmp.name, "clean")
+        os.makedirs(clean_dir)
+        f = Fixture()
+        f.hdr()
+        f.thread(S0 + 100, TID_MAIN, PID_LIVE, "Ableton Live 12")
+        f.sc_entry(S0 + 1_000, TID_MAIN, 0x0046, 0xC1, 0)
+        f.sc_exit(S0 + 2_000, TID_MAIN, 0x0046, 0xC1)
+        f.end(S0 + 3_000)
+        write_run(clean_dir, f.lines)
+        tracer = run_reduce(clean_dir)["tracer"]
+        self.assertEqual(tracer["counters"]["abandoned_entries"], 0)
+        self.assertEqual(tracer["counters"]["unmatched_exits"], 0)
+        self.assertEqual(tracer["counters"]["unmatched_exits_first_on_tid"], 0)
+
     def test_missing_header_and_empty_input(self):
         empty_dir = os.path.join(self.tmp.name, "empty")
         os.makedirs(empty_dir)
