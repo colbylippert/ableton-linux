@@ -200,11 +200,13 @@ ableton_wait_for_pid_exit()
 # AbletonAudioCpl.exe is the USB Audio Driver's applet, started from a Startup
 # shortcut when the installer's "Install USB Audio Driver" task is left checked,
 # which is its default.
-ABLETON_LEFTOVER_AGENTS="AbletonPushCpl.exe tusbaudiocplapp.exe AbletonAudioCpl.exe MicrosoftEdgeUpdate.exe"
+# Ableton Web Connector.exe is Live 12's update/web helper; it outlives Live and
+# keeps the wineserver up.  The list is |-separated because that name has spaces.
+ABLETON_LEFTOVER_AGENTS="AbletonPushCpl.exe|tusbaudiocplapp.exe|AbletonAudioCpl.exe|MicrosoftEdgeUpdate.exe|Ableton Web Connector.exe"
 
 ableton_agent_image()
 {
-    case " $ABLETON_LEFTOVER_AGENTS " in *" $1 "*) return 0 ;; esac
+    case "|$ABLETON_LEFTOVER_AGENTS|" in *"|$1|"*) return 0 ;; esac
     return 1
 }
 
@@ -240,7 +242,9 @@ ableton_stop_leftover_agents()
     # wine builds a prefix at any path it is handed; a refusal must not create one.
     [ -x "$runtime/bin/wine" ] || return 0
     [ -f "$prefix/system.reg" ] || return 0
-    for image in $ABLETON_LEFTOVER_AGENTS; do args+=(/im "$image"); done
+    local images=()
+    IFS='|' read -r -a images <<< "$ABLETON_LEFTOVER_AGENTS"
+    for image in "${images[@]}"; do args+=(/im "$image"); done
     # One invocation: taskkill takes a list, and each wine start costs exit latency.
     # 9>&- as every other launcher-side wine invocation does: this runs from the
     # EXIT trap, where the flock'd bring-up lock can still be open, and wine would

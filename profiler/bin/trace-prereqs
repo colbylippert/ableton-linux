@@ -163,9 +163,12 @@ usdt_row() {   # LABEL FILE PATCH
     fi
     listed=""
     if [ "$have_bpftrace" -eq 1 ]; then
-        listed="$(bpftrace -l "usdt:$file:*" 2>/dev/null | grep -c . || true)"
+        # bpftrace lists nothing without root, so prefer non-interactive sudo
+        local bt=(bpftrace) how="bpftrace -l"
+        if [ "$(id -u)" -ne 0 ] && sudo -n true 2>/dev/null; then bt=(sudo -n bpftrace); how="sudo bpftrace -l"; fi
+        listed="$("${bt[@]}" -l "usdt:$file:*" 2>/dev/null | grep -c . || true)"
         [[ "$listed" =~ ^[0-9]+$ ]] || listed=0
-        listed="; bpftrace -l lists $listed"
+        listed="; $how lists $listed probe(s)"
     fi
     row OK "$label" "$n stapsdt note(s)$listed"
 }
