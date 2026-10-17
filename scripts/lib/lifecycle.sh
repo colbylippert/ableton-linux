@@ -204,47 +204,98 @@ ableton_wait_for_pid_exit()
 # keeps the wineserver up.  The list is |-separated because that name has spaces.
 ABLETON_LEFTOVER_AGENTS="AbletonPushCpl.exe|tusbaudiocplapp.exe|AbletonAudioCpl.exe|MicrosoftEdgeUpdate.exe|Ableton Web Connector.exe"
 
-ableton_agent_image()
+# This project's own session helpers, which the launcher starts beside Live.
+# learnheal.exe leaves by itself once Live has been gone for 60 s (the launcher
+# also bounds it to 90 s from launch), so an interactive session lets it finish:
+# the teardown names it as a helper that will quit on its own, and it is never
+# counted as an unknown holder.  A session that needs the prefix idle as soon as
+# Live has quit - the profiler's suite between two Sets, its state snapshot and
+# restore, its scripted quit - ends it with the agents, by exact image name, and
+# only once no Live and no Max is left in the prefix: the heal is for whichever
+# Live is still open.  See ABLETON_SESSION_HELPERS and ableton_prefix_settle.
+ABLETON_SESSION_HELPER_IMAGES="learnheal.exe"
+
+# IMAGE LIST: true when the |-separated LIST names IMAGE exactly.
+ableton_image_in_list()
 {
-    case "|$ABLETON_LEFTOVER_AGENTS|" in *"|$1|"*) return 0 ;; esac
+    [ -n "$1" ] && [ -n "$2" ] || return 1
+    case "|$2|" in *"|$1|"*) return 0 ;; esac
     return 1
 }
 
-# Holders whose image this teardown ends by name.  Kept separate from the unknown
-# set because the two need opposite handling: one is on its way out, the other did
+ableton_agent_image()
+{
+    ableton_image_in_list "$1" "$ABLETON_LEFTOVER_AGENTS"
+}
+
+ableton_session_helper_image()
+{
+    ableton_image_in_list "$1" "$ABLETON_SESSION_HELPER_IMAGES"
+}
+
+# The teardown's opt-in for scripted sessions: ABLETON_SESSION_HELPERS=stop ends
+# the session helpers with the agents (profiler/bin/bench exports it for the
+# suite).  Unset or anything else keeps the interactive behaviour, in which they
+# finish on their own.
+ableton_session_helpers_stop()
+{
+    [ "${ABLETON_SESSION_HELPERS:-finish}" = stop ]
+}
+
+# The Live and Max processes in the prefix, whichever Wine runtime runs them: the
+# applications a session helper may still be serving.  One pid per line.
+ableton_prefix_app_pids()
+{
+    local runtime="${1:-$ABLETON_WINE_ROOT}" prefix="${2:-$ABLETON_WINEPREFIX}" pid exe cmd
+    while IFS="$(printf '\t')" read -r pid exe; do
+        [ -n "$pid" ] || continue
+        cmd="$(ableton_pid_cmdline "$pid")"
+        case "$cmd" in
+            *"Ableton Live"*.exe*|*"Max 9"*Max.exe*|*"Cycling '74"*Max.exe*) printf '%s\n' "$pid" ;;
+        esac
+    done < <(ableton_prefix_wine_processes_any_runtime "$prefix" "$runtime")
+    return 0
+}
+
+# Holders whose image this teardown ends by name: the agents, plus the |-separated
+# EXTRA images it was told to end as well.  Kept separate from the unknown set
+# because the two need opposite handling: one is on its way out, the other did
 # not go when it was told to.
 ableton_agent_holders()
 {
-    local pid image
+    local extra="${1:-}" pid image
     while IFS="$(printf '\t')" read -r pid image; do
         [ -n "$pid" ] || continue
-        ableton_agent_image "$image" || continue
+        ableton_agent_image "$image" || ableton_image_in_list "$image" "$extra" || continue
         printf '%s\t%s\n' "$pid" "$image"
     done
     return 0
 }
 
-# True while a holder list still names an agent this teardown ends by name.
+# True while a holder list still names an agent (or one of the |-separated EXTRA
+# images) this teardown ends by name.
 ableton_holders_include_agent()
 {
-    local pid image
+    local extra="${2:-}" pid image
     while IFS="$(printf '\t')" read -r pid image; do
         [ -n "$image" ] || continue
         ableton_agent_image "$image" && return 0
+        ableton_image_in_list "$image" "$extra" && return 0
     done <<< "$1"
     return 1
 }
 
+# End the agents by exact image name, and the |-separated EXTRA images with them.
 ableton_stop_leftover_agents()
 {
-    local runtime="${1:-$ABLETON_WINE_ROOT}" prefix="${2:-$ABLETON_WINEPREFIX}" image
+    local runtime="${1:-$ABLETON_WINE_ROOT}" prefix="${2:-$ABLETON_WINEPREFIX}" extra="${3:-}" image
     local args=()
     # wine builds a prefix at any path it is handed; a refusal must not create one.
     [ -x "$runtime/bin/wine" ] || return 0
     [ -f "$prefix/system.reg" ] || return 0
     local images=()
-    IFS='|' read -r -a images <<< "$ABLETON_LEFTOVER_AGENTS"
-    for image in "${images[@]}"; do args+=(/im "$image"); done
+    IFS='|' read -r -a images <<< "$ABLETON_LEFTOVER_AGENTS${extra:+|$extra}"
+    for image in "${images[@]}"; do [ -z "$image" ] || args+=(/im "$image"); done
     # One invocation: taskkill takes a list, and each wine start costs exit latency.
     # 9>&- as every other launcher-side wine invocation does: this runs from the
     # EXIT trap, where the flock'd bring-up lock can still be open, and wine would
@@ -332,15 +383,30 @@ ableton_pid_image()
 # since none of them is distinguishable from a leftover here.  Non-zero if held.
 # Callers name themselves through ABLETON_SESSION_LABEL, which each launcher sets
 # on the call; unset reads as "the session".
+# ABLETON_SESSION_HELPERS=stop (scripted sessions; see ABLETON_SESSION_HELPER_IMAGES)
+# ends this project's session helpers with the agents once no Live and no Max is
+# left (one on its way out gets the grace period), and then waits up to 15 s for
+# the prefix to come down - Live's own helpers (Ableton AddOns.exe, Ableton
+# Index.exe) leave a few seconds after it, Wine's processes 3-5 s after the last
+# client - so the next launch starts on an idle prefix instead of joining a
+# server that is shutting down.
 ableton_session_teardown()
 {
     local runtime="${1:-$ABLETON_WINE_ROOT}" prefix="${2:-$ABLETON_WINEPREFIX}"
     local seconds="${3:-5}" pid image holders unknown="" deadline stuck="" stuck_agents=""
+    local helpers=""
     seconds="$(ableton_timeout_value "$seconds" teardown-settle 1 60)" || return 2
     # First: taskkill is itself a wine process, so on an empty prefix it would start
     # a server and services that outlive the grace period and be reported as holders.
     ableton_prefix_busy "$runtime" "$prefix" || return 0
-    ableton_stop_leftover_agents "$runtime" "$prefix" || true
+    if ableton_session_helpers_stop; then
+        deadline=$((SECONDS + seconds))
+        while [ -n "$(ableton_prefix_app_pids "$runtime" "$prefix")" ] && [ "$SECONDS" -lt "$deadline" ]; do
+            sleep 0.5
+        done
+        [ -n "$(ableton_prefix_app_pids "$runtime" "$prefix")" ] || helpers="$ABLETON_SESSION_HELPER_IMAGES"
+    fi
+    ableton_stop_leftover_agents "$runtime" "$prefix" "$helpers" || true
     # taskkill returns before the processes it signalled have exited, so a flat
     # pause misreports one of them as a program the user is running.  Wait only
     # while an agent this teardown just ended is still there: applications are
@@ -350,14 +416,25 @@ ableton_session_teardown()
     stuck=""
     while :; do
         holders="$(ableton_prefix_holders "$runtime" "$prefix")"
-        ableton_holders_include_agent "$holders" || break
+        ableton_holders_include_agent "$holders" "$helpers" || break
         # The grace ran out with one still there, so the stop did not take.
         [ "$SECONDS" -lt "$deadline" ] || { stuck=1; break; }
         sleep 0.2
     done
+    # Only the opt-in waits for the rest of the prefix: an interactive session
+    # hands the terminal back at once.
+    if [ -n "$helpers" ] && [ -z "$stuck" ]; then
+        ableton_prefix_wait_idle "$runtime" "$prefix" 15 && return 0
+        holders="$(ableton_prefix_holders "$runtime" "$prefix")"
+        if [ -z "$holders" ]; then
+            printf -- '-- %s closed; Wine'\''s own processes were still running 15 s later\n' \
+                "${ABLETON_SESSION_LABEL:-the session}" >&2
+            return 0
+        fi
+    fi
     [ -n "$holders" ] || return 0
     unknown="$(printf '%s\n' "$holders" | ableton_unknown_holders)"
-    [ -z "$stuck" ] || stuck_agents="$(printf '%s\n' "$holders" | ableton_agent_holders)"
+    [ -z "$stuck" ] || stuck_agents="$(printf '%s\n' "$holders" | ableton_agent_holders "$helpers")"
     # An agent that outlived the stop is the exact failure this teardown exists to
     # prevent: MicrosoftEdgeUpdate.exe holds the wineserver for the rest of the
     # login session.  It is named, never folded into the helpers below, because
@@ -395,6 +472,60 @@ ableton_session_teardown()
     printf -- '-- Ableton-Linux helpers close themselves once the prefix is free. To kill the prefix forcefully instead:\n' >&2
     printf -- '   WINEPREFIX=%s %s/bin/wineserver -k\n' "$prefix" "$runtime" >&2
     return 1
+}
+
+# Wait up to SECONDS for every Wine process of the prefix to exit, by looking
+# rather than by asking a server: wineserver -w would wait out the whole bound
+# behind a resident.  The server leaves 3 s after its last client and ends its
+# own services within 2 s more.  0 idle, 1 still busy at the deadline, 2 usage.
+ableton_prefix_wait_idle()
+{
+    local runtime="${1:-$ABLETON_WINE_ROOT}" prefix="${2:-$ABLETON_WINEPREFIX}" seconds="${3:-10}" deadline
+    seconds="$(ableton_timeout_value "$seconds" idle-wait 1 300)" || return 2
+    deadline=$((SECONDS + seconds))
+    while ableton_prefix_busy "$runtime" "$prefix"; do
+        [ "$SECONDS" -lt "$deadline" ] || return 1
+        sleep 0.5
+    done
+    return 0
+}
+
+# For a caller that needs the prefix idle now that its session is over - the
+# profiler's state snapshot/restore and its scripted quit.  Ends the agents and
+# this project's session helpers by exact image name, only once no Live and no
+# Max is left in the prefix and only while one of them is actually there (taskkill
+# is itself a client and would hold a server that is about to leave), and again
+# if another appears; then waits up to SECONDS (default 20) for every Wine process
+# of the prefix to exit.  Nothing else is ended: a Live, a Max or a program the
+# user started keeps the prefix busy.  0 idle; 1 still busy at the deadline, with
+# the holders that are not Wine's own processes on stdout (pid<TAB>image); 2 usage.
+ableton_prefix_settle()
+{
+    local runtime="${1:-$ABLETON_WINE_ROOT}" prefix="${2:-$ABLETON_WINEPREFIX}" seconds="${3:-20}"
+    local deadline holders="" pid image leftover last_stop=-1
+    seconds="$(ableton_timeout_value "$seconds" settle-wait 1 300)" || return 2
+    deadline=$((SECONDS + seconds))
+    while ableton_prefix_busy "$runtime" "$prefix"; do
+        holders="$(ableton_prefix_holders "$runtime" "$prefix")"
+        leftover=0
+        while IFS="$(printf '\t')" read -r pid image; do
+            [ -n "$pid" ] || continue
+            if ableton_agent_image "$image" || ableton_session_helper_image "$image"; then leftover=1; fi
+        done <<< "$holders"
+        # A second stop only after the first had time to take: taskkill returns
+        # before its targets exit.
+        if [ "$leftover" -eq 1 ] && { [ "$last_stop" -lt 0 ] || [ $((SECONDS - last_stop)) -ge 3 ]; } \
+           && [ -z "$(ableton_prefix_app_pids "$runtime" "$prefix")" ]; then
+            ableton_stop_leftover_agents "$runtime" "$prefix" "$ABLETON_SESSION_HELPER_IMAGES" || true
+            last_stop=$SECONDS
+        fi
+        if [ "$SECONDS" -ge "$deadline" ]; then
+            [ -z "$holders" ] || printf '%s\n' "$holders"
+            return 1
+        fi
+        sleep 0.5
+    done
+    return 0
 }
 
 # Wait for every process in the prefix to exit.  Bounded: a resident that outlives

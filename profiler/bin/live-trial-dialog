@@ -16,7 +16,8 @@
 #   live-trial-dialog present                 exit 0 when the dialog is open
 #   live-trial-dialog continue [--wait S]     click Save/Export Disabled
 #   live-trial-dialog exit [--wait S]         click Exit Live
-#   live-trial-dialog quit-live [--timeout S] quit Live without a crash state (below)
+#   live-trial-dialog quit-live [--timeout S] [--settle S]
+#                                             quit Live without a crash state (below)
 #   live-trial-dialog watch [--for S]         answer "continue" whenever the dialog appears
 #
 # quit-live escalates until Live is gone: (1) bring the main window to the
@@ -33,6 +34,15 @@
 # cannot answer the quit-time dialog with "continue". When Live is still there
 # at --timeout (default 60), its windows are listed and screenshotted to
 # $XDG_STATE_HOME/profiler/logs/quit-live-<UTC>/ and the exit status is 1.
+# Once Live is gone (also when it was not running) quit-live settles the prefix:
+# what the finished session left there - Live's agents (Ableton Web Connector.exe,
+# MicrosoftEdgeUpdate.exe, …) and the launcher's learnheal.exe, which otherwise
+# holds it for up to 60 s - is ended by exact image name through
+# scripts/lib/lifecycle.sh (ableton_prefix_settle: never while a Live or a Max is
+# in the prefix, never anything else), and quit-live waits up to --settle seconds
+# (default 30; 0 skips) for the prefix's Wine processes to exit, so `state
+# restore|snapshot` and the next launch find it idle. A prefix still held then is
+# reported (named by image); Live has quit, so the exit status stays 0.
 #
 # Environment: ABLETON_WINE_ROOT, ABLETON_WINEPREFIX (defaults as the launcher's),
 # LIVEINJECT (default: the repo's beta/tester-kit/probes/advanced/windows/liveinject.exe).
@@ -158,6 +168,30 @@ wait_quit() {
     ! live_running
 }
 
+# After Live: end the leftover agents and session helpers of the finished session
+# (exact image names, lifecycle.sh) and wait up to $settle seconds for the prefix
+# to come down; reports what held it.  Never fails: Live has quit already.
+settle_prefix() {
+    local lib="$repo/scripts/lib/lifecycle.sh" r held before
+    [ "$settle" -gt 0 ] || return 0
+    [ -r "$lib" ] || { log "prefix not settled: $lib is missing"; return 0; }
+    # shellcheck source=../../scripts/lib/lifecycle.sh
+    . "$lib" || { log "prefix not settled: cannot load $lib"; return 0; }
+    for r in "$RT" "$RT-dev"; do
+        [ -x "$r/bin/wine" ] || continue
+        ableton_prefix_busy "$r" "$PREFIX" || continue
+        before="$(ableton_prefix_holders "$r" "$PREFIX" | awk -F'\t' '{ printf "%s%s (pid %s)", sep, $2, $1; sep = ", " }')"
+        log "settling the prefix${before:+ (left: $before)}: ending Live's agents and the session helpers by image name, waiting up to ${settle}s"
+        if held="$(ableton_prefix_settle "$r" "$PREFIX" "$settle")"; then
+            log "prefix idle"
+        else
+            [ -n "$held" ] || held="only Wine's own processes"
+            log "prefix still in use after ${settle}s: $(printf '%s' "$held" | awk -F'\t' '{ printf "%s%s (pid %s)", sep, ($2 == "" ? $1 : $2), $1; sep = ", " }')"
+        fi
+    done
+    return 0
+}
+
 # The windows Live still shows, listed and screenshotted for a human.
 evidence() {
     local dir w pid
@@ -175,17 +209,22 @@ evidence() {
 }
 
 cmd="${1:-}"; [ $# -gt 0 ] && shift
-wait=0; dur=0; timeout=60
+wait=0; dur=0; timeout=60; settle=30
 while [ $# -gt 0 ]; do
     case "$1" in
         --wait) wait="${2:?}"; shift 2 ;;
         --for) dur="${2:?}"; shift 2 ;;
         --timeout) timeout="${2:?}"; shift 2 ;;
+        --settle) settle="${2:?}"; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         *) log "unknown option: $1"; exit 2 ;;
     esac
 done
 case "$cmd" in present|continue|exit|quit-live|watch) ;; -h|--help|help) usage; exit 0 ;; *) usage >&2; exit 2 ;; esac
+for n in "$wait" "$dur" "$timeout" "$settle"; do
+    [[ "$n" =~ ^[0-9]+$ ]] || { log "--wait/--for/--timeout/--settle take whole seconds (got '$n')"; exit 2; }
+done
+[ "$settle" -le 300 ] || { log "--settle takes at most 300 seconds"; exit 2; }
 command -v xdotool >/dev/null || { log "xdotool missing (setup phase packages)"; exit 1; }
 session_env
 
@@ -194,7 +233,7 @@ case "$cmd" in
     continue) click_button continue "$wait" ;;
     exit) click_button exit "$wait" ;;
     quit-live)
-        live_running || { log "Live is not running"; exit 0; }
+        live_running || { log "Live is not running"; settle_prefix; exit 0; }
         printf '%s\n' "$$" > "$QUIT_MARK" 2>/dev/null || true
         trap 'rm -f "$QUIT_MARK"' EXIT
         deadline=$((SECONDS + timeout))
@@ -212,9 +251,9 @@ case "$cmd" in
                 esac || log "liveinject $step failed"
                 log "sent $step"
             fi
-            wait_quit "$STEP_WAIT" "$deadline" && { log "Live exited"; exit 0; }
+            wait_quit "$STEP_WAIT" "$deadline" && { log "Live exited"; settle_prefix; exit 0; }
         done
-        wait_quit "$timeout" "$deadline" && { log "Live exited"; exit 0; }
+        wait_quit "$timeout" "$deadline" && { log "Live exited"; settle_prefix; exit 0; }
         evidence
         log "Live still running after ${timeout}s"; exit 1 ;;
     watch)

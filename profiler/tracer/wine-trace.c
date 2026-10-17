@@ -52,6 +52,7 @@
 #include <bpf/bpf.h>
 #include <bpf/btf.h>
 #include <bpf/libbpf.h>
+#include <gelf.h>
 
 #include "wine-trace.h"
 #include "wine-trace.skel.h"
@@ -59,11 +60,19 @@
 #define LOADER_NAME      "wine-trace.c"
 #define SUMMARY_SCHEMA   "ableton-linux-tracer-summary/v1"
 #define DEFAULT_NEAR_LATE 0.15
-#define DEFAULT_TRAP_NS  1000u      /* assumed uprobe trap cost per hit (not measured) */
+/* assumed uprobe trap cost per hit: measured on the CachyOS laptop (7.2.9, B5b) as traceprobe
+ * NtYieldExecution x5000 traced minus untraced (1795 - 662 ns per syscall) less the BPF run time
+ * of the entry/exit pair (93 + 70 ns), i.e. ~485 ns per trap; not measured per run */
+#define DEFAULT_TRAP_NS  500u
 #define BLOCK_FLUSH_NS   700000000ULL      /* write a block 0.7 s after its end */
 #define BLOCK_GIVEUP_NS  5000000000ULL     /* a block without block_end after 5 s is incomplete */
 #define WINDOW_FLUSH_W   25                /* write a 100 ms window 2.5 s after it */
 #define FOLLOW_TIMEOUT_NS 15000000000ULL   /* a forked child must map ntdll.so within 15 s */
+#define MAPS_REFRESH_NS  2000000000ULL     /* re-read a process's executable ranges at most every 2 s */
+/* code-pointing words in a stack fingerprint: with 6, ~3 % of the B5b samples merged with a
+ * representative whose caller-deciding return address (code word 7-10) differed */
+#define STACK_FP_WORDS   16
+#define MAX_STACK_REPS   50000             /* distinct stack fingerprints kept */
 #define POLL_MS          25
 #define DRAIN_BATCH      4096
 #define MAX_LINKS        4096
@@ -76,26 +85,42 @@ static const char *const kind_names[KIND__COUNT] = {
 	"offcpu", "oncpu", "cycle", "sample",
 };
 #define IS_CROSSING_KIND(k) ((k) >= KIND_SYSCALL && (k) <= KIND_NTSYNC_WAKE)
+#define KIND_NAME(k) ((k) < KIND__COUNT ? kind_names[(k)] : "none")
 
-static const char *const stat_names[ST__COUNT] = {
-	[ST_HIT_SYSCALL_ENTRY] = "syscall_entry", [ST_HIT_SYSCALL_EXIT] = "syscall_exit",
-	[ST_HIT_UNIXCALL_ENTRY] = "unixcall_entry", [ST_HIT_UNIXCALL_EXIT] = "unixcall_exit",
-	[ST_HIT_SERVER_REQ_START] = "server_req_start", [ST_HIT_SERVER_REQ_END] = "server_req_end",
-	[ST_HIT_SERVER_WAIT_START] = "server_wait_start", [ST_HIT_SERVER_WAIT_END] = "server_wait_end",
-	[ST_HIT_BLOCK_START] = "block_start", [ST_HIT_BLOCK_BEFORE_LIVE] = "block_before_live",
-	[ST_HIT_BLOCK_AFTER_LIVE] = "block_after_live", [ST_HIT_BLOCK_END] = "block_end",
-	[ST_HIT_CYCLE_START] = "cycle_start", [ST_HIT_CYCLE_END] = "cycle_end",
-	[ST_HIT_NTSYNC_WAIT] = "ntsync_wait", [ST_HIT_NTSYNC_WAKE] = "ntsync_wake",
-	[ST_HIT_SCHED_SWITCH] = "sched_switch", [ST_HIT_SCHED_WAKING] = "sched_waking",
-	[ST_HIT_PERF_SAMPLE] = "perf_sample",
-	[ST_UNMATCHED_EXIT] = "unmatched_exits", [ST_THREAD_START_EXIT] = "unmatched_exits_first_on_tid",
-	[ST_ABANDONED_ENTRY] = "abandoned_entries", [ST_INFLIGHT_OVERFLOW] = "inflight_overflow",
-	[ST_AGG_FULL] = "agg_full", [ST_RINGBUF_DROP] = "ringbuf_drops",
-	[ST_STACK_READ_FAIL] = "stack_read_fail", [ST_STACKS] = "stacks_emitted",
-	[ST_FILTERED] = "filtered_by_role", [ST_NTSYNC_UNMATCHED] = "ntsync_wait_exit_without_entry",
-	[ST_SAMPLE_CTR] = "sample_counter", [ST_UNIXCALL_SLOW_EXIT] = "unixcall_slow_path_exits",
+static const char *const counter_names[CT__COUNT] = {
+	[CT_UNMATCHED_EXIT] = "unmatched_exits", [CT_FIRST_EXIT] = "unmatched_exits_first_on_tid",
+	[CT_ABANDONED] = "abandoned_entries", [CT_INFLIGHT_OVERFLOW] = "inflight_overflow",
+	[CT_TSTATE_FULL] = "thread_state_full", [CT_AGG_FULL] = "agg_full",
+	[CT_RB_DROP_BLOCK] = "ringbuf_drops_block", [CT_RB_DROP_EVENT] = "ringbuf_drops_event",
+	[CT_RB_DROP_OTHER] = "ringbuf_drops_other", [CT_STACK_DROP] = "stack_samples_dropped",
+	[CT_STACK_READ_FAIL] = "stack_read_fail", [CT_STACKS] = "stacks_emitted",
+	[CT_SAMPLE_RANDOM] = "samples_random", [CT_SAMPLE_SLACK] = "samples_slack",
+	[CT_SAMPLE_TRIGGER] = "samples_trigger", [CT_FILTERED] = "filtered_by_role",
+	[CT_NTSYNC_UNMATCHED] = "ntsync_wait_exit_without_entry",
+	[CT_UNIXCALL_SLOW_EXIT] = "unixcall_slow_path_exits",
+	[CT_NTSYNC_WAIT_HITS] = "ntsync_wait_hits", [CT_NTSYNC_WAKE_HITS] = "ntsync_wake_hits",
+	[CT_OPEN_AT_EXIT] = "open_at_thread_exit", [CT_CALLBACK_RETURN] = "callback_returns",
+	[CT_NEVER_RETURNED] = "never_returned", [CT_ANOMALY_DROP] = "anomaly_records_dropped",
 };
-#define ST_FIRST_COUNTER ST_UNMATCHED_EXIT
+
+/* USDT programs: probe-hit key (tracer.json probe_hits, the prototype's names) */
+static const struct { const char *prog; const char *probe; int hit; } usdt_progs[] = {
+	{ "wine_syscall_entry", "syscall_entry", HIT_SYSCALL_ENTRY },
+	{ "wine_syscall_exit", "syscall_exit", HIT_SYSCALL_EXIT },
+	{ "wine_unixcall_entry", "unixcall_entry", HIT_UNIXCALL_ENTRY },
+	{ "wine_unixcall_exit", "unixcall_exit", HIT_UNIXCALL_EXIT },
+	{ "wine_server_req_start", "server_req_start", HIT_SERVER_REQ_START },
+	{ "wine_server_req_end", "server_req_end", HIT_SERVER_REQ_END },
+	{ "wine_server_wait_start", "server_wait_start", HIT_SERVER_WAIT_START },
+	{ "wine_server_wait_end", "server_wait_end", HIT_SERVER_WAIT_END },
+	{ "pipeasio_block_start", "block_start", HIT_BLOCK_START },
+	{ "pipeasio_block_before_live", "block_before_live", HIT_BLOCK_BEFORE_LIVE },
+	{ "pipeasio_block_after_live", "block_after_live", HIT_BLOCK_AFTER_LIVE },
+	{ "pipeasio_block_end", "block_end", HIT_BLOCK_END },
+	{ "pipeasio_cycle_start", "cycle_start", HIT_CYCLE_START },
+	{ "pipeasio_cycle_end", "cycle_end", HIT_CYCLE_END },
+};
+#define N_USDT_PROGS ((int)(sizeof(usdt_progs) / sizeof(usdt_progs[0])))
 
 /* ======================================================================
  * options
@@ -110,6 +135,7 @@ static struct {
 	const char *run_id;
 	__u32 sample_n;
 	int sample_set;
+	int ringbuf_set;
 	__u32 stack_bytes;
 	int roles_audio;
 	int no_exit;
@@ -128,11 +154,16 @@ static struct {
 	int perf_hz;
 	int verbose;
 	int quiet;
-	int allow_priv_stack;
+	int allow_priv_stack;     /* --unsafe-private-stack: attach although the self-check failed */
+	int self_check;           /* --self-check: load, classify, report, exit (no attach) */
+	const char *dump_jit;     /* --dump-jit DIR: write each function's prologue bytes (hex) */
+	int generic_args;         /* --generic-args: always fetch probe operands through bpf_usdt_arg */
+	__u32 slack_samples;
 } opt = {
 	.mode = MODE_SUMMARY, .ntsync = "auto", .sched = -1, .stack_bytes = STACK_BYTES_DEFAULT,
 	.slack_pct = SLACK_THRESH_PCT_DEFAULT, .ringbuf_mb = RINGBUF_MB_DEFAULT, .follow = 1,
 	.near_late = DEFAULT_NEAR_LATE, .keep_stacks = -1, .trap_ns = DEFAULT_TRAP_NS, .perf_hz = 999,
+	.slack_samples = SLACK_SAMPLES_PER_BLOCK_DEFAULT,
 };
 
 static volatile sig_atomic_t stop_flag;
@@ -990,6 +1021,9 @@ struct proc {
 	struct maprange *ranges;
 	size_t nranges;
 	bool ranges_loaded;
+	__u64 *xlo, *xhi;       /* executable mappings, sorted (stack fingerprints) */
+	size_t nx;
+	__u64 x_loaded;         /* mono_ns() of the last read (0 = never) */
 };
 
 struct thr {
@@ -999,6 +1033,9 @@ struct thr {
 	bool role_valid;
 	bool callback;
 	__u8 bpf_role;          /* role written to the tids map (--roles audio) */
+	/* the BPF side's per-thread counters (REC_EXIT, or the tstate map at stop) */
+	__u32 unmatched, first_exit, abandoned, overflow, open_at_exit, never_returned;
+	bool counters_final;
 };
 
 static struct hmap procs;     /* pid -> struct proc* */
@@ -1091,6 +1128,30 @@ static bool proc_scan_maps(struct proc *p, bool keep_text)
 		}
 	}
 	proc_free_ranges(p);
+	{
+		size_t xcap = 0;
+
+		free(p->xlo);
+		free(p->xhi);
+		p->xlo = p->xhi = NULL;
+		p->nx = 0;
+		for (line = text; line && *line; line = strchr(line, '\n') ? strchr(line, '\n') + 1 : NULL) {
+			unsigned long long lo, hi;
+			char perms[8];
+
+			if (sscanf(line, "%llx-%llx %7s", &lo, &hi, perms) == 3 && perms[2] == 'x') {
+				if (p->nx + 1 > xcap) {
+					xcap = xcap ? xcap * 2 : 256;
+					p->xlo = xrealloc(p->xlo, xcap * sizeof(*p->xlo));
+					p->xhi = xrealloc(p->xhi, xcap * sizeof(*p->xhi));
+				}
+				p->xlo[p->nx] = lo;        /* /proc/PID/maps lists ranges in address order */
+				p->xhi[p->nx] = hi;
+				p->nx++;
+			}
+		}
+		p->x_loaded = mono_ns();
+	}
 	for (line = strtok_r(text, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
 		unsigned long long lo, hi;
 		int off = 0;
@@ -1170,6 +1231,13 @@ static struct thr *thr_get(__u32 tid, __u32 pid_hint)
 	}
 	hmap_put(&thrs, tid, (__u64)(uintptr_t)t);
 	return t;
+}
+
+static struct proc *proc_of_tid(__u32 tid, __u32 pid_hint)
+{
+	struct thr *t = thr_get(tid, pid_hint);
+
+	return t->pid ? proc_get(t->pid, true) : NULL;
 }
 
 static __u8 role_enum(const char *role)
@@ -1529,10 +1597,15 @@ static void write_header(FILE *f, const char *file)
 /* ======================================================================
  * whole-trace aggregates for summary.json
  * ==================================================================== */
-struct site {               /* call site (kind, id name), caller-less */
+/* call site (kind, id name), caller-less; a nested kind with an enclosing syscall / unix call
+ * (pkind != 0) is a separate site per parent and goes to nested_call_sites */
+struct site {
 	char *key;
 	int kind;
 	char *name;
+	int pkind;
+	char *pname;
+	__u64 last_seq;
 	__u64 late_blocks, near_late_blocks, n_in_late, total_in_late, blocks_with_site;
 	double attributed;
 	__u64 n_all, total_all, max_ns;
@@ -1542,7 +1615,22 @@ struct site {               /* call site (kind, id name), caller-less */
 };
 static struct hmap sites;            /* fnv64(key) -> struct site* chain */
 
-struct hotspot { char *key; char *role; int kind; char *name; __u64 n, total; struct hotspot *next; };
+struct tidagg { __u32 tid; __u64 n, total; };
+
+/* (role, kind, name, parent) of the non-audio threads; by tid, so that symbolize.py can split
+ * each hotspot by the callers sampled on those threads */
+struct hotspot {
+	char *key;
+	char *role;
+	int kind;
+	char *name;
+	int pkind;
+	char *pname;
+	__u64 n, total;
+	struct tidagg *tids;
+	size_t ntids, captids;
+	struct hotspot *next;
+};
 static struct hmap hotspots;
 
 struct rolebins { char *role; __u64 *n, *total; size_t nb, cap; struct rolebins *next; };
@@ -1565,18 +1653,23 @@ static struct {
 static struct {
 	__u64 rb_records[16];
 	__u64 keys_drained, drains, keys_for_flushed_block, keys_for_unknown_block;
-	__u64 stacks_kept, stacks_dropped, events_written, blocks_written, windows_written;
+	__u64 stack_samples, stack_reps, stack_reps_full, stack_refs_in_blocks;
+	__u64 events_written, blocks_written, windows_written;
 	__u64 forks, follow_attached, follow_failed, offcpu_records, wake_records;
 	__u64 open_entries_at_end, invalid_blocks, rb_short;
+	__u64 blocks_rebuilt, follow_skipped_unverified_ntdll, anomalies;
 } cnt;
 
-static struct site *site_get(int kind, const char *name)
+static struct site *site_get(int kind, const char *name, int pkind, const char *pname)
 {
-	char key[512];
+	char key[768];
 	__u64 h, *v;
 	struct site *s;
 
-	snprintf(key, sizeof(key), "%s|%s", kind_names[kind], name);
+	if (pkind > 0 && pkind < KIND__COUNT)
+		snprintf(key, sizeof(key), "%s|%s|%s:%s", kind_names[kind], name, kind_names[pkind], pname);
+	else
+		snprintf(key, sizeof(key), "%s|%s", kind_names[kind], name);
 	h = fnv64(key);
 	v = hmap_get(&sites, h);
 	for (s = v ? (struct site *)(uintptr_t)*v : NULL; s; s = s->next)
@@ -1586,6 +1679,8 @@ static struct site *site_get(int kind, const char *name)
 	s->key = xstrdup(key);
 	s->kind = kind;
 	s->name = xstrdup(name);
+	s->pkind = pkind > 0 && pkind < KIND__COUNT ? pkind : 0;
+	s->pname = xstrdup(s->pkind ? pname : "");
 	s->next = v ? (struct site *)(uintptr_t)*v : NULL;
 	hmap_put(&sites, h, (__u64)(uintptr_t)s);
 	return s;
@@ -1609,13 +1704,18 @@ static void site_waker(struct site *s, __u32 waker, __u64 n)
 	}
 }
 
-static void hotspot_add(const char *role, int kind, const char *name, __u64 n, __u64 total)
+static const char *id_name(int kind, __u32 id, char *buf, size_t n);
+
+static void hotspot_add(const char *role, __u32 tid, int kind, const char *name, int pkind, __u32 pid_, __u64 n,
+			__u64 total)
 {
-	char key[512];
+	char key[768], pb[256];
+	const char *pname = pkind ? id_name(pkind, pid_, pb, sizeof(pb)) : "";
 	__u64 h, *v;
 	struct hotspot *s;
+	size_t i;
 
-	snprintf(key, sizeof(key), "%s|%s|%s", role, kind_names[kind], name);
+	snprintf(key, sizeof(key), "%s|%s|%s|%s|%s", role, kind_names[kind], name, pkind ? kind_names[pkind] : "", pname);
 	h = fnv64(key);
 	v = hmap_get(&hotspots, h);
 	for (s = v ? (struct hotspot *)(uintptr_t)*v : NULL; s; s = s->next)
@@ -1627,11 +1727,25 @@ static void hotspot_add(const char *role, int kind, const char *name, __u64 n, _
 		s->role = xstrdup(role);
 		s->kind = kind;
 		s->name = xstrdup(name);
+		s->pkind = pkind;
+		s->pname = xstrdup(pname);
 		s->next = v ? (struct hotspot *)(uintptr_t)*v : NULL;
 		hmap_put(&hotspots, h, (__u64)(uintptr_t)s);
 	}
 	s->n += n;
 	s->total += total;
+	for (i = 0; i < s->ntids; i++)
+		if (s->tids[i].tid == tid)
+			break;
+	if (i == s->ntids) {
+		grow((void **)&s->tids, &s->captids, s->ntids + 1, sizeof(*s->tids));
+		s->tids[i].tid = tid;
+		s->tids[i].n = 0;
+		s->tids[i].total = 0;
+		s->ntids++;
+	}
+	s->tids[i].n += n;
+	s->tids[i].total += total;
 }
 
 static struct rolebins *rolebins_get(const char *role)
@@ -1650,22 +1764,66 @@ static struct rolebins *rolebins_get(const char *role)
 }
 
 /* ======================================================================
+ * stack samples: deduplicated by fingerprint
+ * ====================================================================
+ * A sample's fingerprint is (pid, kind, id, rip, rsp & 15, the first STACK_FP_WORDS words of
+ * the window that point into executable mappings, with their offsets): symbolize.py caches
+ * unwinds under the same assumption (its _stack_key).  The first sample of a fingerprint is
+ * kept with its window (the representative, written to stacks.jsonl with per-tid sample
+ * counts); every sample becomes a {ref, t, tid, kind, id} reference in its block, so callers
+ * can be apportioned per block without shipping one window per sample. */
+struct tidn { __u32 tid; __u64 n; };
+
+struct stackrep {
+	__u64 ref, fp, ts, seq, frame, rsp, rip;
+	__u32 tid, pid, id;
+	__u16 kind, nbytes;
+	__u64 regs[20];
+	unsigned char *bytes;
+	__u64 samples, in_blocks;
+	struct tidn *tids;
+	size_t ntids, captids;
+	struct stackrep *next;  /* fingerprint hash chain */
+};
+
+static struct hmap stack_by_fp;     /* fp -> struct stackrep* chain */
+static struct stackrep **stack_list;
+static size_t nstack_list, capstack_list;
+static __u64 stack_ref_next = 1;
+
+static bool proc_is_code(const struct proc *p, __u64 a)
+{
+	size_t lo = 0, hi = p->nx;
+
+	while (lo < hi) {
+		size_t mid = lo + (hi - lo) / 2;
+
+		if (a < p->xlo[mid])
+			hi = mid;
+		else if (a >= p->xhi[mid])
+			lo = mid + 1;
+		else
+			return true;
+	}
+	return false;
+}
+
+/* ======================================================================
  * blocks
  * ==================================================================== */
 struct xent {
 	__u32 tid;
 	__u16 kind, flags;
 	__u32 id, waker;
+	__u16 pkind;
+	__u32 pid_;
 	__u64 count, total, max, oncpu, aux;
 };
 
-struct stackrec {
-	__u64 ref, ts, seq, frame, rsp, rip;
+struct sref {               /* one stack sample of a block */
+	__u64 ref, ts;
 	__u32 tid, id;
-	__u16 kind, nbytes;
-	__u64 regs[20];
-	unsigned char *bytes;
-	bool written;
+	__u16 kind;
 };
 
 struct block {
@@ -1673,9 +1831,10 @@ struct block {
 	__u64 t0, before, after, t1, clock_nsec, deadline;
 	__u32 tid, nframes, rate, start_flags, end_flags, missed;
 	bool have_start, have_end, have_before, have_after;
+	bool rebuilt;           /* BLOCK_START record lost: start fields from BLOCK_END's copies */
 	struct xent *x;
 	size_t nx, capx;
-	struct stackrec *st;
+	struct sref *st;
 	size_t nst, capst;
 	bool have_cycle, cycle_end;
 	__u64 c_start, c_end;
@@ -1686,7 +1845,6 @@ struct block {
 static struct hmap blocks;          /* seq -> struct block* (pending) */
 static struct hmap flushed_seqs;    /* recently written seqs -> t1 (late keys) */
 static struct hmap cycle_starts;    /* tid -> cycle_start ts */
-static __u64 stack_ref_next = 1;
 
 static struct block *block_get(__u64 seq, bool create)
 {
@@ -1706,51 +1864,55 @@ static struct block *block_get(__u64 seq, bool create)
 
 static void block_free(struct block *b)
 {
-	size_t i;
-
-	for (i = 0; i < b->nst; i++)
-		free(b->st[i].bytes);
 	free(b->st);
 	free(b->x);
 	free(b);
 }
 
-static void stack_write(FILE *f, const struct stackrec *s, bool record)
+static const char *stack_kind_name(int kind)
 {
-	struct thr *t = thr_get(s->tid, 0);
+	return kind == KIND_PERF ? "sample" : KIND_NAME(kind);
+}
+
+static const char *stack_id_name(int kind, __u32 id, char *nb, size_t n)
+{
+	return kind == KIND_PERF ? (id ? "kernel" : "user") : id_name(kind, id, nb, n);
+}
+
+/* stacks.jsonl record of a representative (symbolize.py's input shape) */
+static void stackrep_write(FILE *f, const struct stackrep *s)
+{
+	struct thr *t = thr_get(s->tid, s->pid);
 	char nb[256];
-	const char *name = s->kind == KIND_PERF ? (s->id ? "kernel" : "user") : id_name(s->kind, s->id, nb, sizeof(nb));
 	size_t i;
 
-	if (record)
-		fprintf(f, "{\"type\":\"stack\",\"ref\":%llu,", (unsigned long long)s->ref);
-	else
-		fprintf(f, "{\"ref\":%llu,", (unsigned long long)s->ref);
-	fprintf(f, "\"t\":%.6f,\"tid\":%u,\"pid\":%u,\"seq\":%llu,\"kind\":\"%s\",\"id\":", off_s(s->ts), s->tid,
-		t->pid, (unsigned long long)((s->seq & WINDOW_BIT) ? 0 : s->seq),
-		s->kind == KIND_PERF ? "sample" : kind_names[s->kind]);
-	jstr(f, name);
+	fprintf(f, "{\"type\":\"stack\",\"ref\":%llu,\"t\":%.6f,\"tid\":%u,\"pid\":%u,\"seq\":%llu,\"kind\":\"%s\",\"id\":",
+		(unsigned long long)s->ref, off_s(s->ts), s->tid, s->pid ? s->pid : t->pid,
+		(unsigned long long)((s->seq & WINDOW_BIT) ? 0 : s->seq), stack_kind_name(s->kind));
+	jstr(f, stack_id_name(s->kind, s->id, nb, sizeof(nb)));
 	fprintf(f, ",\"id_num\":%u,\"role\":", s->id);
 	jstr(f, role_of(s->tid));
-	fprintf(f, ",\"frame\":\"0x%llx\",\"rip\":\"0x%llx\",\"rsp\":\"0x%llx\",\"regs\":[",
+	fprintf(f, ",\"samples\":%llu,\"in_blocks\":%llu,\"tids\":[", (unsigned long long)s->samples,
+		(unsigned long long)s->in_blocks);
+	for (i = 0; i < s->ntids; i++)
+		fprintf(f, "%s[%u,%llu]", i ? "," : "", s->tids[i].tid, (unsigned long long)s->tids[i].n);
+	fprintf(f, "],\"frame\":\"0x%llx\",\"rip\":\"0x%llx\",\"rsp\":\"0x%llx\",\"regs\":[",
 		(unsigned long long)s->frame, (unsigned long long)s->rip, (unsigned long long)s->rsp);
 	for (i = 0; i < 20; i++)
 		fprintf(f, "%s%llu", i ? "," : "", (unsigned long long)s->regs[i]);
 	fputs("],\"stack_hex\":\"", f);
 	for (i = 0; i < s->nbytes; i++)
 		fprintf(f, "%02x", s->bytes[i]);
-	fputs("\"}", f);
-	if (record)
-		fputc('\n', f);
+	fputs("\"}\n", f);
 }
 
-static void stack_ref_only(FILE *f, const struct stackrec *s)
+static void sref_write(FILE *f, const struct sref *s)
 {
 	char nb[256];
 
 	fprintf(f, "{\"ref\":%llu,\"t\":%.6f,\"tid\":%u,\"kind\":\"%s\",\"id\":", (unsigned long long)s->ref,
-		off_s(s->ts), s->tid, kind_names[s->kind]);
-	jstr(f, id_name(s->kind, s->id, nb, sizeof(nb)));
+		off_s(s->ts), s->tid, stack_kind_name(s->kind));
+	jstr(f, stack_id_name(s->kind, s->id, nb, sizeof(nb)));
 	fputc('}', f);
 }
 
@@ -1991,15 +2153,19 @@ struct xc {                 /* merged crossing of one block */
 	__u32 tid;
 	int kind;
 	char name[160];
+	int pkind;              /* nested kinds: the enclosing syscall / unix call (0 = none) */
+	char pname[160];
 	__u64 n, total, max;
 	__u32 waker;
 	__u64 waker_n;
 	__u64 timeouts;
+	bool attributable;      /* shares the block's lost slack: top-level crossing of an audio-role thread */
 };
 
 static int cmp_xc(const void *a, const void *b)
 {
 	const struct xc *x = a, *y = b;
+	int c;
 
 	if (x->total != y->total)
 		return x->total > y->total ? -1 : 1;
@@ -2007,7 +2173,24 @@ static int cmp_xc(const void *a, const void *b)
 		return x->tid < y->tid ? -1 : 1;
 	if (x->kind != y->kind)
 		return x->kind < y->kind ? -1 : 1;
-	return strcmp(x->name, y->name);
+	c = strcmp(x->name, y->name);
+	if (c)
+		return c;
+	if (x->pkind != y->pkind)
+		return x->pkind < y->pkind ? -1 : 1;
+	return strcmp(x->pname, y->pname);
+}
+
+/* "parent":{"kind":..,"id":..} of a nested crossing / event */
+static void write_parent(FILE *f, int pkind, __u32 pid_)
+{
+	char nb[256];
+
+	if (!pkind || pkind >= KIND__COUNT)
+		return;
+	fprintf(f, ",\"parent\":{\"kind\":\"%s\",\"id\":", kind_names[pkind]);
+	jstr(f, id_name(pkind, pid_, nb, sizeof(nb)));
+	fputc('}', f);
 }
 
 static int cmp_s64(const void *a, const void *b)
@@ -2054,18 +2237,20 @@ static void block_flush(struct block *b)
 	}
 	w0 = b->t0 / WINDOW_NS;
 
-	/* merge the drained keys by (tid, kind, name) */
+	/* merge the drained keys by (tid, kind, name, parent) */
 	for (i = 0; i < b->nx; i++) {
 		const struct xent *x = &b->x[i];
-		char nb[256];
-		const char *nm;
+		char nb[256], pb[256];
+		const char *nm, *pn;
 
 		twin_add(w0, x, false);
 		if (!IS_CROSSING_KIND(x->kind))
 			continue;
 		nm = id_name(x->kind, x->id, nb, sizeof(nb));
+		pn = x->pkind && x->pkind < KIND__COUNT ? id_name(x->pkind, x->pid_, pb, sizeof(pb)) : "";
 		for (j = 0; j < nxc; j++)
-			if (xc[j].tid == x->tid && xc[j].kind == x->kind && strcmp(xc[j].name, nm) == 0)
+			if (xc[j].tid == x->tid && xc[j].kind == x->kind && strcmp(xc[j].name, nm) == 0 &&
+			    xc[j].pkind == x->pkind && strcmp(xc[j].pname, pn) == 0)
 				break;
 		if (j == nxc) {
 			grow((void **)&xc, &capxc, nxc + 1, sizeof(*xc));
@@ -2073,6 +2258,8 @@ static void block_flush(struct block *b)
 			xc[j].tid = x->tid;
 			xc[j].kind = x->kind;
 			scopy(xc[j].name, sizeof(xc[j].name), nm);
+			xc[j].pkind = x->pkind < KIND__COUNT ? x->pkind : 0;
+			scopy(xc[j].pname, sizeof(xc[j].pname), pn);
 			nxc++;
 		}
 		xc[j].n += x->count;
@@ -2092,8 +2279,15 @@ static void block_flush(struct block *b)
 		}
 	}
 	qsort(xc, nxc, sizeof(*xc), cmp_xc);
-	for (i = 0; i < nxc; i++)
-		crossing_total += xc[i].total;
+	/* Lost slack is shared among the block's top-level crossings of audio-role threads, in
+	 * proportion to their time: a nested crossing (server request, NTSync wait or wake inside a
+	 * syscall / unix call) is already part of its enclosing call's time (counting both gave one
+	 * physical wait two shares), and the waits of unrelated threads do not delay the callback. */
+	for (i = 0; i < nxc; i++) {
+		xc[i].attributable = !xc[i].pkind && role_is_audio(role_of(xc[i].tid));
+		if (xc[i].attributable)
+			crossing_total += xc[i].total;
+	}
 
 	/* summary statistics */
 	bstat.count++;
@@ -2128,16 +2322,19 @@ static void block_flush(struct block *b)
 		bstat.lost_total += lost;
 		bstat.attributed_total += (double)attributed;
 		for (i = 0; i < nxc; i++) {
-			struct site *s = site_get(xc[i].kind, xc[i].name);
+			struct site *s = site_get(xc[i].kind, xc[i].name, xc[i].pkind, xc[i].pname);
 
-			s->blocks_with_site++;
-			if (late)
-				s->late_blocks++;
-			else
-				s->near_late_blocks++;
+			if (s->last_seq != b->seq) {   /* one site may appear for several threads */
+				s->last_seq = b->seq;
+				s->blocks_with_site++;
+				if (late)
+					s->late_blocks++;
+				else
+					s->near_late_blocks++;
+			}
 			s->n_in_late += xc[i].n;
 			s->total_in_late += xc[i].total;
-			if (crossing_total)
+			if (crossing_total && xc[i].attributable)
 				s->attributed += (double)attributed * (double)xc[i].total / (double)crossing_total;
 		}
 	}
@@ -2167,6 +2364,8 @@ static void block_flush(struct block *b)
 		jnum_or_null(f, b->have_after, (long long)(b->t1 - b->after));
 		fprintf(f, ",\"elapsed_ns\":%llu,\"slack_ns\":", (unsigned long long)(b->t1 - b->t0));
 		jnum_or_null(f, have_slack, slack);
+		if (b->rebuilt)
+			fputs(",\"rebuilt\":true", f);
 		fprintf(f, ",\"late\":%s,\"near_late\":%s,\"missed_cycles\":%u,\"flags\":[", late ? "true" : "false",
 			near ? "true" : "false", b->missed);
 		{
@@ -2182,6 +2381,11 @@ static void block_flush(struct block *b)
 			jstr(f, role_of(xc[i].tid));
 			fprintf(f, ",\"kind\":\"%s\",\"id\":", kind_names[xc[i].kind]);
 			jstr(f, xc[i].name);
+			if (xc[i].pkind) {
+				fprintf(f, ",\"parent\":{\"kind\":\"%s\",\"id\":", kind_names[xc[i].pkind]);
+				jstr(f, xc[i].pname);
+				fputc('}', f);
+			}
 			fprintf(f, ",\"n\":%llu,\"total_ns\":%llu,\"max_ns\":%llu", (unsigned long long)xc[i].n,
 				(unsigned long long)xc[i].total, (unsigned long long)xc[i].max);
 			if (xc[i].timeouts)
@@ -2225,25 +2429,12 @@ static void block_flush(struct block *b)
 			}
 		}
 		fputs("],\"stacks\":[", f);
-		{
-			bool first = true;
-			bool inline_data = (late || near) && opt.keep_stacks != KEEP_NONE;
-
+		/* references into stacks.jsonl; symbolize.py resolves them and apportions each
+		 * crossing to the callers sampled for its (tid, kind, id) */
+		if (opt.keep_stacks == KEEP_ALL || (opt.keep_stacks == KEEP_LATE && (late || near))) {
 			for (i = 0; i < b->nst; i++) {
-				struct stackrec *s = &b->st[i];
-
-				if (!inline_data && opt.keep_stacks != KEEP_ALL)
-					continue;
-				fputs(first ? "" : ",", f);
-				first = false;
-				if (inline_data)
-					stack_write(f, s, false);
-				else
-					stack_ref_only(f, s);
-				if (inline_data && !s->written && f_stacks) {
-					stack_write(f_stacks, s, true);
-					s->written = true;
-				}
+				fputs(i ? "," : "", f);
+				sref_write(f, &b->st[i]);
 			}
 		}
 		fputc(']', f);
@@ -2258,12 +2449,7 @@ static void block_flush(struct block *b)
 		fputs("}\n", f);
 		cnt.blocks_written++;
 	}
-	for (i = 0; i < b->nst; i++) {
-		if (b->st[i].written)
-			cnt.stacks_kept++;
-		else
-			cnt.stacks_dropped++;
-	}
+	cnt.stack_refs_in_blocks += b->nst;
 	free(xc);
 }
 
@@ -2316,14 +2502,16 @@ static void consume_key(const struct agg_key *k, const struct agg_val *v)
 {
 	struct xent x = {
 		.tid = k->tid, .kind = k->kind, .flags = k->flags, .id = k->id, .waker = v->last_waker,
+		.pkind = k->pkind < KIND__COUNT ? k->pkind : 0, .pid_ = k->pid_,
 		.count = v->count, .total = v->total_ns, .max = v->max_ns, .oncpu = v->oncpu_ns, .aux = v->aux_ns,
 	};
 
 	cnt.keys_drained++;
 	if (k->kind < KIND__COUNT && IS_CROSSING_KIND(k->kind)) {
-		char nb[256];
+		char nb[256], pb[256];
 		const char *nm = id_name(k->kind, k->id, nb, sizeof(nb));
-		struct site *s = site_get(k->kind, nm);
+		const char *pn = x.pkind ? id_name(x.pkind, k->pid_, pb, sizeof(pb)) : "";
+		struct site *s = site_get(k->kind, nm, x.pkind, pn);
 		const char *role = role_of(k->tid);
 
 		kinds_n[k->kind] += v->count;
@@ -2335,7 +2523,7 @@ static void consume_key(const struct agg_key *k, const struct agg_val *v)
 		if (v->last_waker)
 			site_waker(s, v->last_waker, v->count);
 		if (!role_is_audio(role))
-			hotspot_add(role, k->kind, nm, v->count, v->total_ns);
+			hotspot_add(role, k->tid, k->kind, nm, x.pkind, k->pid_, v->count, v->total_ns);
 	}
 	if (k->seq & WINDOW_BIT) {
 		twin_add(k->seq & ~WINDOW_BIT, &x, (k->flags & AGGF_BETWEEN_BLOCKS) != 0);
@@ -2471,11 +2659,11 @@ static void handle_block_rec(const struct rec_block *r)
 		b->have_start = true;
 		b->t0 = r->h.ts;
 		b->tid = r->h.tid;
-		b->nframes = r->nframes;
-		b->rate = r->rate;
-		b->clock_nsec = r->clock_nsec;
-		b->deadline = r->deadline_ns;
-		b->start_flags = r->flags;
+		b->nframes = (__u32)r->a[0];
+		b->rate = (__u32)r->a[1];
+		b->clock_nsec = r->a[2];
+		b->deadline = r->a[3];
+		b->start_flags = (__u32)r->a[4];
 		break;
 	}
 	case PHASE_BEFORE_LIVE:
@@ -2491,16 +2679,21 @@ static void handle_block_rec(const struct rec_block *r)
 	case PHASE_BLOCK_END:
 		b = block_get(r->seq, true);
 		b->t1 = r->h.ts;
-		b->end_flags = r->flags;
-		b->missed = r->missed;
+		b->end_flags = (__u32)r->a[0];
+		b->missed = (__u32)r->a[1];
 		b->have_end = true;
-		if (!b->have_start && r->clock_nsec && r->clock_nsec <= r->h.ts) {
-			/* the block_start record was lost: the BPF side repeats its timestamp here */
-			b->t0 = r->clock_nsec;
-			b->deadline = r->deadline_ns;
-			b->nframes = r->nframes;
-			b->rate = r->rate;
+		if (!b->have_start && r->a[2] && r->a[2] <= r->h.ts) {
+			/* the block_start record was lost: the BPF side repeats the start fields here (only
+			 * when its block state still describes this seq; clock_nsec and the start flags are
+			 * not repeated) */
+			b->t0 = r->a[2];
+			b->deadline = r->a[3];
+			b->nframes = (__u32)r->a[4];
+			b->rate = (__u32)(r->a[4] >> 32);
 			b->tid = r->h.tid;
+			b->have_start = true;
+			b->rebuilt = true;
+			cnt.blocks_rebuilt++;
 		}
 		break;
 	case PHASE_CYCLE_START:
@@ -2508,16 +2701,17 @@ static void handle_block_rec(const struct rec_block *r)
 		break;
 	case PHASE_CYCLE_END: {
 		__u64 *cs = hmap_get(&cycle_starts, r->h.tid);
+		__u64 c0 = r->a[2] ? r->a[2] : (cs ? *cs : 0);
 
-		if (r->seq && cs) {
+		if (r->seq && c0) {
 			b = block_get(r->seq, false);
 			if (b) {
 				b->have_cycle = true;
-				b->c_start = *cs;
+				b->c_start = c0;
 				b->c_end = r->h.ts;
 				b->cycle_end = true;
-				b->c_missed = r->missed;
-				b->c_delivered = r->flags;
+				b->c_missed = (__u32)r->a[0];
+				b->c_delivered = (__u32)r->a[1];
 			}
 		}
 		if (cs)
@@ -2529,52 +2723,164 @@ static void handle_block_rec(const struct rec_block *r)
 	}
 }
 
+static struct proc *proc_of_tid(__u32 tid, __u32 pid_hint);
+
+/* fingerprint of a sample (see "stack samples" above) */
+static __u64 stack_fingerprint(const struct rec_stack *r, struct proc *p)
+{
+	__u64 h = 1469598103934665603ULL, words[2 * STACK_FP_WORDS + 6];
+	size_t n = r->nbytes / 8, i, found = 0, nw = 0;
+	unsigned char *bp = (unsigned char *)words;
+	size_t k;
+
+	words[nw++] = r->pid;
+	words[nw++] = r->kind;
+	words[nw++] = r->id;
+	words[nw++] = r->rip;
+	words[nw++] = r->rsp & 15;
+	for (i = 0; i < n && found < STACK_FP_WORDS; i++) {
+		__u64 w;
+
+		memcpy(&w, r->bytes + i * 8, 8);
+		if (w && p && proc_is_code(p, w)) {
+			words[nw++] = i;
+			words[nw++] = w;
+			found++;
+		}
+	}
+	words[nw++] = found;
+	for (k = 0; k < nw * 8; k++) {
+		h ^= bp[k];
+		h *= 1099511628211ULL;
+	}
+	return h;
+}
+
+static struct stackrep *stackrep_find(__u64 fp, const struct rec_stack *r)
+{
+	__u64 *v = hmap_get(&stack_by_fp, fp);
+	struct stackrep *s;
+
+	for (s = v ? (struct stackrep *)(uintptr_t)*v : NULL; s; s = s->next)
+		if (s->pid == r->pid && s->kind == r->kind && s->id == r->id && s->rip == r->rip)
+			return s;
+	return NULL;
+}
+
+static void stackrep_count(struct stackrep *s, __u32 tid, bool in_block)
+{
+	size_t i;
+
+	s->samples++;
+	if (in_block)
+		s->in_blocks++;
+	for (i = 0; i < s->ntids; i++) {
+		if (s->tids[i].tid == tid) {
+			s->tids[i].n++;
+			return;
+		}
+	}
+	grow((void **)&s->tids, &s->captids, s->ntids + 1, sizeof(*s->tids));
+	s->tids[s->ntids].tid = tid;
+	s->tids[s->ntids].n = 1;
+	s->ntids++;
+}
+
 static void handle_stack_rec(const struct rec_stack *r, size_t size)
 {
-	struct stackrec s = { 0 };
 	size_t n = r->nbytes;
+	struct proc *p;
+	struct stackrep *s;
+	__u64 fp, now = mono_ns();
+	bool in_block = !(r->seq & WINDOW_BIT) && r->seq && r->kind != KIND_PERF;
 
 	if (sizeof(*r) + n > size) {
 		cnt.rb_short++;
 		return;
 	}
-	s.ref = stack_ref_next++;
-	s.ts = r->h.ts;
-	s.seq = r->seq;
-	s.frame = r->frame;
-	s.rsp = r->rsp;
-	s.rip = r->rip;
-	s.tid = r->h.tid;
-	s.id = r->id;
-	s.kind = r->kind;
-	s.nbytes = (__u16)n;
-	memcpy(s.regs, r->regs, sizeof(s.regs));
-	s.bytes = xmalloc(n);
-	memcpy(s.bytes, r->bytes, n);
-	if (opt.mode == MODE_DRILLDOWN)
-		stack_ref_remember(s.tid, s.ts, s.ref);
-	if (opt.keep_stacks == KEEP_ALL && f_stacks) {
-		stack_write(f_stacks, &s, true);
-		s.written = true;
+	cnt.stack_samples++;
+	p = r->pid ? proc_get(r->pid, true) : proc_of_tid(r->h.tid, 0);
+	if (p && !p->gone && (!p->x_loaded || now - p->x_loaded > MAPS_REFRESH_NS))
+		proc_scan_maps(p, false);
+	fp = stack_fingerprint(r, p);
+	s = stackrep_find(fp, r);
+	if (!s) {
+		__u64 *v;
+
+		if (nstack_list >= MAX_STACK_REPS) {
+			cnt.stack_reps_full++;
+			return;
+		}
+		s = xcalloc(1, sizeof(*s));
+		s->ref = stack_ref_next++;
+		s->fp = fp;
+		s->ts = r->h.ts;
+		s->seq = r->seq;
+		s->frame = r->frame;
+		s->rsp = r->rsp;
+		s->rip = r->rip;
+		s->tid = r->h.tid;
+		s->pid = r->pid;
+		s->id = r->id;
+		s->kind = r->kind;
+		s->nbytes = (__u16)n;
+		memcpy(s->regs, r->regs, sizeof(s->regs));
+		s->bytes = xmalloc(n);
+		memcpy(s->bytes, r->bytes, n);
+		v = hmap_get(&stack_by_fp, fp);
+		s->next = v ? (struct stackrep *)(uintptr_t)*v : NULL;
+		hmap_put(&stack_by_fp, fp, (__u64)(uintptr_t)s);
+		grow((void **)&stack_list, &capstack_list, nstack_list + 1, sizeof(*stack_list));
+		stack_list[nstack_list++] = s;
+		cnt.stack_reps++;
 	}
-	if (!(s.seq & WINDOW_BIT) && s.seq && s.kind != KIND_PERF) {
-		struct block *b = block_get(s.seq, true);
+	stackrep_count(s, r->h.tid, in_block);
+	if (opt.mode == MODE_DRILLDOWN)
+		stack_ref_remember(r->h.tid, r->h.ts, s->ref);
+	if (in_block && opt.keep_stacks != KEEP_NONE) {
+		struct block *b = block_get(r->seq, true);
 
 		grow((void **)&b->st, &b->capst, b->nst + 1, sizeof(*b->st));
-		b->st[b->nst++] = s;
-		return;
+		b->st[b->nst].ref = s->ref;
+		b->st[b->nst].ts = r->h.ts;
+		b->st[b->nst].tid = r->h.tid;
+		b->st[b->nst].id = r->id;
+		b->st[b->nst].kind = r->kind;
+		b->nst++;
 	}
-	if (s.written)
-		cnt.stacks_kept++;
+}
+
+static void write_stacks(void)
+{
+	size_t i;
+
+	if (!f_stacks)
+		return;
+	for (i = 0; i < nstack_list; i++)
+		stackrep_write(f_stacks, stack_list[i]);
+}
+
+/* caller placeholder of a drill-down event (reduce.py's convention): syscalls name their
+ * stub (ntdll.dll!<Name>+0x14, win32u.dll! for ids >= 0x1000), unix calls the PE caller
+ * (pe!0x<rip>, resolved by symbolize.py), nested kinds inherit the enclosing call's */
+static void event_caller(char *buf, size_t n, int kind, __u32 id, __u64 aux)
+{
+	char nb[256];
+
+	if (kind == KIND_SYSCALL)
+		snprintf(buf, n, "%s!%s+0x14", (id & 0x3000) ? "win32u.dll" : "ntdll.dll", id_name(kind, id, nb, sizeof(nb)));
+	else if (kind == KIND_UNIXCALL && aux)
+		snprintf(buf, n, "pe!0x%llx", (unsigned long long)aux);
+	else if (kind == KIND_UNIXCALL)
+		snprintf(buf, n, "unixcall:%s", id_name(kind, id, nb, sizeof(nb)));
 	else
-		cnt.stacks_dropped++;
-	free(s.bytes);
+		snprintf(buf, n, "none");
 }
 
 static void handle_event_rec(const struct rec_event *r)
 {
 	FILE *f = f_events;
-	char nb[256];
+	char nb[256], caller[512];
 	__u64 ref;
 
 	if (!f)
@@ -2583,10 +2889,19 @@ static void handle_event_rec(const struct rec_event *r)
 	 * blocks.jsonl's `cycle` */
 	if (r->kind >= KIND__COUNT || !IS_CROSSING_KIND(r->kind))
 		return;
+	if (r->kind == KIND_SYSCALL || r->kind == KIND_UNIXCALL)
+		event_caller(caller, sizeof(caller), r->kind, r->id, r->aux);
+	else if (r->pkind == KIND_SYSCALL || r->pkind == KIND_UNIXCALL)
+		event_caller(caller, sizeof(caller), r->pkind, r->pid_, 0);
+	else
+		snprintf(caller, sizeof(caller), "none");
 	fprintf(f, "{\"t\":%.6f,\"tid\":%u,\"role\":", off_s(r->entry_ts), r->h.tid);
 	jstr(f, role_of(r->h.tid));
 	fprintf(f, ",\"kind\":\"%s\",\"id\":", kind_names[r->kind]);
 	jstr(f, id_name(r->kind, r->id, nb, sizeof(nb)));
+	fputs(",\"caller\":", f);
+	jstr(f, caller);
+	write_parent(f, r->pkind, r->pid_);
 	fprintf(f, ",\"id_num\":%u,\"dur_ns\":%llu,\"status\":", r->id, (unsigned long long)(r->h.ts - r->entry_ts));
 	if (r->kind == KIND_NTSYNC_WAIT || r->kind == KIND_NTSYNC_WAKE)
 		fprintf(f, "%d", r->status);
@@ -2606,6 +2921,81 @@ static void handle_event_rec(const struct rec_event *r)
 	}
 	fputs("}\n", f);
 	cnt.events_written++;
+}
+
+/* ---- drill-down pairing anomalies: anomalies.jsonl, and the most frequent ones in tracer.json ---- */
+static FILE *f_anomalies;
+static char p_anomalies[PATH_MAX];
+
+struct anom { char *key, *name; int what, kind; __u64 n; struct anom *next; };
+static struct hmap anoms;            /* fnv64(what|kind|name) -> struct anom* chain */
+
+static const char *anomaly_name(int what)
+{
+	switch (what) {
+	case AN_OVERFLOW: return "inflight_overflow";
+	case AN_UNMATCHED_EXIT: return "unmatched_exit";
+	case AN_NEVER_RETURNED: return "never_returned";
+	case AN_ABANDONED: return "abandoned";
+	default: return "unknown";
+	}
+}
+
+static void handle_anomaly_rec(const struct rec_anomaly *r)
+{
+	char nb[256], key[512];
+	/* an unmatched exit carries its id only for syscalls (frame->syscall_id) and server requests */
+	bool have_id = r->what != AN_UNMATCHED_EXIT || r->kind == KIND_SYSCALL || r->kind == KIND_SERVER_REQ;
+	const char *name = have_id && r->kind < KIND__COUNT ? id_name(r->kind, r->id, nb, sizeof(nb)) : NULL;
+	__u64 h, *v;
+	struct anom *a;
+	FILE *f = f_anomalies;
+	unsigned i, depth = r->depth < INFLIGHT_DEPTH ? r->depth : INFLIGHT_DEPTH;
+
+	cnt.anomalies++;
+	snprintf(key, sizeof(key), "%s|%s|%s", anomaly_name(r->what), KIND_NAME(r->kind), name ? name : "?");
+	h = fnv64(key);
+	v = hmap_get(&anoms, h);
+	for (a = v ? (struct anom *)(uintptr_t)*v : NULL; a; a = a->next)
+		if (strcmp(a->key, key) == 0)
+			break;
+	if (!a) {
+		a = xcalloc(1, sizeof(*a));
+		a->key = xstrdup(key);
+		a->name = name ? xstrdup(name) : NULL;
+		a->what = r->what;
+		a->kind = r->kind;
+		a->next = v ? (struct anom *)(uintptr_t)*v : NULL;
+		hmap_put(&anoms, h, (__u64)(uintptr_t)a);
+	}
+	a->n++;
+	if (!f)
+		return;
+	fprintf(f, "{\"t\":%.6f,\"tid\":%u,\"role\":", off_s(r->h.ts), r->h.tid);
+	jstr(f, role_of(r->h.tid));
+	fprintf(f, ",\"what\":\"%s\",\"kind\":\"%s\",\"id\":", anomaly_name(r->what), KIND_NAME(r->kind));
+	if (name)
+		jstr(f, name);
+	else
+		fputs("null", f);
+	fprintf(f, ",\"id_num\":%u,\"frame\":\"0x%llx\"", r->id, (unsigned long long)r->frame);
+	if (r->what == AN_UNMATCHED_EXIT && r->kind == KIND_SYSCALL)
+		fprintf(f, ",\"restore_flags\":\"0x%x\"", r->aux);
+	else if (r->what == AN_UNMATCHED_EXIT)
+		fprintf(f, ",\"status\":%d", (int)r->aux);
+	else if (r->what == AN_NEVER_RETURNED)
+		fprintf(f, ",\"first_popped\":%u", r->aux);
+	else if (r->what == AN_ABANDONED)
+		fprintf(f, ",\"completed_index\":%u", r->aux);
+	fprintf(f, ",\"depth\":%u,\"inflight\":[", depth);
+	for (i = 0; i < depth; i++) {
+		int k = r->kinds[i] < KIND__COUNT ? r->kinds[i] : KIND_NONE;
+
+		fprintf(f, "%s{\"kind\":\"%s\",\"id\":", i ? "," : "", KIND_NAME(k));
+		jstr(f, id_name(k, r->ids[i], nb, sizeof(nb)));
+		fprintf(f, ",\"frame\":\"0x%llx\"}", (unsigned long long)r->frames[i]);
+	}
+	fputs("]}\n", f);
 }
 
 static int handle_rec(void *ctx, void *data, size_t size)
@@ -2677,7 +3067,15 @@ static int handle_rec(void *ctx, void *data, size_t size)
 	case REC_EXIT:
 		if (size >= sizeof(struct rec_task)) {
 			const struct rec_task *r = data;
+			struct thr *t = thr_get(h->tid, r->pid);
 
+			t->unmatched += r->unmatched;
+			t->first_exit += r->first_exit;
+			t->abandoned += r->abandoned;
+			t->overflow += r->overflow;
+			t->open_at_exit += r->open_at_exit;
+			t->never_returned += r->never_returned;
+			t->counters_final = true;
 			if (r->flags & 1) {
 				struct proc *p = proc_get(r->pid, false);
 
@@ -2693,6 +3091,10 @@ static int handle_rec(void *ctx, void *data, size_t size)
 		break;
 	case REC_WAKE:
 		cnt.wake_records++;
+		break;
+	case REC_ANOMALY:
+		if (size >= sizeof(struct rec_anomaly))
+			handle_anomaly_rec(data);
 		break;
 	default:
 		break;
@@ -2815,6 +3217,219 @@ static __u32 roundup_pow2(__u32 v)
 	return p;
 }
 
+/* ---- fast operand access: verify patch 0108's dispatcher probe operands ---------------- */
+static int fast_args;
+static char fast_args_note[PATH_MAX + 256];
+
+/* The operand string of USDT provider:name in an ELF file's .note.stapsdt.  Returns 1 when
+ * found (every site agreeing), 0 when absent, -1 when sites disagree or the file is unreadable. */
+static int usdt_note_args(const char *path, const char *provider, const char *name, char *out, size_t n)
+{
+	Elf *e = NULL;
+	Elf_Scn *scn = NULL;
+	size_t shstrndx;
+	int fd, rc = 0;
+
+	if (elf_version(EV_CURRENT) == EV_NONE)
+		return -1;
+	fd = open(path, O_RDONLY | O_CLOEXEC);
+	if (fd < 0)
+		return -1;
+	e = elf_begin(fd, ELF_C_READ, NULL);
+	if (!e || gelf_getclass(e) != ELFCLASS64 || elf_getshdrstrndx(e, &shstrndx) != 0) {
+		rc = -1;
+		goto out;
+	}
+	while ((scn = elf_nextscn(e, scn)) != NULL) {
+		GElf_Shdr sh;
+		Elf_Data *data;
+		const char *sname;
+		size_t off = 0, noff, doff;
+		GElf_Nhdr nh;
+
+		if (!gelf_getshdr(scn, &sh) || sh.sh_type != SHT_NOTE)
+			continue;
+		sname = elf_strptr(e, shstrndx, sh.sh_name);
+		if (!sname || strcmp(sname, ".note.stapsdt") != 0)
+			continue;
+		data = elf_getdata(scn, NULL);
+		while (data && (off = gelf_getnote(data, off, &nh, &noff, &doff)) > 0) {
+			const char *desc = (const char *)data->d_buf + doff, *prov, *nm, *args;
+			size_t len = nh.n_descsz, a, b, c;
+
+			if (nh.n_type != 3 || nh.n_namesz != 8 || memcmp((const char *)data->d_buf + noff, "stapsdt", 8) != 0 ||
+			    len < 24 + 3)
+				continue;
+			prov = desc + 24;                          /* after pc, base, semaphore */
+			a = strnlen(prov, len - 24);
+			if (24 + a + 1 >= len)
+				continue;
+			nm = prov + a + 1;
+			b = strnlen(nm, len - 24 - a - 1);
+			if (24 + a + 1 + b + 1 > len)
+				continue;
+			args = nm + b + 1;
+			c = strnlen(args, len - 24 - a - 1 - b - 1);
+			if (strcmp(prov, provider) != 0 || strcmp(nm, name) != 0)
+				continue;
+			if (rc == 1 && (strlen(out) != c || strncmp(out, args, c) != 0)) {
+				rc = -1;
+				goto out;
+			}
+			if (rc == 0) {
+				snprintf(out, n, "%.*s", (int)c, args);
+				rc = 1;
+			}
+		}
+	}
+out:
+	if (e)
+		elf_end(e);
+	close(fd);
+	return rc;
+}
+
+/* Does the ntdll.so at `path` carry exactly patch 0108's dispatcher operands?  On a mismatch `why`
+ * says which probe differs. */
+static bool ntdll_fast_args_match(const char *path, char *why, size_t n)
+{
+	static const struct { const char *name, *want; } probes[] = {
+		{ "syscall_entry", FAST_ARGS_SYSCALL_ENTRY }, { "syscall_exit", FAST_ARGS_SYSCALL_EXIT },
+		{ "unixcall_entry", FAST_ARGS_UNIXCALL_ENTRY }, { "unixcall_exit", FAST_ARGS_UNIXCALL_EXIT },
+	};
+	char got[256];
+	size_t k;
+
+	for (k = 0; k < sizeof(probes) / sizeof(probes[0]); k++) {
+		int rc = usdt_note_args(path, "wine", probes[k].name, got, sizeof(got));
+
+		if (rc != 1 || strcmp(got, probes[k].want) != 0) {
+			snprintf(why, n, "%s wine:%s operands %s%s%s (the fast path expects \"%s\")", path, probes[k].name,
+				 rc == 1 ? "\"" : "", rc == 1 ? got : rc == 0 ? "missing" : "unreadable or inconsistent",
+				 rc == 1 ? "\"" : "", probes[k].want);
+			return false;
+		}
+	}
+	return true;
+}
+
+/* The files (st_dev, st_ino) whose operands were verified: once the loaded programs read the
+ * registers directly (fast_args, a .rodata constant), every ntdll.so they are attached to, a
+ * followed child's included, must be one of them. */
+static struct { dev_t dev; ino_t ino; } fast_ok[MAX_PIDS + 16];
+static int nfast_ok;
+
+static bool fast_ok_known(const char *path, bool add)
+{
+	struct stat st;
+	int i;
+
+	if (stat(path, &st) != 0)
+		return false;
+	for (i = 0; i < nfast_ok; i++)
+		if (fast_ok[i].dev == st.st_dev && fast_ok[i].ino == st.st_ino)
+			return true;
+	if (add && nfast_ok < (int)(sizeof(fast_ok) / sizeof(fast_ok[0]))) {
+		fast_ok[nfast_ok].dev = st.st_dev;
+		fast_ok[nfast_ok].ino = st.st_ino;
+		nfast_ok++;
+	}
+	return false;
+}
+
+/* may the programs (loaded with fast_args) be attached to this ntdll.so?  Re-verifies a file not
+ * seen before (a followed child running another Wine build) */
+static bool ntdll_ok_for_fast_args(const char *path, char *why, size_t n)
+{
+	if (!fast_args || fast_ok_known(path, false))
+		return true;
+	if (!ntdll_fast_args_match(path, why, n))
+		return false;
+	fast_ok_known(path, true);
+	return true;
+}
+
+/* fast_args = 1 when every ntdll.so this run attaches to carries exactly patch 0108's operands */
+static void verify_fast_args(void)
+{
+	const char *paths[MAX_PIDS + 1];
+	size_t i;
+	int np = 0, j;
+
+	fast_args = 0;
+	if (opt.generic_args) {
+		snprintf(fast_args_note, sizeof(fast_args_note), "generic: --generic-args");
+		return;
+	}
+	if (opt.ntdll && opt.ntdll[0]) {
+		paths[np++] = opt.ntdll;
+	} else {
+		for (i = 0; i < procs.cap && np < MAX_PIDS; i++) {
+			struct proc *p;
+
+			if (!procs.used[i])
+				continue;
+			p = (struct proc *)(uintptr_t)procs.vals[i];
+			if (!p->ntdll[0])
+				continue;
+			for (j = 0; j < np; j++)
+				if (strcmp(paths[j], p->ntdll) == 0)
+					break;
+			if (j == np)
+				paths[np++] = p->ntdll;
+		}
+	}
+	if (!np) {
+		snprintf(fast_args_note, sizeof(fast_args_note), "generic: no ntdll.so to verify (give --ntdll)");
+		return;
+	}
+	for (j = 0; j < np; j++) {
+		char why[PATH_MAX + 192];
+
+		if (!ntdll_fast_args_match(paths[j], why, sizeof(why))) {
+			snprintf(fast_args_note, sizeof(fast_args_note), "generic: %s", why);
+			warn_add("%s", fast_args_note);
+			nfast_ok = 0;
+			return;
+		}
+		fast_ok_known(paths[j], true);
+	}
+	fast_args = 1;
+	snprintf(fast_args_note, sizeof(fast_args_note), "fast: patch 0108 operands verified in %s%s", paths[0],
+		 np > 1 ? " and the other ntdll.so" : "");
+}
+
+/* syscall id of a named syscall in the id table (NO_SYSCALL_ID when unknown) */
+static __u32 syscall_id_of(const char *name)
+{
+	size_t i;
+
+	for (i = 0; i < tables.syscalls.cap; i++)
+		if (tables.syscalls.used[i] && strcmp((const char *)(uintptr_t)tables.syscalls.vals[i], name) == 0)
+			return (__u32)tables.syscalls.keys[i];
+	return NO_SYSCALL_ID;
+}
+
+/* .rodata: the verifier sees these as constants (dead branches vanish, the stack-sample
+ * reservation size is a constant) */
+static void set_config(void)
+{
+	struct wt_config *c = (struct wt_config *)&skel->rodata->CFG;
+
+	c->mode = (__u32)opt.mode;
+	c->sample_n = opt.mode == MODE_SAMPLE ? 0 : opt.sample_n;
+	c->stack_bytes = opt.stack_bytes & ~7u;
+	c->roles_audio = opt.roles_audio ? 1 : 0;
+	c->slack_thresh_pct = opt.slack_pct;
+	c->slack_samples = opt.slack_samples;
+	c->no_exit = (__u32)opt.no_exit;
+	c->trigger_count = (__u32)opt.ntrigger;
+	c->offcpu_min_ns = (__u32)OFFCPU_MIN_NS_DEFAULT;
+	c->count_hits = stats_fd < 0 ? 1 : 0;
+	c->fast_args = (__u32)fast_args;
+	c->callback_return_id = syscall_id_of("NtCallbackReturn");
+}
+
 /* open + load with the NTSync fallback chain; returns 0 or exits */
 static void open_and_load(void)
 {
@@ -2842,6 +3457,7 @@ static void open_and_load(void)
 		err = bpf_map__set_max_entries(skel->maps.rb, roundup_pow2(opt.ringbuf_mb) << 20);
 		if (err)
 			die("cannot size the ring buffer: %s", strerror(-err));
+		set_config();
 		set_autoload();
 		err = wine_trace__load(skel);
 		if (!err)
@@ -2854,6 +3470,246 @@ static void open_and_load(void)
 		die("the BPF object did not load (see the verifier log above)");
 	if (strcmp(ntsync_used, opt.ntsync) != 0 && strcmp(opt.ntsync, "auto") != 0)
 		warn_add("--ntsync %s fell back to %s", opt.ntsync, ntsync_used);
+}
+
+/* ======================================================================
+ * stack self-check: which programs did the verifier put on a per-CPU private stack?
+ * ====================================================================
+ * Read after load, before anything is attached.  Every function (main program and
+ * subprograms) is classified by its JIT prologue (jit_prologue_class in wine-trace.h); a
+ * function whose xlated code addresses r10 must show either "sub rsp" or the private-stack
+ * set-up, anything else is "unknown".  A preemptible uprobe/USDT program with a private or
+ * unknown function is refused (exit 2) unless --unsafe-private-stack. */
+#define MAX_CHECK_FUNCS 64
+
+struct prog_check {
+	char name[64];
+	char section[64];
+	char type[32];
+	bool preemptible;
+	int cls;                 /* worst class of its functions */
+	__u32 frame;             /* largest kernel-stack frame of its functions (bytes) */
+	int nfuncs;
+	struct { int cls; __u32 jit_frame, xlated_depth; bool fp_used; } funcs[MAX_CHECK_FUNCS];
+	char note[96];
+};
+
+static struct prog_check *checks;
+static int nchecks;
+static int checks_risky;
+
+static bool section_is_uprobe(const char *sec)
+{
+	return strncmp(sec, "usdt", 4) == 0 || strncmp(sec, "uprobe", 6) == 0 || strncmp(sec, "uretprobe", 9) == 0;
+}
+
+static int class_rank(int c)
+{
+	switch (c) {
+	case JIT_STACK_NONE: return 0;
+	case JIT_STACK_KERNEL: return 1;
+	case JIT_STACK_UNKNOWN: return 2;
+	default: return 3;     /* JIT_STACK_PRIVATE */
+	}
+}
+
+static void classify_prog(int fd, struct prog_check *pc)
+{
+	struct bpf_prog_info info;
+	__u32 len = sizeof(info), jlen, xlen, njl, nfi, nf, f, off = 0, nins;
+	unsigned char *jit = NULL;
+	__u32 *flens = NULL;
+	struct wt_bpf_insn *xl = NULL;
+	struct bpf_func_info *fi = NULL;
+
+	pc->cls = JIT_STACK_UNKNOWN;
+	memset(&info, 0, sizeof(info));
+	if (bpf_prog_get_info_by_fd(fd, &info, &len)) {
+		snprintf(pc->note, sizeof(pc->note), "bpf_prog_get_info_by_fd: %s", strerror(errno));
+		return;
+	}
+	jlen = info.jited_prog_len;
+	xlen = info.xlated_prog_len;
+	njl = info.nr_jited_func_lens;
+	nfi = info.nr_func_info;
+	if (!jlen) {
+		snprintf(pc->note, sizeof(pc->note), "no JIT image readable (kernel.kptr_restrict? bpf_jit_enable?)");
+		return;
+	}
+	jit = xmalloc(jlen);
+	flens = xcalloc(njl ? njl : 1, sizeof(*flens));
+	xl = xmalloc(xlen ? xlen : sizeof(*xl));
+	fi = xcalloc(nfi ? nfi : 1, sizeof(*fi));
+	memset(&info, 0, sizeof(info));
+	info.jited_prog_len = jlen;
+	info.jited_prog_insns = (__u64)(uintptr_t)jit;
+	info.nr_jited_func_lens = njl;
+	info.jited_func_lens = (__u64)(uintptr_t)flens;
+	info.xlated_prog_len = xlen;
+	info.xlated_prog_insns = (__u64)(uintptr_t)xl;
+	info.nr_func_info = nfi;
+	info.func_info_rec_size = sizeof(*fi);
+	info.func_info = (__u64)(uintptr_t)fi;
+	len = sizeof(info);
+	if (bpf_prog_get_info_by_fd(fd, &info, &len) || info.jited_prog_len != jlen) {
+		snprintf(pc->note, sizeof(pc->note), "second bpf_prog_get_info_by_fd failed");
+		goto out;
+	}
+	nf = njl ? njl : 1;
+	if (!njl)
+		flens[0] = jlen;
+	nins = xlen / sizeof(*xl);
+	pc->cls = JIT_STACK_NONE;
+	for (f = 0; f < nf && f < MAX_CHECK_FUNCS; f++) {
+		__u32 d = 0, xd = 0, xs = 0, xe = 0;
+		int c;
+		bool fp;
+
+		if (off + flens[f] > jlen) {
+			snprintf(pc->note, sizeof(pc->note), "inconsistent jited_func_lens");
+			pc->cls = JIT_STACK_UNKNOWN;
+			break;
+		}
+		c = jit_prologue_class(jit + off, flens[f], &d);
+		if (opt.dump_jit) {
+			char path[PATH_MAX];
+			FILE *df;
+			__u32 b, nb = flens[f] < 96 ? flens[f] : 96;
+
+			snprintf(path, sizeof(path), "%s/%s.f%u.hex", opt.dump_jit, pc->name, f);
+			df = fopen(path, "w");
+			if (df) {
+				for (b = 0; b < nb; b++)
+					fprintf(df, "%02x%s", jit[off + b], b + 1 < nb ? " " : "\n");
+				fclose(df);
+			}
+		}
+		if (nf == 1) {
+			xs = 0;
+			xe = nins;
+		} else if (nfi == nf) {
+			xs = fi[f].insn_off;
+			xe = f + 1 < nf ? fi[f + 1].insn_off : nins;
+		}
+		if (xe > nins || xs > xe)
+			xs = xe = 0;
+		fp = xe > xs ? xlated_stack_depth(xl + xs, xe - xs, &xd) != 0 : true;   /* unknown range: assume a stack */
+		if (c == JIT_STACK_NONE && fp)
+			c = JIT_STACK_UNKNOWN;   /* the code uses its stack, but no frame set-up was recognised */
+		pc->funcs[f].cls = c;
+		pc->funcs[f].jit_frame = d;
+		pc->funcs[f].xlated_depth = xd;
+		pc->funcs[f].fp_used = fp;
+		if (class_rank(c) > class_rank(pc->cls))
+			pc->cls = c;
+		if (d > pc->frame)
+			pc->frame = d;
+		off += flens[f];
+	}
+	pc->nfuncs = (int)(nf < MAX_CHECK_FUNCS ? nf : MAX_CHECK_FUNCS);
+	if (nf > MAX_CHECK_FUNCS) {
+		snprintf(pc->note, sizeof(pc->note), "more than %d functions", MAX_CHECK_FUNCS);
+		pc->cls = JIT_STACK_UNKNOWN;
+	}
+out:
+	free(jit);
+	free(flens);
+	free(xl);
+	free(fi);
+}
+
+/* returns the number of risky programs (preemptible and not provably on the kernel stack) */
+static int stack_self_check(void)
+{
+	struct bpf_program *prog;
+
+	free(checks);
+	checks = NULL;
+	nchecks = 0;
+	checks_risky = 0;
+	bpf_object__for_each_program(prog, skel->obj) {
+		struct prog_check *pc;
+		const char *ts;
+		int fd = bpf_program__fd(prog);
+
+		if (!bpf_program__autoload(prog) || fd < 0)
+			continue;
+		checks = xrealloc(checks, (size_t)(nchecks + 1) * sizeof(*checks));
+		pc = &checks[nchecks++];
+		memset(pc, 0, sizeof(*pc));
+		scopy(pc->name, sizeof(pc->name), bpf_program__name(prog));
+		scopy(pc->section, sizeof(pc->section), bpf_program__section_name(prog));
+		ts = libbpf_bpf_prog_type_str(bpf_program__type(prog));
+		scopy(pc->type, sizeof(pc->type), ts ? ts : "?");
+		pc->preemptible = section_is_uprobe(pc->section);
+		classify_prog(fd, pc);
+		if (pc->preemptible && pc->cls != JIT_STACK_NONE && pc->cls != JIT_STACK_KERNEL)
+			checks_risky++;
+	}
+	return checks_risky;
+}
+
+static void write_stack_check(FILE *f)
+{
+	int i, k;
+	bool first;
+
+	fputs("{\"usdt_operands\":", f);
+	jstr(f, fast_args_note);
+	fprintf(f, ",\"ok\":%s,\"risky\":%d,\"allowed_by_override\":%s,\"private_stack_min_bytes\":%d,"
+		   "\"rule\":\"kernel >= 6.14 runs KPROBE/TRACING programs with >= 64 bytes of BPF stack on a per-CPU "
+		   "private stack; uprobe/USDT programs are preemptible without a recursion guard, so they must stay on "
+		   "the kernel stack\",\"programs\":[",
+		checks_risky ? "false" : "true", checks_risky, checks_risky && opt.allow_priv_stack ? "true" : "false",
+		PRIV_STACK_MIN_BYTES);
+	for (i = 0; i < nchecks; i++) {
+		const struct prog_check *pc = &checks[i];
+
+		fprintf(f, "%s{\"name\":", i ? "," : "");
+		jstr(f, pc->name);
+		fputs(",\"section\":", f);
+		jstr(f, pc->section);
+		fputs(",\"type\":", f);
+		jstr(f, pc->type);
+		fprintf(f, ",\"preemptible\":%s,\"stack\":\"%s\",\"frame_bytes\":%u,\"functions\":[",
+			pc->preemptible ? "true" : "false", jit_stack_class_name(pc->cls), pc->frame);
+		for (k = 0; k < pc->nfuncs; k++)
+			fprintf(f, "%s{\"stack\":\"%s\",\"jit_frame\":%u,\"xlated_depth\":%u,\"uses_r10\":%s}", k ? "," : "",
+				jit_stack_class_name(pc->funcs[k].cls), pc->funcs[k].jit_frame, pc->funcs[k].xlated_depth,
+				pc->funcs[k].fp_used ? "true" : "false");
+		fputc(']', f);
+		if (pc->note[0]) {
+			fputs(",\"note\":", f);
+			jstr(f, pc->note);
+		}
+		fputc('}', f);
+	}
+	fputs("],\"private_stack_programs\":[", f);
+	first = true;
+	for (i = 0; i < nchecks; i++) {
+		if (checks[i].cls != JIT_STACK_PRIVATE)
+			continue;
+		fputs(first ? "" : ",", f);
+		jstr(f, checks[i].name);
+		first = false;
+	}
+	fputs("]}", f);
+}
+
+static void print_stack_check(FILE *f)
+{
+	int i;
+
+	for (i = 0; i < nchecks; i++) {
+		const struct prog_check *pc = &checks[i];
+		bool bad = pc->preemptible && pc->cls != JIT_STACK_NONE && pc->cls != JIT_STACK_KERNEL;
+
+		fprintf(f, "wine-trace: stack-check %-28s %-34s %-13s frame %3u bytes, %d function%s%s%s%s\n", pc->name,
+			pc->section, jit_stack_class_name(pc->cls), pc->frame, pc->nfuncs, pc->nfuncs == 1 ? "" : "s",
+			pc->preemptible ? " (preemptible uprobe)" : "", bad ? "  <-- RISKY" : "", pc->note[0] ? "" : "");
+		if (pc->note[0])
+			fprintf(f, "wine-trace: stack-check %-28s note: %s\n", pc->name, pc->note);
+	}
 }
 
 static int attach_usdt_one(struct bpf_program *prog, __u32 pid, const char *path, const char *provider,
@@ -2873,33 +3729,45 @@ static int attach_usdt_one(struct bpf_program *prog, __u32 pid, const char *path
 	return 0;
 }
 
-/* attach the USDT programs to one process; returns the number of probes attached */
+/* attach the USDT programs to one process; returns the number of probes attached, -1 when its
+ * ntdll.so does not have the operands the programs were loaded for (fast path).  The exit / end
+ * probe of every pair goes first (and is detached last, main): an entry recorded while its exit
+ * program did not exist yet would never be popped (see attach_kernel). */
 static int attach_proc(struct proc *p)
 {
 	struct { struct bpf_program *prog; const char *name; bool exit; } wine[] = {
-		{ skel->progs.wine_syscall_entry, "syscall_entry", false },
 		{ skel->progs.wine_syscall_exit, "syscall_exit", true },
-		{ skel->progs.wine_unixcall_entry, "unixcall_entry", false },
+		{ skel->progs.wine_syscall_entry, "syscall_entry", false },
 		{ skel->progs.wine_unixcall_exit, "unixcall_exit", true },
-		{ skel->progs.wine_server_req_start, "server_req_start", false },
+		{ skel->progs.wine_unixcall_entry, "unixcall_entry", false },
 		{ skel->progs.wine_server_req_end, "server_req_end", true },
-		{ skel->progs.wine_server_wait_start, "server_wait_start", false },
+		{ skel->progs.wine_server_req_start, "server_req_start", false },
 		{ skel->progs.wine_server_wait_end, "server_wait_end", true },
+		{ skel->progs.wine_server_wait_start, "server_wait_start", false },
 	}, pa[] = {
-		{ skel->progs.pipeasio_block_start, "block_start", false },
-		{ skel->progs.pipeasio_block_before_live, "block_before_live", false },
-		{ skel->progs.pipeasio_block_after_live, "block_after_live", false },
 		{ skel->progs.pipeasio_block_end, "block_end", false },
-		{ skel->progs.pipeasio_cycle_start, "cycle_start", false },
+		{ skel->progs.pipeasio_block_after_live, "block_after_live", false },
+		{ skel->progs.pipeasio_block_before_live, "block_before_live", false },
+		{ skel->progs.pipeasio_block_start, "block_start", false },
 		{ skel->progs.pipeasio_cycle_end, "cycle_end", false },
+		{ skel->progs.pipeasio_cycle_start, "cycle_start", false },
 	};
 	const char *ntdll = opt.ntdll && opt.ntdll[0] ? opt.ntdll : p->ntdll;
 	const char *pipeasio = opt.pipeasio && opt.pipeasio[0] ? opt.pipeasio : p->pipeasio;
+	char why[PATH_MAX + 192];
 	size_t i;
 	int n = 0;
 
 	if (!ntdll[0])
 		return 0;
+	if (!ntdll_ok_for_fast_args(ntdll, why, sizeof(why))) {
+		/* the programs read the dispatcher operands straight from the registers (patch 0108's
+		 * layout): another layout would give wrong syscall ids and frames without any error */
+		warn_add("pid %u (%s) not traced: the programs were loaded for patch 0108's probe operands, but %s",
+			 p->pid, p->image[0] ? p->image : p->comm, why);
+		cnt.follow_skipped_unverified_ntdll++;
+		return -1;
+	}
 	for (i = 0; i < sizeof(wine) / sizeof(wine[0]); i++) {
 		if (opt.no_exit && wine[i].exit)
 			continue;
@@ -2917,33 +3785,47 @@ static int attach_proc(struct proc *p)
 	return n;
 }
 
+/* The exit side of each entry/exit pair is attached first (fexit before fentry, kretprobe before
+ * kprobe, sys_exit_ioctl before sys_enter_ioctl) and detached last: an entry recorded before its
+ * exit program existed is never popped.  B5b: the fentry/fexit attach window left every busy
+ * AudioCalc thread with 8 NTSync waits and no enclosing syscall; they overflowed its in-flight
+ * stack, and later exits completed them with durations of seconds (drill-down anomalies.jsonl). */
+static bool exit_side(const char *sec)
+{
+	return strncmp(sec, "fexit/", 6) == 0 || strncmp(sec, "kretprobe/", 10) == 0 ||
+	       strncmp(sec, "tracepoint/syscalls/sys_exit", 28) == 0;
+}
+
 static void attach_kernel(void)
 {
 	struct bpf_program *prog;
+	int pass;
 
-	bpf_object__for_each_program(prog, skel->obj) {
-		enum bpf_prog_type t = bpf_program__type(prog);
-		struct bpf_link *l;
-		const char *sec = bpf_program__section_name(prog);
+	for (pass = 0; pass < 2; pass++) {       /* 0: exit sides, 1: everything else */
+		bpf_object__for_each_program(prog, skel->obj) {
+			enum bpf_prog_type t = bpf_program__type(prog);
+			struct bpf_link *l;
+			const char *sec = bpf_program__section_name(prog);
 
-		if (!bpf_program__autoload(prog) || t == BPF_PROG_TYPE_PERF_EVENT)
-			continue;
-		if (strcmp(sec, "usdt") == 0)
-			continue;
-		l = bpf_program__attach(prog);
-		if (!l) {
-			int e = errno;
+			if (!bpf_program__autoload(prog) || t == BPF_PROG_TYPE_PERF_EVENT)
+				continue;
+			if (strcmp(sec, "usdt") == 0 || exit_side(sec) != (pass == 0))
+				continue;
+			l = bpf_program__attach(prog);
+			if (!l) {
+				int e = errno;
 
-			if (strncmp(bpf_program__name(prog), "on_sched_process_fork", 21) == 0 ||
-			    strncmp(bpf_program__name(prog), "on_task_rename", 14) == 0 ||
-			    strncmp(bpf_program__name(prog), "on_sched_process_exit", 21) == 0)
-				warn_add("attaching %s (%s) failed: %s", bpf_program__name(prog), sec, strerror(e));
-			else
-				die("attaching %s (%s) failed: %s", bpf_program__name(prog), sec, strerror(e));
-			continue;
+				if (strncmp(bpf_program__name(prog), "on_sched_process_fork", 21) == 0 ||
+				    strncmp(bpf_program__name(prog), "on_task_rename", 14) == 0 ||
+				    strncmp(bpf_program__name(prog), "on_sched_process_exit", 21) == 0)
+					warn_add("attaching %s (%s) failed: %s", bpf_program__name(prog), sec, strerror(e));
+				else
+					die("attaching %s (%s) failed: %s", bpf_program__name(prog), sec, strerror(e));
+				continue;
+			}
+			add_link(l);
+			add_desc("%s", sec);
 		}
-		add_link(l);
-		add_desc("%s", sec);
 	}
 }
 
@@ -2999,14 +3881,14 @@ static void follow_child(__u32 pid, __u64 now)
 	proc_identify(p);
 	n = attach_proc(p);
 	p->pending_since = 0;
-	if (n) {
+	if (n > 0) {
 		cnt.follow_attached++;
 		proc_scan_maps(p, true);
 		scan_threads(pid);
 		logmsg("followed child pid %u (%s): %d probes", pid, p->image, n);
-	} else {
+	} else if (n == 0) {
 		cnt.follow_failed++;
-	}
+	}   /* n < 0: counted in follow_skipped_unverified_ntdll */
 }
 
 static void follow_pending(__u64 now)
@@ -3024,19 +3906,67 @@ static void follow_pending(__u64 now)
 	}
 }
 
-static void read_stats(__u64 *out)
-{
-	int ncpu = libbpf_num_possible_cpus(), fd = bpf_map__fd(skel->maps.stats), c;
-	__u64 *vals = xcalloc((size_t)ncpu, sizeof(__u64));
-	__u32 k;
+/* the BPF side's counters (.bss, mmapped by the skeleton) */
+static __u64 ctr[CT__COUNT];
+static __u64 phits[N_USDT_PROGS];       /* USDT probe hits: run_cnt (BPF_ENABLE_STATS) or hits[] */
+static __u64 sched_switch_runs, sched_waking_runs, perf_runs;
+/* Runs the kernel skipped because the program was already running on that CPU (bpf_prog_info
+ * recursion_misses), summed over the kernel-side programs: fentry/fexit and tp_btf (per-program
+ * guard, preemptible fentry included), kprobe/kretprobe, tracepoint and perf_event
+ * (bpf_prog_active).  Uprobe programs have no guard (always 0).  A skipped NTSync fentry/fexit
+ * loses a wait, its exit or a wake; counted whether or not BPF_ENABLE_STATS is on. */
+static __u64 rmisses_total;
 
-	for (k = 0; k < ST__COUNT; k++) {
-		out[k] = 0;
-		if (bpf_map_lookup_elem(fd, &k, vals) == 0)
-			for (c = 0; c < ncpu; c++)
-				out[k] += vals[c];
+static bool prog_info(struct bpf_program *prog, struct bpf_prog_info *info)
+{
+	__u32 len = sizeof(*info);
+	int fd = bpf_program__fd(prog);
+
+	memset(info, 0, sizeof(*info));
+	return bpf_program__autoload(prog) && fd >= 0 && bpf_prog_get_info_by_fd(fd, info, &len) == 0;
+}
+
+static void read_counters(void)
+{
+	struct bpf_program *prog;
+	int k;
+
+	for (k = 0; k < CT__COUNT; k++)
+		ctr[k] = ((volatile __u64 *)skel->bss->counters)[k];
+	for (k = 0; k < N_USDT_PROGS; k++)
+		phits[k] = stats_fd < 0 ? ((volatile __u64 *)skel->bss->hits)[usdt_progs[k].hit] : 0;
+	sched_switch_runs = sched_waking_runs = perf_runs = 0;
+	rmisses_total = 0;
+	bpf_object__for_each_program(prog, skel->obj) {
+		struct bpf_prog_info info;
+		const char *name = bpf_program__name(prog);
+
+		if (!prog_info(prog, &info))
+			continue;
+		if (!section_is_uprobe(bpf_program__section_name(prog)))
+			rmisses_total += info.recursion_misses;
+		if (stats_fd < 0)
+			continue;
+		for (k = 0; k < N_USDT_PROGS; k++)
+			if (strcmp(name, usdt_progs[k].prog) == 0)
+				phits[k] = info.run_cnt;
+		if (strcmp(name, "on_sched_switch") == 0)
+			sched_switch_runs = info.run_cnt;
+		else if (strncmp(name, "on_sched_waking", 15) == 0)
+			sched_waking_runs = info.run_cnt;
+		else if (strcmp(name, "on_perf_sample") == 0)
+			perf_runs = info.run_cnt;
 	}
-	free(vals);
+}
+
+static __u64 usdt_hits_total(void)
+{
+	__u64 n = 0;
+	int k;
+
+	for (k = 0; k < N_USDT_PROGS; k++)
+		n += phits[k];
+	return n;
 }
 
 /* ======================================================================
@@ -3089,51 +4019,94 @@ static int cmp_hot(const void *a, const void *b)
 }
 
 struct overhead {
-	__u64 bpf_run_ns, bpf_run_cnt, usdt_hits;
-	double bpf_ns_per_hit, hits_per_block;
+	__u64 bpf_run_ns, bpf_run_cnt, usdt_run_ns, usdt_hits, kernel_run_ns, hits;
+	double bpf_ns_per_hit, hits_per_block, hits_per_s;
 	__u64 estimate_ns_per_block;
 	double loader_user_s, loader_sys_s, loader_cpu_pct, wall_s;
+	double bpf_cpu_pct, trap_cpu_pct, total_cpu_pct;
 	long maxrss_kb;
 	bool stats_ok;
 };
 
-static __u64 stats[ST__COUNT];
 static struct overhead ov;
 
 static void collect_overhead(void)
 {
 	struct bpf_program *prog;
 	struct rusage ru;
-	int k;
 
+	memset(&ov, 0, sizeof(ov));
 	ov.stats_ok = stats_fd >= 0;
 	bpf_object__for_each_program(prog, skel->obj) {
-		struct bpf_prog_info info = { 0 };
-		__u32 len = sizeof(info);
-		int fd = bpf_program__fd(prog);
+		struct bpf_prog_info info;
 
-		if (fd < 0 || bpf_prog_get_info_by_fd(fd, &info, &len))
+		if (!prog_info(prog, &info))
 			continue;
 		ov.bpf_run_ns += info.run_time_ns;
 		ov.bpf_run_cnt += info.run_cnt;
+		if (section_is_uprobe(bpf_program__section_name(prog)))
+			ov.usdt_run_ns += info.run_time_ns;
+		else
+			ov.kernel_run_ns += info.run_time_ns;
 	}
-	for (k = ST_HIT_SYSCALL_ENTRY; k <= ST_HIT_CYCLE_END; k++)
-		ov.usdt_hits += stats[k];
-	ov.bpf_ns_per_hit = ov.bpf_run_cnt ? (double)ov.bpf_run_ns / (double)ov.bpf_run_cnt : 0.0;
-	ov.hits_per_block = bstat.count ? (double)(ov.usdt_hits + stats[ST_HIT_NTSYNC_WAIT] + stats[ST_HIT_NTSYNC_WAKE]) /
-						  (double)bstat.count : 0.0;
+	ov.usdt_hits = usdt_hits_total();
+	ov.hits = ov.usdt_hits + ctr[CT_NTSYNC_WAIT_HITS] + ctr[CT_NTSYNC_WAKE_HITS];
+	ov.bpf_ns_per_hit = ov.usdt_hits ? (double)ov.usdt_run_ns / (double)ov.usdt_hits : 0.0;
+	ov.hits_per_block = bstat.count ? (double)ov.hits / (double)bstat.count : 0.0;
 	ov.estimate_ns_per_block = (__u64)llround(ov.hits_per_block * (ov.bpf_ns_per_hit + (double)opt.trap_ns));
 	getrusage(RUSAGE_SELF, &ru);
 	ov.loader_user_s = (double)ru.ru_utime.tv_sec + (double)ru.ru_utime.tv_usec / 1e6;
 	ov.loader_sys_s = (double)ru.ru_stime.tv_sec + (double)ru.ru_stime.tv_usec / 1e6;
 	ov.wall_s = (double)(stop_ns - base_ns) / 1e9;
 	ov.loader_cpu_pct = ov.wall_s > 0 ? 100.0 * (ov.loader_user_s + ov.loader_sys_s) / ov.wall_s : 0.0;
+	ov.hits_per_s = ov.wall_s > 0 ? (double)ov.hits / ov.wall_s : 0.0;
+	ov.bpf_cpu_pct = ov.wall_s > 0 ? 100.0 * (double)ov.bpf_run_ns / (ov.wall_s * 1e9) : 0.0;
+	ov.trap_cpu_pct = ov.wall_s > 0 ? 100.0 * (double)ov.usdt_hits * (double)opt.trap_ns / (ov.wall_s * 1e9) : 0.0;
+	ov.total_cpu_pct = ov.bpf_cpu_pct + ov.trap_cpu_pct + ov.loader_cpu_pct;
 	ov.maxrss_kb = ru.ru_maxrss;
 }
 
+/* crossings or blocks missing from the output, including the kernel-side programs' skipped runs
+ * (recursion misses); dropped stack samples are not lost events (their crossings are counted)
+ * and are reported apart */
 static __u64 lost_events(void)
 {
-	return stats[ST_RINGBUF_DROP] + stats[ST_AGG_FULL] + stats[ST_INFLIGHT_OVERFLOW];
+	return ctr[CT_RB_DROP_BLOCK] + ctr[CT_RB_DROP_EVENT] + ctr[CT_RB_DROP_OTHER] + ctr[CT_AGG_FULL] +
+	       ctr[CT_INFLIGHT_OVERFLOW] + ctr[CT_TSTATE_FULL] + rmisses_total;
+}
+
+static void write_loss(FILE *f)
+{
+	static const int kinds[] = { CT_RB_DROP_BLOCK, CT_RB_DROP_EVENT, CT_RB_DROP_OTHER, CT_AGG_FULL,
+				     CT_INFLIGHT_OVERFLOW, CT_TSTATE_FULL };
+	size_t i;
+	bool first = true;
+
+	fprintf(f, "{\"total\":%llu,\"source\":\"bpf_counters\",\"lower_bound\":false,\"by_kind\":{",
+		(unsigned long long)lost_events());
+	for (i = 0; i < sizeof(kinds) / sizeof(kinds[0]); i++) {
+		if (!ctr[kinds[i]])
+			continue;
+		fprintf(f, "%s\"%s\":%llu", first ? "" : ",", counter_names[kinds[i]], (unsigned long long)ctr[kinds[i]]);
+		first = false;
+	}
+	if (rmisses_total)
+		fprintf(f, "%s\"recursion_misses\":%llu", first ? "" : ",", (unsigned long long)rmisses_total);
+	fprintf(f, "},\"recursion_misses\":%llu,\"probe_hits\":%llu,\"fraction_of_hits\":%.6f,"
+		   "\"stack_samples_dropped\":%llu,\"stack_samples_unstored\":%llu}",
+		(unsigned long long)rmisses_total, (unsigned long long)ov.hits,
+		ov.hits ? (double)lost_events() / (double)ov.hits : 0.0, (unsigned long long)ctr[CT_STACK_DROP],
+		(unsigned long long)cnt.stack_reps_full);
+}
+
+static const struct prog_check *check_of(const char *name)
+{
+	int i;
+
+	for (i = 0; i < nchecks; i++)
+		if (strcmp(checks[i].name, name) == 0)
+			return &checks[i];
+	return NULL;
 }
 
 static void write_programs(FILE *f)
@@ -3143,19 +4116,23 @@ static void write_programs(FILE *f)
 
 	fputc('[', f);
 	bpf_object__for_each_program(prog, skel->obj) {
-		struct bpf_prog_info info = { 0 };
-		__u32 len = sizeof(info);
-		int fd = bpf_program__fd(prog);
+		struct bpf_prog_info info;
+		const struct prog_check *pc = check_of(bpf_program__name(prog));
 
-		if (!bpf_program__autoload(prog) || fd < 0 || bpf_prog_get_info_by_fd(fd, &info, &len))
+		if (!prog_info(prog, &info))
 			continue;
 		fprintf(f, "%s{\"name\":\"%s\",\"section\":", first ? "" : ",", bpf_program__name(prog));
 		jstr(f, bpf_program__section_name(prog));
 		fprintf(f, ",\"verified_insns\":%u,\"xlated_bytes\":%u,\"jited_bytes\":%u,\"run_cnt\":%llu,"
-			   "\"run_time_ns\":%llu,\"ns_per_run\":%.1f}",
+			   "\"run_time_ns\":%llu,\"ns_per_run\":%.1f,\"recursion_misses\":%llu",
 			info.verified_insns, info.xlated_prog_len, info.jited_prog_len, (unsigned long long)info.run_cnt,
 			(unsigned long long)info.run_time_ns,
-			info.run_cnt ? (double)info.run_time_ns / (double)info.run_cnt : 0.0);
+			info.run_cnt ? (double)info.run_time_ns / (double)info.run_cnt : 0.0,
+			(unsigned long long)info.recursion_misses);
+		if (pc)
+			fprintf(f, ",\"stack\":\"%s\",\"frame_bytes\":%u,\"preemptible\":%s", jit_stack_class_name(pc->cls),
+				pc->frame, pc->preemptible ? "true" : "false");
+		fputc('}', f);
 		first = false;
 	}
 	fputc(']', f);
@@ -3166,8 +4143,15 @@ static void write_probe_hits(FILE *f)
 	int k;
 
 	fputc('{', f);
-	for (k = ST_HIT_SYSCALL_ENTRY; k <= ST_HIT_PERF_SAMPLE; k++)
-		fprintf(f, "%s\"%s\":%llu", k ? "," : "", stat_names[k], (unsigned long long)stats[k]);
+	for (k = 0; k < N_USDT_PROGS; k++)
+		fprintf(f, "%s\"%s\":%llu", k ? "," : "", usdt_progs[k].probe, (unsigned long long)phits[k]);
+	fprintf(f, ",\"ntsync_wait\":%llu,\"ntsync_wake\":%llu", (unsigned long long)ctr[CT_NTSYNC_WAIT_HITS],
+		(unsigned long long)ctr[CT_NTSYNC_WAKE_HITS]);
+	if (sched_enabled)
+		fprintf(f, ",\"sched_switch_all_processes\":%llu,\"sched_waking_all_processes\":%llu",
+			(unsigned long long)sched_switch_runs, (unsigned long long)sched_waking_runs);
+	if (opt.mode == MODE_SAMPLE)
+		fprintf(f, ",\"perf_sample\":%llu", (unsigned long long)perf_runs);
 	fputc('}', f);
 }
 
@@ -3177,25 +4161,32 @@ static void write_counters_all(FILE *f)
 	size_t i;
 
 	fputc('{', f);
-	for (k = ST_FIRST_COUNTER; k < ST__COUNT; k++)
-		fprintf(f, "%s\"%s\":%llu", k == ST_FIRST_COUNTER ? "" : ",", stat_names[k], (unsigned long long)stats[k]);
+	for (k = 0; k < CT__COUNT; k++)
+		fprintf(f, "%s\"%s\":%llu", k ? "," : "", counter_names[k], (unsigned long long)ctr[k]);
 	fprintf(f, ",\"keys_drained\":%llu,\"drains\":%llu,\"keys_for_flushed_block\":%llu,"
-		   "\"keys_for_unknown_block\":%llu,\"stacks_kept\":%llu,\"stacks_dropped\":%llu,\"events\":%llu,"
+		   "\"keys_for_unknown_block\":%llu,\"stack_samples\":%llu,\"stack_representatives\":%llu,"
+		   "\"stack_samples_unstored\":%llu,\"stack_refs_in_blocks\":%llu,\"events\":%llu,"
 		   "\"blocks_written\":%llu,\"windows_written\":%llu,\"incomplete_blocks\":%llu,\"invalid_blocks\":%llu,"
 		   "\"forks\":%llu,\"follow_attached\":%llu,\"follow_failed\":%llu,\"offcpu_records\":%llu,"
-		   "\"wake_records\":%llu,\"open_entries_at_end\":%llu,\"short_records\":%llu,\"ringbuf_records\":{",
+		   "\"wake_records\":%llu,\"open_entries_at_end\":%llu,\"short_records\":%llu,\"ringbuf_drops\":%llu,"
+		   "\"recursion_misses\":%llu,\"blocks_rebuilt\":%llu,\"follow_skipped_unverified_ntdll\":%llu,"
+		   "\"anomaly_records\":%llu,\"ringbuf_records\":{",
 		(unsigned long long)cnt.keys_drained, (unsigned long long)cnt.drains,
 		(unsigned long long)cnt.keys_for_flushed_block, (unsigned long long)cnt.keys_for_unknown_block,
-		(unsigned long long)cnt.stacks_kept, (unsigned long long)cnt.stacks_dropped,
+		(unsigned long long)cnt.stack_samples, (unsigned long long)cnt.stack_reps,
+		(unsigned long long)cnt.stack_reps_full, (unsigned long long)cnt.stack_refs_in_blocks,
 		(unsigned long long)cnt.events_written, (unsigned long long)cnt.blocks_written,
 		(unsigned long long)cnt.windows_written, (unsigned long long)bstat.incomplete,
 		(unsigned long long)cnt.invalid_blocks, (unsigned long long)cnt.forks,
 		(unsigned long long)cnt.follow_attached, (unsigned long long)cnt.follow_failed,
 		(unsigned long long)cnt.offcpu_records, (unsigned long long)cnt.wake_records,
-		(unsigned long long)cnt.open_entries_at_end, (unsigned long long)cnt.rb_short);
+		(unsigned long long)cnt.open_entries_at_end, (unsigned long long)cnt.rb_short,
+		(unsigned long long)(ctr[CT_RB_DROP_BLOCK] + ctr[CT_RB_DROP_EVENT] + ctr[CT_RB_DROP_OTHER]),
+		(unsigned long long)rmisses_total, (unsigned long long)cnt.blocks_rebuilt,
+		(unsigned long long)cnt.follow_skipped_unverified_ntdll, (unsigned long long)cnt.anomalies);
 	{
 		static const char *const rn[] = { "", "stack", "block", "wake", "offcpu", "name", "event", "unixlib",
-						  "fork", "thread", "exit" };
+						  "fork", "thread", "exit", "anomaly" };
 		bool first = true;
 
 		for (i = 1; i < sizeof(rn) / sizeof(rn[0]); i++) {
@@ -3219,18 +4210,63 @@ static void write_attach(FILE *f)
 	fputc(']', f);
 }
 
+static int cmp_anom(const void *a, const void *b)
+{
+	const struct anom *x = *(const struct anom *const *)a, *y = *(const struct anom *const *)b;
+
+	if (x->n != y->n)
+		return x->n > y->n ? -1 : 1;
+	return strcmp(x->key, y->key);
+}
+
+/* tracer.json "anomalies": the 40 most frequent (what, kind, id) */
+static void write_anomalies(FILE *f)
+{
+	struct anom **list = NULL, *a;
+	size_t n = 0, cap = 0, i;
+
+	for (i = 0; i < anoms.cap; i++) {
+		if (!anoms.used[i])
+			continue;
+		for (a = (struct anom *)(uintptr_t)anoms.vals[i]; a; a = a->next) {
+			grow((void **)&list, &cap, n + 1, sizeof(*list));
+			list[n++] = a;
+		}
+	}
+	qsort(list, n, sizeof(*list), cmp_anom);
+	fprintf(f, "{\"records\":%llu,\"dropped\":%llu,\"file\":\"anomalies.jsonl\",\"top\":[",
+		(unsigned long long)cnt.anomalies, (unsigned long long)ctr[CT_ANOMALY_DROP]);
+	for (i = 0; i < n && i < 40; i++) {
+		fprintf(f, "%s{\"what\":\"%s\",\"kind\":\"%s\",\"id\":", i ? "," : "", anomaly_name(list[i]->what),
+			KIND_NAME(list[i]->kind));
+		if (list[i]->name)
+			jstr(f, list[i]->name);
+		else
+			fputs("null", f);
+		fprintf(f, ",\"n\":%llu}", (unsigned long long)list[i]->n);
+	}
+	fputs("]}", f);
+	free(list);
+}
+
 static void write_overhead(FILE *f)
 {
-	fprintf(f, "{\"usdt_hits\":%llu,\"bpf_stats_enabled\":%s,\"bpf_run_cnt\":%llu,\"bpf_run_time_ns\":%llu,"
-		   "\"bpf_ns_per_run\":%.1f,\"hits_per_block\":%.2f,\"assumed_trap_ns_per_hit\":%u,"
-		   "\"estimate_ns_per_block\":%llu,\"loader_user_s\":%.3f,\"loader_sys_s\":%.3f,\"loader_wall_s\":%.3f,"
-		   "\"loader_cpu_pct\":%.3f,\"loader_maxrss_kb\":%ld,\"note\":\"bpf_* are measured "
-		   "(kernel.bpf_stats_enabled via BPF_ENABLE_STATS while tracing); the uprobe trap itself is not "
-		   "measured: estimate_ns_per_block = hits_per_block x (bpf_ns_per_run + assumed_trap_ns_per_hit)\"}",
-		(unsigned long long)ov.usdt_hits, ov.stats_ok ? "true" : "false", (unsigned long long)ov.bpf_run_cnt,
-		(unsigned long long)ov.bpf_run_ns, ov.bpf_ns_per_hit, ov.hits_per_block, opt.trap_ns,
+	fprintf(f, "{\"usdt_hits\":%llu,\"probe_hits\":%llu,\"probe_hits_per_s\":%.1f,\"bpf_stats_enabled\":%s,"
+		   "\"bpf_run_cnt\":%llu,\"bpf_run_time_ns\":%llu,\"usdt_bpf_run_time_ns\":%llu,"
+		   "\"kernel_bpf_run_time_ns\":%llu,\"bpf_ns_per_run\":%.1f,\"hits_per_block\":%.2f,"
+		   "\"assumed_trap_ns_per_hit\":%u,\"estimate_ns_per_block\":%llu,\"loader_user_s\":%.3f,"
+		   "\"loader_sys_s\":%.3f,\"loader_wall_s\":%.3f,\"loader_cpu_pct\":%.3f,\"bpf_cpu_pct\":%.3f,"
+		   "\"trap_cpu_pct_estimate\":%.3f,\"total_cpu_pct_estimate\":%.3f,\"loader_maxrss_kb\":%ld,"
+		   "\"note\":\"cpu_pct values are percent of one CPU over the traced wall time. bpf_* are measured "
+		   "(kernel.bpf_stats_enabled via BPF_ENABLE_STATS while tracing; bpf_ns_per_run is the USDT programs' "
+		   "mean); the uprobe trap itself is not measured: trap_cpu_pct_estimate = usdt_hits x "
+		   "assumed_trap_ns_per_hit, estimate_ns_per_block = hits_per_block x (bpf_ns_per_run + "
+		   "assumed_trap_ns_per_hit)\"}",
+		(unsigned long long)ov.usdt_hits, (unsigned long long)ov.hits, ov.hits_per_s, ov.stats_ok ? "true" : "false",
+		(unsigned long long)ov.bpf_run_cnt, (unsigned long long)ov.bpf_run_ns, (unsigned long long)ov.usdt_run_ns,
+		(unsigned long long)ov.kernel_run_ns, ov.bpf_ns_per_hit, ov.hits_per_block, opt.trap_ns,
 		(unsigned long long)ov.estimate_ns_per_block, ov.loader_user_s, ov.loader_sys_s, ov.wall_s,
-		ov.loader_cpu_pct, ov.maxrss_kb);
+		ov.loader_cpu_pct, ov.bpf_cpu_pct, ov.trap_cpu_pct, ov.total_cpu_pct, ov.maxrss_kb);
 }
 
 static void write_summary(void)
@@ -3288,13 +4324,16 @@ static void write_summary(void)
 		   "\"backend\": \"libbpf\", \"mode\": \"%s\", \"sample_rate\": 1, \"attach\": ",
 		SUMMARY_SCHEMA, mode_name());
 	write_attach(f);
-	fprintf(f, ", \"lost_events\": %llu, \"started_monotonic_ns\": %llu, \"stopped_monotonic_ns\": %llu, "
+	fprintf(f, ", \"lost_events\": %llu, \"loss\": ", (unsigned long long)lost_events());
+	write_loss(f);
+	fprintf(f, ", \"clean_exit\": true, \"started_monotonic_ns\": %llu, \"stopped_monotonic_ns\": %llu, "
 		   "\"overhead_estimate_ns_per_block\": %llu, \"overhead\": ",
-		(unsigned long long)lost_events(), (unsigned long long)base_ns, (unsigned long long)stop_ns,
-		(unsigned long long)ov.estimate_ns_per_block);
+		(unsigned long long)base_ns, (unsigned long long)stop_ns, (unsigned long long)ov.estimate_ns_per_block);
 	write_overhead(f);
 	fputs(", \"programs\": ", f);
 	write_programs(f);
+	fputs(", \"stack_check\": ", f);
+	write_stack_check(f);
 	fprintf(f, "},\n \"thresholds\": {\"near_late_fraction\": %g, \"deadline_ns_mode\": %llu, "
 		   "\"near_late_slack_ns\": %lld, \"near_late_basis\": \"each block's own period_ns\"},\n",
 		opt.near_late, (unsigned long long)mode_period, (long long)llround(opt.near_late * (double)mode_period));
@@ -3325,40 +4364,59 @@ static void write_summary(void)
 		__u64 attributed = (__u64)llround(bstat.attributed_total);
 
 		fprintf(f, " \"lost_slack\": {\"definition\": \"sum over late and near-late blocks of (near_late_slack_ns "
-			   "- slack_ns)\", \"total_ns\": %llu, \"attributed_ns\": %llu, \"unattributed_ns\": %lld},\n",
+			   "- slack_ns)\", \"attribution\": \"each block's lost slack is shared among its top-level crossings "
+			   "of audio-role threads in proportion to their time, capped at that time; nested crossings "
+			   "(nested_call_sites) are part of their enclosing call's time and get no share\", "
+			   "\"total_ns\": %llu, \"attributed_ns\": %llu, \"unattributed_ns\": %lld},\n",
 			(unsigned long long)bstat.lost_total, (unsigned long long)attributed,
 			(long long)bstat.lost_total - (long long)attributed);
 	}
-	fputs(" \"call_sites\": [", f);
-	for (i = 0; i < nsl; i++) {
-		struct site *s = sl[i];
-		__u64 stressed = s->late_blocks + s->near_late_blocks;
-		int w;
-		bool wf = true;
+	for (k = 0; k < 2; k++) {               /* 0: call_sites (top-level), 1: nested_call_sites */
+		size_t rank = 0;
 
-		fprintf(f, "%s\n  {\"rank\": %zu, \"key\": ", i ? "," : "", i + 1);
-		jstr(f, s->key);
-		fprintf(f, ", \"kind\": \"%s\", \"name\": ", kind_names[s->kind]);
-		jstr(f, s->name);
-		fprintf(f, ", \"caller\": \"*\", \"late_blocks\": %llu, \"near_late_blocks\": %llu, \"n_in_late_blocks\": %llu, "
-			   "\"per_late_block\": %.3f, \"total_ns_in_late_blocks\": %llu, \"max_ns\": %llu, "
-			   "\"share_of_lost_slack\": %.4f, \"n_all_blocks\": %llu, \"total_ns_all_blocks\": %llu, \"woken_by\": [",
-			(unsigned long long)s->late_blocks, (unsigned long long)s->near_late_blocks,
-			(unsigned long long)s->n_in_late, stressed ? (double)s->n_in_late / (double)stressed : 0.0,
-			(unsigned long long)s->total_in_late, (unsigned long long)s->max_ns,
-			bstat.lost_total ? s->attributed / (double)bstat.lost_total : 0.0, (unsigned long long)s->n_all,
-			(unsigned long long)s->total_all);
-		for (w = 0; w < 5; w++) {
-			if (!s->wakers[w])
+		fputs(k ? " \"nested_call_sites\": [" : " \"call_sites\": [", f);
+		for (i = 0; i < nsl; i++) {
+			struct site *s = sl[i];
+			__u64 stressed = s->late_blocks + s->near_late_blocks;
+			int w;
+			bool wf = true;
+
+			if ((s->pkind != 0) != (k == 1))
 				continue;
-			fprintf(f, "%s{\"tid\": %u, \"role\": ", wf ? "" : ", ", s->wakers[w]);
-			jstr(f, role_of(s->wakers[w]));
-			fprintf(f, ", \"count\": %llu}", (unsigned long long)s->waker_n[w]);
-			wf = false;
+			fprintf(f, "%s\n  {\"rank\": %zu, \"key\": ", rank ? "," : "", rank + 1);
+			rank++;
+			jstr(f, s->key);
+			fprintf(f, ", \"kind\": \"%s\", \"name\": ", kind_names[s->kind]);
+			jstr(f, s->name);
+			if (s->pkind) {
+				fprintf(f, ", \"parent\": {\"kind\": \"%s\", \"id\": ", kind_names[s->pkind]);
+				jstr(f, s->pname);
+				fputc('}', f);
+			}
+			fprintf(f, ", \"caller\": \"*\", \"late_blocks\": %llu, \"near_late_blocks\": %llu, "
+				   "\"n_in_late_blocks\": %llu, \"per_late_block\": %.3f, \"total_ns_in_late_blocks\": %llu, "
+				   "\"max_ns\": %llu, ",
+				(unsigned long long)s->late_blocks, (unsigned long long)s->near_late_blocks,
+				(unsigned long long)s->n_in_late, stressed ? (double)s->n_in_late / (double)stressed : 0.0,
+				(unsigned long long)s->total_in_late, (unsigned long long)s->max_ns);
+			if (!s->pkind)
+				fprintf(f, "\"share_of_lost_slack\": %.4f, ",
+					bstat.lost_total ? s->attributed / (double)bstat.lost_total : 0.0);
+			fprintf(f, "\"n_all_blocks\": %llu, \"total_ns_all_blocks\": %llu, \"woken_by\": [",
+				(unsigned long long)s->n_all, (unsigned long long)s->total_all);
+			for (w = 0; w < 5; w++) {
+				if (!s->wakers[w])
+					continue;
+				fprintf(f, "%s{\"tid\": %u, \"role\": ", wf ? "" : ", ", s->wakers[w]);
+				jstr(f, role_of(s->wakers[w]));
+				fprintf(f, ", \"count\": %llu}", (unsigned long long)s->waker_n[w]);
+				wf = false;
+			}
+			fputs("]}", f);
 		}
-		fputs("]}", f);
+		fputs("\n ],\n", f);
 	}
-	fputs("\n ],\n \"kinds\": {", f);
+	fputs(" \"kinds\": {", f);
 	first = true;
 	for (k = KIND_SYSCALL; k <= KIND_NTSYNC_WAKE; k++) {
 		if (!kinds_n[k])
@@ -3407,26 +4465,43 @@ static void write_summary(void)
 		}
 		free(rl);
 	}
+	/* top 60 (role, kind, name, parent): symbolize.py splits them by caller and keeps the top 20 */
 	fputs("\n },\n \"hotspots_non_audio\": [", f);
-	for (i = 0; i < nhl && i < 20; i++) {
+	for (i = 0; i < nhl && i < 60; i++) {
+		size_t t;
+
 		fprintf(f, "%s\n  {\"role\": ", i ? "," : "");
 		jstr(f, hl[i]->role);
 		fprintf(f, ", \"kind\": \"%s\", \"name\": ", kind_names[hl[i]->kind]);
 		jstr(f, hl[i]->name);
-		fprintf(f, ", \"caller\": \"*\", \"n\": %llu, \"total_ns\": %llu}", (unsigned long long)hl[i]->n,
+		if (hl[i]->pkind) {
+			fprintf(f, ", \"parent\": {\"kind\": \"%s\", \"id\": ", kind_names[hl[i]->pkind]);
+			jstr(f, hl[i]->pname);
+			fputc('}', f);
+		}
+		fprintf(f, ", \"caller\": \"*\", \"n\": %llu, \"total_ns\": %llu, \"by_tid\": [", (unsigned long long)hl[i]->n,
 			(unsigned long long)hl[i]->total);
+		for (t = 0; t < hl[i]->ntids; t++)
+			fprintf(f, "%s[%u, %llu, %llu]", t ? ", " : "", hl[i]->tids[t].tid, (unsigned long long)hl[i]->tids[t].n,
+				(unsigned long long)hl[i]->tids[t].total);
+		fputs("]}", f);
 	}
 	fprintf(f, "\n ],\n \"counters\": {\"unmatched_exits\": %llu, \"unmatched_exits_first_on_tid\": %llu, "
-		   "\"abandoned_entries\": %llu, \"ringbuf_drops\": %llu, \"lost_events\": %llu, \"probe_hits\": ",
-		(unsigned long long)stats[ST_UNMATCHED_EXIT], (unsigned long long)stats[ST_THREAD_START_EXIT],
-		(unsigned long long)stats[ST_ABANDONED_ENTRY], (unsigned long long)stats[ST_RINGBUF_DROP],
-		(unsigned long long)lost_events());
+		   "\"abandoned_entries\": %llu, \"ringbuf_drops\": %llu, \"stack_samples_dropped\": %llu, "
+		   "\"lost_events\": %llu, \"probe_hits\": ",
+		(unsigned long long)ctr[CT_UNMATCHED_EXIT], (unsigned long long)ctr[CT_FIRST_EXIT],
+		(unsigned long long)ctr[CT_ABANDONED],
+		(unsigned long long)(ctr[CT_RB_DROP_BLOCK] + ctr[CT_RB_DROP_EVENT] + ctr[CT_RB_DROP_OTHER]),
+		(unsigned long long)ctr[CT_STACK_DROP], (unsigned long long)lost_events());
 	write_probe_hits(f);
 	fprintf(f, ", \"events\": %llu, \"all\": ", (unsigned long long)cnt.events_written);
 	write_counters_all(f);
-	fputs("},\n \"notes\": [\"call_sites and hotspots_non_audio are per (kind, id) with caller '*': the "
-	      "production tracer aggregates in the kernel; per-caller sites come from the stack samples in "
-	      "blocks.jsonl (symbolized into blocks.symbolized.jsonl, ranked by bench-report.py interface)\", "
+	fputs("},\n \"notes\": [\"the loader writes call_sites and hotspots_non_audio per (kind, id) with caller '*' (the "
+	      "kernel aggregates without callers); symbolize.py replaces them with per-caller sites apportioned from "
+	      "the stack samples (blocks.symbolized.jsonl crossings carry the same callers)\", "
+	      "\"nested_call_sites: server requests and waits, NTSync waits and wakes inside a syscall / unix call, per "
+	      "enclosing call; their time is already inside it, so they are ranked apart and get no share of the lost "
+	      "slack\", "
 	      "\"blocks.offcpu counts the off-CPU intervals that began inside the block (not clipped to t_end)\", "
 	      "\"threads.jsonl includes the crossings inside blocks (window of the block start) as well as the "
 	      "between-block buckets\"],\n \"warnings\": [", f);
@@ -3473,19 +4548,69 @@ static void write_tracer_json(void)
 		   "\",\"abi\":%d,\"libbpf\":\"%u.%u\"},\"attach\":",
 		WINE_TRACE_ABI, libbpf_major_version(), libbpf_minor_version());
 	write_attach(m);
-	fprintf(m, ",\"attached_monotonic_ns\":%llu,\"stopped_monotonic_ns\":%llu,\"lost_events\":%llu,"
-		   "\"probe_hits\":",
+	fprintf(m, ",\"attached_monotonic_ns\":%llu,\"stopped_monotonic_ns\":%llu,\"lost_events\":%llu,\"loss\":",
 		(unsigned long long)base_ns, (unsigned long long)stop_ns, (unsigned long long)lost_events());
+	write_loss(m);
+	fputs(",\"tracer_exit\":\"clean\",\"clean_exit\":true,\"probe_hits\":", m);
 	write_probe_hits(m);
 	fputs(",\"counters\":", m);
 	write_counters_all(m);
-	fprintf(m, ",\"blocks\":{\"count\":%llu,\"late\":%llu,\"near_late\":%llu},"
+	if (opt.mode == MODE_DRILLDOWN) {
+		fputs(",\"anomalies\":", m);
+		write_anomalies(m);
+	}
+	fputs(",\"per_tid\":{", m);
+	{
+		bool first = true;
+
+		for (i = 0; i < thrs.cap; i++) {
+			struct thr *t;
+
+			if (!thrs.used[i])
+				continue;
+			t = (struct thr *)(uintptr_t)thrs.vals[i];
+			if (!t->unmatched && !t->first_exit && !t->abandoned && !t->overflow && !t->open_at_exit &&
+			    !t->never_returned)
+				continue;
+			fprintf(m, "%s\"%u\":{\"unmatched_exits\":%u,\"unmatched_exits_first_on_tid\":%u,"
+				   "\"abandoned_entries\":%u,\"inflight_overflow\":%u,\"open_at_thread_exit\":%u,"
+				   "\"never_returned\":%u}",
+				first ? "" : ",", t->tid, t->unmatched, t->first_exit, t->abandoned, t->overflow,
+				t->open_at_exit, t->never_returned);
+			first = false;
+		}
+	}
+	fprintf(m, "},\"blocks\":{\"count\":%llu,\"late\":%llu,\"near_late\":%llu},"
 		   "\"overhead_estimate_ns_per_block\":%llu,\"overhead\":",
 		(unsigned long long)bstat.count, (unsigned long long)bstat.late, (unsigned long long)bstat.near_late,
 		(unsigned long long)ov.estimate_ns_per_block);
 	write_overhead(m);
 	fputs(",\"programs\":", m);
 	write_programs(m);
+	fputs(",\"stack_check\":", m);
+	write_stack_check(m);
+	fputs(",\"private_stack_programs\":[", m);
+	{
+		bool first = true;
+
+		for (i = 0; i < (size_t)nchecks; i++) {
+			if (checks[i].cls != JIT_STACK_PRIVATE)
+				continue;
+			fputs(first ? "" : ",", m);
+			jstr(m, checks[i].name);
+			first = false;
+		}
+		fputs("],\"private_stack_risky\":[", m);
+		first = true;
+		for (i = 0; i < (size_t)nchecks; i++) {
+			if (!checks[i].preemptible || checks[i].cls == JIT_STACK_NONE || checks[i].cls == JIT_STACK_KERNEL)
+				continue;
+			fputs(first ? "" : ",", m);
+			jstr(m, checks[i].name);
+			first = false;
+		}
+		fprintf(m, "],\"private_stack_allowed\":%s", opt.allow_priv_stack ? "true" : "false");
+	}
 	fprintf(m, ",\"ntsync\":\"%s\",\"sched\":%s,\"follow\":%s,\"sched_waking_irq\":%s,"
 		   "\"sample\":{\"stack_sample_n\":%u,\"stack_bytes\":%u,\"slack_threshold_pct\":%u,\"keep_stacks\":\"%s\","
 		   "\"roles\":\"%s\",\"no_exit\":%s,\"ringbuf_mb\":%u,\"trigger_ids\":%d},"
@@ -3710,20 +4835,24 @@ static void usage(int code)
 {
 	fprintf(code ? stderr : stdout,
 		"usage: wine-trace --out DIR --pid PID [--pid PID]... [options]\n"
+		"       wine-trace --self-check [load options]     (load, classify every program's stack, exit 0/2)\n"
 		"\n"
 		"  --mode summary|drilldown|sample   (default summary)\n"
 		"  --ntsync auto|fentry|kprobe|tracepoint|off   (default auto: fentry, then kprobe, tracepoint)\n"
 		"  --sched on|off           scheduler probes (default: on in drilldown, off otherwise)\n"
 		"  --run-id TOKEN           recorded in tracer.json\n"
-		"  --sample 1/N             stack sample every N-th syscall/unix-call entry (default 1/64, drilldown 1/4;\n"
-		"                           1/0 disables)\n"
+		"  --sample 1/N             stack sample with probability 1/N per syscall/unix-call entry (default 1/64,\n"
+		"                           drilldown 1/4; 1/0 disables)\n"
 		"  --stack-bytes N          stack window per sample, %d..%d (default %d)\n"
-		"  --keep-stacks none|late|all   which samples reach the output (default late; drilldown all)\n"
+		"  --keep-stacks none|late|all   which blocks list their samples (default all; stacks.jsonl holds one\n"
+		"                           representative per distinct stack)\n"
 		"  --roles audio|all        audio: USDT crossings of audio-role threads only (default all)\n"
 		"  --no-exit                count at entry; exit probes not attached (no durations)\n"
-		"  --slack-threshold PCT    also sample when the block is within PCT%% of its deadline (default %d)\n"
+		"  --slack-threshold PCT    also sample once the block is within PCT%% of its period of the deadline\n"
+		"                           (default %d)\n"
+		"  --slack-samples N        at most N slack-triggered samples per block (default %d)\n"
 		"  --near-late-fraction F   near-late threshold as a fraction of the period (default %.2f)\n"
-		"  --ringbuf-mb N           ring buffer size (default %d, rounded up to a power of two)\n"
+		"  --ringbuf-mb N           ring buffer size (default %d, drilldown %d; rounded up to a power of two)\n"
 		"  --duration S             stop after S seconds (default: until SIGINT/SIGTERM)\n"
 		"  --trigger-ids ID,...     always sample these syscall ids (hex or decimal)\n"
 		"  --tables FILE            id table (default ../tables/wine-<ver>.json next to the binary)\n"
@@ -3731,10 +4860,18 @@ static void usage(int code)
 		"  --no-follow              do not attach to children forked by traced processes\n"
 		"  --trap-ns N              assumed uprobe trap cost for the overhead estimate (default %u)\n"
 		"  --perf-hz N              --mode sample frequency (default 999)\n"
-		"  --unsafe-private-stack   attach although the USDT programs exceed 64 bytes of BPF stack (BUILD.md)\n"
+		"  --self-check             load the programs, print the stack classification as JSON, exit 0 when\n"
+		"                           every uprobe program is on the kernel stack, 2 otherwise (no attach)\n"
+		"  --unsafe-private-stack   attach although a uprobe program landed on a per-CPU private stack\n"
+		"                           (experiments only, never against Live: BUILD.md)\n"
+		"  --generic-args           fetch every probe operand through libbpf's bpf_usdt_arg (default: the\n"
+		"                           dispatcher probes read registers directly once ntdll.so's operands are\n"
+		"                           verified against patch 0108)\n"
+		"  --dump-jit DIR           with the self-check: write each function's first 96 JIT bytes to\n"
+		"                           DIR/<program>.f<N>.hex (classifier fixtures, new-kernel triage)\n"
 		"  -v, --verbose (twice: libbpf debug)   -q, --quiet   --version   -h, --help\n",
-		STACK_BYTES_MIN, STACK_BYTES_MAX, STACK_BYTES_DEFAULT, SLACK_THRESH_PCT_DEFAULT, DEFAULT_NEAR_LATE,
-		RINGBUF_MB_DEFAULT, DEFAULT_TRAP_NS);
+		STACK_BYTES_MIN, STACK_BYTES_MAX, STACK_BYTES_DEFAULT, SLACK_THRESH_PCT_DEFAULT,
+		SLACK_SAMPLES_PER_BLOCK_DEFAULT, DEFAULT_NEAR_LATE, RINGBUF_MB_DEFAULT, RINGBUF_MB_DRILLDOWN, DEFAULT_TRAP_NS);
 	exit(code);
 }
 
@@ -3755,7 +4892,8 @@ static unsigned long parse_ulong(const char *s, const char *what, unsigned long 
 static void parse_args(int argc, char **argv)
 {
 	enum { OPT_MODE = 256, OPT_NTSYNC, OPT_SCHED, OPT_RUNID, OPT_SAMPLE, OPT_STACKB, OPT_ROLES, OPT_NOEXIT, OPT_SLACK, OPT_RBMB,
-	       OPT_DUR, OPT_TRIG, OPT_TABLES, OPT_NTDLL, OPT_PIPE, OPT_NOFOLLOW, OPT_NEAR, OPT_KEEP, OPT_TRAP, OPT_PERFHZ, OPT_VERSION, OPT_PRIVSTACK };
+	       OPT_DUR, OPT_TRIG, OPT_TABLES, OPT_NTDLL, OPT_PIPE, OPT_NOFOLLOW, OPT_NEAR, OPT_KEEP, OPT_TRAP, OPT_PERFHZ, OPT_VERSION, OPT_PRIVSTACK,
+	       OPT_SELFCHECK, OPT_SLACKN, OPT_DUMPJIT, OPT_GENERIC };
 	static const struct option lo[] = {
 		{ "out", required_argument, NULL, 'o' }, { "pid", required_argument, NULL, 'p' },
 		{ "mode", required_argument, NULL, OPT_MODE }, { "ntsync", required_argument, NULL, OPT_NTSYNC },
@@ -3769,7 +4907,9 @@ static void parse_args(int argc, char **argv)
 		{ "near-late-fraction", required_argument, NULL, OPT_NEAR }, { "keep-stacks", required_argument, NULL, OPT_KEEP },
 		{ "trap-ns", required_argument, NULL, OPT_TRAP }, { "perf-hz", required_argument, NULL, OPT_PERFHZ },
 		{ "verbose", no_argument, NULL, 'v' }, { "quiet", no_argument, NULL, 'q' },
-		{ "unsafe-private-stack", no_argument, NULL, OPT_PRIVSTACK },
+		{ "unsafe-private-stack", no_argument, NULL, OPT_PRIVSTACK }, { "self-check", no_argument, NULL, OPT_SELFCHECK },
+		{ "slack-samples", required_argument, NULL, OPT_SLACKN }, { "dump-jit", required_argument, NULL, OPT_DUMPJIT },
+		{ "generic-args", no_argument, NULL, OPT_GENERIC },
 		{ "version", no_argument, NULL, OPT_VERSION }, { "help", no_argument, NULL, 'h' }, { NULL, 0, NULL, 0 },
 	};
 	int c;
@@ -3825,7 +4965,12 @@ static void parse_args(int argc, char **argv)
 			break;
 		case OPT_NOEXIT: opt.no_exit = 1; break;
 		case OPT_SLACK: opt.slack_pct = (__u32)parse_ulong(optarg, "--slack-threshold", 100); break;
-		case OPT_RBMB: opt.ringbuf_mb = (__u32)parse_ulong(optarg, "--ringbuf-mb", 1024); if (!opt.ringbuf_mb) opt.ringbuf_mb = 1; break;
+		case OPT_RBMB:
+			opt.ringbuf_mb = (__u32)parse_ulong(optarg, "--ringbuf-mb", 1024);
+			if (!opt.ringbuf_mb)
+				opt.ringbuf_mb = 1;
+			opt.ringbuf_set = 1;
+			break;
 		case OPT_DUR: {
 			char *end;
 
@@ -3872,6 +5017,10 @@ static void parse_args(int argc, char **argv)
 		case OPT_TRAP: opt.trap_ns = (__u32)parse_ulong(optarg, "--trap-ns", 1000000); break;
 		case OPT_PERFHZ: opt.perf_hz = (int)parse_ulong(optarg, "--perf-hz", 100000); if (!opt.perf_hz) opt.perf_hz = 1; break;
 		case OPT_PRIVSTACK: opt.allow_priv_stack = 1; break;
+		case OPT_SELFCHECK: opt.self_check = 1; break;
+		case OPT_SLACKN: opt.slack_samples = (__u32)parse_ulong(optarg, "--slack-samples", 1u << 20); break;
+		case OPT_DUMPJIT: opt.dump_jit = optarg; break;
+		case OPT_GENERIC: opt.generic_args = 1; break;
 		case 'v': opt.verbose++; break;
 		case 'q': opt.quiet = 1; break;
 		case OPT_VERSION:
@@ -3886,11 +5035,11 @@ static void parse_args(int argc, char **argv)
 		fprintf(stderr, "wine-trace: unexpected argument '%s'\n", argv[optind]);
 		usage(2);
 	}
-	if (!opt.out) {
+	if (!opt.out && !opt.self_check) {
 		fprintf(stderr, "wine-trace: --out DIR is required\n");
 		usage(2);
 	}
-	if (!opt.npids) {
+	if (!opt.npids && !opt.self_check) {
 		fprintf(stderr, "wine-trace: at least one --pid is required (profiler/bin/wine-trace discovers them)\n");
 		usage(2);
 	}
@@ -3899,7 +5048,9 @@ static void parse_args(int argc, char **argv)
 	if (!opt.sample_set)
 		opt.sample_n = opt.mode == MODE_DRILLDOWN ? SAMPLE_N_DRILLDOWN : SAMPLE_N_SUMMARY;
 	if (opt.keep_stacks < 0)
-		opt.keep_stacks = opt.mode == MODE_SUMMARY ? KEEP_LATE : KEEP_ALL;
+		opt.keep_stacks = KEEP_ALL;
+	if (!opt.ringbuf_set && opt.mode == MODE_DRILLDOWN)
+		opt.ringbuf_mb = RINGBUF_MB_DRILLDOWN;
 }
 
 static void setup_exe_dir(const char *argv0)
@@ -3921,10 +5072,83 @@ static void setup_exe_dir(const char *argv0)
 	scopy(exe_dir, sizeof(exe_dir), self);
 }
 
+/* open + load + stack self-check; exits 2 when a uprobe program is not provably on the kernel
+ * stack (unless --unsafe-private-stack, which is recorded) */
+static void load_and_check(void)
+{
+	int risky;
+
+	/* run_cnt/run_time_ns of every program; without it the BPF side counts probe hits itself */
+	stats_fd = bpf_enable_stats(BPF_STATS_RUN_TIME);
+	if (stats_fd < 0)
+		warn_add("BPF_ENABLE_STATS failed (%s): no measured BPF run time, probe hits counted in BPF",
+			 strerror(errno));
+	verify_fast_args();
+	logmsg("probe operands: %s", fast_args_note);
+	open_and_load();
+	risky = stack_self_check();
+	if (opt.self_check) {
+		write_stack_check(stdout);
+		fputc('\n', stdout);
+		fflush(stdout);
+		print_stack_check(stderr);
+		logmsg("self-check: %s (%d risky program%s)", risky ? "FAILED" : "ok", risky, risky == 1 ? "" : "s");
+		wine_trace__destroy(skel);
+		exit(risky ? 2 : 0);
+	}
+	if (opt.verbose || risky)
+		print_stack_check(stderr);
+	if (risky && !opt.allow_priv_stack) {
+		fprintf(stderr, "wine-trace: error: refusing to attach: %d preemptible uprobe program%s not provably on the "
+				"kernel stack (per-CPU private stack or unknown JIT prologue).  Two threads entering such a "
+				"program on one CPU share its frame (the B5 kernel oops).  Keep every USDT program's BPF "
+				"frame below %d bytes (BUILD.md); --unsafe-private-stack overrides for experiments only, "
+				"never against Live\n",
+			risky, risky == 1 ? " is" : "s are", PRIV_STACK_MIN_BYTES);
+		wine_trace__destroy(skel);
+		exit(2);
+	}
+	if (risky)
+		warn_add("--unsafe-private-stack: attached although %d uprobe program%s may share a per-CPU private stack",
+			 risky, risky == 1 ? "" : "s");
+	else
+		logmsg("stack self-check passed: %d programs, every uprobe program on the kernel stack", nchecks);
+}
+
+/* open entries and per-thread counters of the threads still alive */
+static void read_tstates(void)
+{
+	int fd = bpf_map__fd(skel->maps.tstate);
+	__u32 key, next, *prev = NULL;
+	struct tstate *ts = xmalloc(sizeof(*ts));
+
+	while (bpf_map_get_next_key(fd, prev, &next) == 0) {
+		if (bpf_map_lookup_elem(fd, &next, ts) == 0) {
+			struct thr *t;
+
+			if (ts->depth <= INFLIGHT_DEPTH)
+				cnt.open_entries_at_end += ts->depth;
+			if (ts->unmatched || ts->first_exit || ts->abandoned || ts->overflow || ts->open_at_exit ||
+			    ts->never_returned) {
+				t = thr_get(next, 0);
+				if (!t->counters_final) {
+					t->unmatched = ts->unmatched;
+					t->first_exit = ts->first_exit;
+					t->abandoned = ts->abandoned;
+					t->overflow = ts->overflow;
+					t->open_at_exit = ts->open_at_exit;
+					t->never_returned = ts->never_returned;
+				}
+			}
+		}
+		key = next;
+		prev = &key;
+	}
+	free(ts);
+}
+
 int main(int argc, char **argv)
 {
-	struct cfg c = { 0 };
-	__u32 zero = 0;
 	struct ring_buffer *rb;
 	struct sigaction sa;
 	__u64 now, deadline = 0, last_progress, last_flush = 0;
@@ -3934,22 +5158,14 @@ int main(int argc, char **argv)
 	parse_args(argc, argv);
 	setup_exe_dir(argv[0]);
 	if (geteuid() != 0)
-		die("needs root (uprobe/fentry attach): run through sudo -n or profiler/bin/wine-trace");
-	/* B5 live test (kernel 7.2.9-cachyos): the verifier gives BPF_PROG_TYPE_KPROBE programs whose
-	 * stack is >= 64 bytes a per-CPU private stack, but uprobe programs are preemptible, so two
-	 * runs on one CPU share that stack.  It oopsed inside wine_syscall_exit (a timestamp loaded
-	 * as a pointer through r9 = the private stack), killed Live's pipeasio-rt thread and left
-	 * uprobe unregistration stuck in synchronize_srcu.  Every USDT program here uses 184-304
-	 * bytes of stack, so refuse to attach until they are below 64 bytes. */
-	if (!opt.allow_priv_stack)
-		die("disabled: the USDT programs use >= 64 bytes of BPF stack, which this kernel runs on a "
-		    "per-CPU private stack that preemptible uprobe programs corrupt (oops in the B5 live test; "
-		    "see profiler/tracer/BUILD.md).  --unsafe-private-stack overrides, never against Live");
+		die("needs root (BPF load, uprobe/fentry attach): run through sudo -n or profiler/bin/wine-trace");
+	libbpf_set_print(libbpf_print);
+	if (opt.self_check)
+		load_and_check();          /* exits */
 	if (mkdir(opt.out, 0755) != 0 && errno != EEXIST)
 		die("cannot create %s: %s", opt.out, strerror(errno));
 	if (stat(opt.out, &st) != 0 || !S_ISDIR(st.st_mode))
 		die("%s is not a directory", opt.out);
-	libbpf_set_print(libbpf_print);
 
 	/* processes and libraries */
 	for (i = 0; i < opt.npids; i++) {
@@ -3975,25 +5191,9 @@ int main(int argc, char **argv)
 	detect_wine_version();
 	load_tables();
 
-	/* BPF */
-	open_and_load();
+	/* BPF: load, verify the stack class of every program BEFORE anything is attached */
+	load_and_check();
 	sched_enabled = opt.sched == 1;
-	stats_fd = bpf_enable_stats(BPF_STATS_RUN_TIME);
-	if (stats_fd < 0)
-		warn_add("BPF_ENABLE_STATS failed (%s): no measured BPF run time", strerror(errno));
-	c.mode = (__u32)opt.mode;
-	c.sample_n = opt.sample_n;
-	c.stack_bytes = opt.stack_bytes;
-	c.roles = opt.roles_audio ? ROLES_AUDIO : ROLES_ALL;
-	c.slack_thresh_pct = opt.slack_pct;
-	c.no_exit = (__u32)opt.no_exit;
-	c.trigger_count = (__u32)opt.ntrigger;
-	c.offcpu_min_ns = (__u32)OFFCPU_MIN_NS_DEFAULT;
-	if (opt.mode == MODE_SAMPLE)
-		c.sample_n = 0;
-	err = bpf_map_update_elem(bpf_map__fd(skel->maps.cfg), &zero, &c, BPF_ANY);
-	if (err)
-		die("cannot write cfg: %s", strerror(errno));
 	for (i = 0; i < opt.ntrigger; i++) {
 		__u8 one = 1;
 
@@ -4027,6 +5227,8 @@ int main(int argc, char **argv)
 		if (p->gone)
 			continue;
 		n = attach_proc(p);
+		if (n < 0)
+			continue;
 		total += n;
 		if (opt.verbose || n)
 			logmsg("pid %u (%s): %d USDT probes%s", p->pid, p->image, n,
@@ -4043,6 +5245,8 @@ int main(int argc, char **argv)
 		if (opt.mode == MODE_DRILLDOWN) {
 			f_events = open_out("events.jsonl", p_events);
 			write_header(f_events, "events");
+			f_anomalies = open_out("anomalies.jsonl", p_anomalies);
+			write_header(f_anomalies, "anomalies");
 		}
 	}
 	if (opt.keep_stacks != KEEP_NONE || opt.mode == MODE_SAMPLE) {
@@ -4085,56 +5289,57 @@ int main(int argc, char **argv)
 			last_flush = now;
 		}
 		if (opt.verbose && now - last_progress >= 5000000000ULL) {
-			read_stats(stats);
-			logmsg("t=%.0fs blocks=%llu written=%llu keys=%llu rb_drops=%llu agg_full=%llu stacks=%llu",
-			       off_s(now), (unsigned long long)stats[ST_HIT_BLOCK_START], (unsigned long long)cnt.blocks_written,
-			       (unsigned long long)cnt.keys_drained, (unsigned long long)stats[ST_RINGBUF_DROP],
-			       (unsigned long long)stats[ST_AGG_FULL], (unsigned long long)stats[ST_STACKS]);
+			read_counters();
+			logmsg("t=%.0fs blocks=%llu written=%llu keys=%llu lost=%llu stack_drops=%llu samples=%llu reps=%llu",
+			       off_s(now), (unsigned long long)skel->bss->gl.blocks, (unsigned long long)cnt.blocks_written,
+			       (unsigned long long)cnt.keys_drained, (unsigned long long)lost_events(),
+			       (unsigned long long)ctr[CT_STACK_DROP], (unsigned long long)cnt.stack_samples,
+			       (unsigned long long)cnt.stack_reps);
 			last_progress = now;
 		}
 		if (deadline && now >= deadline)
 			break;
 	}
 
-	/* stop: detach everything, then empty the ring buffer and every agg slot */
+	/* stop: no new block from here on (the ~0.1 s link teardown used to detach block_start before
+	 * block_end, so the blocks of that window arrived as END records without a START; the block in
+	 * progress still completes), then detach in reverse attach order (entry sides before their exit
+	 * sides, see attach_kernel), then empty the ring buffer and every agg slot. */
 	stop_ns = mono_ns();
-	for (i = 0; i < nlinks; i++)
+	skel->bss->gl.stopping = 1;
+	__sync_synchronize();
+	for (i = nlinks - 1; i >= 0; i--)
 		bpf_link__destroy(links[i]);
 	nlinks = 0;
 	ring_buffer__consume(rb);
 	for (i = 0; i < AGG_SLOTS; i++)
 		drain_slot(i);
-	{
-		int fd = bpf_map__fd(skel->maps.inflight);
-		__u32 key, next, *prev = NULL;
-		struct inflight f;
-
-		while (bpf_map_get_next_key(fd, prev, &next) == 0) {
-			if (bpf_map_lookup_elem(fd, &next, &f) == 0)
-				cnt.open_entries_at_end += f.depth;
-			key = next;
-			prev = &key;
-		}
-	}
-	read_stats(stats);
+	read_tstates();
+	read_counters();
 	flush_blocks(UINT64_MAX, true);
 	flush_windows(UINT64_MAX);
 	collect_overhead();
+	write_stacks();
 	close_out(&f_blocks, p_blocks);
 	close_out(&f_threads, p_threads);
 	close_out(&f_events, p_events);
+	close_out(&f_anomalies, p_anomalies);
 	close_out(&f_stacks, p_stacks);
 	if (opt.mode != MODE_SAMPLE)
 		write_summary();
 	snapshot_stop_maps();
 	write_tracer_json();
 	chown_outputs();
-	logmsg("stopped: %llu blocks (%llu late, %llu near-late), lost=%llu, unmatched=%llu, abandoned=%llu, "
-	       "bpf %.0f ns/run over %llu runs, loader cpu %.2f%%",
+	logmsg("stopped: %llu blocks (%llu late, %llu near-late), lost=%llu of %llu hits, unmatched=%llu, abandoned=%llu, "
+	       "%llu stack samples in %llu distinct stacks, bpf %.0f ns/run (USDT), cpu: bpf %.2f%% + loader %.2f%% "
+	       "(+ ~%.2f%% assumed trap cost)",
 	       (unsigned long long)bstat.count, (unsigned long long)bstat.late, (unsigned long long)bstat.near_late,
-	       (unsigned long long)lost_events(), (unsigned long long)stats[ST_UNMATCHED_EXIT],
-	       (unsigned long long)stats[ST_ABANDONED_ENTRY], ov.bpf_ns_per_hit, (unsigned long long)ov.bpf_run_cnt,
-	       ov.loader_cpu_pct);
+	       (unsigned long long)lost_events(), (unsigned long long)ov.hits, (unsigned long long)ctr[CT_UNMATCHED_EXIT],
+	       (unsigned long long)ctr[CT_ABANDONED], (unsigned long long)cnt.stack_samples,
+	       (unsigned long long)cnt.stack_reps, ov.bpf_ns_per_hit, ov.bpf_cpu_pct, ov.loader_cpu_pct, ov.trap_cpu_pct);
+	printf("stopped monotonic_stop_ns=%llu blocks=%llu lost=%llu\n", (unsigned long long)stop_ns,
+	       (unsigned long long)bstat.count, (unsigned long long)lost_events());
+	fflush(stdout);
 	ring_buffer__free(rb);
 	if (stats_fd >= 0)
 		close(stats_fd);

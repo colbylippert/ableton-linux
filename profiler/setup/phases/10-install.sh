@@ -18,10 +18,11 @@
 # input_device = PipeWire node.names): phase audio (06-audio.sh) owns the
 # decision and records it in setup.conf — audio_node= (the sink: profiler-null
 # for --audio-device null, the built-in speaker sink for builtin, the given
-# node.name otherwise), audio_input= (builtin: the Mic source on the same card,
-# so capture shares the sink's hardware clock; null: profiler-null; otherwise
-# unset → input_device removed and PipeASIO picks a capture source on the same
-# card) and audio_mute=. The installer seeds config.ini only here, so this
+# node.name otherwise), audio_input= (a capture source on the sink's own card,
+# so capture shares its hardware clock: the mirror name pro-output-N →
+# pro-input-N or …__sink → …__source, else the card's first Mic source, else its
+# first source — pwa_resolve_input in setup/lib/host.sh; null: profiler-null)
+# and audio_mute=. The installer seeds config.ini only here, so this
 # phase points it right after the install through phase audio's own
 # _aud_point_pipeasio (one writer, one format); check compares the file with the
 # recorded pair. When the runtime, prefix, Live and launcher are already

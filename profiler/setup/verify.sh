@@ -15,7 +15,8 @@
 #     uname -r, sudo -n / the root helper, required commands, rootless podman,
 #     realtime groups and limits, the display probe and the display-manager
 #     autologin, PipeWire clock settings, the audio device contract
-#     (--audio-device / audio_node= / mute / PipeASIO's output_device), the
+#     (--audio-device / audio_node= / audio_input= / mute / PipeASIO's
+#     output_device and input_device), the
 #     laptop (AC power, lid-switch policy, Wi-Fi power save, ananicy-cpp), the
 #     checkout (branch, aceb236 ancestry, clean tree, bench/SHA256SUMS), dist/
 #     artifacts, the installed runtime's identity, `state diff --name golden`,
@@ -214,7 +215,7 @@ declare -A PROBE_DESC=(
     [realtime]="realtime/audio membership, chrt -r, rtprio/memlock, limits and sysctl drop-ins"
     [display]="DISPLAY from the user session, xdotool probe, display-manager autologin, inhibit unit"
     [pipewire]="PipeWire socket, clock settings (min-quantum 32), conf.d drop-ins, null sink when used"
-    [audio-device]="--audio-device contract: audio_node= recorded, node present, muted (real sinks), PipeASIO output/input_device"
+    [audio-device]="--audio-device contract: audio_node= recorded, node present, muted (real sinks), audio_input= the capture node on the same card, PipeASIO output/input_device"
     [checkout]="branch, aceb236 ancestry, clean tree, bench/SHA256SUMS, trace-point patches"
     [dist]="dist/ artifacts for VERSION, tarball checksum, recorded build audit"
     [runtime]="installed runtime identity vs dist VERSION, modules, launcher, prefix"
@@ -703,7 +704,7 @@ probe_pipewire() {
 }
 
 probe_audio_device() {
-    local rc=0 node="" rec res id="" state ini out_dev in_dev input mute
+    local rc=0 node="" rec res id="" state ini out_dev in_dev input mute want_in in_id
     kv "audio device" "$AUDIO_DEVICE"
     if ! pwa_available; then fail "PipeWire is not reachable (pw-cli): the audio device cannot be checked" || true; return 1; fi
     rec="$(cfg_get audio_node)"
@@ -737,6 +738,24 @@ probe_audio_device() {
         ok "$node is PipeWire node $id"
     else
         fail "$node is not a PipeWire node (wpctl status / pw-cli ls Node; phase audio)" || true; rc=1; id=""
+    fi
+    # the capture node: phase audio pairs the sink with a source on the same card
+    # (lib/host.sh pwa_resolve_input) and records it as audio_input=
+    if [ "$AUDIO_DEVICE" != null ] && [ -n "$id" ]; then
+        want_in="$(pwa_resolve_input "$node" 2>/dev/null || true)"
+        if [ -n "$input" ]; then
+            if in_id="$(pwa_node_id "$input")"; then
+                ok "audio_input $input is PipeWire node $in_id"
+            else
+                fail "audio_input $input is not a PipeWire node: PipeASIO would capture from another device (wpctl status; setup-machine.sh --only audio)" || true; rc=1
+            fi
+            [ -z "$want_in" ] || [ "$want_in" = "$input" ] \
+                || warn "audio_input=$input, but the capture node on the card of $node is $want_in now (setup-machine.sh --only audio)"
+        elif [ -n "$want_in" ]; then
+            warn "audio_input is not recorded: phase audio pairs $node with its card's capture node $want_in and names it in config.ini (setup-machine.sh --only audio)"
+        else
+            kv "audio_input" "unset (the card of $node has no capture node)"
+        fi
     fi
     case "$node" in
         alsa_output.*Speaker*|profiler-null) ;;

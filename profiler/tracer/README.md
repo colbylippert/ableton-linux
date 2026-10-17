@@ -1,25 +1,50 @@
-# profiler/tracer — Wine interface tracer (prototype stage)
+# profiler/tracer — Wine interface tracer
 
 Traces the Windows→Wine crossings of Ableton Live (NT syscalls, unix calls, wineserver
 requests/waits, NTSync waits and wakes) and joins them to PipeASIO audio blocks. Design:
 `../../plans/design-B-tracer-and-probes.md` (sections 3a, 3b, 9); the `summary.json` shape
 follows `../../plans/design-C-control-suite-agent-loop.md` section B.
 
-This directory currently holds the **bpftrace prototype** (`wine-trace.bt` + `reduce.py`), the
-id tables and their generator, and the tests. The libbpf production tracer
-(`wine-trace.bpf.c`/`wine-trace.c`, built into `build/wine-trace`) is opt-in (`--libbpf` or
-`WINE_TRACE_BACKEND=libbpf`) while its loader refuses to attach (private-stack blocker,
-`BUILD.md`); `make` alone never changes the backend.
+Two backends write the same files. The **libbpf production tracer** (`wine-trace.bpf.c` +
+`wine-trace.c`, built into `build/wine-trace` by `make -C profiler/tracer`; `BUILD.md`) aggregates
+in the kernel, samples stack windows and gives every crossing a real caller through
+`symbolize.py`. `profiler/bin/wine-trace` uses it by default when it is built **and** its stack
+self-check passes (every uprobe/USDT program must run on the kernel stack, never on the kernel's
+per-CPU private stack, which preemptible uprobe programs corrupt); otherwise it falls back to the
+**bpftrace prototype** (`wine-trace.bt` + `reduce.py`) and prints why (`tracer.json`
+`backend_reason`). `--libbpf` / `--proto` (or `WINE_TRACE_BACKEND=libbpf|bpftrace`) force a
+backend; a forced libbpf start still fails when the loader's own pre-attach self-check refuses.
 
 | File | Role |
 |---|---|
+| `wine-trace.bpf.c`, `wine-trace.c`, `wine-trace.h`, `Makefile` | libbpf tracer: kernel side, loader/reducer, shared structs and the JIT prologue classifier (`BUILD.md`) |
 | `wine-trace.bt` | bpftrace 0.27 template: one text line per event (USDT probes of patch 0108 / pipeasio 0017, kernel-side NTSync `fentry`, optional scheduler and child-follow probes). Never run directly: `profiler/bin/wine-trace` rewrites it. |
-| `reduce.py` | Offline join of the event lines into `blocks.jsonl`, `threads.jsonl`, `summary.json` (+ `events.jsonl` in drilldown); updates `tracer.json`. |
+| `reduce.py` | Offline join of the prototype's event lines into `blocks.jsonl`, `threads.jsonl`, `summary.json` (+ `events.jsonl` in drilldown); updates `tracer.json`. |
+| `symbolize.py` | Module maps, PE `.pdata` unwinder, caller apportionment (`blocks.symbolized.jsonl`, `summary.json` call sites per caller), roles table (design B sections 4-5). |
 | `gen_tables.py` | Generates `tables/wine-<ver>.json` (syscall ids, wineserver request numbers, unix-call codes) from a patched Wine tree. |
 | `tables/wine-11.13.json` | Generated from the 11.13 base + the 96-patch series (`series-aceb236`) + 0108 (table inputs unchanged by 0108), protocol 957. |
 | `validate.py` | Compares a traced `tools/traceprobe.exe` run (its `EXPECT` lines) and PipeASIO telemetry with the tracer's output (design B section 7). |
-| `tests/test_reduce.py`, `tests/test_bt_template.py`, `tests/test_gen_tables.py`, `tests/test_validate.py`, `tests/test_symbolize.py` | `python3 -I -m unittest discover -s profiler/tracer/tests -v` from the repo root. |
+| `tests/test_reduce.py`, `tests/test_bt_template.py`, `tests/test_gen_tables.py`, `tests/test_validate.py`, `tests/test_symbolize.py`, `tests/test_jit_classifier.py` (+ `.c`) | `python3 -I -m unittest discover -s profiler/tracer/tests -v` from the repo root; the C classifier test also runs as `make -C profiler/tracer test`. |
 | `../bin/wine-trace` | The CLI (`start`/`stop`/`run`/`status`) shared with the suite and the root helper. |
+
+## Callers (libbpf backend)
+
+A crossing's `caller` in `blocks.symbolized.jsonl` and in `summary.json` `call_sites` /
+`hotspots_non_audio` is a real chain from the sampled stack windows: the frames after the syscall
+stub up to and including the first application frame (Live or a plugin, `module+offset`, never
+disassembled), e.g. `kernelbase.dll!WaitForSingleObject+0x49 <- Ableton Live 12 Trial.exe+0x4f8c119`;
+native runtime DLLs of the prefix (`msvcp140.dll`, `vcruntime*`, `ucrtbase`, anything under
+`drive_c/windows/system32`) are walked past to the code that called them.
+Stacks are sampled at syscall / unix-call entries (1/64 in summary, 1/4 in drilldown, plus up to 16
+per block once the block is within 15 % of its period of the deadline). Unsampled crossings are
+apportioned to the callers sampled for the same (tid, kind, id) in the same block
+(`caller_basis: block`), else in the whole run (`run`); server requests and NTSync waits/wakes use
+their enclosing call's samples (`parent-block`, `parent-run`); `unsampled` when that thread never
+sampled the id. `scripts/bench-report.py interface` ranks call sites by these callers (it prefers
+each crossing's recorded caller). The libbpf `summary.json` ranks the nested kinds apart
+(`nested_call_sites`) and shares each late block's lost slack among the top-level crossings of
+audio-role threads only (BUILD.md, "Lost slack"); the reducer's summary and `bench-report.py`
+still share it among all crossings.
 
 ## Running (passwordless `sudo -n`)
 
@@ -35,14 +60,24 @@ sudo -n profiler/bin/wine-trace run   --out DIR --duration 30 --mode drilldown  
 `scripts/lib/lifecycle.sh` `ableton_prefix_pids`, evaluated with the invoking user's `HOME`, and
 `--run-id TOKEN` keeps only processes carrying `ABLETON_BENCH_RUN_ID=TOKEN`), `--mode
 summary|drilldown` (drilldown also writes `events.jsonl` and enables the scheduler probes),
-`--proto` (the bpftrace backend, the default), `--libbpf` (the production loader, opt-in),
-`--allow-private-stack` (trace although a multi-thread USDT program landed on a per-CPU private
-stack, see "Stack budget" below), `--no-ntsync` (strip the
+`--libbpf` / `--proto` (force a backend; default: libbpf when built and its `--self-check` passes,
+see above), `--allow-private-stack` (prototype only: trace although a multi-thread USDT program
+landed on a per-CPU private stack, see "Stack budget" below), `--no-ntsync` (strip the
 kernel-side NTSync probes), `--sched`/`--no-sched`, `--no-follow` (no exec/rename tracking),
 `--no-pid-filter` (trace every process mapping ntdll.so), `--wine-root DIR`, `--prefix DIR`,
 `--tables FILE`, `--attach-timeout S`.
 
-What `start` does: resolves `ntdll.so` and `pipeasio64.dll.so` from the pids' `/proc/PID/maps`
+What `start` does with the libbpf backend: resolves the libraries and snapshots maps and threads
+as below, runs `build/wine-trace --self-check` with the run's options (report in
+`stack-check.json`; a failure falls back to bpftrace), daemonises `build/wine-trace` with `setsid`
+(pidfile `DIR/wine-trace.pid`, `wine-trace.stdout`, `wine-trace.stderr`) and waits for its
+`attached monotonic_start_ns=N` line (the loader checks every program's stack again before it
+attaches; exit 2 = refused). `stop` sends SIGINT, records `tracer_exit` (`clean` when the loader
+merged its final fields into `tracer.json`; `killed`, `crashed`, `no-end` otherwise) and runs
+`symbolize.py --blocks --stacks --summary` (`blocks.symbolized.jsonl`; `WINE_TRACE_SYMBOLIZE_EVENTS=1`
+also writes `events.symbolized.jsonl`). The libbpf tracer's files are described in `BUILD.md`.
+
+What `start` does with the bpftrace backend: resolves `ntdll.so` and `pipeasio64.dll.so` from the pids' `/proc/PID/maps`
 (fallback `$ABLETON_WINE_ROOT/lib/wine/x86_64-unix/`), snapshots the maps to `maps-<pid>.txt`,
 lists the available probes with `bpftrace -l`, writes `DIR/wine-trace.bt` (sections and absent
 probes stripped, placeholders substituted), checks it with `bpftrace --dry-run` (if the NTSync
@@ -249,10 +284,15 @@ checks the committed 11.13 table (`NtYieldExecution` 0x0046, `NtQueryPerformance
 
 ## Known limits of the prototype
 
+* bpftrace formats about 775k lines/s on the laptop: Benchmark_VSTs at 64 frames emits ~1M/s and
+  lost 22 % (B5b), with the stock 16 MiB ring and with 256 MiB alike (`perf_rb_pages` is pinned
+  in the template's config block; the comment there has the numbers). Use the libbpf backend for
+  such loads.
 * Every crossing is a `printf` through the ring buffer: expect µs-level overhead per hit and
   silent drops under load (counted through `@emitted`). Timing claims come from the production
   tracer on bare metal, never from this prototype.
-* No stack windows: callers are placeholders until the libbpf tracer and `symbolize.py` exist.
+* No stack windows: its callers stay placeholders (`ntdll.dll!<Name>+0x14`, `pe!0x<rip>` resolved
+  to `module+offset`); real caller chains come from the libbpf backend (above).
 * USDT probes are attached by file (every process mapping that `ntdll.so` pays the nop → trap);
   the pid filter only limits the output.
 * The stack budget depends on bpftrace's code generation and the kernel's private-stack rule:

@@ -185,6 +185,10 @@ class TemplateTest(unittest.TestCase):
         self.assertGreaterEqual(int(settings["on_stack_limit"]), 128)
         self.assertEqual(settings.get("print_maps_on_exit"), "false")
         self.assertLess(self.code.index("config = {"), self.code.index("BEGIN"))
+        # B5b: the ring size is pinned (16 MiB): the prototype's loss is consumer-bound (see the comment)
+        pages = int(settings["perf_rb_pages"])
+        self.assertEqual(pages & (pages - 1), 0, "perf_rb_pages must be a power of two")
+        self.assertEqual(pages, 4096)
 
     def test_every_event_printf_is_counted(self):
         for head, body in probe_blocks(self.text):
@@ -314,6 +318,44 @@ class GeneratorTest(unittest.TestCase):
         self.assertIn("/1/", text)
         self.assertEqual(attached, ["wine:syscall_entry", "wine:syscall_exit"])
         self.assertIn("print(@emitted);", text)
+
+
+class WrapperBackendTest(unittest.TestCase):
+    """profiler/bin/wine-trace picks the libbpf tracer only when it is built and its stack
+    self-check passes (B5b), else the prototype, and always says why."""
+
+    def setUp(self):
+        self.wrapper = WRAPPER.read_text(encoding="utf-8")
+
+    def test_default_is_auto_with_the_self_check(self):
+        self.assertRegex(self.wrapper, r'case "\$\{WINE_TRACE_BACKEND:-auto\}" in')
+        self.assertIn("*) backend_request=auto ;;", self.wrapper)
+        body = self.wrapper[self.wrapper.index("choose_backend()"):]
+        body = body[:body.index("\n}\n")]
+        self.assertRegex(body, r'"\$libbpf_bin" --self-check "\$\{load_args\[@\]\}" > "\$out/stack-check.json"')
+        self.assertIn('backend_reason="libbpf tracer not built', body)
+        self.assertIn('backend_reason="libbpf stack self-check failed with exit $rc', body)
+        self.assertIn('log "backend: $backend: $backend_reason"', body)
+
+    def test_flags_force_a_backend(self):
+        self.assertIn("--proto) backend_request=bpftrace; shift ;;", self.wrapper)
+        self.assertIn("--libbpf) backend_request=libbpf; shift ;;", self.wrapper)
+
+    def test_self_check_sees_the_run_options(self):
+        body = self.wrapper[self.wrapper.index("libbpf_load_args()"):]
+        body = body[:body.index("\n}\n")]
+        for option in ("--mode", "--ntsync off", "--sched on", "--sched off", "--no-follow", "--ntdll"):
+            self.assertIn(option, body)
+
+    def test_libbpf_start_waits_for_the_attach_line_and_reports_a_refusal(self):
+        self.assertIn("s/^attached monotonic_start_ns=", self.wrapper)
+        self.assertIn("its stack self-check failed (exit 2", self.wrapper)
+        self.assertIn('"backend_reason=$backend_reason"', self.wrapper)
+
+    def test_stop_symbolizes_stacks_and_summary_for_libbpf(self):
+        self.assertIn('sym_args+=(--stacks "$out/stacks.jsonl")', self.wrapper)
+        self.assertIn('sym_args+=(--summary "$out/summary.json")', self.wrapper)
+        self.assertIn('WINE_TRACE_SYMBOLIZE_EVENTS', self.wrapper)
 
 
 if __name__ == "__main__":

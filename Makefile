@@ -63,8 +63,11 @@ test-profiler:                 ## run profiler workbench checks (control layer, 
 	python3 -I ./profiler/tracer/tests/test_reduce.py
 	python3 -I ./profiler/tracer/tests/test_validate.py
 	python3 -I ./profiler/tracer/tests/test_bt_template.py
+	python3 -I ./profiler/tracer/tests/test_jit_classifier.py
 	python3 -I ./profiler/bin/tests/test-ledger-report.py
 	python3 -I ./profiler/bin/tests/test-history-add.py
+	./profiler/bin/tests/test-state-leftovers.sh
+	./profiler/setup/tests/test-audio-device.sh
 
 bench-compare:                 ## compare completed runs (BEFORE=... AFTER=... OUTPUT=...)
 	@test -n "$(BEFORE)" -a -n "$(AFTER)" -a -n "$(OUTPUT)"

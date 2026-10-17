@@ -71,10 +71,19 @@
 // pipeasio:block_start, cleared by block_end).  Every entry line prints @seq as it was at entry
 // time; 0 means "no block in progress" (window bucket / between_blocks for the callback thread).
 
+// Ring buffer: bpftrace 0.27 sends printf output through one BPF ring buffer of perf_rb_pages x 4 KiB
+// (its default is 4096 pages = 16 MiB; verified with bpftool map show).  It is pinned here, not
+// raised: on Benchmark_VSTs at 64 frames / 48 kHz (B5b) the script emits ~1M lines/s while bpftrace
+// formats ~775k/s, and the loss was 22.07% with 16 MiB and 22.24% with 256 MiB (perf_rb_pages =
+// 65536), i.e. consumer-bound; a larger ring only turns reserve-time drops into an unconsumed
+// backlog that is lost at exit (12.0M vs 6.8M "Lost" reports, same shortfall), which also cuts the
+// trace's coverage short.  The libbpf tracer (profiler/tracer/BUILD.md) aggregates in the kernel and
+// is the backend for such loads.
 config = {
 	on_stack_limit = 256;
 	max_map_keys = 65536;
 	print_maps_on_exit = false;
+	perf_rb_pages = 4096;
 }
 
 BEGIN

@@ -51,6 +51,15 @@
 # process whose command line names "Ableton Live…​.exe" (mirrors
 # scripts/lib/lifecycle.sh: no process is selected by a name match alone, so a
 # shell that merely mentions the Live installer never counts).
+# Before snapshot and restore refuse a busy prefix, and only while no Live is in
+# it, they end what a finished session leaves behind — the agents
+# (ABLETON_LEFTOVER_AGENTS: Ableton Web Connector.exe, MicrosoftEdgeUpdate.exe, …)
+# and this project's session helpers (learnheal.exe, which otherwise lingers up to
+# 60 s after Live) — by exact image name through scripts/lib/lifecycle.sh's
+# ableton_prefix_settle (never while a Live or a Max is in the prefix), and wait
+# up to PROFILER_STATE_SETTLE seconds (default 30) for the prefix to come down.
+# A Live, a Max or any other program is never ended: it is named in the refusal.
+# --dry-run only says what it would end.
 #
 # Mechanism: `cp -a --reflink=always` when the snapshot root and the prefix are
 # on btrfs (instant, shares extents), `rsync -aHAX --delete` otherwise (or when a
@@ -77,6 +86,10 @@ HOST_LIB="$here/../setup/lib/host.sh"
 ' "$HOST_LIB" >&2; exit 2; }
 # shellcheck source=../setup/lib/host.sh
 . "$HOST_LIB"      # pipeasio_ini_render (the renderer setup phase audio uses)
+LIFECYCLE_LIB="$here/../../scripts/lib/lifecycle.sh"
+[ -r "$LIFECYCLE_LIB" ] || { printf 'state: missing %s\n' "$LIFECYCLE_LIB" >&2; exit 2; }
+# shellcheck source=../../scripts/lib/lifecycle.sh
+. "$LIFECYCLE_LIB"  # ableton_prefix_settle, ableton_pid_image (definitions only)
 
 usage() {
     cat <<'EOF'
@@ -92,6 +105,9 @@ usage: profiler/bin/state COMMAND [options]
   clean-crash                             remove Live's crash-recovery files
 
 global: --dry-run (print, change nothing) · --force · -h
+snapshot and restore first end what a finished session left in the prefix (Live's
+agents, learnheal.exe; never Live, Max or anything else) and wait up to
+PROFILER_STATE_SETTLE seconds (default 30) for it to come down.
 The header of this file documents the snapshot set and the runtime policy.
 EOF
 }
@@ -125,6 +141,9 @@ RUNTIME="${ABLETON_WINE_ROOT:-}"; [ -n "$RUNTIME" ] || RUNTIME="$(abl_cfg runtim
 LAUNCHER="${ABLETON_BIN_HOME:-$HOME/.local/bin}/ableton-live"
 USER_LIBRARY="$(setup_cfg user_library)"
 SNAP_TMP=""     # the snapshot being assembled; removed by the EXIT trap unless moved into place
+SETTLE_SECONDS="${PROFILER_STATE_SETTLE:-30}"   # how long snapshot/restore wait for a finishing prefix
+{ [[ "$SETTLE_SECONDS" =~ ^[1-9][0-9]{0,2}$ ]] && [ "$SETTLE_SECONDS" -le 300 ]; } \
+    || die "PROFILER_STATE_SETTLE must be 1-300 seconds (got '$SETTLE_SECONDS')" 2
 
 declare -a ITEM_KEY=() ITEM_SRC=() ITEM_DEST=() ITEM_KIND=() ITEM_PRESENT=()
 add_item() { ITEM_KEY+=("$1"); ITEM_SRC+=("$2"); ITEM_DEST+=("$3"); ITEM_KIND+=("$4"); }
@@ -181,27 +200,68 @@ live_pids() {   # PREFIX → the Live processes among prefix_pids
     done < <(prefix_pids "$1")
     return 0
 }
-# prints "pid comm" for every Wine process using PREFIX; returns 0 when any
+# prints "pid image" for every Wine process using PREFIX (the Windows image name,
+# lifecycle.sh's ableton_pid_image: comm reads "MainThread" for Live); returns 0 when any
 busy_list() {
     local pid out
     out="$(prefix_pids "$1" | sort -un)"
     [ -n "$out" ] || return 1
     while IFS= read -r pid; do
         [ -n "$pid" ] || continue
-        printf '%s %s\n' "$pid" "$(cat "/proc/$pid/comm" 2>/dev/null || echo ?)"
+        printf '%s %s\n' "$pid" "$(ableton_pid_image "$pid")"
     done <<< "$out"
     return 0
 }
-refuse_if_busy() {   # PREFIX WHAT
-    local list
-    if list="$(busy_list "$1")"; then
-        if [ "${FORCE:-0}" = 1 ] && [ "$2" != restore ]; then
-            warn "Wine processes use the prefix (--force): $(printf '%s' "$list" | tr '\n' ',')"
-            return 0
-        fi
-        die "refusing to $2 while Wine processes use the prefix $1 (quit Live first, File > Quit): $(printf '%s' "$list" | tr '\n' ';' | sed 's/;/; /g')" 1
-    fi
+# 0 when every process in a busy_list is one a settle ends or that leaves with
+# them: an agent, a session helper, or Wine's own (services.exe, wineserver, …)
+only_leftovers() {   # BUSY_LIST
+    local pid image
+    while read -r pid image; do
+        [ -n "$pid" ] || continue
+        ableton_agent_image "$image" || ableton_session_helper_image "$image" || ableton_wine_own_image "$image" || return 1
+    done <<< "$1"
     return 0
+}
+# End the leftover agents and session helpers of a finished session and wait for
+# the prefix to come down (lifecycle.sh's ableton_prefix_settle), for whichever of
+# RUNTIME and its -dev twin holds the prefix: taskkill must reach that server.
+settle_prefix() {   # PREFIX
+    local r held
+    for r in "$RUNTIME" "$RUNTIME-dev"; do
+        [ -x "$r/bin/wine" ] || continue
+        ableton_prefix_busy "$r" "$1" || continue
+        info "ending what the last session left in the prefix (agents: ${ABLETON_LEFTOVER_AGENTS//|/, }; helpers: ${ABLETON_SESSION_HELPER_IMAGES//|/, }) and waiting up to ${SETTLE_SECONDS}s for it to come down"
+        if held="$(ableton_prefix_settle "$r" "$1" "$SETTLE_SECONDS")"; then
+            ok "prefix idle"
+        else
+            [ -n "$held" ] || held="only Wine's own processes"
+            info "still in the prefix after ${SETTLE_SECONDS}s: $(printf '%s' "$held" | tr '\t\n' ' ;')"
+        fi
+    done
+    return 0
+}
+refuse_if_busy() {   # PREFIX WHAT
+    local list live ending
+    list="$(busy_list "$1")" || return 0
+    live="$(live_pids "$1")"
+    # Live itself is never ended here; whatever else a finished session left is
+    if [ -z "$live" ]; then
+        if dry; then
+            if only_leftovers "$list"; then
+                ending="$(printf '%s\n' "$list" | while read -r _ i; do ableton_wine_own_image "$i" || printf '%s, ' "$i"; done)"
+                info "dry run: would ${ending:+end ${ending%, } and }wait up to ${SETTLE_SECONDS}s for the prefix to come down (now: $(printf '%s' "$list" | tr '\n' ';' | sed 's/;/; /g'))"
+                return 0
+            fi
+        else
+            settle_prefix "$1"
+            list="$(busy_list "$1")" || return 0
+        fi
+    fi
+    if [ "${FORCE:-0}" = 1 ] && [ "$2" != restore ]; then
+        warn "Wine processes use the prefix (--force): $(printf '%s' "$list" | tr '\n' ',')"
+        return 0
+    fi
+    die "refusing to $2 while Wine processes use the prefix $1 (quit Live first: profiler/bin/live-trial-dialog quit-live, or File > Quit): $(printf '%s' "$list" | tr '\n' ';' | sed 's/;/; /g')" 1
 }
 
 # --------------------------------------------------------------- runtime ----

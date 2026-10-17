@@ -61,6 +61,7 @@ from __future__ import annotations
 import argparse
 import base64
 import bisect
+import collections
 import fnmatch
 import hashlib
 import io
@@ -112,11 +113,25 @@ IMAGE_FILE_MACHINE_I386 = 0x14C
 
 WINE_PE_DIR_RE = re.compile(r"/lib(?:64)?/wine/(?:x86_64|i386|aarch64|arm64ec)-windows/")
 WOW64_DLL_RE = re.compile(r"^wow64[a-z0-9_]*\.dll$", re.IGNORECASE)
+# Native runtime libraries of the prefix (MSVC/UCRT redistributables, api-ms-win-* forwarders) and any
+# PE image under drive_c/windows/system32|syswow64: a call through them (std::condition_variable,
+# std::chrono, ...) is still made by Live or a plugin, so site_caller walks past them.
+RUNTIME_DLL_RE = re.compile(r"^(?:msvcp|vcruntime|concrt|vcomp|msvcr|ucrtbase|api-ms-win-)[a-z0-9_.-]*\.dll$",
+                            re.IGNORECASE)
+PREFIX_SYSTEM_DIR_RE = re.compile(r"/drive_c/windows/(?:system32|syswow64)/", re.IGNORECASE)
 
 DEFAULT_MAX_FRAMES = 12
-STACK_CACHE_WORDS = 6
+# code-pointing words of a stack window in the unwind cache key; the loader's stack fingerprint
+# (wine-trace.c STACK_FP_WORDS) uses the same number: with 6, ~3 % of the B5b samples shared a key
+# with a stack whose caller-deciding return address (code word 7-10) differed
+STACK_CACHE_WORDS = 16
 CHAIN_DEPTH = 3
 CHAIN_SEP = " <- "
+CALLER_MAX_FRAMES = 4          # a crossing's caller ends at the first application frame within this many
+                               # (plus one per runtime frame walked past)
+UNSAMPLED = "unsampled"
+CALL_SITES_KEEP = 200
+HOTSPOTS_KEEP = 20
 
 STOP_MAX_FRAMES = "max_frames"
 STOP_END = "end"
@@ -1117,6 +1132,54 @@ def caller_chain(frames: Sequence[str], depth: int = CHAIN_DEPTH) -> str:
     return CHAIN_SEP.join(frames[:depth])
 
 
+def is_runtime_module(mod: Optional["Module"]) -> bool:
+    """A native C/C++ runtime DLL of the prefix (RUNTIME_DLL_RE, or any PE under system32/syswow64)."""
+    return mod is not None and not mod.is_wine_dll and bool(
+        RUNTIME_DLL_RE.match(mod.name) or PREFIX_SYSTEM_DIR_RE.search(mod.path))
+
+
+def frame_class(mod: Optional["Module"]) -> str:
+    """wine (a Wine PE DLL), runtime (a native runtime DLL of the prefix: msvcp*, vcruntime*,
+    ucrtbase, concrt*, api-ms-win-*, any PE under drive_c/windows/system32|syswow64), app (any other
+    PE image: Live, plugins), unix (ELF) or unknown."""
+    if mod is None:
+        return "unknown"
+    if mod.kind == "elf":
+        return "unix"
+    if mod.kind in ("pe64", "pe32"):
+        if mod.is_wine_dll:
+            return "wine"
+        return "runtime" if is_runtime_module(mod) else "app"
+    return "unknown"
+
+
+def site_caller(frames: Sequence[str], classes: Sequence[str], mode: str) -> str:
+    """The caller of one sampled crossing, as call sites are keyed.
+
+    A syscall stack starts with the NtXxx stub (``ntdll.dll!NtWaitForSingleObject+0x14``), which
+    the crossing's id already names, so the caller starts at the frame after it; a unix-call stack
+    starts at the PE caller itself.  The chain runs up to and including the first application
+    frame (Live or a plugin, ``module+offset``) within CALLER_MAX_FRAMES frames, e.g.
+    ``kernelbase.dll!WaitForMultipleObjectsEx+0xe3 <- Ableton Live 12 Trial.exe+0x1a2b3c4``.
+    Runtime frames (msvcp140.dll's std::condition_variable, ...) are walked past: each one extends
+    the limit by a frame, so ``... <- msvcp140.dll+0x122e8 <- Ableton Live 12 Trial.exe+0x...``.
+    Without an application frame the caller is the first CHAIN_DEPTH frames.
+    """
+    start = 1 if mode == "syscall" and len(frames) > 1 else 0
+    tail, kinds = list(frames[start:]), list(classes[start:])
+    if not tail:
+        return "unresolved"
+    limit = CALLER_MAX_FRAMES
+    for index, kind in enumerate(kinds):
+        if index >= limit:
+            break
+        if kind == "app":
+            return CHAIN_SEP.join(tail[:index + 1])
+        if kind == "runtime":
+            limit += 1
+    return CHAIN_SEP.join(tail[:CHAIN_DEPTH])
+
+
 # --------------------------------------------------------------------------- #
 # Stack window and unwinder
 # --------------------------------------------------------------------------- #
@@ -1418,7 +1481,10 @@ class Symbolizer(object):
         return hashlib.sha1("|".join(parts).encode("utf-8")).hexdigest()[:24]
 
     def unwind_record(self, rec: Dict[str, Any]) -> Dict[str, Any]:
-        """Symbolize one stacks.jsonl record -> {"frames", "addrs", "caller", "stop"}."""
+        """Symbolize one stacks.jsonl record -> {"frames", "addrs", "caller", "stop", "site"}.
+
+        ``caller`` is the plain depth-3 chain (stub included); ``site`` is the caller a crossing
+        gets (site_caller: after the stub, up to the first application frame)."""
         self.stats["stacks"] += 1
         pid = to_int(rec.get("pid"), None)
         t = rec.get("t")
@@ -1433,8 +1499,10 @@ class Symbolizer(object):
             frames, addrs, stop = unwind(rip, rsp, regs, mem, mode, self.modules, pid, t, self.max_frames)
             addrs_hex = [hexs(a) for a in addrs]
             self.cache.stacks[key] = [frames, addrs_hex, stop]
+        classes = [frame_class(self.modules.find(to_int(a, 0) or 0, pid, t)) for a in addrs_hex]
         self.stats["stops"][stop] = self.stats["stops"].get(stop, 0) + 1
-        return {"frames": list(frames), "addrs": list(addrs_hex), "caller": caller_chain(frames), "stop": stop}
+        return {"frames": list(frames), "addrs": list(addrs_hex), "caller": caller_chain(frames), "stop": stop,
+                "site": site_caller(frames, classes, mode)}
 
     def finish(self) -> None:
         for pid in self.modules.pids():
@@ -1747,6 +1815,315 @@ def _replace_file(path: str, writer: Callable[[Any], None]) -> None:
     os.replace(tmp, path)
 
 
+# --------------------------------------------------------------------------- #
+# Caller apportionment (design B section 9: unsampled events go to the sampled sites of the
+# same (tid, kind, id) within the block)
+# --------------------------------------------------------------------------- #
+
+CROSSING_KINDS = ("syscall", "unixcall", "server_req", "server_wait", "ntsync_wait", "ntsync_wake")
+CALLER_BASES = ("block", "run", "parent-block", "parent-run", "none")
+
+
+def apportion(count: int, total: int, weights: Dict[str, float]) -> List[Tuple[str, int, int, float]]:
+    """Split an aggregate of ``count`` events / ``total`` ns over callers in proportion to their
+    sample weights.  Counts are integers that sum to ``count`` (largest remainder); time follows
+    the counts, so every part keeps the aggregate's mean.  A caller left without an event gets no
+    part.  Returns [(caller, n, total_ns, weight share)], the largest share first."""
+    items = sorted(((c, float(w)) for c, w in weights.items() if w and w > 0), key=lambda kv: (-kv[1], kv[0]))
+    if not items:
+        return [(UNSAMPLED, count, total, 1.0)]
+    weight = sum(w for _, w in items)
+    if count <= 0:
+        return [(items[0][0], count, total, items[0][1] / weight)]
+    raw = [count * w / weight for _, w in items]
+    base = [int(x) for x in raw]
+    order = sorted(range(len(items)), key=lambda i: (-(raw[i] - base[i]), i))
+    for i in order[:count - sum(base)]:
+        base[i] += 1
+    keep = [i for i in range(len(items)) if base[i] > 0]
+    parts: List[Tuple[str, int, int, float]] = []
+    given = 0
+    for position, i in enumerate(keep):
+        if position == len(keep) - 1:
+            part_total = total - given
+        else:
+            part_total = int(round(total * base[i] / count))
+            given += part_total
+        parts.append((items[i][0], base[i], part_total, items[i][1] / weight))
+    return parts
+
+
+class CallerIndex(object):
+    """Sampled callers per (tid, kind, id): over the whole run (the per-tid sample counts of each
+    stacks.jsonl representative) and per block (the block's own sample references)."""
+
+    def __init__(self) -> None:
+        self.by_ref: Dict[str, str] = {}
+        self.run: Dict[Tuple[Any, str, str], collections.Counter] = {}
+        self.samples = 0
+
+    def add_stack(self, rec: Dict[str, Any], res: Dict[str, Any]) -> None:
+        caller = res.get("site") or UNSAMPLED
+        ref = stack_ref_of(rec)
+        if ref is not None:
+            self.by_ref[ref] = caller
+        kind, ident = str(rec.get("kind")), str(rec.get("id"))
+        tids = rec.get("tids")
+        counted = False
+        if isinstance(tids, list):
+            for item in tids:
+                if isinstance(item, (list, tuple)) and len(item) >= 2:
+                    tid, n = to_int(item[0]), to_int(item[1], 0) or 0
+                    if tid is not None and n > 0:
+                        self.run.setdefault((tid, kind, ident), collections.Counter())[caller] += n
+                        self.samples += n
+                        counted = True
+        if not counted and to_int(rec.get("tid")) is not None:
+            self.run.setdefault((to_int(rec.get("tid")), kind, ident), collections.Counter())[caller] += 1
+            self.samples += 1
+
+    def block_dist(self, block: Dict[str, Any]) -> Dict[Tuple[Any, str, str], collections.Counter]:
+        dist: Dict[Tuple[Any, str, str], collections.Counter] = {}
+        for stack in block.get("stacks") or []:
+            if not isinstance(stack, dict):
+                continue
+            ref = stack_ref_of(stack)
+            caller = stack.get("site") or (self.by_ref.get(ref) if ref is not None else None)
+            if not caller:
+                continue
+            key = (to_int(stack.get("tid")), str(stack.get("kind")), str(stack.get("id")))
+            dist.setdefault(key, collections.Counter())[caller] += 1
+        return dist
+
+    def pick(self, bdist: Dict[Tuple[Any, str, str], collections.Counter], key: Tuple[Any, str, str],
+             parent: Any) -> Tuple[Optional[collections.Counter], str]:
+        """The block's own samples of (tid, kind, id), else the run's; nested kinds (server
+        requests, waits) have no samples of their own and take their enclosing call's."""
+        if bdist.get(key):
+            return bdist[key], "block"
+        if self.run.get(key):
+            return self.run[key], "run"
+        if isinstance(parent, dict):
+            pkey = (key[0], str(parent.get("kind")), str(parent.get("id")))
+            if bdist.get(pkey):
+                return bdist[pkey], "parent-block"
+            if self.run.get(pkey):
+                return self.run[pkey], "parent-run"
+        return None, "none"
+
+
+def _scaled(value: Any, fraction: float) -> Any:
+    n = to_int(value)
+    return int(round(n * fraction)) if n is not None else value
+
+
+def assign_callers(block: Dict[str, Any], index: CallerIndex, stats: Dict[str, Any]) -> Any:
+    """Return the block's crossings with a ``caller`` each: a crossing without one (the libbpf
+    tracer aggregates without callers) is split over the callers sampled for its (tid, kind, id),
+    see CallerIndex.pick; ``caller_basis`` says which samples decided, ``caller_share`` the
+    sample share when a crossing was split.  Crossings that already carry a caller (reduce.py)
+    are kept as they are."""
+    crossings = block.get("crossings")
+    if not isinstance(crossings, list):
+        return crossings
+    bdist = None
+    out: List[Any] = []
+    for crossing in crossings:
+        if not isinstance(crossing, dict) or (isinstance(crossing.get("caller"), str) and crossing["caller"]):
+            out.append(crossing)
+            continue
+        if bdist is None:
+            bdist = index.block_dist(block)
+        key = (to_int(crossing.get("tid")), str(crossing.get("kind")), str(crossing.get("id")))
+        dist, basis = index.pick(bdist, key, crossing.get("parent"))
+        count = to_int(crossing.get("n"), 0) or 0
+        total = to_int(crossing.get("total_ns"), 0) or 0
+        parts = apportion(count, total, dist) if dist else [(UNSAMPLED, count, total, 1.0)]
+        stats["crossings"] += 1
+        stats["by_basis"][basis] = stats["by_basis"].get(basis, 0) + count
+        stats["time_by_basis"][basis] = stats["time_by_basis"].get(basis, 0) + total
+        if len(parts) > 1:
+            stats["split"] += 1
+        for caller, part_n, part_total, share in parts:
+            part = dict(crossing)
+            part["caller"] = caller
+            part["caller_basis"] = basis
+            part["n"] = part_n
+            part["total_ns"] = part_total
+            if len(parts) > 1:
+                fraction = part_n / count if count else share
+                part["caller_share"] = round(share, 4)
+                if "timeouts" in part:
+                    part["timeouts"] = _scaled(part["timeouts"], fraction)
+                woken = part.get("woken_by")
+                if isinstance(woken, dict) and "count" in woken:
+                    part["woken_by"] = dict(woken, count=_scaled(woken["count"], fraction))
+            out.append(part)
+    return out
+
+
+def new_caller_stats() -> Dict[str, Any]:
+    return {"crossings": 0, "split": 0, "by_basis": {}, "time_by_basis": {}}
+
+
+DEFAULT_AUDIO_ROLES = ("pipeasio_callback", "audio_worker", "pipeasio_rt", "pipeasio_worker", "plugin:*")
+
+
+def default_is_audio() -> Callable[[str], bool]:
+    """roles.toml's audio_roles matcher (the built-in list when the table cannot be read)."""
+    try:
+        return load_roles().is_audio
+    except (OSError, ValueError, KeyError, TypeError, re.error):
+        return lambda role: any(fnmatch.fnmatchcase(role, pattern) for pattern in DEFAULT_AUDIO_ROLES)
+
+
+class SiteRanker(object):
+    """summary.json call_sites per (kind, id, caller), accumulated one symbolized block at a time
+    (constant memory): the reducer's ranking (total_ns_in_late_blocks, then n_in_late_blocks).
+
+    Each late / near-late block's lost slack is shared among its top-level crossings of audio-role
+    threads in proportion to their time (capped at that time).  A nested crossing (a ``parent``:
+    server request or wait, NTSync wait or wake inside a syscall / unix call) is already part of its
+    enclosing call's time: it is ranked in ``nested`` (nested_call_sites, keyed by its parent too)
+    and gets no share.  Crossings without a role (inputs older than roles) stay attributable."""
+
+    def __init__(self, near_late_fraction: float, is_audio: Optional[Callable[[str], bool]] = None):
+        self.fraction = near_late_fraction
+        self.is_audio = is_audio or default_is_audio()
+        self.sites: Dict[str, Dict[str, Any]] = {}
+        self.nested: Dict[str, Dict[str, Any]] = {}
+        self.lost_total = 0
+        self.attributed_total = 0.0
+
+    @staticmethod
+    def parent_of(crossing: Dict[str, Any]) -> Optional[Tuple[str, str]]:
+        parent = crossing.get("parent")
+        if isinstance(parent, dict):
+            return str(parent.get("kind")), str(parent.get("id"))
+        return None
+
+    def attributable(self, crossing: Dict[str, Any]) -> bool:
+        role = crossing.get("role")
+        return self.parent_of(crossing) is None and (not isinstance(role, str) or not role or self.is_audio(role))
+
+    def add(self, block: Dict[str, Any]) -> None:
+        crossings = [c for c in block.get("crossings") or [] if isinstance(c, dict)]
+        late, near = bool(block.get("late")), bool(block.get("near_late"))
+        stressed = late or near
+        lost = 0
+        slack, period = to_int(block.get("slack_ns")), to_int(block.get("period_ns"))
+        if stressed and slack is not None and period:
+            lost = max(0, int(round(self.fraction * period)) - slack)
+        crossing_total = sum(to_int(c.get("total_ns"), 0) or 0 for c in crossings if self.attributable(c))
+        weight = min(1.0, lost / crossing_total) if stressed and crossing_total > 0 else 0.0
+        if stressed:
+            self.lost_total += lost
+            self.attributed_total += min(lost, crossing_total)
+        counted = set()
+        for c in crossings:
+            kind, name, caller = str(c.get("kind")), str(c.get("id")), str(c.get("caller") or UNSAMPLED)
+            parent = self.parent_of(c)
+            if parent is None:
+                table, key = self.sites, "%s|%s|%s" % (kind, name, caller)
+            else:
+                table, key = self.nested, "%s|%s|%s:%s|%s" % (kind, name, parent[0], parent[1], caller)
+            n = to_int(c.get("n"), 0) or 0
+            total = to_int(c.get("total_ns"), 0) or 0
+            site = table.get(key)
+            if site is None:
+                site = table[key] = {"key": key, "kind": kind, "name": name, "caller": caller, "parent": parent,
+                                     "late_blocks": 0, "near_late_blocks": 0, "n_in_late_blocks": 0,
+                                     "total_ns_in_late_blocks": 0, "max_ns": 0, "attributed": 0.0,
+                                     "n_all_blocks": 0, "total_ns_all_blocks": 0,
+                                     "woken": collections.Counter(), "bases": collections.Counter()}
+            site["n_all_blocks"] += n
+            site["total_ns_all_blocks"] += total
+            site["max_ns"] = max(site["max_ns"], to_int(c.get("max_ns"), 0) or 0)
+            site["bases"][str(c.get("caller_basis") or "recorded")] += n
+            woken = c.get("woken_by")
+            if isinstance(woken, dict) and to_int(woken.get("tid")) is not None:
+                site["woken"][(to_int(woken.get("tid")), woken.get("role"))] += to_int(woken.get("count"), n) or 0
+            if stressed:
+                site["n_in_late_blocks"] += n
+                site["total_ns_in_late_blocks"] += total
+                if self.attributable(c):
+                    site["attributed"] += total * weight
+                if key not in counted:
+                    counted.add(key)
+                    site["late_blocks" if late else "near_late_blocks"] += 1
+
+    def _ranked(self, table: Dict[str, Dict[str, Any]], nested: bool) -> List[Dict[str, Any]]:
+        ordered = sorted(table.values(), key=lambda s: (-s["total_ns_in_late_blocks"], -s["n_in_late_blocks"],
+                                                        -s["total_ns_all_blocks"], s["key"]))
+        out = []
+        for rank, site in enumerate(ordered, 1):
+            stressed = site["late_blocks"] + site["near_late_blocks"]
+            item = {
+                "rank": rank, "key": site["key"], "kind": site["kind"], "name": site["name"], "caller": site["caller"],
+                "late_blocks": site["late_blocks"], "near_late_blocks": site["near_late_blocks"],
+                "n_in_late_blocks": site["n_in_late_blocks"],
+                "per_late_block": round(site["n_in_late_blocks"] / stressed, 3) if stressed else 0.0,
+                "total_ns_in_late_blocks": site["total_ns_in_late_blocks"], "max_ns": site["max_ns"],
+                "n_all_blocks": site["n_all_blocks"], "total_ns_all_blocks": site["total_ns_all_blocks"],
+                "caller_basis": dict(site["bases"]),
+                "woken_by": [{"tid": tid, "role": role, "count": count}
+                             for (tid, role), count in site["woken"].most_common(5) if count > 0],
+            }
+            if nested:
+                item["parent"] = {"kind": site["parent"][0], "id": site["parent"][1]}
+            else:
+                item["share_of_lost_slack"] = (round(site["attributed"] / self.lost_total, 4)
+                                               if self.lost_total else 0.0)
+            out.append(item)
+        return out
+
+    def ranked(self) -> List[Dict[str, Any]]:
+        """call_sites: the top-level crossings (with share_of_lost_slack)."""
+        return self._ranked(self.sites, False)
+
+    def ranked_nested(self) -> List[Dict[str, Any]]:
+        """nested_call_sites: crossings inside an enclosing syscall / unix call (no share)."""
+        return self._ranked(self.nested, True)
+
+
+def rank_call_sites(blocks: Iterable[Dict[str, Any]], near_late_fraction: float,
+                    is_audio: Optional[Callable[[str], bool]] = None) -> Tuple[List[Dict[str, Any]], int, int]:
+    """SiteRanker over a sequence of blocks.  Returns (top-level sites, lost_total, attributed)."""
+    ranker = SiteRanker(near_late_fraction, is_audio)
+    for block in blocks:
+        ranker.add(block)
+    return ranker.ranked(), ranker.lost_total, int(round(ranker.attributed_total))
+
+
+def split_hotspots(hotspots: Any, index: CallerIndex) -> Any:
+    """hotspots_non_audio per (role, kind, id, caller): each loader entry's per-tid breakdown is
+    split over the callers sampled for (tid, kind, id) in the whole run (the enclosing call's for
+    nested kinds).  Entries without a breakdown (reduce.py's) are kept."""
+    if not isinstance(hotspots, list) or not any(isinstance(h, dict) and isinstance(h.get("by_tid"), list) for h in hotspots):
+        return hotspots
+    merged: Dict[Tuple[str, str, str, str], Dict[str, Any]] = {}
+    for entry in hotspots:
+        if not isinstance(entry, dict):
+            continue
+        role, kind, name = str(entry.get("role")), str(entry.get("kind")), str(entry.get("name"))
+        rows = entry.get("by_tid") if isinstance(entry.get("by_tid"), list) else []
+        if not rows:
+            rows = [[None, entry.get("n"), entry.get("total_ns")]]
+        for row in rows:
+            if not isinstance(row, (list, tuple)) or len(row) < 3:
+                continue
+            tid, n, total = to_int(row[0]), to_int(row[1], 0) or 0, to_int(row[2], 0) or 0
+            dist, basis = index.pick({}, (tid, kind, name), entry.get("parent"))
+            for caller, part_n, part_total, _share in (apportion(n, total, dist) if dist else [(UNSAMPLED, n, total, 1.0)]):
+                key = (role, kind, name, caller)
+                item = merged.setdefault(key, {"role": role, "kind": kind, "name": name, "caller": caller,
+                                               "n": 0, "total_ns": 0, "caller_basis": basis})
+                item["n"] += part_n
+                item["total_ns"] += part_total
+    items = sorted(merged.values(), key=lambda h: (-h["total_ns"], -h["n"], h["role"], h["kind"], h["name"], h["caller"]))
+    return items[:HOTSPOTS_KEEP]
+
+
 def cmd_symbolize(args: argparse.Namespace) -> int:
     with ModuleMap(symbols_root=args.symbols_root) as modules:
         run_dir = os.path.dirname(os.path.abspath(args.blocks)) if args.blocks else None
@@ -1780,6 +2157,8 @@ def _symbolize_files(args: argparse.Namespace, modules: ModuleMap) -> int:
     cache = SymCache.load(args.symcache)
     sym = Symbolizer(modules, cache, args.max_frames)
     results: Dict[str, Dict[str, Any]] = {}
+    index = CallerIndex()
+    caller_stats = new_caller_stats()
     placeholders = 0
 
     def resolve(addr: int) -> str:
@@ -1797,6 +2176,7 @@ def _symbolize_files(args: argparse.Namespace, modules: ModuleMap) -> int:
                     continue
                 ref = stack_ref_of(rec)
                 res = sym.unwind_record(rec)
+                index.add_stack(rec, res)
                 if ref is not None:
                     results[ref] = res
                 if stacks_out:
@@ -1822,12 +2202,45 @@ def _symbolize_files(args: argparse.Namespace, modules: ModuleMap) -> int:
             out.update(res)
         return out
 
-    if args.blocks and args.out:
-        records = list(iter_jsonl(args.blocks))   # read fully first: --out may be the input (in place)
+    def attach_compact(entry: Dict[str, Any]) -> Dict[str, Any]:
+        """A block's stack reference: site, stop and the first frames of its representative (the
+        addresses, the full frame list and the plain depth-3 chain stay with the stack record;
+        blocks are large enough)."""
+        out = attach(entry)
+        out.pop("addrs", None)
+        out.pop("caller", None)
+        frames = out.get("frames")
+        if isinstance(frames, list) and len(frames) > CALLER_MAX_FRAMES + 1:
+            out["frames"] = frames[:CALLER_MAX_FRAMES + 1]
+            out["frames_truncated"] = len(frames)
+        return out
 
+    # summary.json first (small): its near-late fraction drives the call-site ranking
+    summary: Optional[Dict[str, Any]] = None
+    if args.summary:
+        try:
+            with open(args.summary, "r", encoding="utf-8") as fh:
+                loaded = json.load(fh)
+            summary = loaded if isinstance(loaded, dict) else None
+        except (OSError, ValueError) as exc:
+            print("symbolize: cannot read %s: %s" % (args.summary, exc), file=sys.stderr)
+    thresholds = summary.get("thresholds") if summary and isinstance(summary.get("thresholds"), dict) else {}
+    fraction = thresholds.get("near_late_fraction") if thresholds else None
+    is_audio: Optional[Callable[[str], bool]] = None
+    if getattr(args, "roles", None):
+        try:
+            is_audio = load_roles(args.roles).is_audio
+        except (OSError, ValueError, KeyError, TypeError, re.error) as exc:
+            print("symbolize: cannot read --roles %s (%s): the default roles.toml decides the lost-slack shares"
+                  % (args.roles, exc), file=sys.stderr)
+    ranker = SiteRanker(float(fraction) if isinstance(fraction, (int, float)) else 0.15, is_audio)
+
+    # blocks and events are streamed (a drill-down events.jsonl can be gigabytes): each record is
+    # read, symbolized and written to OUT.tmp, which replaces OUT at the end (in place is fine)
+    if args.blocks and args.out:
         def write_blocks(fh: Any) -> None:
             nonlocal placeholders
-            for rec in records:
+            for rec in iter_jsonl(args.blocks):
                 if rec.get("type") == "header":
                     rec = dict(rec)
                     rec["symbolized"] = True
@@ -1837,38 +2250,51 @@ def _symbolize_files(args: argparse.Namespace, modules: ModuleMap) -> int:
                 stacks = rec.get("stacks")
                 if isinstance(stacks, list):
                     rec = dict(rec)
-                    rec["stacks"] = [attach(s) if isinstance(s, dict) else s for s in stacks]
+                    rec["stacks"] = [attach_compact(s) if isinstance(s, dict) else s for s in stacks]
+                if isinstance(rec.get("crossings"), list):
+                    rec = dict(rec)
+                    rec["crossings"] = assign_callers(rec, index, caller_stats)
                 placeholders += rewrite_placeholders(rec, resolve)
                 write_jsonl_line(fh, rec)
+                ranker.add(rec)
         _replace_file(args.out, write_blocks)
 
     if args.events and args.events_out:
-        records = list(iter_jsonl(args.events))
-
         def write_events(fh: Any) -> None:
             nonlocal placeholders
-            for rec in records:
+            for rec in iter_jsonl(args.events):
                 if rec.get("type") != "header" and stack_ref_of(rec) is not None:
                     rec = attach(rec)
                 placeholders += rewrite_placeholders(rec, resolve)
                 write_jsonl_line(fh, rec)
         _replace_file(args.events_out, write_events)
 
-    if args.summary:
-        try:
-            with open(args.summary, "r", encoding="utf-8") as fh:
-                summary = json.load(fh)
-        except (OSError, ValueError) as exc:
-            print("symbolize: cannot read %s: %s" % (args.summary, exc), file=sys.stderr)
-            summary = None
-        if isinstance(summary, dict):
-            placeholders += rewrite_placeholders(summary, resolve)
-            summary["symbolized"] = True
+    if summary is not None:
+        if caller_stats["crossings"]:
+            # the libbpf tracer's caller-less sites, replaced by per-caller ones (the nested kinds apart:
+            # their time is inside their enclosing call's, see SiteRanker)
+            summary["call_sites"] = ranker.ranked()[:CALL_SITES_KEEP]
+            summary["nested_call_sites"] = ranker.ranked_nested()[:CALL_SITES_KEEP]
+        if caller_stats["crossings"] or index.samples:
+            summary["hotspots_non_audio"] = split_hotspots(summary.get("hotspots_non_audio"), index)
+            summary["callers"] = {
+                "definition": "caller = the stack frames after the syscall stub up to and including the first "
+                              "application frame (at most %d, plus one per native runtime frame such as "
+                              "msvcp140.dll walked past), else the first %d frames; crossings are split over "
+                              "the callers sampled for their (tid, kind, id) in the same block, else in the whole "
+                              "run; nested kinds use their enclosing call's samples" % (CALLER_MAX_FRAMES, CHAIN_DEPTH),
+                "crossing_aggregates": caller_stats["crossings"], "split_aggregates": caller_stats["split"],
+                "events_by_basis": caller_stats["by_basis"], "time_ns_by_basis": caller_stats["time_by_basis"],
+                "stack_samples": index.samples, "stack_representatives": len(index.by_ref),
+                "unwind_stops": dict(sym.stats["stops"]),
+            }
+        placeholders += rewrite_placeholders(summary, resolve)
+        summary["symbolized"] = True
 
-            def write_summary(fh: Any) -> None:
-                json.dump(summary, fh, indent=1, sort_keys=True)
-                fh.write("\n")
-            _replace_file(args.summary, write_summary)
+        def write_summary(fh: Any) -> None:
+            json.dump(summary, fh, indent=1, sort_keys=True)
+            fh.write("\n")
+        _replace_file(args.summary, write_summary)
 
     if args.imports_out:
         dump: Dict[str, Any] = {"type": "imports", "modules": {}}

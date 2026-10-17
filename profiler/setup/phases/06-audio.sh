@@ -13,13 +13,18 @@
 #                 share): the ALSA Audio/Sink whose node.name contains "Speaker"
 #                 (the default sink when it is one, else the highest
 #                 priority.session), else the default sink when it is an ALSA
-#                 sink; input = the Mic source on the same
-#                 PipeWire device (the default source first), else unset. The
-#                 sink is MUTED (wpctl set-mute <id> 1): the graph keeps the
-#                 card's hardware clock, the room stays quiet.
+#                 sink. The sink is MUTED (wpctl set-mute <id> 1): the graph
+#                 keeps the card's hardware clock, the room stays quiet.
 #       null      profiler-null for output and input; not muted
-#       <name>    that Audio/Sink node.name; input unset (PipeASIO then picks a
-#                 capture source on the same card itself); not muted
+#       <name>    that Audio/Sink node.name (a USB interface's
+#                 alsa_output.…pro-output-0, say); not muted
+#     The input of builtin and <name> is the capture node on the sink's own card
+#     (lib/host.sh's pwa_pick_input, shared with verify.sh), so capture runs on
+#     the same hardware clock and config.ini names it explicitly instead of
+#     leaving PipeASIO to pick one: the mirror name (…pro-output-0 →
+#     …pro-input-0), else the card's lexically first *Mic* source (the built-in
+#     Speaker sink, a HiFi Line sink), else its lexically first source; unset
+#     only when the card has no capture node.
 #     Recorded in ~/.config/profiler/setup.conf: audio_node=, audio_input=,
 #     audio_mute=1|0 (profiler/bin/bench re-applies the mute before every run)
 #     and audio_pipeasio=configured|pending.
@@ -102,7 +107,7 @@ _aud_resolve() {
     local mode="$1" dump nodes def_sink def_src line dev
     AUD_NODE="" AUD_NODE_ID="" AUD_INPUT="" AUD_MUTE=0 AUD_WHY=""
     if ! command -v pw-dump >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1; then AUD_WHY="pw-dump or jq is missing (phase packages)"; return 1; fi
-    dump="$(timeout 10 pw-dump 2>/dev/null || true)"
+    dump="$(timeout 15 pw-dump -N 2>/dev/null || true)"
     [ -n "$dump" ] || { AUD_WHY="pw-dump printed nothing (PipeWire not running for $(_p1_user)?)"; return 1; }
     nodes="$(_aud_nodes "$dump")"
     def_sink="$(_aud_default "$dump" default.audio.sink)"
@@ -130,14 +135,14 @@ _aud_resolve() {
     [ -n "$line" ] || { AUD_WHY="PipeWire has no Audio/Sink named '$AUD_NODE'"; return 1; }
     AUD_NODE_ID="$(cut -f1 <<< "$line")"
     dev="$(cut -f4 <<< "$line")"
-    if [ "$mode" = builtin ] && [ -n "$dev" ]; then
-        # Stable choice: node ids and the default source both change when PipeWire
-        # restarts, so pick the lexically first *Mic* source on the sink's card.
-        AUD_INPUT="$(awk -F'\t' -v dev="$dev" '
-            $2 == "Audio/Source" && $4 == dev && $3 ~ /Mic/ {
-                if (first == "" || $3 < first) first = $3
-            }
-            END { if (first != "") print first }' <<< "$nodes")"
+    if [ "$mode" != null ]; then
+        declare -F pwa_pick_input >/dev/null 2>&1 || { AUD_WHY="lib/host.sh is not loaded (pwa_pick_input)"; return 1; }
+        # Stable choice by node.name (ids and the default source both change when
+        # PipeWire restarts): lib/host.sh's rule, shared with verify.sh
+        AUD_INPUT="$(awk -F'\t' '{ print $3 "\t" $2 "\t" $4 }' <<< "$nodes" | pwa_pick_input "$AUD_NODE" || true)"
+        if [ -z "$AUD_INPUT" ]; then
+            AUD_WHY="${AUD_WHY:+$AUD_WHY; }no capture node on the card of $AUD_NODE${dev:+ (PipeWire device $dev)}: input_device stays unset"
+        fi
     fi
     return 0
 }
@@ -246,11 +251,11 @@ phase_audio_check() {
         warn "$ini is a symlink: not checked"
     elif [ -f "$ini" ]; then
         _aud_ini_current "$ini" "$AUD_NODE" "$AUD_INPUT" || { info "$ini does not name output_device = $AUD_NODE${AUD_INPUT:+ / input_device = $AUD_INPUT}"; return 1; }
-        ok "PipeASIO config.ini names output_device = $AUD_NODE"
+        ok "PipeASIO config.ini names output_device = $AUD_NODE${AUD_INPUT:+, input_device = $AUD_INPUT}"
     else
         info "pending: $ini does not exist yet (phase install seeds it; a later setup run points it at $AUD_NODE)"
     fi
-    phase_note "PipeASIO → $AUD_NODE$([ "$AUD_MUTE" = 1 ] && printf ' (muted)')$([ -f "$ini" ] || printf '; config.ini pending')"
+    phase_note "PipeASIO → $AUD_NODE$([ "$AUD_MUTE" = 1 ] && printf ' (muted)')${AUD_INPUT:+, input $AUD_INPUT}$([ -f "$ini" ] || printf '; config.ini pending')"
     return 0
 }
 
@@ -296,7 +301,7 @@ phase_audio_apply() {
     fi
     [ -z "$AUD_WHY" ] || warn "$AUD_WHY"
     kv "audio_node" "$AUD_NODE (id $AUD_NODE_ID)"
-    kv "audio_input" "${AUD_INPUT:-unset (PipeASIO picks a capture source on the same card)}"
+    kv "audio_input" "${AUD_INPUT:-unset (the card has no capture node; PipeASIO picks one itself)}"
     kv "mute" "$([ "$AUD_MUTE" = 1 ] && printf 'yes (bench re-applies it before every run)' || printf no)"
     cfg_set audio_node "$AUD_NODE" && cfg_set audio_input "$AUD_INPUT" && cfg_set audio_mute "$AUD_MUTE" || return 1
     is_dry_run && info "would record audio_node=$AUD_NODE audio_input=$AUD_INPUT audio_mute=$AUD_MUTE in $PROFILER_SETUP_CONF"
@@ -309,6 +314,6 @@ phase_audio_apply() {
     fi
     step "PipeASIO config.ini"
     _aud_point_pipeasio "$AUD_NODE" "$AUD_INPUT" || return 1
-    phase_note "PipeASIO → $AUD_NODE$([ "$AUD_MUTE" = 1 ] && printf ' (muted)')"
+    phase_note "PipeASIO → $AUD_NODE$([ "$AUD_MUTE" = 1 ] && printf ' (muted)')${AUD_INPUT:+, input $AUD_INPUT}"
     return 0
 }

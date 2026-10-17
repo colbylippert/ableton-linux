@@ -18,6 +18,29 @@
  *   tp_btf    sched_switch, sched_waking (+ irq-aware variant), sched_process_fork,
  *             sched_process_exit, task_rename
  *   perf_event on_perf_sample                                        (--mode sample)
+ *
+ * ---- Why the code looks the way it does (B5: kernel oops, bpftrace aborts) ----------
+ * The USDT programs are BPF_PROG_TYPE_KPROBE programs on uprobe(_multi) links.  They run
+ * preemptible (migrate_disable only) and without a recursion guard: a second thread can
+ * run the same program on the same CPU while the first run is preempted halfway.  Since
+ * 6.14 the verifier gives KPROBE programs (and each subprogram) whose BPF stack is >= 64
+ * bytes a per-CPU *private* stack, which those two runs then share: a spilled pointer of
+ * the preempted run gets overwritten (the B5 oops in wine_syscall_exit).  Any per-CPU
+ * map used as scratch has the same problem.  So, in every uprobe program and every
+ * subprogram they call:
+ *   * the BPF frame stays below 64 bytes: the only stack variable is the tid used as a
+ *     map key; everything else lives in map values or ring-buffer records;
+ *   * per-thread scratch (map keys and values under construction, USDT arguments) is in
+ *     the thread's own `struct tstate`, a hash map value keyed by tid: no other thread
+ *     ever touches it, and a thread cannot run two of its programs at once;
+ *   * ring-buffer records are reserved first and filled in place (bpf_usdt_arg and
+ *     bpf_probe_read_user write straight into them; each reservation is private memory);
+ *   * counters are atomic adds on global data (no in-flight pointers, no lost updates);
+ *   * no per-CPU maps at all.
+ * The loader reads the JIT image of every program and subprogram after load and refuses to
+ * attach when a uprobe program landed on a private stack (wine-trace.c: stack_self_check).
+ * fentry/fexit/tp_btf programs have the kernel's per-program recursion guard and the
+ * scheduler tracepoints run non-preemptible; they follow the same rules anyway.
  */
 #include "vmlinux.h"
 #include <bpf/bpf_helpers.h>
@@ -28,6 +51,22 @@
 #include "wine-trace.h"
 
 char LICENSE[] SEC("license") = "GPL";
+
+/* ------------------------------------------------------------------------
+ * configuration and global data
+ * ---------------------------------------------------------------------- */
+const volatile struct wt_config CFG = {
+	.sample_n = SAMPLE_N_SUMMARY, .stack_bytes = STACK_BYTES_DEFAULT,
+	.slack_thresh_pct = SLACK_THRESH_PCT_DEFAULT, .slack_samples = SLACK_SAMPLES_PER_BLOCK_DEFAULT,
+	.offcpu_min_ns = OFFCPU_MIN_NS_DEFAULT, .callback_return_id = NO_SYSCALL_ID,
+};
+
+/* zero image of a new thread's state (the update source must not be on the BPF stack) */
+const volatile struct tstate ZERO_TSTATE = {};
+
+struct global gl = {};
+__u64 counters[CT__COUNT] = {};
+__u64 hits[HIT__COUNT] = {};
 
 /* ------------------------------------------------------------------------
  * maps
@@ -61,15 +100,8 @@ struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, MAX_TIDS);
 	__type(key, __u32);
-	__type(value, struct inflight);
-} inflight SEC(".maps");
-
-struct {
-	__uint(type, BPF_MAP_TYPE_HASH);
-	__uint(max_entries, MAX_TIDS);
-	__type(key, __u32);
-	__type(value, struct sched_ent);
-} sched SEC(".maps");
+	__type(value, struct tstate);
+} tstate SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
@@ -86,30 +118,9 @@ struct {
 } tids SEC(".maps");
 
 struct {
-	__uint(type, BPF_MAP_TYPE_ARRAY);
-	__uint(max_entries, 1);
-	__type(key, __u32);
-	__type(value, struct cfg);
-} cfg SEC(".maps");
-
-struct {
-	__uint(type, BPF_MAP_TYPE_ARRAY);
-	__uint(max_entries, 1);
-	__type(key, __u32);
-	__type(value, struct global);
-} gl SEC(".maps");
-
-struct {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
 	__uint(max_entries, RINGBUF_MB_DEFAULT << 20);   /* overridden by --ringbuf-mb before load */
 } rb SEC(".maps");
-
-struct {
-	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-	__uint(max_entries, ST__COUNT);
-	__type(key, __u32);
-	__type(value, __u64);
-} stats SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
@@ -126,26 +137,11 @@ struct {
 } trigger_ids SEC(".maps");
 
 /* ------------------------------------------------------------------------
- * small helpers
+ * small helpers (always inlined; nothing here declares a stack variable)
  * ---------------------------------------------------------------------- */
-static __always_inline __u64 *stat_ptr(__u32 idx)
-{
-	return bpf_map_lookup_elem(&stats, &idx);
-}
-
-static __always_inline void stat_inc(__u32 idx)
-{
-	__u64 *p = stat_ptr(idx);
-	if (p)
-		(*p)++;
-}
-
-static __always_inline void stat_add(__u32 idx, __u64 n)
-{
-	__u64 *p = stat_ptr(idx);
-	if (p)
-		*p += n;
-}
+#define cnt(i)        __sync_fetch_and_add(&counters[(i)], 1)
+#define cnt_add(i, n) __sync_fetch_and_add(&counters[(i)], (n))
+#define hit(i)        do { if (CFG.count_hits) __sync_fetch_and_add(&hits[(i)], 1); } while (0)
 
 /* The consumer polls the ring every 25 ms on its own; waking it for each record would cost a
  * context switch per block phase.  Wake it only when the ring is more than a quarter full. */
@@ -155,92 +151,35 @@ static __always_inline __u64 rb_flags(void)
 		BPF_RB_FORCE_WAKEUP : BPF_RB_NO_WAKEUP;
 }
 
-static __always_inline struct cfg *cfg_get(void)
+static __always_inline struct tstate *ts_get(__u32 *tid)
 {
-	__u32 z = 0;
-	return bpf_map_lookup_elem(&cfg, &z);
+	struct tstate *t = bpf_map_lookup_elem(&tstate, tid);
+
+	if (t)
+		return t;
+	bpf_map_update_elem(&tstate, tid, (const void *)&ZERO_TSTATE, BPF_NOEXIST);
+	t = bpf_map_lookup_elem(&tstate, tid);
+	if (!t)
+		cnt(CT_TSTATE_FULL);
+	return t;
 }
 
-static __always_inline struct global *gl_get(void)
+static __always_inline bool pid_traced(__u32 *pid)
 {
-	__u32 z = 0;
-	return bpf_map_lookup_elem(&gl, &z);
-}
-
-static __always_inline bool pid_traced(__u32 pid)
-{
-	return bpf_map_lookup_elem(&pids, &pid) != NULL;
+	return bpf_map_lookup_elem(&pids, pid) != NULL;
 }
 
 /* --roles audio: USDT crossings only for audio-role threads (+ the callback tid) */
-static __always_inline bool tid_wanted(const struct cfg *c, const struct global *g, __u32 tid)
+static __always_inline bool tid_wanted(__u32 *tid)
 {
 	__u8 *r;
 
-	if (c->roles == ROLES_ALL)
+	if (!CFG.roles_audio)
 		return true;
-	if (tid == g->callback_tid)
+	if (*tid == gl.callback_tid)
 		return true;
-	r = bpf_map_lookup_elem(&tids, &tid);
+	r = bpf_map_lookup_elem(&tids, tid);
 	return r && ROLE_IS_AUDIO(*r);
-}
-
-static __always_inline __u32 agg_slot(__u64 now)
-{
-	return (__u32)((now / AGG_SLOT_NS) & (AGG_SLOTS - 1));
-}
-
-/* Block association rule (design B §3b): the block in progress at entry time,
- * else the 100 ms window bucket (flagged between_blocks for the callback thread). */
-static __always_inline __u64 assoc_seq(const struct global *g, __u32 tid, __u64 ts, __u16 *flags)
-{
-	__u64 seq = g->cur_seq;
-
-	if (seq)
-		return seq;
-	*flags |= AGGF_WINDOW;
-	if (tid == g->callback_tid)
-		*flags |= AGGF_BETWEEN_BLOCKS;
-	return WINDOW_BIT | (ts / WINDOW_NS);
-}
-
-static __always_inline void agg_add(__u64 now, __u64 seq, __u32 tid, __u16 kind, __u16 flags, __u32 id,
-				    __u64 dur, __u64 oncpu, __u64 aux, __u32 waker)
-{
-	struct agg_key k = { .seq = seq, .tid = tid, .kind = kind, .flags = flags, .id = id, .pad = 0 };
-	__u32 slot = agg_slot(now);
-	struct agg_val *v;
-	void *m;
-
-	m = bpf_map_lookup_elem(&agg, &slot);
-	if (!m)
-		return;
-	v = bpf_map_lookup_elem(m, &k);
-	if (!v) {
-		struct agg_val nv = { .count = 1, .total_ns = dur, .max_ns = dur, .oncpu_ns = oncpu,
-				      .aux_ns = aux, .last_waker = waker, .pad = 0 };
-		long err = bpf_map_update_elem(m, &k, &nv, BPF_NOEXIST);
-
-		if (err == 0)
-			return;
-		if (err != -WT_EEXIST) {
-			stat_inc(ST_AGG_FULL);
-			return;
-		}
-		v = bpf_map_lookup_elem(m, &k);
-		if (!v)
-			return;
-	}
-	/* keys are per tid: only the owning thread (or the CPU switching it in) writes them */
-	v->count++;
-	v->total_ns += dur;
-	if (dur > v->max_ns)
-		v->max_ns = dur;
-	v->oncpu_ns += oncpu;
-	if (aux > v->aux_ns)
-		v->aux_ns = aux;
-	if (waker)
-		v->last_waker = waker;
 }
 
 static __always_inline __u16 ntstatus_flags(__u32 st)
@@ -256,79 +195,262 @@ static __always_inline __u16 ntstatus_flags(__u32 st)
 	return 0;
 }
 
-/* ------------------------------------------------------------------------
- * in-flight stack per tid (depth 4), entry/exit pairing
- * ---------------------------------------------------------------------- */
-static __always_inline struct inflight *inflight_get(__u32 tid, bool create)
+/* Block association rule (design B §3b): the block in progress at entry time, else the
+ * 100 ms window bucket (flagged between_blocks for the callback thread). */
+static __always_inline void assoc_into(__u64 *seq, __u16 *flags, __u32 tid, __u64 now)
 {
-	struct inflight *f = bpf_map_lookup_elem(&inflight, &tid);
+	__u64 s = gl.cur_seq;
 
-	if (f || !create)
-		return f;
-	{
-		struct inflight z = {};
-
-		bpf_map_update_elem(&inflight, &tid, &z, BPF_NOEXIST);
+	if (s) {
+		*seq = s;
+		*flags = 0;
+		return;
 	}
-	return bpf_map_lookup_elem(&inflight, &tid);
+	*seq = WINDOW_BIT | (now / WINDOW_NS);
+	*flags = tid == gl.callback_tid ? (AGGF_WINDOW | AGGF_BETWEEN_BLOCKS) : AGGF_WINDOW;
 }
 
-static __always_inline struct inflight_ent *inflight_push(struct inflight *f, __u16 kind, __u16 flags,
-							  __u32 id, __u64 frame, __u64 ts, __u64 seq)
+/* --mode drilldown: one pairing anomaly with a copy of the thread's in-flight stack, so that the
+ * entries that never return (or the exits that match nothing) can be identified.  Always runs
+ * in the current thread's context; what_kind = what | kind << 8 (five arguments at most). */
+static __noinline int emit_anomaly(struct tstate *t, __u32 what_kind, __u32 id, __u64 frame, __u32 aux)
 {
-	__u32 d = f->depth;
+	struct rec_anomaly *r;
+	__u32 d = t->depth;
+	int i;
+
+	r = bpf_ringbuf_reserve(&rb, sizeof(*r), 0);
+	if (!r) {
+		cnt(CT_ANOMALY_DROP);
+		return 0;
+	}
+	r->h.type = REC_ANOMALY;
+	r->h.len = sizeof(*r);
+	r->h.tid = (__u32)bpf_get_current_pid_tgid();
+	r->h.ts = bpf_ktime_get_ns();
+	r->frame = frame;
+	r->id = id;
+	r->aux = aux;
+	r->what = (__u8)what_kind;
+	r->kind = (__u8)(what_kind >> 8);
+	r->depth = (__u8)(d < INFLIGHT_DEPTH ? d : INFLIGHT_DEPTH);
+	r->pad = 0;
+	r->pad2 = 0;
+#pragma unroll
+	for (i = 0; i < INFLIGHT_DEPTH; i++) {
+		r->kinds[i] = t->s[i].kind;
+		r->ids[i] = t->s[i].id;
+		r->frames[i] = t->s[i].frame;
+	}
+	bpf_ringbuf_submit(r, rb_flags());
+	return 0;
+}
+
+#define anomaly(t, what, kind, id, frame, aux) \
+	do { if (CFG.mode == MODE_DRILLDOWN) emit_anomaly((t), (what) | ((__u32)(kind) << 8), (id), (frame), (aux)); } while (0)
+
+/* ------------------------------------------------------------------------
+ * aggregation: one key/value under construction in a map value (struct aggscratch)
+ * ---------------------------------------------------------------------- */
+static __noinline int agg_commit(struct aggscratch *s)
+{
+	struct agg_val *v;
+	void *m;
+	long err;
+
+	m = bpf_map_lookup_elem(&agg, &s->slot);
+	if (!m)
+		return 0;
+	v = bpf_map_lookup_elem(m, &s->key);
+	if (!v) {
+		err = bpf_map_update_elem(m, &s->key, &s->val, BPF_NOEXIST);
+		if (err == 0)
+			return 0;
+		if (err != -WT_EEXIST) {
+			cnt(CT_AGG_FULL);
+			return 0;
+		}
+		v = bpf_map_lookup_elem(m, &s->key);
+		if (!v)
+			return 0;
+	}
+	/* keys are per tid: only the owning thread (or the CPU switching it) updates them */
+	v->count += s->val.count;
+	v->total_ns += s->val.total_ns;
+	if (s->val.max_ns > v->max_ns)
+		v->max_ns = s->val.max_ns;
+	v->oncpu_ns += s->val.oncpu_ns;
+	if (s->val.aux_ns > v->aux_ns)
+		v->aux_ns = s->val.aux_ns;
+	if (s->val.last_waker)
+		v->last_waker = s->val.last_waker;
+	return 0;
+}
+
+/* fill s for a count-only / duration key and commit it */
+static __always_inline void agg_add(struct aggscratch *s, __u64 now, __u64 seq, __u32 tid, __u8 kind,
+				    __u16 flags, __u32 id, __u64 dur, __u64 oncpu, __u64 aux, __u32 waker)
+{
+	s->key.seq = seq;
+	s->key.tid = tid;
+	s->key.kind = kind;
+	s->key.pkind = 0;
+	s->key.flags = flags;
+	s->key.id = id;
+	s->key.pid_ = 0;
+	s->val.count = 1;
+	s->val.total_ns = dur;
+	s->val.max_ns = dur;
+	s->val.oncpu_ns = oncpu;
+	s->val.aux_ns = aux;
+	s->val.last_waker = waker;
+	s->val.pad = 0;
+	s->slot = (__u32)((now / AGG_SLOT_NS) & (AGG_SLOTS - 1));
+	agg_commit(s);
+}
+
+/* count-only key (wakes, --no-exit entries) for the block / window in progress */
+static __always_inline void agg_count(struct aggscratch *s, __u32 tid, __u8 kind, __u32 id)
+{
+	__u64 now = bpf_ktime_get_ns();
+
+	assoc_into(&s->key.seq, &s->key.flags, tid, now);
+	agg_add(s, now, s->key.seq, tid, kind, s->key.flags, id, 0, 0, 0, 0);
+}
+
+/* count-only key of a point event inside the thread's innermost open syscall / unix call (an
+ * NTSync wake inside NtSetEvent): the parent gives it its caller */
+static __noinline int agg_point(struct tstate *t, __u32 tid, __u32 kind, __u32 id)
+{
+	struct aggscratch *s = &t->ag;
+	__u64 now = bpf_ktime_get_ns();
+	__u32 d = t->depth;
+	int i;
+
+	assoc_into(&s->key.seq, &s->key.flags, tid, now);
+	s->key.tid = tid;
+	s->key.kind = (__u8)kind;
+	s->key.id = id;
+	s->key.pkind = 0;
+	s->key.pid_ = 0;
+#pragma unroll
+	for (i = 0; i < INFLIGHT_DEPTH; i++) {
+		if ((__u32)i < d && (t->s[i].kind == KIND_SYSCALL || t->s[i].kind == KIND_UNIXCALL)) {
+			s->key.pkind = t->s[i].kind;
+			s->key.pid_ = t->s[i].id;
+		}
+	}
+	s->val.count = 1;
+	s->val.total_ns = 0;
+	s->val.max_ns = 0;
+	s->val.oncpu_ns = 0;
+	s->val.aux_ns = 0;
+	s->val.last_waker = 0;
+	s->val.pad = 0;
+	s->slot = (__u32)((now / AGG_SLOT_NS) & (AGG_SLOTS - 1));
+	return agg_commit(s);
+}
+
+/* ------------------------------------------------------------------------
+ * in-flight stack per tid (depth INFLIGHT_DEPTH), entry/exit pairing
+ * ---------------------------------------------------------------------- */
+
+/* The next free slot of t's in-flight stack, initialised (association, timestamp, id, pairing
+ * key); NULL on overflow.  The entry becomes visible with t->depth++ once the caller filled it. */
+static __always_inline struct inflight_ent *push_slot(struct tstate *t, __u32 tid, __u8 kind, __u64 now, __u32 id,
+						      __u64 frame)
+{
+	__u32 d = t->depth;
 	struct inflight_ent *e;
 
 	if (d >= INFLIGHT_DEPTH) {
-		f->drops++;
-		stat_inc(ST_INFLIGHT_OVERFLOW);
+		t->overflow++;
+		cnt(CT_INFLIGHT_OVERFLOW);
+		anomaly(t, AN_OVERFLOW, kind, id, frame, 0);
 		return NULL;
 	}
-	e = &f->s[d & (INFLIGHT_DEPTH - 1)];
-	e->ts = ts;
-	e->seq = seq;
-	e->frame = frame;
+	e = &t->s[d & (INFLIGHT_DEPTH - 1)];
+	e->ts = now;
 	e->off_ns = 0;
+	e->aux = 0;
+	e->frame = frame;
 	e->id = id;
+	e->pid_ = 0;
 	e->kind = kind;
+	e->pkind = 0;
 	e->sampled = 0;
-	e->flags = flags;
-	f->depth = d + 1;
+	assoc_into(&e->seq, &e->flags, tid, now);
 	return e;
 }
 
-/* index of the newest in-flight entry of `kind` (and `frame` when match_frame), or -1 */
-static __always_inline int inflight_find(const struct inflight *f, __u16 kind, __u64 frame, bool match_frame)
+/* A new syscall or unix call at `frame`.  The dispatcher keeps one frame per user-callback nesting
+ * level (a callback gets a new frame below it), and PE code cannot enter it while an outer call
+ * of the same level is in progress, so an in-flight syscall / unix call with the same frame
+ * never passed its exit probe (missed, or entered before the exit probe was attached): pop it and
+ * everything entered after it as never_returned.  Left there, it would sit below every later
+ * entry of the thread, fill its in-flight stack and let a later exit at that frame complete it
+ * with a bogus duration.  (The B5b AudioCalc overflows themselves came from NTSync waits of the
+ * fentry/fexit attach window: the loader now attaches every exit side first.) */
+static __noinline int pop_stale(struct tstate *t, __u32 kind, __u32 id, __u64 frame)
 {
-	__u32 d = f->depth;
-	int found = -1;
-	__u32 i;
+	__u32 d = t->depth;
+	int i, found = -1;
+
+#pragma unroll
+	for (i = INFLIGHT_DEPTH - 1; i >= 0; i--) {
+		if ((__u32)i < d && t->s[i].frame == frame &&
+		    (t->s[i].kind == KIND_SYSCALL || t->s[i].kind == KIND_UNIXCALL))
+			found = i;                     /* the lowest such entry */
+	}
+	if (found < 0 || d > INFLIGHT_DEPTH)
+		return 0;
+	anomaly(t, AN_NEVER_RETURNED, kind, id, frame, (__u32)found);
+	t->never_returned += d - (__u32)found;
+	cnt_add(CT_NEVER_RETURNED, d - (__u32)found);
+	t->depth = (__u32)found;
+	return 0;
+}
+
+/* nested kinds: remember the innermost open syscall / unix call (design B: server_req and
+ * ntsync waits inherit the enclosing entry's caller) */
+static __always_inline void set_parent(struct tstate *t, struct inflight_ent *e)
+{
+	__u32 d = t->depth;
+	int i;
 
 #pragma unroll
 	for (i = 0; i < INFLIGHT_DEPTH; i++) {
-		if (i < d && f->s[i].kind == kind && (!match_frame || f->s[i].frame == frame))
-			found = (int)i;
+		if ((__u32)i < d && (t->s[i].kind == KIND_SYSCALL || t->s[i].kind == KIND_UNIXCALL)) {
+			e->pkind = t->s[i].kind;
+			e->pid_ = t->s[i].id;
+		}
+	}
+}
+
+/* index of the newest in-flight entry of `kind` (with `frame` when match_frame), or -1 */
+static __always_inline int find_entry(struct tstate *t, __u8 kind, __u64 frame, bool match_frame)
+{
+	__u32 d = t->depth;
+	int found = -1, i;
+
+#pragma unroll
+	for (i = 0; i < INFLIGHT_DEPTH; i++) {
+		if ((__u32)i < d && t->s[i].kind == kind && (!match_frame || t->s[i].frame == frame))
+			found = i;
 	}
 	return found;
 }
 
-static __always_inline __u32 wait_waker(__u32 tid, __u64 entry_ts)
+static __noinline int emit_event(struct tstate *t, __u32 tid, __u32 idx, __u64 now, __s32 status)
 {
-	struct sched_ent *s = bpf_map_lookup_elem(&sched, &tid);
+	struct inflight_ent *e = &t->s[idx & (INFLIGHT_DEPTH - 1)];
+	struct rec_event *r;
+	int i;
 
-	if (s && s->last_wake_ts >= entry_ts)
-		return s->last_waker;
-	return 0;
-}
-
-static __always_inline void emit_event(__u32 tid, __u64 now, const struct inflight_ent *e, __u64 stack_ts,
-				       __u16 flags, __s32 status, __u32 waker)
-{
-	struct rec_event *r = bpf_ringbuf_reserve(&rb, sizeof(*r), 0);
-
+	r = bpf_ringbuf_reserve(&rb, sizeof(*r), 0);
 	if (!r) {
-		stat_inc(ST_RINGBUF_DROP);
-		return;
+		cnt(CT_RB_DROP_EVENT);
+		return 0;
 	}
 	r->h.type = REC_EVENT;
 	r->h.len = sizeof(*r);
@@ -336,668 +458,760 @@ static __always_inline void emit_event(__u32 tid, __u64 now, const struct inflig
 	r->h.ts = now;
 	r->seq = e->seq;
 	r->entry_ts = e->ts;
-	r->stack_ts = stack_ts;
+	r->aux = e->aux;
 	r->id = e->id;
+	r->pid_ = e->pid_;
 	r->kind = e->kind;
-	r->flags = flags;
+	r->pkind = e->pkind;
+	r->flags = t->ag.key.flags;
 	r->status = status;
-	r->waker_tid = waker;
+	r->waker_tid = t->ag.val.last_waker;
+	r->pad = 0;
+	/* this entry's sample, or the innermost enclosing sampled entry's (server_req / ntsync
+	 * inside a syscall inherit the enclosing stack sample) */
+	r->stack_ts = 0;
+#pragma unroll
+	for (i = 0; i < INFLIGHT_DEPTH; i++) {
+		if ((__u32)i < (idx & (INFLIGHT_DEPTH - 1)) && t->s[i].sampled)
+			r->stack_ts = t->s[i].ts;
+	}
+	if (e->sampled)
+		r->stack_ts = e->ts;
 	bpf_ringbuf_submit(r, rb_flags());
+	return 0;
 }
 
-/* pop entry `idx` (and everything nested above it), aggregate it, emit the drill-down line */
-static __always_inline void complete_event(const struct cfg *c, __u32 tid, struct inflight *f, int idx,
-					   __u64 now, __u16 extra_flags, __s32 status, __u32 waker)
+/* pop entry idx (and everything nested above it), aggregate it, emit the drill-down record */
+static __noinline int complete(struct tstate *t, __u32 tid, __u32 idx, __u32 extra, __s32 status)
 {
-	struct inflight_ent e;
-	__u32 abandoned;
-	__u64 dur, oncpu;
-	__u16 flags;
+	struct inflight_ent *e;
+	struct aggscratch *s = &t->ag;
+	__u32 d = t->depth;
+	__u64 now, dur;
 
 	idx &= INFLIGHT_DEPTH - 1;
-	e = f->s[idx];
-	abandoned = f->depth - 1 - (__u32)idx;
-	if (abandoned)
-		stat_add(ST_ABANDONED_ENTRY, abandoned);
-	f->depth = (__u8)idx;
-
-	dur = now - e.ts;
-	oncpu = dur > e.off_ns ? dur - e.off_ns : 0;
-	flags = e.flags | extra_flags;
-	agg_add(now, e.seq, tid, e.kind, flags, e.id, dur, oncpu, 0, waker);
-
-	if (c->mode == MODE_DRILLDOWN) {
-		/* this entry's sample, or the nearest enclosing sampled entry (server_req / ntsync
-		 * inside a syscall inherit the enclosing stack sample) */
-		__u64 stack_ts = e.sampled ? e.ts : 0;
-		int i;
-
-#pragma unroll
-		for (i = INFLIGHT_DEPTH - 1; i >= 0; i--) {
-			if (!stack_ts && i < idx && f->s[i].sampled)
-				stack_ts = f->s[i].ts;
-		}
-		emit_event(tid, now, &e, stack_ts, flags, status, waker);
+	if (idx >= d || d > INFLIGHT_DEPTH)
+		return 0;
+	e = &t->s[idx];
+	now = bpf_ktime_get_ns();
+	dur = now - e->ts;
+	if (d - 1 - idx) {
+		anomaly(t, AN_ABANDONED, e->kind, e->id, e->frame, idx);
+		t->abandoned += d - 1 - idx;
+		cnt_add(CT_ABANDONED, d - 1 - idx);
 	}
+	s->key.seq = e->seq;
+	s->key.tid = tid;
+	s->key.kind = e->kind;
+	s->key.pkind = e->pkind;
+	s->key.flags = e->flags | (__u16)extra;
+	s->key.id = e->id;
+	s->key.pid_ = e->pid_;
+	s->val.count = 1;
+	s->val.total_ns = dur;
+	s->val.max_ns = dur;
+	s->val.oncpu_ns = dur > e->off_ns ? dur - e->off_ns : 0;
+	s->val.aux_ns = 0;
+	s->val.last_waker = t->last_wake_ts >= e->ts ? t->last_waker : 0;
+	s->val.pad = 0;
+	s->slot = (__u32)((now / AGG_SLOT_NS) & (AGG_SLOTS - 1));
+	agg_commit(s);
+	if (CFG.mode == MODE_DRILLDOWN)
+		emit_event(t, tid, idx, now, status);
+	t->depth = idx;
+	return 0;
 }
 
 /* ------------------------------------------------------------------------
- * stack sampling (rec_stack) — fixed size classes reserved straight in the
- * ring buffer (uprobe programs are preemptible, so a per-CPU scratch would race)
+ * stack sampling (rec_stack), reserved and filled in place
  * ---------------------------------------------------------------------- */
-struct stack_req {
-	__u64 ts, seq, frame, rsp, rip;
-	const __u64 *regs;      /* NULL: read the 0xa0-byte block from `frame` */
-	__u32 tid, id;
-	__u16 kind;
-	__u16 nbytes;
-};
-
-static __always_inline bool want_stack(const struct cfg *c, const struct global *g, __u64 now, __u32 id)
+static __always_inline bool want_sample(struct inflight_ent *e)
 {
-	if (c->mode == MODE_SAMPLE)
+	if (CFG.mode == MODE_SAMPLE)
 		return false;
-	if (c->trigger_count && bpf_map_lookup_elem(&trigger_ids, &id))
+	if (CFG.sample_n && bpf_get_prandom_u32() % CFG.sample_n == 0) {
+		cnt(CT_SAMPLE_RANDOM);
 		return true;
-	if (c->sample_n) {
-		__u64 *ctr = stat_ptr(ST_SAMPLE_CTR);
-
-		if (ctr) {
-			__u64 n = (*ctr)++;
-
-			if (n % c->sample_n == 0)
-				return true;
-		}
 	}
-	if (c->slack_thresh_pct && g->cur_seq && g->deadline_ns && g->period_ns) {
-		__u64 margin = g->period_ns * c->slack_thresh_pct / 100;
-
-		if (now + margin >= g->deadline_ns)
-			return true;
+	if (CFG.slack_thresh_pct && e->seq == gl.cur_seq && gl.sample_after_ns && e->ts >= gl.sample_after_ns &&
+	    __sync_fetch_and_add(&gl.trig_used, 1) < CFG.slack_samples) {
+		cnt(CT_SAMPLE_SLACK);
+		return true;
+	}
+	if (CFG.trigger_count && bpf_map_lookup_elem(&trigger_ids, &e->id)) {
+		cnt(CT_SAMPLE_TRIGGER);
+		return true;
 	}
 	return false;
 }
 
-/* fills r; returns the number of stack bytes copied (0 = nothing useful: discard) */
-static __always_inline __u32 stack_fill(struct rec_stack *r, const __u32 cap, const struct stack_req *q)
+#define SB (CFG.stack_bytes)
+
+/* The register block is Wine's syscall_frame, read through the entry's frame pointer.  Its rsp
+ * (regs[17]) and rip (regs[14]) are exactly the probes' user_rsp/user_rip (syscall: NtXxx+0x14)
+ * and caller_rip (unix call: the PE caller) operands, so no argument fetch is needed here. */
+static __noinline int sample_stack(struct pt_regs *ctx, struct tstate *t, __u32 idx, __u32 tid)
 {
-	__u32 n, got = 0;
-	__u64 rsp;
-
-	r->h.type = REC_STACK;
-	r->h.tid = q->tid;
-	r->h.ts = q->ts;
-	r->seq = q->seq;
-	r->frame = q->frame;
-	r->rip = q->rip;
-	r->id = q->id;
-	r->kind = q->kind;
-	if (q->regs) {
-		__builtin_memcpy(r->regs, q->regs, sizeof(r->regs));
-	} else if (!q->frame || bpf_probe_read_user(r->regs, sizeof(r->regs), (const void *)q->frame)) {
-		__builtin_memset(r->regs, 0, sizeof(r->regs));
-	}
-	rsp = q->rsp ? q->rsp : r->regs[17];   /* unix calls: frame->rsp */
-	r->rsp = rsp;
-
-	n = q->nbytes;
-	if (n > cap)
-		n = cap;
-	n &= ~7u;
-	if (rsp) {
-		/* a thread near the top of its stack cannot supply the full window: halve on EFAULT */
-		if (n >= 64 && bpf_probe_read_user(r->bytes, n, (const void *)rsp) == 0) {
-			got = n;
-		} else {
-			n >>= 1;
-			if (n >= 64 && bpf_probe_read_user(r->bytes, n, (const void *)rsp) == 0) {
-				got = n;
-			} else {
-				n >>= 1;
-				if (n >= 64 && bpf_probe_read_user(r->bytes, n, (const void *)rsp) == 0) {
-					got = n;
-				} else {
-					n >>= 1;
-					if (n >= 64 && bpf_probe_read_user(r->bytes, n, (const void *)rsp) == 0)
-						got = n;
-				}
-			}
-		}
-	}
-	r->nbytes = (__u16)got;
-	r->h.len = (__u16)(sizeof(*r) + got);
-	return got;
-}
-
-static __always_inline int emit_stack(const struct stack_req *q)
-{
+	struct inflight_ent *e = &t->s[idx & (INFLIGHT_DEPTH - 1)];
 	struct rec_stack *r;
-	__u32 want = q->nbytes, got;
+	__u32 got = 0;
 
-	/* one reservation per size class (the verifier needs a constant size); a record
-	 * whose stack window could not be read at all is discarded, not submitted */
-	if (want <= 512) {
-		r = bpf_ringbuf_reserve(&rb, sizeof(*r) + 512, 0);
-		if (!r)
-			goto drop;
-		got = stack_fill(r, 512, q);
-	} else if (want <= 1024) {
-		r = bpf_ringbuf_reserve(&rb, sizeof(*r) + 1024, 0);
-		if (!r)
-			goto drop;
-		got = stack_fill(r, 1024, q);
-	} else if (want <= 2048) {
-		r = bpf_ringbuf_reserve(&rb, sizeof(*r) + 2048, 0);
-		if (!r)
-			goto drop;
-		got = stack_fill(r, 2048, q);
-	} else {
-		r = bpf_ringbuf_reserve(&rb, sizeof(*r) + STACK_BYTES_MAX, 0);
-		if (!r)
-			goto drop;
-		got = stack_fill(r, STACK_BYTES_MAX, q);
+	r = bpf_ringbuf_reserve(&rb, sizeof(struct rec_stack) + SB, 0);
+	if (!r) {
+		cnt(CT_STACK_DROP);
+		return 0;
+	}
+	r->h.type = REC_STACK;
+	r->h.tid = tid;
+	r->h.ts = e->ts;
+	r->seq = e->seq;
+	r->frame = e->frame;
+	r->id = e->id;
+	r->pid = (__u32)(bpf_get_current_pid_tgid() >> 32);
+	r->kind = e->kind;
+	r->pad8 = 0;
+	r->pad32 = 0;
+	/* zeroed by the helper on failure */
+	bpf_probe_read_user(r->regs, sizeof(r->regs), (const void *)e->frame);
+	r->rsp = r->regs[SYSCALL_FRAME_RSP_OFF / 8];
+	r->rip = r->regs[SYSCALL_FRAME_RIP_OFF / 8];
+	/* a thread near the top of its stack cannot supply the full window: halve on EFAULT */
+	if (r->rsp) {
+		if (bpf_probe_read_user(r->bytes, SB, (const void *)r->rsp) == 0)
+			got = SB;
+		else if (bpf_probe_read_user(r->bytes, SB / 2, (const void *)r->rsp) == 0)
+			got = SB / 2;
+		else if (bpf_probe_read_user(r->bytes, SB / 4, (const void *)r->rsp) == 0)
+			got = SB / 4;
+		else if (bpf_probe_read_user(r->bytes, SB / 8, (const void *)r->rsp) == 0)
+			got = SB / 8;
 	}
 	if (!got) {
 		bpf_ringbuf_discard(r, BPF_RB_NO_WAKEUP);
-		stat_inc(ST_STACK_READ_FAIL);
-		return -1;
+		cnt(CT_STACK_READ_FAIL);
+		return 0;
 	}
+	r->nbytes = (__u16)got;
+	r->h.len = (__u16)(sizeof(struct rec_stack) + got);
 	bpf_ringbuf_submit(r, rb_flags());
-	stat_inc(ST_STACKS);
-	return 0;
-drop:
-	stat_inc(ST_RINGBUF_DROP);
-	return -1;
-}
-
-static __always_inline __u16 clamp_stack_bytes(__u32 v)
-{
-	if (v < STACK_BYTES_MIN)
-		v = STACK_BYTES_MIN;
-	if (v > STACK_BYTES_MAX)
-		v = STACK_BYTES_MAX;
-	return (__u16)v;
-}
-
-/* common entry path for syscall / unix-call entries */
-static __always_inline int crossing_entry(__u16 kind, __u32 id, __u64 frame, __u64 rsp, __u64 rip)
-{
-	__u64 pt = bpf_get_current_pid_tgid();
-	__u32 pid = pt >> 32, tid = (__u32)pt;
-	const struct cfg *c;
-	const struct global *g;
-	struct inflight *f;
-	struct inflight_ent *e = NULL;
-	__u64 now, seq;
-	__u16 fl = 0;
-
-	if (!pid_traced(pid))
-		return 0;
-	c = cfg_get();
-	g = gl_get();
-	if (!c || !g)
-		return 0;
-	if (!tid_wanted(c, g, tid)) {
-		stat_inc(ST_FILTERED);
-		return 0;
-	}
-	now = bpf_ktime_get_ns();
-	seq = assoc_seq(g, tid, now, &fl);
-
-	if (c->no_exit) {
-		agg_add(now, seq, tid, kind, fl, id, 0, 0, 0, 0);
-	} else {
-		f = inflight_get(tid, true);
-		if (f)
-			e = inflight_push(f, kind, fl, id, frame, now, seq);
-	}
-
-	/* design B section 3c: stacks only at syscall / unix-call entries.  server_req and
-	 * server_wait entries have no frame or user rsp (and would consume the 1/N counter);
-	 * their events inherit the enclosing entry's sample.  `kind` is a constant after
-	 * inlining, so the stack code drops out of the server_* programs entirely. */
-	if ((kind == KIND_SYSCALL || kind == KIND_UNIXCALL) && want_stack(c, g, now, id)) {
-		struct stack_req q = {
-			.ts = now, .seq = seq, .frame = frame, .rsp = rsp, .rip = rip, .regs = NULL,
-			.tid = tid, .id = id, .kind = kind, .nbytes = clamp_stack_bytes(c->stack_bytes),
-		};
-
-		if (emit_stack(&q) == 0 && e)
-			e->sampled = 1;
-	}
-	return 0;
-}
-
-/* miss_stat: the counter for an exit that matches no in-flight entry (ST_UNMATCHED_EXIT,
- * or ST_UNIXCALL_SLOW_EXIT for the unix-call slow path's syscall_exit) */
-static __always_inline int crossing_exit(__u16 kind, __u64 frame, bool match_frame, __u16 extra, __s32 status,
-					 __u32 miss_stat)
-{
-	__u64 pt = bpf_get_current_pid_tgid();
-	__u32 pid = pt >> 32, tid = (__u32)pt;
-	const struct cfg *c;
-	struct inflight *f;
-	int i;
-
-	if (!pid_traced(pid))
-		return 0;
-	c = cfg_get();
-	if (!c)
-		return 0;
-	f = inflight_get(tid, false);
-	if (!f) {
-		/* init_syscall_frame's tail jumps to the return label: one unmatched exit per thread */
-		if (c->roles == ROLES_ALL)
-			stat_inc(ST_THREAD_START_EXIT);
-		return 0;
-	}
-	i = inflight_find(f, kind, frame, match_frame);
-	if (i < 0) {
-		stat_inc(miss_stat);
-		return 0;
-	}
-	{
-		__u64 now = bpf_ktime_get_ns();
-		__u32 waker = wait_waker(tid, f->s[i & (INFLIGHT_DEPTH - 1)].ts);
-
-		complete_event(c, tid, f, i, now, extra, status, waker);
-	}
+	e->sampled = 1;
+	cnt(CT_STACKS);
 	return 0;
 }
 
 /* ------------------------------------------------------------------------
- * USDT: wine:* (ntdll.so, patch 0108)
+ * USDT: wine:* (ntdll.so, patch 0108).  The probes are attached per traced pid, so no
+ * pid filter is needed here.
  * ---------------------------------------------------------------------- */
 SEC("usdt")
-int BPF_USDT(wine_syscall_entry, __s32 id, __u64 frame, __u64 user_rsp, __u64 user_rip)
+int wine_syscall_entry(struct pt_regs *ctx)
 {
-	stat_inc(ST_HIT_SYSCALL_ENTRY);
-	return crossing_entry(KIND_SYSCALL, (__u32)id, frame, user_rsp, user_rip);
+	__u32 tid = (__u32)bpf_get_current_pid_tgid();
+	struct inflight_ent *e;
+	struct tstate *t;
+	__u32 d;
+
+	hit(HIT_SYSCALL_ENTRY);
+	if (!tid_wanted(&tid)) {
+		cnt(CT_FILTERED);
+		return 0;
+	}
+	t = ts_get(&tid);
+	if (!t)
+		return 0;
+	t->seen = 1;
+	if (CFG.fast_args) {                             /* -4@176(%rcx) 8@%rcx */
+		t->arg[0] = 0;
+		t->arg[1] = ctx->cx;
+		bpf_probe_read_user(&t->arg[0], 4, (const void *)(t->arg[1] + SYSCALL_FRAME_ID_OFF));
+	} else {
+		bpf_usdt_arg(ctx, 0, (long *)&t->arg[0]);    /* id */
+		bpf_usdt_arg(ctx, 1, (long *)&t->arg[1]);    /* frame */
+	}
+	if (CFG.no_exit) {
+		agg_count(&t->ag, tid, KIND_SYSCALL, (__u32)t->arg[0]);
+		return 0;
+	}
+	if ((__u32)t->arg[0] == CFG.callback_return_id) {
+		/* NtCallbackReturn resumes the user callback's caller inside the outer syscall and never
+		 * exits through its own frame: pushing it would stack one dead entry per callback until
+		 * the outer exit (GUI threads overflowed INFLIGHT_DEPTH) */
+		agg_count(&t->ag, tid, KIND_SYSCALL, (__u32)t->arg[0]);
+		cnt(CT_CALLBACK_RETURN);
+		return 0;
+	}
+	pop_stale(t, KIND_SYSCALL, (__u32)t->arg[0], t->arg[1]);
+	d = t->depth;
+	e = push_slot(t, tid, KIND_SYSCALL, bpf_ktime_get_ns(), (__u32)t->arg[0], t->arg[1]);
+	if (!e)
+		return 0;
+	t->depth = d + 1;
+	if (want_sample(e))
+		sample_stack(ctx, t, d, tid);
+	return 0;
 }
 
 SEC("usdt")
-int BPF_USDT(wine_syscall_exit, __s32 status, __u64 frame, __s32 id, __s32 restore_flags)
+int wine_syscall_exit(struct pt_regs *ctx)
 {
-	__u16 extra = ntstatus_flags((__u32)status);
+	__u32 tid = (__u32)bpf_get_current_pid_tgid();
+	struct tstate *t;
+	int i;
 
-	stat_inc(ST_HIT_SYSCALL_EXIT);
-	(void)id;
-	if ((__u32)restore_flags & WT_RESTORE_FLAGS_INCOMPLETE_FRAME_CONTEXT) {
-		/* The unix-call dispatcher marks every unix-call frame INCOMPLETE_FRAME_CONTEXT and
-		 * its slow path returns through the syscall dispatcher's return label after
-		 * unixcall_exit already popped the KIND_UNIXCALL entry: no syscall entry exists for
-		 * it, so a miss is expected and counted apart from the genuine unmatched exits. */
-		extra |= AGGF_INCOMPLETE;
-		return crossing_exit(KIND_SYSCALL, frame, true, extra, status, ST_UNIXCALL_SLOW_EXIT);
+	hit(HIT_SYSCALL_EXIT);
+#ifdef WT_SELFTEST_BIG_FRAME
+	/* `make test-gate` only: a 128-byte frame must put this program on the per-CPU private
+	 * stack, and the loader's self-check must refuse to attach (never built otherwise) */
+	{
+		volatile __u64 big[16];
+		int k;
+
+		for (k = 0; k < 16; k++)
+			big[k] = bpf_get_prandom_u32();
+		if (big[tid & 15] == 42)
+			cnt(CT_FILTERED);
 	}
-	return crossing_exit(KIND_SYSCALL, frame, true, extra, status, ST_UNMATCHED_EXIT);
+#endif
+	if (!tid_wanted(&tid))
+		return 0;
+	t = bpf_map_lookup_elem(&tstate, &tid);
+	if (!t || !t->seen) {
+		/* init_syscall_frame's tail jumps to the return label: one exit without entry per
+		 * thread start (and per thread that was inside a syscall when tracing began) */
+		t = ts_get(&tid);
+		if (t) {
+			t->seen = 1;
+			t->first_exit++;
+		}
+		cnt(CT_FIRST_EXIT);
+		return 0;
+	}
+	if (CFG.fast_args)                               /* -4@%eax 8@%rcx -4@176(%rcx) -4@180(%rcx) */
+		t->arg[1] = ctx->cx;
+	else
+		bpf_usdt_arg(ctx, 1, (long *)&t->arg[1]);    /* frame */
+	i = find_entry(t, KIND_SYSCALL, t->arg[1], true);
+	t->arg[3] = 0;
+	if (i < 0 || CFG.mode == MODE_DRILLDOWN) {      /* restore_flags */
+		if (CFG.fast_args)
+			bpf_probe_read_user(&t->arg[3], 4, (const void *)(t->arg[1] + SYSCALL_FRAME_RF_OFF));
+		else
+			bpf_usdt_arg(ctx, 3, (long *)&t->arg[3]);
+	}
+	if (i < 0) {
+		/* The unix-call dispatcher marks every unix-call frame INCOMPLETE_FRAME_CONTEXT and its
+		 * slow path returns through this label after unixcall_exit already popped the unix
+		 * call: no syscall entry exists for it, so the miss is counted apart. */
+		if ((__u32)t->arg[3] & WT_RESTORE_FLAGS_INCOMPLETE_FRAME_CONTEXT) {
+			cnt(CT_UNIXCALL_SLOW_EXIT);
+		} else {
+			t->unmatched++;
+			cnt(CT_UNMATCHED_EXIT);
+			if (CFG.mode == MODE_DRILLDOWN) {        /* the exit's syscall id: -4@176(%rcx) */
+				t->arg[2] = 0;
+				if (CFG.fast_args)
+					bpf_probe_read_user(&t->arg[2], 4, (const void *)(t->arg[1] + SYSCALL_FRAME_ID_OFF));
+				else
+					bpf_usdt_arg(ctx, 2, (long *)&t->arg[2]);
+				anomaly(t, AN_UNMATCHED_EXIT, KIND_SYSCALL, (__u32)t->arg[2], t->arg[1], (__u32)t->arg[3]);
+			}
+		}
+		return 0;
+	}
+	if (CFG.fast_args)
+		t->arg[0] = (__u32)ctx->ax;                  /* status */
+	else
+		bpf_usdt_arg(ctx, 0, (long *)&t->arg[0]);
+	complete(t, tid, (__u32)i,
+		 ntstatus_flags((__u32)t->arg[0]) |
+		 (((__u32)t->arg[3] & WT_RESTORE_FLAGS_INCOMPLETE_FRAME_CONTEXT) ? AGGF_INCOMPLETE : 0),
+		 (__s32)t->arg[0]);
+	return 0;
 }
 
-static __always_inline __u32 unixlib_index(__u32 pid, __u64 handle, __u32 tid, __u64 now)
+/* handle -> small index (REC_UNIXLIB tells user space which handle an index stands for) */
+static __noinline __u32 unixlib_index(struct tstate *t, __u32 tid)
 {
-	struct unixlib_key k = { .pid = pid, .pad = 0, .handle = handle };
-	struct global *g;
+	struct rec_unixlib *r;
 	__u32 *p, idx;
 
-	p = bpf_map_lookup_elem(&unixlibs, &k);
+	p = bpf_map_lookup_elem(&unixlibs, &t->ukey);
 	if (p)
 		return *p;
-	g = gl_get();
-	if (!g)
-		return 0xffff;
-	idx = __sync_fetch_and_add(&g->unixlib_next, 1) + 1;
+	idx = __sync_fetch_and_add(&gl.unixlib_next, 1) + 1;
 	if (idx > 0xfffe)
 		return 0xffff;
-	if (bpf_map_update_elem(&unixlibs, &k, &idx, BPF_NOEXIST) == 0) {
-		struct rec_unixlib *r = bpf_ringbuf_reserve(&rb, sizeof(*r), 0);
-
+	t->arg[5] = idx;
+	if (bpf_map_update_elem(&unixlibs, &t->ukey, &t->arg[5], BPF_NOEXIST) == 0) {
+		r = bpf_ringbuf_reserve(&rb, sizeof(*r), 0);
 		if (r) {
 			r->h.type = REC_UNIXLIB;
 			r->h.len = sizeof(*r);
 			r->h.tid = tid;
-			r->h.ts = now;
-			r->handle = handle;
-			r->pid = pid;
+			r->h.ts = bpf_ktime_get_ns();
+			r->handle = t->ukey.handle;
+			r->pid = t->ukey.pid;
 			r->idx = idx;
 			bpf_ringbuf_submit(r, rb_flags());
 		} else {
-			stat_inc(ST_RINGBUF_DROP);
+			cnt(CT_RB_DROP_OTHER);
 		}
 		return idx;
 	}
-	p = bpf_map_lookup_elem(&unixlibs, &k);
+	p = bpf_map_lookup_elem(&unixlibs, &t->ukey);
 	return p ? *p : 0xffff;
 }
 
 SEC("usdt")
-int BPF_USDT(wine_unixcall_entry, __u64 handle, __s32 code, __u64 frame, __u64 caller_rip)
+int wine_unixcall_entry(struct pt_regs *ctx)
 {
-	__u64 pt = bpf_get_current_pid_tgid();
-	__u32 pid = pt >> 32, tid = (__u32)pt;
-	__u32 idx, id;
+	__u32 tid = (__u32)bpf_get_current_pid_tgid();
+	struct inflight_ent *e;
+	struct tstate *t;
+	__u32 d, idx;
 
-	stat_inc(ST_HIT_UNIXCALL_ENTRY);
-	if (!pid_traced(pid))
+	hit(HIT_UNIXCALL_ENTRY);
+	if (!tid_wanted(&tid)) {
+		cnt(CT_FILTERED);
 		return 0;
-	idx = unixlib_index(pid, handle, tid, bpf_ktime_get_ns());
-	id = (idx << 16) | ((__u32)code & 0xffff);
-	/* rsp = 0: stack_fill takes frame->rsp from the register block */
-	return crossing_entry(KIND_UNIXCALL, id, frame, 0, caller_rip);
+	}
+	t = ts_get(&tid);
+	if (!t)
+		return 0;
+	if (CFG.fast_args) {                             /* 8@%r10 -4@%edx 8@%rsp 8@112(%rsp) */
+		t->ukey.handle = ctx->r10;
+		t->arg[1] = (__u32)ctx->dx;
+		t->arg[2] = ctx->sp;
+	} else {
+		bpf_usdt_arg(ctx, 0, (long *)&t->ukey.handle);
+		bpf_usdt_arg(ctx, 1, (long *)&t->arg[1]);    /* code */
+		bpf_usdt_arg(ctx, 2, (long *)&t->arg[2]);    /* frame */
+	}
+	t->ukey.pid = (__u32)(bpf_get_current_pid_tgid() >> 32);
+	t->ukey.pad = 0;
+	idx = unixlib_index(t, tid);
+	if (CFG.no_exit) {
+		agg_count(&t->ag, tid, KIND_UNIXCALL, (idx << 16) | ((__u32)t->arg[1] & 0xffff));
+		return 0;
+	}
+	/* the unix-call frame is the dispatcher's frame of this level too (8@%rsp == the syscall frame) */
+	pop_stale(t, KIND_UNIXCALL, (idx << 16) | ((__u32)t->arg[1] & 0xffff), t->arg[2]);
+	d = t->depth;
+	e = push_slot(t, tid, KIND_UNIXCALL, bpf_ktime_get_ns(), (idx << 16) | ((__u32)t->arg[1] & 0xffff), t->arg[2]);
+	if (!e)
+		return 0;
+	if (CFG.mode == MODE_DRILLDOWN) {                /* the PE caller: 8@112(%rsp) = frame->rip */
+		if (CFG.fast_args)
+			bpf_probe_read_user(&e->aux, 8, (const void *)(e->frame + SYSCALL_FRAME_RIP_OFF));
+		else
+			bpf_usdt_arg(ctx, 3, (long *)&e->aux);
+	}
+	t->depth = d + 1;
+	if (want_sample(e))
+		sample_stack(ctx, t, d, tid);
+	return 0;
 }
 
 SEC("usdt")
-int BPF_USDT(wine_unixcall_exit, __s32 status, __u64 frame)
+int wine_unixcall_exit(struct pt_regs *ctx)
 {
-	stat_inc(ST_HIT_UNIXCALL_EXIT);
-	return crossing_exit(KIND_UNIXCALL, frame, true, ntstatus_flags((__u32)status), status, ST_UNMATCHED_EXIT);
+	__u32 tid = (__u32)bpf_get_current_pid_tgid();
+	struct tstate *t;
+	int i;
+
+	hit(HIT_UNIXCALL_EXIT);
+	if (!tid_wanted(&tid))
+		return 0;
+	t = bpf_map_lookup_elem(&tstate, &tid);
+	if (!t)
+		return 0;
+	if (CFG.fast_args)                               /* -4@%eax 8@%rcx */
+		t->arg[1] = ctx->cx;
+	else
+		bpf_usdt_arg(ctx, 1, (long *)&t->arg[1]);    /* frame */
+	i = find_entry(t, KIND_UNIXCALL, t->arg[1], true);
+	if (i < 0) {
+		t->unmatched++;
+		cnt(CT_UNMATCHED_EXIT);
+		anomaly(t, AN_UNMATCHED_EXIT, KIND_UNIXCALL, 0, t->arg[1], CFG.fast_args ? (__u32)ctx->ax : 0);
+		return 0;
+	}
+	if (CFG.fast_args)
+		t->arg[0] = (__u32)ctx->ax;                  /* status */
+	else
+		bpf_usdt_arg(ctx, 0, (long *)&t->arg[0]);
+	complete(t, tid, (__u32)i, ntstatus_flags((__u32)t->arg[0]), (__s32)t->arg[0]);
+	return 0;
+}
+
+/* server_req_start(req_type) / server_wait_start(flags): nested entries keyed by their id */
+static __always_inline int nested_start(struct pt_regs *ctx, __u8 kind)
+{
+	__u32 tid = (__u32)bpf_get_current_pid_tgid();
+	struct inflight_ent *e;
+	struct tstate *t;
+	__u32 d;
+
+	if (!tid_wanted(&tid)) {
+		cnt(CT_FILTERED);
+		return 0;
+	}
+	t = ts_get(&tid);
+	if (!t)
+		return 0;
+	bpf_usdt_arg(ctx, 0, (long *)&t->arg[0]);
+	if (CFG.no_exit) {
+		agg_count(&t->ag, tid, kind, (__u32)t->arg[0]);
+		return 0;
+	}
+	d = t->depth;
+	e = push_slot(t, tid, kind, bpf_ktime_get_ns(), (__u32)t->arg[0], (__u32)t->arg[0]);
+	if (!e)
+		return 0;
+	set_parent(t, e);
+	t->depth = d + 1;
+	return 0;
+}
+
+static __always_inline int nested_end(struct pt_regs *ctx, __u8 kind, bool match_id)
+{
+	__u32 tid = (__u32)bpf_get_current_pid_tgid();
+	struct tstate *t;
+	__u32 st;
+	int i;
+
+	if (!tid_wanted(&tid))
+		return 0;
+	t = bpf_map_lookup_elem(&tstate, &tid);
+	if (!t)
+		return 0;
+	if (match_id) {
+		bpf_usdt_arg(ctx, 0, (long *)&t->arg[0]);   /* req_type */
+		i = find_entry(t, kind, (__u32)t->arg[0], true);
+		bpf_usdt_arg(ctx, 1, (long *)&t->arg[1]);   /* status */
+		st = (__u32)t->arg[1];
+	} else {
+		i = find_entry(t, kind, 0, false);
+		bpf_usdt_arg(ctx, 0, (long *)&t->arg[1]);   /* ret */
+		st = (__u32)t->arg[1];
+	}
+	if (i < 0) {
+		t->unmatched++;
+		cnt(CT_UNMATCHED_EXIT);
+		anomaly(t, AN_UNMATCHED_EXIT, kind, match_id ? (__u32)t->arg[0] : 0, 0, st);
+		return 0;
+	}
+	complete(t, tid, (__u32)i, ntstatus_flags(st), (__s32)st);
+	return 0;
 }
 
 SEC("usdt")
-int BPF_USDT(wine_server_req_start, __s32 req_type)
+int wine_server_req_start(struct pt_regs *ctx)
 {
-	stat_inc(ST_HIT_SERVER_REQ_START);
-	return crossing_entry(KIND_SERVER_REQ, (__u32)req_type, (__u32)req_type, 0, 0);
+	hit(HIT_SERVER_REQ_START);
+	return nested_start(ctx, KIND_SERVER_REQ);
 }
 
 SEC("usdt")
-int BPF_USDT(wine_server_req_end, __s32 req_type, __s32 status)
+int wine_server_req_end(struct pt_regs *ctx)
 {
-	stat_inc(ST_HIT_SERVER_REQ_END);
-	return crossing_exit(KIND_SERVER_REQ, (__u32)req_type, true, ntstatus_flags((__u32)status), status,
-			     ST_UNMATCHED_EXIT);
+	hit(HIT_SERVER_REQ_END);
+	return nested_end(ctx, KIND_SERVER_REQ, true);
 }
 
 SEC("usdt")
-int BPF_USDT(wine_server_wait_start, __s32 flags)
+int wine_server_wait_start(struct pt_regs *ctx)
 {
-	stat_inc(ST_HIT_SERVER_WAIT_START);
-	return crossing_entry(KIND_SERVER_WAIT, (__u32)flags, 0, 0, 0);
+	hit(HIT_SERVER_WAIT_START);
+	return nested_start(ctx, KIND_SERVER_WAIT);
 }
 
 SEC("usdt")
-int BPF_USDT(wine_server_wait_end, __s32 ret)
+int wine_server_wait_end(struct pt_regs *ctx)
 {
-	stat_inc(ST_HIT_SERVER_WAIT_END);
-	return crossing_exit(KIND_SERVER_WAIT, 0, false, ntstatus_flags((__u32)ret), ret, ST_UNMATCHED_EXIT);
+	hit(HIT_SERVER_WAIT_END);
+	return nested_end(ctx, KIND_SERVER_WAIT, false);
 }
 
 /* ------------------------------------------------------------------------
- * USDT: pipeasio:* (pipeasio64.dll.so, patch pipeasio/0017)
+ * USDT: pipeasio:* (pipeasio64.dll.so, patch pipeasio/0017).  Block probes fire on the
+ * PipeASIO callback thread, cycle probes on the PipeWire data-loop thread.
  * ---------------------------------------------------------------------- */
-static __always_inline void emit_block(__u32 tid, __u64 now, __u8 phase, __u64 seq, __u64 clock_nsec,
-				       __u64 deadline_ns, __u32 nframes, __u32 rate, __u32 flags, __u32 missed)
+static __always_inline struct rec_block *block_rec(__u32 tid, __u32 phase)
 {
 	struct rec_block *r = bpf_ringbuf_reserve(&rb, sizeof(*r), 0);
 
 	if (!r) {
-		stat_inc(ST_RINGBUF_DROP);
-		return;
+		cnt(CT_RB_DROP_BLOCK);
+		return NULL;
 	}
 	r->h.type = REC_BLOCK;
 	r->h.len = sizeof(*r);
 	r->h.tid = tid;
-	r->h.ts = now;
-	r->seq = seq;
-	r->clock_nsec = clock_nsec;
-	r->deadline_ns = deadline_ns;
-	r->nframes = nframes;
-	r->rate = rate;
-	r->flags = flags;
-	r->missed = missed;
+	r->h.ts = bpf_ktime_get_ns();
+	r->seq = 0;
+	r->a[0] = 0;
+	r->a[1] = 0;
+	r->a[2] = 0;
+	r->a[3] = 0;
+	r->a[4] = 0;
 	r->phase = phase;
+	r->pad = 0;
+	return r;
+}
+
+/* t->arg[] = seq, nframes, rate, clock_nsec, deadline_ns, flags; t->now0 = probe time */
+static __noinline int block_begin(struct tstate *t, __u32 tid)
+{
+	struct rec_block *r;
+	__u64 margin;
+
+	gl.callback_tid = tid;
+	gl.block_start_ts = t->now0;
+	gl.deadline_ns = t->arg[4];
+	gl.nframes = (__u32)t->arg[1];
+	gl.rate = (__u32)t->arg[2];
+	gl.period_ns = gl.rate ? ((__u64)gl.nframes * 1000000000ULL + gl.rate / 2) / gl.rate : 0;
+	margin = gl.period_ns * CFG.slack_thresh_pct / 100;
+	gl.sample_after_ns = gl.deadline_ns > margin ? gl.deadline_ns - margin : 0;
+	gl.trig_used = 0;
+	gl.blocks++;
+	gl.cur_seq = t->arg[0];          /* last: entries of other threads now join this block */
+	r = block_rec(tid, PHASE_BLOCK_START);
+	if (!r)
+		return 0;
+	r->h.ts = t->now0;
+	r->seq = t->arg[0];
+	r->a[0] = t->arg[1];
+	r->a[1] = t->arg[2];
+	r->a[2] = t->arg[3];
+	r->a[3] = t->arg[4];
+	r->a[4] = t->arg[5];
 	bpf_ringbuf_submit(r, rb_flags());
-}
-
-SEC("usdt")
-int BPF_USDT(pipeasio_block_start, __u64 seq, __u32 nframes, __u32 rate, __u64 clock_nsec, __u64 deadline_ns,
-	     __u32 flags)
-{
-	__u64 pt = bpf_get_current_pid_tgid();
-	__u32 pid = pt >> 32, tid = (__u32)pt;
-	struct global *g;
-	__u64 now;
-
-	stat_inc(ST_HIT_BLOCK_START);
-	if (!pid_traced(pid))
-		return 0;
-	g = gl_get();
-	if (!g)
-		return 0;
-	now = bpf_ktime_get_ns();
-	g->cur_seq = seq;
-	g->callback_tid = tid;
-	g->block_start_ts = now;
-	g->deadline_ns = deadline_ns;
-	g->epoch = seq >> AGG_EPOCH_SHIFT;
-	g->nframes = nframes;
-	g->rate = rate;
-	g->period_ns = rate ? ((__u64)nframes * 1000000000ULL + rate / 2) / rate : 0;
-	g->blocks++;
-	emit_block(tid, now, PHASE_BLOCK_START, seq, clock_nsec, deadline_ns, nframes, rate, flags, 0);
 	return 0;
 }
 
 SEC("usdt")
-int BPF_USDT(pipeasio_block_before_live, __u64 seq)
+int pipeasio_block_start(struct pt_regs *ctx)
 {
-	__u64 pt = bpf_get_current_pid_tgid();
+	__u32 tid = (__u32)bpf_get_current_pid_tgid();
+	struct tstate *t;
 
-	stat_inc(ST_HIT_BLOCK_BEFORE_LIVE);
-	if (!pid_traced(pt >> 32))
+	hit(HIT_BLOCK_START);
+	if (gl.stopping)        /* the loader is detaching (block_start goes first): no new block */
 		return 0;
-	emit_block((__u32)pt, bpf_ktime_get_ns(), PHASE_BEFORE_LIVE, seq, 0, 0, 0, 0, 0, 0);
+	t = ts_get(&tid);
+	if (!t)
+		return 0;
+	t->now0 = bpf_ktime_get_ns();
+	bpf_usdt_arg(ctx, 0, (long *)&t->arg[0]);
+	bpf_usdt_arg(ctx, 1, (long *)&t->arg[1]);
+	bpf_usdt_arg(ctx, 2, (long *)&t->arg[2]);
+	bpf_usdt_arg(ctx, 3, (long *)&t->arg[3]);
+	bpf_usdt_arg(ctx, 4, (long *)&t->arg[4]);
+	bpf_usdt_arg(ctx, 5, (long *)&t->arg[5]);
+	return block_begin(t, tid);
+}
+
+/* Only blocks whose block_start this tracer saw (gl.cur_seq set) get their other phases: a block
+ * in progress at attach, or one that started after gl.stopping, would be an END without a START. */
+static __always_inline int block_mark(struct pt_regs *ctx, __u32 phase)
+{
+	__u32 tid = (__u32)bpf_get_current_pid_tgid();
+	struct rec_block *r;
+
+	if (!gl.cur_seq)
+		return 0;
+	r = block_rec(tid, phase);
+	if (!r)
+		return 0;
+	bpf_usdt_arg(ctx, 0, (long *)&r->seq);
+	bpf_ringbuf_submit(r, rb_flags());
 	return 0;
 }
 
 SEC("usdt")
-int BPF_USDT(pipeasio_block_after_live, __u64 seq)
+int pipeasio_block_before_live(struct pt_regs *ctx)
 {
-	__u64 pt = bpf_get_current_pid_tgid();
-
-	stat_inc(ST_HIT_BLOCK_AFTER_LIVE);
-	if (!pid_traced(pt >> 32))
-		return 0;
-	emit_block((__u32)pt, bpf_ktime_get_ns(), PHASE_AFTER_LIVE, seq, 0, 0, 0, 0, 0, 0);
-	return 0;
+	hit(HIT_BLOCK_BEFORE_LIVE);
+	return block_mark(ctx, PHASE_BEFORE_LIVE);
 }
 
 SEC("usdt")
-int BPF_USDT(pipeasio_block_end, __u64 seq, __u32 flags, __u32 missed)
+int pipeasio_block_after_live(struct pt_regs *ctx)
 {
-	__u64 pt = bpf_get_current_pid_tgid();
-	__u32 pid = pt >> 32, tid = (__u32)pt;
-	struct global *g;
-	__u64 now;
-
-	stat_inc(ST_HIT_BLOCK_END);
-	if (!pid_traced(pid))
-		return 0;
-	g = gl_get();
-	if (!g)
-		return 0;
-	now = bpf_ktime_get_ns();
-	emit_block(tid, now, PHASE_BLOCK_END, seq, g->block_start_ts, g->deadline_ns, g->nframes, g->rate,
-		   flags, missed);
-	g->last_seq = seq;
-	g->cur_seq = 0;
-	return 0;
+	hit(HIT_BLOCK_AFTER_LIVE);
+	return block_mark(ctx, PHASE_AFTER_LIVE);
 }
 
 SEC("usdt")
-int BPF_USDT(pipeasio_cycle_start, __u64 clock_nsec, __u64 next_nsec, __u32 duration, __u64 position,
-	     __u32 cycle_flags)
+int pipeasio_block_end(struct pt_regs *ctx)
 {
-	__u64 pt = bpf_get_current_pid_tgid();
-	__u32 pid = pt >> 32, tid = (__u32)pt;
-	const struct cfg *c;
-	const struct global *g;
-	struct inflight *f;
-	__u64 now, seq;
-	__u16 fl = 0;
+	__u32 tid = (__u32)bpf_get_current_pid_tgid();
+	struct rec_block *r;
 
-	stat_inc(ST_HIT_CYCLE_START);
-	if (!pid_traced(pid))
+	hit(HIT_BLOCK_END);
+	if (!gl.cur_seq)        /* see block_mark */
 		return 0;
-	c = cfg_get();
-	g = gl_get();
-	if (!c || !g)
-		return 0;
-	now = bpf_ktime_get_ns();
-	emit_block(tid, now, PHASE_CYCLE_START, position, clock_nsec, next_nsec, duration, 0, cycle_flags, 0);
-	seq = assoc_seq(g, tid, now, &fl);
-	if (c->no_exit) {
-		/* --no-exit: like every other entry, count at entry instead of pushing an in-flight
-		 * entry that nothing may pop (the data-loop thread's stack would fill up) */
-		agg_add(now, seq, tid, KIND_CYCLE, fl, 0, 0, 0, 0, 0);
-		return 0;
-	}
-	f = inflight_get(tid, true);
-	if (f)
-		inflight_push(f, KIND_CYCLE, fl, 0, 0, now, seq);
-	return 0;
-}
-
-SEC("usdt")
-int BPF_USDT(pipeasio_cycle_end, __u32 missed, __u32 delivered)
-{
-	__u64 pt = bpf_get_current_pid_tgid();
-	__u32 pid = pt >> 32, tid = (__u32)pt;
-	const struct cfg *c;
-	const struct global *g;
-	struct inflight *f;
-	__u64 now, joined = 0;
-	int i;
-
-	stat_inc(ST_HIT_CYCLE_END);
-	if (!pid_traced(pid))
-		return 0;
-	c = cfg_get();
-	g = gl_get();
-	if (!c || !g)
-		return 0;
-	now = bpf_ktime_get_ns();
-	f = inflight_get(tid, false);
-	if (f) {
-		i = inflight_find(f, KIND_CYCLE, 0, false);
-		if (i >= 0) {
-			struct inflight_ent *e = &f->s[i & (INFLIGHT_DEPTH - 1)];
-
-			/* a block that started inside this cycle owns the cycle */
-			if (g->block_start_ts >= e->ts) {
-				joined = g->cur_seq ? g->cur_seq : g->last_seq;
-				if (joined) {
-					e->seq = joined;
-					e->flags &= (__u16)~(AGGF_WINDOW | AGGF_BETWEEN_BLOCKS);
-				}
-			}
-			complete_event(c, tid, f, i, now, 0, 0, 0);
+	r = block_rec(tid, PHASE_BLOCK_END);
+	if (r) {
+		bpf_usdt_arg(ctx, 0, (long *)&r->seq);
+		bpf_usdt_arg(ctx, 1, (long *)&r->a[0]);   /* flags */
+		bpf_usdt_arg(ctx, 2, (long *)&r->a[1]);   /* missed */
+		if (r->seq == gl.cur_seq) {               /* gl describes this block: rebuild data */
+			r->a[2] = gl.block_start_ts;
+			r->a[3] = gl.deadline_ns;
+			r->a[4] = (__u64)gl.nframes | ((__u64)gl.rate << 32);
 		}
+		gl.last_seq = r->seq;
+		bpf_ringbuf_submit(r, rb_flags());
+	} else {
+		gl.last_seq = gl.cur_seq;
 	}
-	emit_block(tid, now, PHASE_CYCLE_END, joined, 0, 0, 0, 0, delivered, missed);
+	gl.cur_seq = 0;
+	return 0;
+}
+
+SEC("usdt")
+int pipeasio_cycle_start(struct pt_regs *ctx)
+{
+	__u32 tid = (__u32)bpf_get_current_pid_tgid();
+	struct rec_block *r;
+	struct tstate *t;
+
+	hit(HIT_CYCLE_START);
+	t = ts_get(&tid);
+	if (t)
+		t->cycle_ts = bpf_ktime_get_ns();
+	r = block_rec(tid, PHASE_CYCLE_START);
+	if (!r)
+		return 0;
+	if (t)
+		r->h.ts = t->cycle_ts;
+	/* clock_nsec, next_nsec, duration, position, cycle_flags */
+	bpf_usdt_arg(ctx, 0, (long *)&r->a[0]);
+	bpf_usdt_arg(ctx, 1, (long *)&r->a[1]);
+	bpf_usdt_arg(ctx, 2, (long *)&r->a[2]);
+	bpf_usdt_arg(ctx, 3, (long *)&r->a[3]);
+	bpf_usdt_arg(ctx, 4, (long *)&r->a[4]);
+	bpf_ringbuf_submit(r, rb_flags());
+	return 0;
+}
+
+SEC("usdt")
+int pipeasio_cycle_end(struct pt_regs *ctx)
+{
+	__u32 tid = (__u32)bpf_get_current_pid_tgid();
+	struct rec_block *r;
+	struct tstate *t;
+
+	hit(HIT_CYCLE_END);
+	t = bpf_map_lookup_elem(&tstate, &tid);
+	r = block_rec(tid, PHASE_CYCLE_END);
+	if (!r)
+		return 0;
+	if (t && t->cycle_ts) {
+		r->a[2] = t->cycle_ts;
+		/* a block that started inside this cycle owns the cycle */
+		if (gl.block_start_ts >= t->cycle_ts)
+			r->seq = gl.cur_seq ? gl.cur_seq : gl.last_seq;
+	}
+	bpf_usdt_arg(ctx, 0, (long *)&r->a[0]);       /* missed */
+	bpf_usdt_arg(ctx, 1, (long *)&r->a[1]);       /* delivered */
+	bpf_ringbuf_submit(r, rb_flags());
 	return 0;
 }
 
 /* ------------------------------------------------------------------------
  * NTSync (kernel side, no Wine patch): waits via ntsync_char_ioctl, wakes via
- * ntsync_obj_ioctl.  Three attachment variants share these two helpers.
+ * ntsync_obj_ioctl.  Three attachment variants share these helpers.
  * ---------------------------------------------------------------------- */
-static __always_inline int ntsync_wait_enter(__u32 cmd, __u64 parm)
+static __noinline int ntsync_wait_enter(__u32 cmd, __u64 parm)
 {
 	__u64 pt = bpf_get_current_pid_tgid();
-	__u32 pid = pt >> 32, tid = (__u32)pt;
-	const struct cfg *c;
-	const struct global *g;
-	struct nt_wait_args wa;
-	struct inflight *f;
-	__u64 now, seq;
-	__u32 id;
-	__u16 fl = 0;
+	__u32 key = (__u32)(pt >> 32);
+	struct inflight_ent *e;
+	struct nt_wait_args *wa;
+	struct tstate *t;
+	__u32 d;
 
-	/* kernel-side probes fire for every process: count the traced ones only (the cost of the
-	 * others shows in the program's run_cnt / run_time_ns) */
-	if (!pid_traced(pid))
+	/* kernel-side probes fire for every process: only the traced ones count */
+	if (!pid_traced(&key))
 		return 0;
-	stat_inc(ST_HIT_NTSYNC_WAIT);
-	c = cfg_get();
-	g = gl_get();
-	if (!c || !g)
-		return 0;
-	if (!tid_wanted(c, g, tid)) {
-		stat_inc(ST_FILTERED);
+	cnt(CT_NTSYNC_WAIT_HITS);
+	key = (__u32)pt;
+	if (!tid_wanted(&key)) {
+		cnt(CT_FILTERED);
 		return 0;
 	}
-	if (bpf_probe_read_user(&wa, sizeof(wa), (const void *)parm)) {
-		wa.count = 0xff;
-		wa.alert = 0;
+	t = ts_get(&key);
+	if (!t)
+		return 0;
+	wa = (struct nt_wait_args *)t->wa;
+	if (bpf_probe_read_user(wa, sizeof(*wa), (const void *)parm)) {
+		wa->count = 0xff;
+		wa->alert = 0;
 	}
-	id = NTSYNC_WAIT_ID(cmd == NTSYNC_IOC_WAIT_ALL, wa.alert, wa.count);
-	now = bpf_ktime_get_ns();
-	seq = assoc_seq(g, tid, now, &fl);
-	if (c->no_exit) {
-		agg_add(now, seq, tid, KIND_NTSYNC_WAIT, fl, id, 0, 0, 0, 0);
+	if (CFG.no_exit) {
+		agg_count(&t->ag, (__u32)pt, KIND_NTSYNC_WAIT, NTSYNC_WAIT_ID(cmd == NTSYNC_IOC_WAIT_ALL, wa->alert, wa->count));
 		return 0;
 	}
-	f = inflight_get(tid, true);
-	if (f)
-		inflight_push(f, KIND_NTSYNC_WAIT, fl, id, parm, now, seq);
+	d = t->depth;
+	e = push_slot(t, (__u32)pt, KIND_NTSYNC_WAIT, bpf_ktime_get_ns(),
+		      NTSYNC_WAIT_ID(cmd == NTSYNC_IOC_WAIT_ALL, wa->alert, wa->count), parm);
+	if (!e)
+		return 0;
+	set_parent(t, e);
+	t->depth = d + 1;
 	return 0;
 }
 
 /* strict: the caller knows this return belongs to a WAIT_ANY/WAIT_ALL (fexit sees cmd), so a
- * miss is counted in ST_NTSYNC_UNMATCHED.  The kretprobe and sys_exit_ioctl variants see every
+ * miss is counted in CT_NTSYNC_UNMATCHED.  The kretprobe and sys_exit_ioctl variants see every
  * ntsync_char_ioctl / ioctl return and pass strict = false: they complete the wait only when it
- * is the innermost in-flight entry of the thread (a thread sits in one ioctl at a time) and
- * return silently otherwise. */
-static __always_inline int ntsync_wait_exit(long ret, bool strict)
+ * is the innermost in-flight entry of the thread and return silently otherwise. */
+static __noinline int ntsync_wait_exit(long ret, bool strict)
 {
 	__u64 pt = bpf_get_current_pid_tgid();
-	__u32 pid = pt >> 32, tid = (__u32)pt;
-	const struct cfg *c;
-	struct inflight *f;
-	__u16 extra = 0;
-	__u64 now;
-	__u32 waker;
+	__u32 key = (__u32)(pt >> 32);
+	struct inflight_ent *e;
+	struct nt_wait_args *wa;
+	struct tstate *t;
+	__u32 extra = 0;
 	int i;
 
-	if (!pid_traced(pid))
+	if (!pid_traced(&key))
 		return 0;
-	c = cfg_get();
-	if (!c)
+	key = (__u32)pt;
+	t = bpf_map_lookup_elem(&tstate, &key);
+	if (!t)
 		return 0;
-	f = inflight_get(tid, false);
-	if (!f)
-		return 0;
-	i = inflight_find(f, KIND_NTSYNC_WAIT, 0, false);
+	i = find_entry(t, KIND_NTSYNC_WAIT, 0, false);
 	if (i < 0) {
-		if (strict)
-			stat_inc(ST_NTSYNC_UNMATCHED);
-		return 0;
-	}
-	if (!strict && (__u32)i + 1 != f->depth)
-		return 0;
-	{
-		const struct inflight_ent *e = &f->s[i & (INFLIGHT_DEPTH - 1)];
-
-		if (ret == 0) {
-			struct nt_wait_args wa;
-			__u32 count = (e->id >> 8) & 0xff;
-
-			if (bpf_probe_read_user(&wa, sizeof(wa), (const void *)e->frame) == 0 &&
-			    (e->id & 2) && wa.index == count)
-				extra = AGGF_ALERTED;
-		} else if (ret == -WT_ETIMEDOUT) {
-			extra = AGGF_TIMEOUT;
-		} else if (ret == -WT_EINTR) {
-			extra = AGGF_INTR;
-		} else if (ret == -WT_EOWNERDEAD) {
-			extra = AGGF_OWNERDEAD;
-		} else {
-			extra = AGGF_ERROR;
+		if (strict) {
+			cnt(CT_NTSYNC_UNMATCHED);
+			anomaly(t, AN_UNMATCHED_EXIT, KIND_NTSYNC_WAIT, 0, 0, (__u32)ret);
 		}
-		now = bpf_ktime_get_ns();
-		waker = wait_waker(tid, e->ts);
+		return 0;
 	}
-	complete_event(c, tid, f, i, now, extra, (__s32)ret, waker);
+	if (!strict && (__u32)i + 1 != t->depth)
+		return 0;
+	e = &t->s[i & (INFLIGHT_DEPTH - 1)];
+	if (ret == 0) {
+		wa = (struct nt_wait_args *)t->wa;
+		if ((e->id & 2) && bpf_probe_read_user(wa, sizeof(*wa), (const void *)e->frame) == 0 &&
+		    wa->index == ((e->id >> 8) & 0xff))
+			extra = AGGF_ALERTED;
+	} else if (ret == -WT_ETIMEDOUT) {
+		extra = AGGF_TIMEOUT;
+	} else if (ret == -WT_EINTR) {
+		extra = AGGF_INTR;
+	} else if (ret == -WT_EOWNERDEAD) {
+		extra = AGGF_OWNERDEAD;
+	} else {
+		extra = AGGF_ERROR;
+	}
+	complete(t, (__u32)pt, (__u32)i, extra, (__s32)ret);
 	return 0;
 }
 
@@ -1012,27 +1226,68 @@ static __always_inline __u32 wake_id(__u32 cmd)
 	}
 }
 
-static __always_inline int ntsync_wake(__u32 cmd)
+/* drill-down record of a point event (an NTSync wake: no duration) whose association and
+ * timestamp agg_count just left in t->ag; parent = the innermost open syscall / unix call */
+static __noinline int emit_point_event(struct tstate *t, __u32 tid, __u32 kind, __u32 id)
+{
+	struct rec_event *r;
+	__u32 d = t->depth;
+	int i;
+
+	r = bpf_ringbuf_reserve(&rb, sizeof(*r), 0);
+	if (!r) {
+		cnt(CT_RB_DROP_EVENT);
+		return 0;
+	}
+	r->h.type = REC_EVENT;
+	r->h.len = sizeof(*r);
+	r->h.tid = tid;
+	r->h.ts = bpf_ktime_get_ns();
+	r->seq = t->ag.key.seq;
+	r->entry_ts = r->h.ts;
+	r->stack_ts = 0;
+	r->aux = 0;
+	r->id = id;
+	r->pid_ = 0;
+	r->kind = (__u8)kind;
+	r->pkind = 0;
+	r->flags = t->ag.key.flags;
+	r->status = 0;
+	r->waker_tid = 0;
+	r->pad = 0;
+#pragma unroll
+	for (i = 0; i < INFLIGHT_DEPTH; i++) {
+		if ((__u32)i < d && (t->s[i].kind == KIND_SYSCALL || t->s[i].kind == KIND_UNIXCALL)) {
+			r->pkind = t->s[i].kind;
+			r->pid_ = t->s[i].id;
+		}
+		if ((__u32)i < d && t->s[i].sampled)
+			r->stack_ts = t->s[i].ts;
+	}
+	bpf_ringbuf_submit(r, rb_flags());
+	return 0;
+}
+
+static __noinline int ntsync_wake(__u32 cmd)
 {
 	__u64 pt = bpf_get_current_pid_tgid();
-	__u32 pid = pt >> 32, tid = (__u32)pt;
-	const struct global *g;
-	__u64 now, seq;
+	__u32 key = (__u32)(pt >> 32);
+	struct tstate *t;
 	__u32 id;
-	__u16 fl = 0;
 
 	id = wake_id(cmd);
 	if (!id)
 		return 0;
-	if (!pid_traced(pid))
+	if (!pid_traced(&key))
 		return 0;
-	stat_inc(ST_HIT_NTSYNC_WAKE);
-	g = gl_get();
-	if (!g)
+	cnt(CT_NTSYNC_WAKE_HITS);
+	key = (__u32)pt;
+	t = ts_get(&key);
+	if (!t)
 		return 0;
-	now = bpf_ktime_get_ns();
-	seq = assoc_seq(g, tid, now, &fl);
-	agg_add(now, seq, tid, KIND_NTSYNC_WAKE, fl, id, 0, 0, 0, 0);
+	agg_point(t, (__u32)pt, KIND_NTSYNC_WAKE, id);
+	if (CFG.mode == MODE_DRILLDOWN)
+		emit_point_event(t, (__u32)pt, KIND_NTSYNC_WAKE, id);
 	return 0;
 }
 
@@ -1109,29 +1364,15 @@ int tp_sys_exit_ioctl(struct trace_event_raw_sys_exit *ctx)
 }
 
 /* ------------------------------------------------------------------------
- * scheduler
+ * scheduler (tp_btf: non-preemptible, recursion-guarded)
  * ---------------------------------------------------------------------- */
-static __always_inline struct sched_ent *sched_get(__u32 tid, bool create)
-{
-	struct sched_ent *s = bpf_map_lookup_elem(&sched, &tid);
-
-	if (s || !create)
-		return s;
-	{
-		struct sched_ent z = {};
-
-		bpf_map_update_elem(&sched, &tid, &z, BPF_NOEXIST);
-	}
-	return bpf_map_lookup_elem(&sched, &tid);
-}
-
-static __always_inline void emit_offcpu(__u32 tid, __u64 now, __u64 off_ts, __u64 run_delay, __u32 waker)
+static __noinline int emit_offcpu(__u32 tid, __u64 now, __u64 off_ts, __u64 run_delay, __u32 waker)
 {
 	struct rec_offcpu *r = bpf_ringbuf_reserve(&rb, sizeof(*r), 0);
 
 	if (!r) {
-		stat_inc(ST_RINGBUF_DROP);
-		return;
+		cnt(CT_RB_DROP_OTHER);
+		return 0;
 	}
 	r->h.type = REC_OFFCPU;
 	r->h.len = sizeof(*r);
@@ -1141,132 +1382,133 @@ static __always_inline void emit_offcpu(__u32 tid, __u64 now, __u64 off_ts, __u6
 	r->on_ts = now;
 	r->run_delay_ns = run_delay;
 	r->waker_tid = waker;
+	r->pad = 0;
 	bpf_ringbuf_submit(r, rb_flags());
+	return 0;
+}
+
+static __noinline int switch_out(struct tstate *t, __u32 tid, __u64 now, __u32 prev_state)
+{
+	if (t->on_ts) {
+		assoc_into(&t->sg.key.seq, &t->sg.key.flags, tid, now);
+		agg_add(&t->sg, now, t->sg.key.seq, tid, KIND_ONCPU, t->sg.key.flags, 0, now - t->on_ts, 0, 0, 0);
+	}
+	t->on_ts = 0;
+	t->off_ts = now;
+	assoc_into(&t->off_seq, &t->off_flags, tid, now);
+	if (prev_state == 0)
+		t->off_flags |= AGGF_PREEMPTED;   /* still runnable */
+	t->wake_ts = 0;
+	t->waker_tid = 0;
+	return 0;
+}
+
+static __noinline int switch_in(struct tstate *t, __u32 tid, __u64 now)
+{
+	__u64 off, rd;
+	int i;
+
+	if (t->off_ts) {
+		off = now - t->off_ts;
+		if (t->off_flags & AGGF_PREEMPTED)
+			rd = off;
+		else
+			rd = t->wake_ts > t->off_ts ? now - t->wake_ts : 0;
+		agg_add(&t->sg, now, t->off_seq, tid, KIND_OFFCPU, t->off_flags, t->waker_tid, off, rd, rd,
+			t->waker_tid);
+#pragma unroll
+		for (i = 0; i < INFLIGHT_DEPTH; i++) {
+			if ((__u32)i < t->depth)
+				t->s[i].off_ns += off;
+		}
+		if (CFG.mode == MODE_DRILLDOWN && off >= CFG.offcpu_min_ns)
+			emit_offcpu(tid, now, t->off_ts, rd, t->waker_tid);
+		t->off_ts = 0;
+	}
+	t->on_ts = now;
+	return 0;
+}
+
+/* A thread past exit_signals() (PF_EXITING) is about to reach, or has passed,
+ * on_sched_process_exit, which deletes its state: the scheduler programs only update an existing
+ * entry then, never create one (its final switches recreated it, and nothing deleted it again). */
+#define WT_PF_EXITING 0x00000004u     /* include/linux/sched.h */
+#define WT_TASK_DEAD  0x00000080u
+
+static __always_inline bool task_exiting(struct task_struct *p)
+{
+	return (p->flags & WT_PF_EXITING) || p->exit_state;
 }
 
 SEC("tp_btf/sched_switch")
 int BPF_PROG(on_sched_switch, bool preempt, struct task_struct *prev, struct task_struct *next,
 	     unsigned int prev_state)
 {
-	const struct cfg *c;
-	const struct global *g;
-	struct sched_ent *s;
-	__u32 ptgid, ptid, ntgid, ntid;
-	__u64 now;
+	__u32 key;
+	struct tstate *t;
+	__u64 now = bpf_ktime_get_ns();
 
 	(void)preempt;
-	stat_inc(ST_HIT_SCHED_SWITCH);
-	c = cfg_get();
-	g = gl_get();
-	if (!c || !g)
-		return 0;
-	now = bpf_ktime_get_ns();
-
-	ptgid = prev->tgid;
-	ptid = prev->pid;
-	if (pid_traced(ptgid)) {
-		s = sched_get(ptid, true);
-		if (s) {
-			__u16 fl = 0;
-
-			if (s->on_ts) {
-				__u64 on = now - s->on_ts;
-				__u64 seq = assoc_seq(g, ptid, now, &fl);
-
-				agg_add(now, seq, ptid, KIND_ONCPU, fl, 0, on, 0, 0, 0);
-				fl = 0;
-			}
-			s->on_ts = 0;
-			s->off_ts = now;
-			s->off_seq = assoc_seq(g, ptid, now, &fl);
-			if (prev_state == 0)
-				fl |= AGGF_PREEMPTED;   /* still runnable */
-			s->off_flags = fl;
-			s->wake_ts = 0;
-			s->waker_tid = 0;
+	key = prev->tgid;
+	if (pid_traced(&key)) {
+		key = prev->pid;
+		if ((prev_state & WT_TASK_DEAD) || prev->exit_state) {
+			/* past on_sched_process_exit (exit_notify / do_task_dead): the last switch-outs */
+			bpf_map_delete_elem(&tstate, &key);
+		} else {
+			t = task_exiting(prev) ? bpf_map_lookup_elem(&tstate, &key) : ts_get(&key);
+			if (t)
+				switch_out(t, key, now, prev_state);
 		}
 	}
-
-	ntgid = next->tgid;
-	ntid = next->pid;
-	if (pid_traced(ntgid)) {
-		s = sched_get(ntid, true);
-		if (s) {
-			if (s->off_ts) {
-				__u64 off = now - s->off_ts;
-				__u64 rd;
-				struct inflight *f;
-
-				if (s->off_flags & AGGF_PREEMPTED)
-					rd = off;
-				else
-					rd = (s->wake_ts > s->off_ts) ? now - s->wake_ts : 0;
-				agg_add(now, s->off_seq, ntid, KIND_OFFCPU, s->off_flags, s->waker_tid, off, rd, rd,
-					s->waker_tid);
-				f = bpf_map_lookup_elem(&inflight, &ntid);
-				if (f) {
-					int i;
-
-#pragma unroll
-					for (i = 0; i < INFLIGHT_DEPTH; i++) {
-						if (i < f->depth)
-							f->s[i].off_ns += off;
-					}
-				}
-				if (c->mode == MODE_DRILLDOWN && off >= c->offcpu_min_ns)
-					emit_offcpu(ntid, now, s->off_ts, rd, s->waker_tid);
-				s->off_ts = 0;
-			}
-			s->on_ts = now;
-		}
+	key = next->tgid;
+	if (pid_traced(&key)) {
+		key = next->pid;
+		t = task_exiting(next) ? bpf_map_lookup_elem(&tstate, &key) : ts_get(&key);
+		if (t)
+			switch_in(t, key, now);
 	}
 	return 0;
 }
 
 static __always_inline int sched_waking_common(struct task_struct *p, bool irq)
 {
-	const struct cfg *c;
-	struct sched_ent *s;
-	__u32 wtgid, wtid, waker_tid, waker_pid;
+	__u32 key = p->tgid, waker_tid, waker_pid;
+	struct rec_wake *r;
+	struct tstate *t;
 	__u64 now, cur;
 
-	stat_inc(ST_HIT_SCHED_WAKING);
-	wtgid = p->tgid;
-	wtid = p->pid;
-	if (!pid_traced(wtgid))
+	if (!pid_traced(&key))
 		return 0;
-	c = cfg_get();
-	if (!c)
-		return 0;
-	s = sched_get(wtid, true);
-	if (!s)
+	key = p->pid;
+	t = task_exiting(p) ? bpf_map_lookup_elem(&tstate, &key) : ts_get(&key);
+	if (!t)
 		return 0;
 	now = bpf_ktime_get_ns();
 	cur = bpf_get_current_pid_tgid();
 	waker_tid = (__u32)cur;
 	waker_pid = cur >> 32;
-	if (irq || waker_tid == wtid) {
+	if (irq || waker_tid == key) {
 		/* interrupt context (timers, I/O completion): `current` is only the interrupted task */
 		waker_tid = 0;
 		waker_pid = 0;
 	}
-	s->wake_ts = now;
-	s->waker_tid = waker_tid;
-	s->last_wake_ts = now;
-	s->last_waker = waker_tid;
-	s->wakeups++;
-	if (c->mode == MODE_DRILLDOWN) {
-		struct rec_wake *r = bpf_ringbuf_reserve(&rb, sizeof(*r), 0);
-
+	t->wake_ts = now;
+	t->waker_tid = waker_tid;
+	t->last_wake_ts = now;
+	t->last_waker = waker_tid;
+	t->wakeups++;
+	if (CFG.mode == MODE_DRILLDOWN) {
+		r = bpf_ringbuf_reserve(&rb, sizeof(*r), 0);
 		if (!r) {
-			stat_inc(ST_RINGBUF_DROP);
+			cnt(CT_RB_DROP_OTHER);
 			return 0;
 		}
 		r->h.type = REC_WAKE;
 		r->h.len = sizeof(*r);
 		r->h.tid = (__u32)cur;
 		r->h.ts = now;
-		r->wakee_tid = wtid;
+		r->wakee_tid = key;
 		r->waker_pid = waker_pid;
 		r->waker_tid = waker_tid;
 		if (irq)
@@ -1310,159 +1552,203 @@ int BPF_PROG(on_sched_waking_irq, struct task_struct *p)
 /* ------------------------------------------------------------------------
  * task lifecycle: fork follow, thread names, exits
  * ---------------------------------------------------------------------- */
-static __always_inline void emit_task(__u16 type, __u32 tid, __u64 now, __u32 pid, __u32 ppid, __u32 ptid,
-				      __u32 flags, struct task_struct *src)
+static __always_inline struct rec_task *task_rec(__u16 type, __u32 tid, __u32 pid, __u32 ppid, __u32 ptid,
+						 __u32 flags)
 {
 	struct rec_task *r = bpf_ringbuf_reserve(&rb, sizeof(*r), 0);
 
 	if (!r) {
-		stat_inc(ST_RINGBUF_DROP);
-		return;
+		cnt(CT_RB_DROP_OTHER);
+		return NULL;
 	}
 	r->h.type = type;
 	r->h.len = sizeof(*r);
 	r->h.tid = tid;
-	r->h.ts = now;
+	r->h.ts = bpf_ktime_get_ns();
 	r->pid = pid;
 	r->parent_pid = ppid;
 	r->parent_tid = ptid;
 	r->flags = flags;
-	if (src)
-		BPF_CORE_READ_STR_INTO(&r->comm, src, comm);
-	else
-		__builtin_memset(r->comm, 0, sizeof(r->comm));
-	bpf_ringbuf_submit(r, rb_flags());
+	r->unmatched = 0;
+	r->first_exit = 0;
+	r->abandoned = 0;
+	r->overflow = 0;
+	r->open_at_exit = 0;
+	r->never_returned = 0;
+	return r;
 }
 
 SEC("tp_btf/sched_process_fork")
 int BPF_PROG(on_sched_process_fork, struct task_struct *parent, struct task_struct *child)
 {
-	__u32 ppid = parent->tgid, ptid = parent->pid;
-	__u32 cpid, ctid;
+	__u32 key = parent->tgid;
+	struct rec_task *r;
+	__u8 *one;
 
-	if (!pid_traced(ppid))
+	if (!pid_traced(&key))
 		return 0;
-	cpid = child->tgid;
-	ctid = child->pid;
-	if (cpid != ppid) {
-		__u8 one = 1;
-
-		/* new process: trace it kernel-side at once; user space re-attaches the USDTs */
-		bpf_map_update_elem(&pids, &cpid, &one, BPF_ANY);
-		emit_task(REC_FORK, ctid, bpf_ktime_get_ns(), cpid, ppid, ptid, 0, child);
+	if (child->tgid != parent->tgid) {
+		/* new process: trace it kernel-side at once (the value pointer is the parent's own
+		 * pids entry, 1); user space attaches its USDT probes */
+		one = bpf_map_lookup_elem(&pids, &key);
+		key = child->tgid;
+		if (one)
+			bpf_map_update_elem(&pids, &key, one, BPF_ANY);
+		r = task_rec(REC_FORK, child->pid, child->tgid, parent->tgid, parent->pid, 0);
 	} else {
-		emit_task(REC_THREAD, ctid, bpf_ktime_get_ns(), cpid, ppid, ptid, 0, child);
+		r = task_rec(REC_THREAD, child->pid, child->tgid, parent->tgid, parent->pid, 0);
 	}
+	if (!r)
+		return 0;
+	BPF_CORE_READ_STR_INTO(&r->comm, child, comm);
+	bpf_ringbuf_submit(r, rb_flags());
 	return 0;
 }
 
 SEC("tp_btf/sched_process_exit")
 int BPF_PROG(on_sched_process_exit, struct task_struct *p, bool group_dead)
 {
-	__u32 pid = p->tgid, tid = p->pid;
-	struct inflight *f;
+	__u32 key = p->tgid, tid = p->pid;
+	struct rec_task *r;
+	struct tstate *t;
 
-	if (!pid_traced(pid))
+	if (!pid_traced(&key))
 		return 0;
-	f = bpf_map_lookup_elem(&inflight, &tid);
-	if (f) {
-		if (f->depth)
-			stat_add(ST_ABANDONED_ENTRY, f->depth);
-		bpf_map_delete_elem(&inflight, &tid);
+	r = task_rec(REC_EXIT, tid, key, 0, 0, group_dead ? 1 : 0);
+	if (r)
+		__builtin_memset(r->comm, 0, sizeof(r->comm));
+	key = tid;
+	t = bpf_map_lookup_elem(&tstate, &key);
+	if (t) {
+		/* the thread's last calls (NtTerminateThread/Process) never return: open, not abandoned */
+		if (t->depth && t->depth <= INFLIGHT_DEPTH) {
+			t->open_at_exit += t->depth;
+			cnt_add(CT_OPEN_AT_EXIT, t->depth);
+		}
+		if (r) {
+			r->unmatched = t->unmatched;
+			r->first_exit = t->first_exit;
+			r->abandoned = t->abandoned;
+			r->overflow = t->overflow;
+			r->open_at_exit = t->open_at_exit;
+			r->never_returned = t->never_returned;
+		}
+		bpf_map_delete_elem(&tstate, &key);
 	}
-	bpf_map_delete_elem(&sched, &tid);
-	bpf_map_delete_elem(&tids, &tid);
-	if (group_dead)
-		bpf_map_delete_elem(&pids, &pid);
-	emit_task(REC_EXIT, tid, bpf_ktime_get_ns(), pid, 0, 0, group_dead ? 1 : 0, NULL);
+	bpf_map_delete_elem(&tids, &key);
+	if (group_dead) {
+		key = p->tgid;
+		bpf_map_delete_elem(&pids, &key);
+	}
+	if (r)
+		bpf_ringbuf_submit(r, rb_flags());
 	return 0;
 }
 
 SEC("tp_btf/task_rename")
 int BPF_PROG(on_task_rename, struct task_struct *task, const char *comm)
 {
-	__u32 pid = task->tgid;
+	__u32 key = task->tgid;
 	struct rec_name *r;
 
-	if (!pid_traced(pid))
+	if (!pid_traced(&key))
 		return 0;
 	r = bpf_ringbuf_reserve(&rb, sizeof(*r), 0);
 	if (!r) {
-		stat_inc(ST_RINGBUF_DROP);
+		cnt(CT_RB_DROP_OTHER);
 		return 0;
 	}
 	r->h.type = REC_NAME;
 	r->h.len = sizeof(*r);
 	r->h.tid = task->pid;
 	r->h.ts = bpf_ktime_get_ns();
-	r->pid = pid;
+	r->pid = key;
 	bpf_probe_read_kernel_str(r->comm, sizeof(r->comm), comm);
 	bpf_ringbuf_submit(r, rb_flags());
 	return 0;
 }
 
 /* ------------------------------------------------------------------------
- * --mode sample: cpu-clock perf sampling (per CPU, pid-filtered here)
+ * --mode sample: cpu-clock perf sampling (per CPU, pid-filtered here); the record is
+ * filled in place from the interrupted registers
  * ---------------------------------------------------------------------- */
 SEC("perf_event")
 int on_perf_sample(struct bpf_perf_event_data *ctx)
 {
 	__u64 pt = bpf_get_current_pid_tgid();
-	__u32 pid = pt >> 32, tid = (__u32)pt;
-	const struct cfg *c;
-	const struct global *g;
-	__u64 regs[20];
-	__u64 now, seq, cs;
-	__u16 fl = 0;
+	__u32 key = (__u32)(pt >> 32);
+	struct rec_stack *r;
+	struct pt_regs *u;
+	__u64 now;
+	__u32 got = 0;
 	bool user;
 
-	if (!pid_traced(pid))
+	if (!pid_traced(&key))
 		return 0;
-	c = cfg_get();
-	g = gl_get();
-	if (!c || !g)
+	key = (__u32)pt;
+	if (!tid_wanted(&key))
 		return 0;
-	stat_inc(ST_HIT_PERF_SAMPLE);
-	if (!tid_wanted(c, g, tid))
+	r = bpf_ringbuf_reserve(&rb, sizeof(struct rec_stack) + SB, 0);
+	if (!r) {
+		cnt(CT_STACK_DROP);
 		return 0;
+	}
 	now = bpf_ktime_get_ns();
-	cs = ctx->regs.csx;
-	user = (cs & 3) == 3;
+	user = (ctx->regs.csx & 3) == 3;
 	if (user) {
-		regs[0] = ctx->regs.ax;   regs[1] = ctx->regs.bx;   regs[2] = ctx->regs.cx;
-		regs[3] = ctx->regs.dx;   regs[4] = ctx->regs.si;   regs[5] = ctx->regs.di;
-		regs[6] = ctx->regs.r8;   regs[7] = ctx->regs.r9;   regs[8] = ctx->regs.r10;
-		regs[9] = ctx->regs.r11;  regs[10] = ctx->regs.r12; regs[11] = ctx->regs.r13;
-		regs[12] = ctx->regs.r14; regs[13] = ctx->regs.r15; regs[14] = ctx->regs.ip;
-		regs[15] = cs;            regs[16] = ctx->regs.flags; regs[17] = ctx->regs.sp;
-		regs[18] = ctx->regs.ssx; regs[19] = ctx->regs.bp;
+		r->regs[0] = ctx->regs.ax;   r->regs[1] = ctx->regs.bx;   r->regs[2] = ctx->regs.cx;
+		r->regs[3] = ctx->regs.dx;   r->regs[4] = ctx->regs.si;   r->regs[5] = ctx->regs.di;
+		r->regs[6] = ctx->regs.r8;   r->regs[7] = ctx->regs.r9;   r->regs[8] = ctx->regs.r10;
+		r->regs[9] = ctx->regs.r11;  r->regs[10] = ctx->regs.r12; r->regs[11] = ctx->regs.r13;
+		r->regs[12] = ctx->regs.r14; r->regs[13] = ctx->regs.r15; r->regs[14] = ctx->regs.ip;
+		r->regs[15] = ctx->regs.csx; r->regs[16] = ctx->regs.flags; r->regs[17] = ctx->regs.sp;
+		r->regs[18] = ctx->regs.ssx; r->regs[19] = ctx->regs.bp;
 	} else {
 		/* kernel-mode sample (thread inside a syscall): the user registers at syscall entry */
-		struct task_struct *t = bpf_get_current_task_btf();
-		struct pt_regs *u = (struct pt_regs *)bpf_task_pt_regs(t);
-
-		if (!u)
+		u = (struct pt_regs *)bpf_task_pt_regs(bpf_get_current_task_btf());
+		if (!u) {
+			bpf_ringbuf_discard(r, BPF_RB_NO_WAKEUP);
 			return 0;
-		regs[0] = BPF_CORE_READ(u, ax);   regs[1] = BPF_CORE_READ(u, bx);
-		regs[2] = BPF_CORE_READ(u, cx);   regs[3] = BPF_CORE_READ(u, dx);
-		regs[4] = BPF_CORE_READ(u, si);   regs[5] = BPF_CORE_READ(u, di);
-		regs[6] = BPF_CORE_READ(u, r8);   regs[7] = BPF_CORE_READ(u, r9);
-		regs[8] = BPF_CORE_READ(u, r10);  regs[9] = BPF_CORE_READ(u, r11);
-		regs[10] = BPF_CORE_READ(u, r12); regs[11] = BPF_CORE_READ(u, r13);
-		regs[12] = BPF_CORE_READ(u, r14); regs[13] = BPF_CORE_READ(u, r15);
-		regs[14] = BPF_CORE_READ(u, ip);  regs[15] = BPF_CORE_READ(u, csx);
-		regs[16] = BPF_CORE_READ(u, flags); regs[17] = BPF_CORE_READ(u, sp);
-		regs[18] = BPF_CORE_READ(u, ssx); regs[19] = BPF_CORE_READ(u, bp);
+		}
+		r->regs[0] = BPF_CORE_READ(u, ax);   r->regs[1] = BPF_CORE_READ(u, bx);
+		r->regs[2] = BPF_CORE_READ(u, cx);   r->regs[3] = BPF_CORE_READ(u, dx);
+		r->regs[4] = BPF_CORE_READ(u, si);   r->regs[5] = BPF_CORE_READ(u, di);
+		r->regs[6] = BPF_CORE_READ(u, r8);   r->regs[7] = BPF_CORE_READ(u, r9);
+		r->regs[8] = BPF_CORE_READ(u, r10);  r->regs[9] = BPF_CORE_READ(u, r11);
+		r->regs[10] = BPF_CORE_READ(u, r12); r->regs[11] = BPF_CORE_READ(u, r13);
+		r->regs[12] = BPF_CORE_READ(u, r14); r->regs[13] = BPF_CORE_READ(u, r15);
+		r->regs[14] = BPF_CORE_READ(u, ip);  r->regs[15] = BPF_CORE_READ(u, csx);
+		r->regs[16] = BPF_CORE_READ(u, flags); r->regs[17] = BPF_CORE_READ(u, sp);
+		r->regs[18] = BPF_CORE_READ(u, ssx); r->regs[19] = BPF_CORE_READ(u, bp);
 	}
-	seq = assoc_seq(g, tid, now, &fl);
-	{
-		struct stack_req q = {
-			.ts = now, .seq = seq, .frame = regs[19], .rsp = regs[17], .rip = regs[14], .regs = regs,
-			.tid = tid, .id = user ? 0 : 1, .kind = KIND_PERF,
-			.nbytes = clamp_stack_bytes(c->stack_bytes),
-		};
-
-		emit_stack(&q);
+	r->h.type = REC_STACK;
+	r->h.tid = key;
+	r->h.ts = now;
+	r->seq = gl.cur_seq ? gl.cur_seq : (WINDOW_BIT | (now / WINDOW_NS));
+	r->frame = r->regs[19];
+	r->rsp = r->regs[17];
+	r->rip = r->regs[14];
+	r->id = user ? 0 : 1;
+	r->pid = (__u32)(pt >> 32);
+	r->kind = KIND_PERF;
+	r->pad8 = 0;
+	r->pad32 = 0;
+	if (r->rsp) {
+		if (bpf_probe_read_user(r->bytes, SB, (const void *)r->rsp) == 0)
+			got = SB;
+		else if (bpf_probe_read_user(r->bytes, SB / 2, (const void *)r->rsp) == 0)
+			got = SB / 2;
+		else if (bpf_probe_read_user(r->bytes, SB / 4, (const void *)r->rsp) == 0)
+			got = SB / 4;
 	}
+	if (!got) {
+		bpf_ringbuf_discard(r, BPF_RB_NO_WAKEUP);
+		cnt(CT_STACK_READ_FAIL);
+		return 0;
+	}
+	r->nbytes = (__u16)got;
+	r->h.len = (__u16)(sizeof(struct rec_stack) + got);
+	bpf_ringbuf_submit(r, rb_flags());
+	cnt(CT_STACKS);
 	return 0;
 }

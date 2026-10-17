@@ -9,11 +9,15 @@
 #   wine-trace run    --duration S  <start options>
 #   wine-trace status --out DIR
 #
-# Backend: the bpftrace prototype profiler/tracer/wine-trace.bt (default, --proto) whose event
-# lines profiler/tracer/reduce.py joins offline into blocks.jsonl, threads.jsonl, summary.json
-# (and events.jsonl in drilldown).  The libbpf tracer profiler/tracer/build/wine-trace is opt-in
-# (--libbpf or WINE_TRACE_BACKEND=libbpf) until its USDT programs fit the 64-byte stack budget:
-# the loader refuses to attach without --unsafe-private-stack (profiler/tracer/BUILD.md).
+# Backend: the libbpf tracer profiler/tracer/build/wine-trace when it is built (make -C
+# profiler/tracer) AND its stack self-check passes (`wine-trace --self-check` with the same
+# options: every uprobe/USDT program must run on the kernel stack, never on the kernel's per-CPU
+# private stack, which preemptible uprobe programs corrupt; profiler/tracer/BUILD.md); otherwise
+# the bpftrace prototype profiler/tracer/wine-trace.bt, whose event lines
+# profiler/tracer/reduce.py joins offline into blocks.jsonl, threads.jsonl, summary.json (and
+# events.jsonl in drilldown).  The reason for a fallback is printed and kept in tracer.json
+# (backend_reason).  --libbpf / --proto (or WINE_TRACE_BACKEND=libbpf|bpftrace) force a backend;
+# a forced libbpf start still fails when the loader's own self-check refuses to attach (exit 2).
 # --allow-private-stack: trace even when a multi-thread USDT program of the bpftrace script runs on
 # a per-CPU private stack (events can mix; recorded in tracer.json, a bench-report confounder).
 #
@@ -53,8 +57,13 @@ out=""
 pids=()
 run_id=""
 mode="summary"
-use_libbpf=0
-[ "${WINE_TRACE_BACKEND:-}" != libbpf ] || use_libbpf=1
+# backend: auto (libbpf when built and its self-check passes, else bpftrace) | libbpf | bpftrace
+case "${WINE_TRACE_BACKEND:-auto}" in
+    libbpf) backend_request=libbpf ;;
+    bpftrace|proto) backend_request=bpftrace ;;
+    *) backend_request=auto ;;
+esac
+backend_reason=""
 allow_private_stack=0
 ntsync=1
 sched=""
@@ -99,8 +108,8 @@ parse_args()
             --pid) [ "$#" -ge 2 ] || usage; pids+=("$2"); shift 2 ;;
             --run-id) [ "$#" -ge 2 ] || usage; run_id="$2"; shift 2 ;;
             --mode) [ "$#" -ge 2 ] || usage; mode="$2"; shift 2 ;;
-            --proto) use_libbpf=0; shift ;;
-            --libbpf) use_libbpf=1; shift ;;
+            --proto) backend_request=bpftrace; shift ;;
+            --libbpf) backend_request=libbpf; shift ;;
             --allow-private-stack) allow_private_stack=1; shift ;;
             --no-ntsync) ntsync=0; shift ;;
             --sched) sched=1; shift ;;
@@ -458,9 +467,27 @@ if fields.get("clock_before_ns") and fields.get("clock_after_ns"):
         "boottime_ns": int(fields.get("clock_boottime_ns") or 0) or None,
         "ok": fields.get("clock_ok") == "1",
     }
+stack_check = None
+check_path = os.path.join(out, "stack-check.json")
+if fields.get("backend") == "libbpf" and os.path.isfile(check_path):
+    try:
+        with open(check_path, encoding="utf-8") as handle:
+            stack_check = json.load(handle)
+    except ValueError:
+        stack_check = None
+if isinstance(stack_check, dict):
+    # the libbpf loader's own report replaces this at stop
+    if not fields.get("private_stack_programs"):
+        fields["private_stack_programs"] = ",".join(stack_check.get("private_stack_programs") or [])
+    if not fields.get("private_stack_risky"):
+        fields["private_stack_risky"] = ",".join(
+            p.get("name", "") for p in stack_check.get("programs", [])
+            if p.get("preemptible") and p.get("stack") != "kernel-stack")
 data = {
     "version": fields.get("version", "wine-trace/1"),
     "backend": fields.get("backend", "bpftrace"),
+    "backend_reason": fields.get("backend_reason") or None,
+    "stack_check": stack_check,
     "mode": fields.get("mode", "summary"),
     "sample_rate": 1,
     "attach": attach,
@@ -548,12 +575,60 @@ daemonise()
     shift 3
     rm -f -- "$pidfile"
     setsid bash -c 'printf "%s\n" "$$" > "$1"; shift; exec "$@"' _ "$pidfile" "$@" > "$stdout_file" 2> "$stderr_file" < /dev/null &
+    daemon_job=$!     # our child (setsid does not fork here): `wait` gives its status if it dies early
     local deadline=$((SECONDS + 10))
     while [ "$SECONDS" -lt "$deadline" ]; do
         [ -s "$pidfile" ] && return 0
         sleep 0.05
     done
     die "daemon did not write $pidfile"
+}
+
+# Options that change which BPF programs the libbpf loader loads (and so their stack frames):
+# the self-check runs with exactly these, then the loader checks again before it attaches.
+libbpf_load_args()
+{
+    load_args=(--mode "$mode")
+    [ "$ntsync" -eq 1 ] || load_args+=(--ntsync off)
+    if [ "$sched" -eq 1 ]; then load_args+=(--sched on); else load_args+=(--sched off); fi
+    [ "$follow" -eq 1 ] || load_args+=(--no-follow)
+    # the loader verifies this ntdll.so's probe operands to pick its fast register path
+    [ -z "${ntdll:-}" ] || load_args+=(--ntdll "$ntdll")
+}
+
+# Sets $backend (libbpf | bpftrace) and $backend_reason (printed, kept in tracer.json).
+choose_backend()
+{
+    local rc=0
+    case "$backend_request" in
+        bpftrace)
+            backend=bpftrace
+            backend_reason="forced (--proto or WINE_TRACE_BACKEND=bpftrace)"
+            ;;
+        libbpf)
+            [ -x "$libbpf_bin" ] || die "--libbpf: $libbpf_bin is not built (make -C profiler/tracer)"
+            backend=libbpf
+            backend_reason="forced (--libbpf or WINE_TRACE_BACKEND=libbpf); the loader checks its stack before attaching"
+            ;;
+        *)
+            if [ ! -x "$libbpf_bin" ]; then
+                backend=bpftrace
+                backend_reason="libbpf tracer not built ($libbpf_bin missing: make -C profiler/tracer)"
+            else
+                libbpf_load_args
+                "$libbpf_bin" --self-check "${load_args[@]}" > "$out/stack-check.json" 2> "$out/stack-check.err" || rc=$?
+                if [ "$rc" -eq 0 ]; then
+                    backend=libbpf
+                    backend_reason="libbpf tracer built and its stack self-check passed (stack-check.json)"
+                else
+                    backend=bpftrace
+                    backend_reason="libbpf stack self-check failed with exit $rc (stack-check.err)"
+                    tail -n 25 "$out/stack-check.err" >&2 2>/dev/null || true
+                fi
+            fi
+            ;;
+    esac
+    log "backend: $backend: $backend_reason"
 }
 
 cmd_start()
@@ -573,24 +648,47 @@ cmd_start()
     snapshot_maps ""
     snapshot_tasks start
     local backend="bpftrace" started_ns tool_version script_name="" events_name=""
-    if [ "$use_libbpf" -eq 1 ]; then
-        [ -x "$libbpf_bin" ] || die "--libbpf: $libbpf_bin is not built (make -C profiler/tracer)"
-        backend="libbpf"
+    choose_backend
+    if [ "$backend" = libbpf ]; then
         tool_version="$("$libbpf_bin" --version 2>/dev/null | head -n 1 || true)"
-        local args=(--out "$out" --mode "$mode")
+        local args=(--out "$out")
         local pid
+        libbpf_load_args
+        args+=("${load_args[@]}")
         for pid in "${pids[@]}"; do args+=(--pid "$pid"); done
-        [ "$ntsync" -eq 1 ] || args+=(--ntsync off)
-        [ "$sched" -eq 1 ] && args+=(--sched on) || args+=(--sched off)
         [ -n "$run_id" ] && args+=(--run-id "$run_id")
-        log "backend: libbpf $libbpf_bin ${args[*]}"
-        started_ns="$(monotonic_ns)"
+        [ -z "$tables" ] || args+=(--tables "$tables")
+        log "backend: libbpf $libbpf_bin ${args[*]} ($backend_reason)"
+        clock_before_ns="$(monotonic_ns)"
         daemonise "$out/wine-trace.pid" "$out/wine-trace.stdout" "$out/wine-trace.stderr" "$libbpf_bin" "${args[@]}"
-        sleep 1
-        if ! tracer_alive; then
-            tail -n 20 "$out/wine-trace.stderr" >&2 2>/dev/null || true
+        # The loader prints "attached monotonic_start_ns=N ..." once its own stack self-check
+        # passed and every probe is attached; it exits 2 when the self-check refuses.
+        local deadline=$((SECONDS + attach_timeout)) rc=0
+        started_ns=""
+        while [ "$SECONDS" -lt "$deadline" ]; do
+            started_ns="$(sed -n 's/^attached monotonic_start_ns=\([0-9]*\).*$/\1/p' "$out/wine-trace.stdout" 2>/dev/null | head -n 1)"
+            [ -z "$started_ns" ] || break
+            if ! tracer_alive; then
+                wait "$daemon_job" 2>/dev/null || rc=$?
+                tail -n 30 "$out/wine-trace.stderr" >&2 2>/dev/null || true
+                rm -f -- "$out/wine-trace.pid"
+                [ "$rc" -ne 2 ] || die "libbpf tracer refused to attach: its stack self-check failed (exit 2, $out/wine-trace.stderr)"
+                die "libbpf tracer exited early (exit $rc, $out/wine-trace.stderr)"
+            fi
+            sleep 0.1
+        done
+        if [ -z "$started_ns" ]; then
+            stop_daemon "$(pidfile_pid)" || true
             rm -f -- "$out/wine-trace.pid"
-            die "libbpf tracer exited early ($out/wine-trace.stderr)"
+            die "libbpf tracer did not report attachment within ${attach_timeout}s ($out/wine-trace.stderr)"
+        fi
+        clock_after_ns="$(monotonic_ns)"
+        clock_boottime_ns="$(boottime_ns)"
+        if [ "$started_ns" -ge "$clock_before_ns" ] && [ "$started_ns" -le "$clock_after_ns" ]; then
+            clock_ok=1
+        else
+            clock_ok=0
+            log "warning: the loader's monotonic_start_ns=$started_ns is outside python's monotonic $clock_before_ns..$clock_after_ns"
         fi
         : > "$out/attach.txt"
     else
@@ -661,7 +759,8 @@ cmd_start()
     elif [ -n "$wine_version" ] && [ -f "$tracer_dir/tables/wine-$wine_version.json" ]; then
         table_name="wine-$wine_version.json"
     fi
-    write_tracer_json "version=$WINE_TRACE_VERSION" "backend=$backend" "mode=$mode" "started_monotonic_ns=$started_ns" \
+    write_tracer_json "version=$WINE_TRACE_VERSION" "backend=$backend" "backend_reason=$backend_reason" \
+        "mode=$mode" "started_monotonic_ns=$started_ns" \
         "run_id=$run_id" "pid_filter=$pid_filter" "wine_root=$wine_root" "wine_version=$wine_version" \
         "ntdll=$ntdll" "pipeasio=$pipeasio" "ntsync=$([ "$ntsync" -eq 1 ] && echo fentry || echo off)" \
         "sched=$sched" "follow=$follow" "tables=$table_name" "tool_version=$tool_version" \
@@ -832,23 +931,76 @@ cmd_stop()
         [ "$rc" -eq 0 ] || { update_tracer_json "tracer_exit=$tracer_exit"; chown_out; die "reduce.py failed with $rc"; }
         update_tracer_json "tracer_exit=$tracer_exit"
     else
-        update_tracer_json "stopped_monotonic_ns=$stopped_ns"
+        # The loader merges stopped_monotonic_ns, lost_events, probe_hits, tracer_exit=clean, ...
+        # into tracer.json as its last act; without them it did not finish.
+        if grep -q '"tracer_exit": *"clean"' "$out/tracer.json" 2>/dev/null && [ "$stop_signal" != KILL ]; then
+            tracer_exit="clean"
+            [ "$was_running" -eq 1 ] || tracer_exit="exited-before-stop"
+        elif [ "$stop_signal" = KILL ]; then
+            tracer_exit="killed"
+        elif grep -qE 'Segmentation fault|Aborted|core dumped|error:' "$out/wine-trace.stderr" 2>/dev/null; then
+            tracer_exit="crashed"
+        else
+            tracer_exit="no-end"
+        fi
+        if [ "$tracer_exit" != clean ]; then
+            log "warning: the libbpf tracer did not exit cleanly ($tracer_exit); see $out/wine-trace.stderr"
+            update_tracer_json "tracer_exit=$tracer_exit" "stopped_monotonic_ns=$stopped_ns"
+        elif [ "$was_running" -eq 0 ]; then
+            update_tracer_json "tracer_exit=$tracer_exit"
+        fi
         [ -f "$out/blocks.jsonl" ] || log "warning: the libbpf backend left no blocks.jsonl in $out"
     fi
     write_maps_json "$stopped_ns"
     if [ -f "$symbolize_py" ] && [ -f "$out/blocks.jsonl" ] && [ -f "$out/maps.json" ]; then
-        # symbolize.py (design B section 4) resolves stack windows; the prototype has none, so
-        # this only validates the pipeline, dumps Live's import table (imports.json) and seeds
-        # symcache.json.  blocks.jsonl stays as reduce.py wrote it (summary.json matches it);
-        # the symbolized copy is blocks.symbolized.jsonl.
-        log "symbolizing: python3 -I $symbolize_py --blocks blocks.jsonl --maps maps.json --out blocks.symbolized.jsonl"
-        python3 -I "$symbolize_py" --blocks "$out/blocks.jsonl" --maps "$out/maps.json" \
-            --out "$out/blocks.symbolized.jsonl" --symcache "$out/symcache.json" \
-            --imports-out "$out/imports.json" --quiet 2>> "$out/wine-trace.log" \
+        # symbolize.py (design B section 4) unwinds the stack windows.  blocks.jsonl stays as the
+        # tracer wrote it; the symbolized copy is blocks.symbolized.jsonl.  The prototype records
+        # no stack windows (this validates the pipeline, dumps Live's import table and seeds
+        # symcache.json); for the libbpf tracer it gives every crossing a caller apportioned
+        # from the samples and rewrites summary.json's call sites and hotspots per caller.
+        local sym_args=(--blocks "$out/blocks.jsonl" --maps "$out/maps.json" --out "$out/blocks.symbolized.jsonl"
+                        --symcache "$out/symcache.json" --imports-out "$out/imports.json" --quiet)
+        if [ "$backend" = libbpf ]; then
+            [ ! -f "$out/stacks.jsonl" ] || sym_args+=(--stacks "$out/stacks.jsonl")
+            [ ! -f "$out/summary.json" ] || sym_args+=(--summary "$out/summary.json")
+            # A drill-down events.jsonl holds every crossing (gigabytes per minute); its events keep
+            # their stack_ref into stacks.jsonl.  WINE_TRACE_SYMBOLIZE_EVENTS=1 also writes the
+            # symbolized copy (events.symbolized.jsonl, frames per sampled event).
+            if [ -f "$out/events.jsonl" ] && [ "${WINE_TRACE_SYMBOLIZE_EVENTS:-0}" = 1 ]; then
+                sym_args+=(--events "$out/events.jsonl" --events-out "$out/events.symbolized.jsonl")
+            fi
+        fi
+        log "symbolizing: python3 -I $symbolize_py ${sym_args[*]}"
+        python3 -I "$symbolize_py" "${sym_args[@]}" 2>> "$out/wine-trace.log" \
             || log "warning: symbolize.py failed (see $out/wine-trace.log); blocks keep placeholder callers"
     fi
     chown_out
-    log "stopped: out=$out stopped_monotonic_ns=$stopped_ns lost_extra=$lost_extra recursion_misses=${rmisses:-0} tracer_exit=${tracer_exit:-n/a}"
+    if [ "$backend" = bpftrace ]; then
+        log "stopped: out=$out stopped_monotonic_ns=$stopped_ns lost_extra=$lost_extra recursion_misses=${rmisses:-0} tracer_exit=${tracer_exit:-n/a}"
+    else
+        # the loader reads its own programs' recursion misses (they are part of its lost_events)
+        log "stopped: out=$out stopped_monotonic_ns=$stopped_ns $(libbpf_loss_of_tracer_json) tracer_exit=${tracer_exit:-n/a}"
+    fi
+}
+
+# "lost_events=N recursion_misses=M" from the libbpf loader's tracer.json ("?" when absent)
+libbpf_loss_of_tracer_json()
+{
+    python3 -I - "$out/tracer.json" <<'PY' 2>/dev/null || printf 'lost_events=? recursion_misses=?'
+import json
+import sys
+
+try:
+    with open(sys.argv[1], encoding="utf-8") as handle:
+        data = json.load(handle)
+except (OSError, ValueError):
+    data = {}
+if not isinstance(data, dict):
+    data = {}
+loss = data.get("loss") if isinstance(data.get("loss"), dict) else {}
+lost, misses = data.get("lost_events"), loss.get("recursion_misses")
+print("lost_events=%s recursion_misses=%s" % ("?" if lost is None else lost, "?" if misses is None else misses), end="")
+PY
 }
 
 # maps.json for symbolize.py: {"type":"maps","snapshots":[{"t":..,"pid":..,"text":..}]} from the

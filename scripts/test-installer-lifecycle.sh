@@ -1501,6 +1501,188 @@ wait "$helper_pid" "$unknown_pid" 2>/dev/null || true
     || fail "teardown polls instead of looking once (${helper_only_s}s, ${unknown_s}s)"
 ok "teardown looks once whoever holds the prefix (${helper_only_s}s, ${unknown_s}s)"
 
+# Scripted sessions (the profiler's suite, its state snapshot/restore and its
+# scripted quit) need the prefix idle as soon as Live has quit, so they end this
+# project's session helpers with the agents - by exact image name, and never while
+# a Live or a Max is in the prefix.  The stub wine below does what taskkill /f /im
+# does: it ends this prefix's processes whose image is one of the names.
+leftover_fixture()
+{
+    local base="$1"
+    mkdir -p "$base/runtime/bin" "$base/prefix" "$base/data/ableton-wine" "$base/run"
+    cp /bin/sleep "$base/runtime/bin/wine-client"
+    cat > "$base/runtime/bin/wine" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${ABLETON_TEST_LOG:?}"
+[ "${1:-}" = taskkill ] || exit 0
+shift
+images=()
+while [ $# -gt 0 ]; do
+    case "$1" in /im) images+=("$2"); shift 2 ;; *) shift ;; esac
+done
+for proc in /proc/[0-9]*; do
+    tr '\0' '\n' < "$proc/environ" 2>/dev/null | grep -Fxq "WINEPREFIX=$WINEPREFIX" || continue
+    a0="$(tr '\0' '\n' < "$proc/cmdline" 2>/dev/null | head -n 1)"
+    a0="${a0##*\\}"; a0="${a0##*/}"
+    for image in "${images[@]}"; do
+        if [ "$a0" = "$image" ]; then kill "${proc#/proc/}" 2>/dev/null || true; fi
+    done
+done
+exit 0
+EOF
+    for tool in wineserver wineboot winepath; do
+        printf '#!/bin/sh\nexit 0\n' > "$base/runtime/bin/$tool"
+    done
+    chmod +x "$base/runtime/bin/"*
+    printf 'registry\n' > "$base/prefix/system.reg"
+    printf 'helper\n' > "$base/data/ableton-wine/learnheal.exe"
+    : > "$base/wine.log"
+}
+# IMAGE: a stand-in Windows process of the fixture prefix; prints its pid
+leftover_standin()
+{
+    local base="$1" image="$2"
+    env WINEPREFIX="$base/prefix" bash -c 'exec -a "$1" "$2" 600' _ "$image" \
+        "$base/runtime/bin/wine-client" >/dev/null 2>&1 &
+    printf '%s\n' "$!"
+}
+# alive: running and not a zombie the test shell has not reaped yet
+standin_alive()
+{
+    local state
+    state="$(sed -n 's/^.*) \(.\).*/\1/p' "/proc/$1/stat" 2>/dev/null || true)"
+    [ -n "$state" ] && [ "$state" != Z ]
+}
+standin_reap()
+{
+    local pid
+    for pid in "$@"; do kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; done
+}
+cat > "$work/lifecycle-call" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+. "$here/lib/config.sh"
+ableton_config_init
+. "$here/lib/lifecycle.sh"
+"\$@"
+EOF
+chmod +x "$work/lifecycle-call"
+live_image='C:\ProgramData\Ableton\Live 12 Suite\Program\Ableton Live 12 Suite.exe'
+connector_image='C:\ProgramData\Ableton\Live 12 Suite\Resources\Extensions\WebConnector\Ableton Web Connector.exe'
+
+base="$(new_env teardown-helpers-stop)"
+leftover_fixture "$base"
+helper_pid="$(leftover_standin "$base" 'C:\learnheal.exe')"
+agent_pid="$(leftover_standin "$base" "$connector_image")"
+sleep 0.3
+rc=0
+run_isolated "$base" env ABLETON_WINE_ROOT="$base/runtime" ABLETON_WINEPREFIX="$base/prefix" \
+    ABLETON_SESSION_HELPERS=stop ABLETON_TEST_LOG="$base/wine.log" ABLETON_SESSION_LABEL="Ableton Live" \
+    "$work/lifecycle-call" ableton_session_teardown >"$base/out" 2>"$base/err" || rc=$?
+helper_left=0; agent_left=0
+standin_alive "$helper_pid" && helper_left=1
+standin_alive "$agent_pid" && agent_left=1
+standin_reap "$helper_pid" "$agent_pid"
+[ "$rc" -eq 0 ] || fail "the opt-in teardown failed (exit $rc): $(cat "$base/err")"
+[ "$helper_left" -eq 0 ] || fail "ABLETON_SESSION_HELPERS=stop leaves learnheal.exe running after the session"
+[ "$agent_left" -eq 0 ] || fail "the opt-in teardown leaves an agent whose image name has spaces"
+grep -qF '/im learnheal.exe' "$base/wine.log" \
+    || fail "the opt-in teardown does not end the helper by its exact image name"
+grep -qF '/im Ableton Web Connector.exe' "$base/wine.log" \
+    || fail "the opt-in teardown drops an agent from the stop"
+! grep -Eq 'unknown processes|will quit on its own|did not stop' "$base/err" \
+    || fail "the opt-in teardown reports a prefix it emptied: $(cat "$base/err")"
+ok "ABLETON_SESSION_HELPERS=stop ends learnheal.exe with the agents and leaves the prefix idle"
+
+# The opt-in still never reaches past a Live: the helper serves whichever Live is open.
+base="$(new_env teardown-helpers-stop-live)"
+leftover_fixture "$base"
+live_pid="$(leftover_standin "$base" "$live_image")"
+helper_pid="$(leftover_standin "$base" 'C:\learnheal.exe')"
+sleep 0.3
+run_isolated "$base" env ABLETON_WINE_ROOT="$base/runtime" ABLETON_WINEPREFIX="$base/prefix" \
+    ABLETON_SESSION_HELPERS=stop ABLETON_TEST_LOG="$base/wine.log" \
+    "$work/lifecycle-call" ableton_session_teardown "$base/runtime" "$base/prefix" 1 \
+    >"$base/out" 2>"$base/err" || true
+helper_left=0; live_left=0
+standin_alive "$helper_pid" && helper_left=1
+standin_alive "$live_pid" && live_left=1
+standin_reap "$helper_pid" "$live_pid"
+[ "$live_left" -eq 1 ] && [ "$helper_left" -eq 1 ] \
+    || fail "the opt-in teardown ended a helper (or Live) while a Live was running"
+! grep -qF 'learnheal.exe' "$base/wine.log" \
+    || fail "the opt-in teardown names the helper to taskkill while a Live is running"
+ok "the opt-in teardown leaves the helper to a Live that is still running"
+
+# ableton_prefix_settle: what state snapshot/restore and quit-live use.
+base="$(new_env settle-leftovers)"
+leftover_fixture "$base"
+helper_pid="$(leftover_standin "$base" 'C:\learnheal.exe')"
+agent_pid="$(leftover_standin "$base" "$connector_image")"
+sleep 0.3
+rc=0; start=$SECONDS
+held="$(run_isolated "$base" env ABLETON_WINE_ROOT="$base/runtime" ABLETON_WINEPREFIX="$base/prefix" \
+    ABLETON_TEST_LOG="$base/wine.log" "$work/lifecycle-call" \
+    ableton_prefix_settle "$base/runtime" "$base/prefix" 10 2>"$base/err")" || rc=$?
+settle_s=$((SECONDS - start))
+helper_left=0; agent_left=0
+standin_alive "$helper_pid" && helper_left=1
+standin_alive "$agent_pid" && agent_left=1
+standin_reap "$helper_pid" "$agent_pid"
+[ "$rc" -eq 0 ] && [ -z "$held" ] || fail "settle reports a prefix it emptied as held (exit $rc): $held"
+[ "$helper_left" -eq 0 ] && [ "$agent_left" -eq 0 ] || fail "settle leaves learnheal.exe or an agent running"
+[ "$(grep -c '^taskkill' "$base/wine.log")" -eq 1 ] || fail "settle stops the leftovers more than once: $(cat "$base/wine.log")"
+[ "$settle_s" -le 5 ] || fail "settle waits out its deadline on a prefix that came down (${settle_s}s)"
+ok "ableton_prefix_settle ends the agents and learnheal.exe by exact name and returns once idle (${settle_s}s)"
+
+base="$(new_env settle-unknown-holder)"
+leftover_fixture "$base"
+helper_pid="$(leftover_standin "$base" 'C:\learnheal.exe')"
+other_pid="$(leftover_standin "$base" 'C:\some-daw.exe')"
+sleep 0.3
+rc=0
+held="$(run_isolated "$base" env ABLETON_WINE_ROOT="$base/runtime" ABLETON_WINEPREFIX="$base/prefix" \
+    ABLETON_TEST_LOG="$base/wine.log" "$work/lifecycle-call" \
+    ableton_prefix_settle "$base/runtime" "$base/prefix" 2 2>"$base/err")" || rc=$?
+helper_left=0; other_left=0
+standin_alive "$helper_pid" && helper_left=1
+standin_alive "$other_pid" && other_left=1
+standin_reap "$helper_pid" "$other_pid"
+[ "$rc" -eq 1 ] || fail "settle reports a prefix another program holds as idle (exit $rc)"
+[ "$other_left" -eq 1 ] || fail "settle ended a program it does not know"
+[ "$helper_left" -eq 0 ] || fail "settle leaves learnheal.exe beside another program"
+printf '%s\n' "$held" | grep -q 'some-daw.exe' || fail "settle does not name the program still holding the prefix: $held"
+! printf '%s\n' "$held" | grep -q 'learnheal' || fail "settle names a helper it ended as a holder: $held"
+ok "ableton_prefix_settle never ends another program, and names it"
+
+base="$(new_env settle-live-running)"
+leftover_fixture "$base"
+live_pid="$(leftover_standin "$base" "$live_image")"
+helper_pid="$(leftover_standin "$base" 'C:\learnheal.exe')"
+agent_pid="$(leftover_standin "$base" "$connector_image")"
+sleep 0.3
+rc=0
+held="$(run_isolated "$base" env ABLETON_WINE_ROOT="$base/runtime" ABLETON_WINEPREFIX="$base/prefix" \
+    ABLETON_TEST_LOG="$base/wine.log" "$work/lifecycle-call" \
+    ableton_prefix_settle "$base/runtime" "$base/prefix" 1 2>"$base/err")" || rc=$?
+alive=0
+for pid in "$live_pid" "$helper_pid" "$agent_pid"; do standin_alive "$pid" && alive=$((alive + 1)); done
+standin_reap "$live_pid" "$helper_pid" "$agent_pid"
+[ "$rc" -eq 1 ] || fail "settle reports a prefix with a running Live as idle (exit $rc)"
+[ "$alive" -eq 3 ] || fail "settle ended something while a Live was running"
+[ ! -s "$base/wine.log" ] || fail "settle starts taskkill while a Live is running: $(cat "$base/wine.log")"
+ok "ableton_prefix_settle touches nothing while a Live is in the prefix"
+
+base="$(new_env settle-idle)"
+leftover_fixture "$base"
+rc=0
+run_isolated "$base" env ABLETON_WINE_ROOT="$base/runtime" ABLETON_WINEPREFIX="$base/prefix" \
+    ABLETON_TEST_LOG="$base/wine.log" "$work/lifecycle-call" \
+    ableton_prefix_settle "$base/runtime" "$base/prefix" 5 >"$base/out" 2>"$base/err" || rc=$?
+[ "$rc" -eq 0 ] || fail "settle fails on an idle prefix (exit $rc)"
+[ ! -s "$base/wine.log" ] || fail "settle starts a Wine process in an idle prefix"
+ok "ableton_prefix_settle starts nothing in an idle prefix"
+
 # Every walker takes the prefix, so setup-prefix.sh inside its staging window
 # reports on the prefix it named rather than on the user's.  The wait itself was
 # always right; the /proc walk behind the progress tick was not.

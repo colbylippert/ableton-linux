@@ -1005,6 +1005,227 @@ class CLITests(unittest.TestCase):
                              ["Ableton Live 12 Trial.exe", "Serum.vst3", "ntdll.dll", "ntdll.so", "wow64.dll"])
 
 
+class CallerTests(unittest.TestCase):
+    """The per-crossing caller of the libbpf tracer's output (design B section 9)."""
+
+    KB = "kernelbase.dll!WaitForMultipleObjectsEx+0xe3"
+    LIVE1 = "Ableton Live 12 Trial.exe+0x1a2b3c4"
+    LIVE2 = "Ableton Live 12 Trial.exe+0x2000"
+
+    def test_site_caller_skips_the_stub_and_ends_at_the_application(self):
+        frames = ["ntdll.dll!NtWaitForMultipleObjects+0x14", self.KB, self.LIVE1, self.LIVE2]
+        classes = ["wine", "wine", "app", "app"]
+        self.assertEqual(S.site_caller(frames, classes, "syscall"), self.KB + S.CHAIN_SEP + self.LIVE1)
+        # a unix call's first frame is the PE caller itself
+        self.assertEqual(S.site_caller(frames[1:], classes[1:], "unixcall"), self.KB + S.CHAIN_SEP + self.LIVE1)
+        # no application frame within CALLER_MAX_FRAMES: the first CHAIN_DEPTH frames after the stub
+        wine_only = ["ntdll.dll!NtDelayExecution+0x14"] + ["kernelbase.dll!f%d+0x1" % i for i in range(6)]
+        self.assertEqual(S.site_caller(wine_only, ["wine"] * 7, "syscall"),
+                         S.CHAIN_SEP.join(wine_only[1:1 + S.CHAIN_DEPTH]))
+        self.assertEqual(S.site_caller(["ntdll.dll!NtClose+0x14"], ["wine"], "syscall"), "ntdll.dll!NtClose+0x14")
+        self.assertEqual(S.site_caller([], [], "syscall"), "unresolved")
+
+    def test_site_caller_walks_past_runtime_frames(self):
+        # std::condition_variable::wait: kernelbase -> msvcp140.dll (prefix system32) -> Live, 5 frames deep
+        frames = ["ntdll.dll!NtWaitForAlertByThreadId+0x14", "ntdll.dll!RtlWaitOnAddress+0x16d",
+                  "ntdll.dll!RtlSleepConditionVariableSRW+0x14b", "kernelbase.dll!SleepConditionVariableSRW+0x2c",
+                  "msvcp140.dll+0x122e8", self.LIVE1, self.LIVE2]
+        classes = ["wine", "wine", "wine", "wine", "runtime", "app", "app"]
+        self.assertEqual(S.site_caller(frames, classes, "syscall"), S.CHAIN_SEP.join(frames[1:6]))
+        # the old classification (msvcp140 as an application frame) stopped there
+        self.assertEqual(S.site_caller(frames, classes[:4] + ["app"] + classes[5:], "syscall"),
+                         S.CHAIN_SEP.join(frames[1:5]))
+        # every runtime frame extends the walk by one; without an application frame: CHAIN_DEPTH frames
+        deep = frames[:4] + ["ucrtbase.dll+0x10", "vcruntime140.dll+0x20", "msvcp140.dll+0x30", self.LIVE1]
+        self.assertEqual(S.site_caller(deep, classes[:4] + ["runtime"] * 3 + ["app"], "syscall"),
+                         S.CHAIN_SEP.join(deep[1:]))
+        self.assertEqual(S.site_caller(frames[:5], classes[:5], "syscall"),
+                         S.CHAIN_SEP.join(frames[1:1 + S.CHAIN_DEPTH]))
+
+    def test_frame_class_runtime_modules(self):
+        def mod(path, kind="pe64"):
+            return S.Module(path, 0x10000, 0x20000, kind, None, {"path": path})
+        prefix = "/home/u/.wine-ableton/drive_c/windows/system32/"
+        self.assertEqual(S.frame_class(mod(prefix + "msvcp140.dll")), "runtime")
+        self.assertEqual(S.frame_class(mod(prefix + "d3dcompiler_47.dll")), "runtime")      # any native system32 PE
+        self.assertEqual(S.frame_class(mod("/opt/app/api-ms-win-crt-runtime-l1-1-0.dll")), "runtime")
+        self.assertEqual(S.frame_class(mod("/opt/app/VCRUNTIME140_1.dll")), "runtime")
+        self.assertEqual(S.frame_class(mod("/x/drive_c/ProgramData/Ableton/Live 12 Trial/Program/"
+                                           "Ableton Live 12 Trial.exe")), "app")
+        self.assertEqual(S.frame_class(mod("/x/drive_c/Program Files/Common Files/VST3/Serum.vst3")), "app")
+        # Wine's own builtin msvcp140 stays a Wine frame; ELF and unknown are unchanged
+        self.assertEqual(S.frame_class(mod("/rt/lib/wine/x86_64-windows/msvcp140.dll")), "wine")
+        self.assertEqual(S.frame_class(mod("/rt/lib/wine/x86_64-unix/ntdll.so", "elf")), "unix")
+        self.assertEqual(S.frame_class(None), "unknown")
+
+    def test_apportion_keeps_integer_counts_and_the_mean(self):
+        parts = S.apportion(10, 1000, {"A": 2, "B": 1})
+        self.assertEqual([(c, n, t) for c, n, t, _ in parts], [("A", 7, 700), ("B", 3, 300)])
+        self.assertAlmostEqual(parts[0][3], 2 / 3)
+        # one event, two equally likely callers: it goes to one of them (ties by name), with all its time
+        self.assertEqual([(c, n, t) for c, n, t, _ in S.apportion(1, 500, {"B": 1, "A": 1})], [("A", 1, 500)])
+        # the parts always add up
+        parts = S.apportion(7, 1001, {"A": 1, "B": 1, "C": 1})
+        self.assertEqual(sum(p[1] for p in parts), 7)
+        self.assertEqual(sum(p[2] for p in parts), 1001)
+        self.assertEqual(S.apportion(3, 30, {}), [(S.UNSAMPLED, 3, 30, 1.0)])
+
+    def index(self):
+        index = S.CallerIndex()
+        # ref 1: NtWaitForSingleObject on tid 4301, 3 samples over the run; ref 2: same id, other caller, 1 sample
+        index.add_stack({"ref": 1, "kind": "syscall", "id": "NtWaitForSingleObject", "tid": 4301,
+                         "tids": [[4301, 3]]}, {"site": "A"})
+        index.add_stack({"ref": 2, "kind": "syscall", "id": "NtWaitForSingleObject", "tid": 4301,
+                         "tids": [[4301, 1]]}, {"site": "B"})
+        index.add_stack({"ref": 3, "kind": "syscall", "id": "NtClose", "tid": 4302}, {"site": "C"})
+        return index
+
+    def test_assign_callers_block_run_parent(self):
+        index = self.index()
+        block = {"seq": 5, "stacks": [{"ref": 2, "tid": 4301, "kind": "syscall", "id": "NtWaitForSingleObject"}],
+                 "crossings": [
+                     {"tid": 4301, "kind": "syscall", "id": "NtWaitForSingleObject", "n": 4, "total_ns": 400,
+                      "max_ns": 150, "woken_by": {"tid": 9, "role": "audio_worker", "count": 4}},
+                     {"tid": 4302, "kind": "syscall", "id": "NtClose", "n": 2, "total_ns": 20, "max_ns": 10},
+                     {"tid": 4301, "kind": "ntsync_wait", "id": "WAIT_ANY", "n": 4, "total_ns": 300, "max_ns": 100,
+                      "parent": {"kind": "syscall", "id": "NtWaitForSingleObject"}},
+                     {"tid": 4303, "kind": "syscall", "id": "NtYieldExecution", "n": 1, "total_ns": 5, "max_ns": 5},
+                     {"tid": 4301, "kind": "syscall", "id": "NtClose", "caller": "recorded", "n": 1, "total_ns": 1}]}
+        stats = S.new_caller_stats()
+        out = S.assign_callers(block, index, stats)
+        by = {(c["kind"], c["id"], c["tid"]): c for c in out}
+        # the block's own sample decides (B), not the run's majority (A)
+        wait = by[("syscall", "NtWaitForSingleObject", 4301)]
+        self.assertEqual((wait["caller"], wait["caller_basis"], wait["n"], wait["total_ns"]), ("B", "block", 4, 400))
+        self.assertNotIn("caller_share", wait)
+        # no sample of NtClose on 4302 in this block: the run's (C)
+        close = by[("syscall", "NtClose", 4302)]
+        self.assertEqual((close["caller"], close["caller_basis"]), ("C", "run"))
+        # nested wait: the enclosing syscall's samples in this block
+        nested = by[("ntsync_wait", "WAIT_ANY", 4301)]
+        self.assertEqual((nested["caller"], nested["caller_basis"]), ("B", "parent-block"))
+        self.assertEqual(by[("syscall", "NtYieldExecution", 4303)]["caller"], S.UNSAMPLED)
+        self.assertEqual(by[("syscall", "NtClose", 4301)]["caller"], "recorded")     # kept as recorded
+        self.assertEqual(stats["by_basis"], {"block": 4, "run": 2, "parent-block": 4, "none": 1})
+        # without the block sample the run's distribution splits the aggregate 3:1
+        block["stacks"] = []
+        out = S.assign_callers(block, index, S.new_caller_stats())
+        parts = [c for c in out if c["kind"] == "syscall" and c["id"] == "NtWaitForSingleObject"]
+        self.assertEqual([(c["caller"], c["n"], c["total_ns"], c["caller_share"]) for c in parts],
+                         [("A", 3, 300, 0.75), ("B", 1, 100, 0.25)])
+        self.assertEqual([c["woken_by"]["count"] for c in parts], [3, 1])
+        nested = [c for c in out if c["kind"] == "ntsync_wait"]
+        self.assertEqual([(c["caller"], c["caller_basis"]) for c in nested], [("A", "parent-run"), ("B", "parent-run")])
+
+    def test_rank_call_sites_by_caller(self):
+        blocks = [
+            {"seq": 1, "late": True, "near_late": False, "slack_ns": -100000, "period_ns": 1333333, "crossings": [
+                {"tid": 1, "kind": "syscall", "id": "NtWait", "caller": "A", "n": 2, "total_ns": 300000, "max_ns": 200000},
+                {"tid": 1, "kind": "syscall", "id": "NtWait", "caller": "B", "n": 1, "total_ns": 100000, "max_ns": 100000}]},
+            {"seq": 2, "late": False, "near_late": False, "slack_ns": 900000, "period_ns": 1333333, "crossings": [
+                {"tid": 1, "kind": "syscall", "id": "NtWait", "caller": "B", "n": 5, "total_ns": 500000, "max_ns": 100000}]},
+        ]
+        sites, lost, attributed = S.rank_call_sites(blocks, 0.15)
+        self.assertEqual(lost, 300000)                     # 0.15 x 1333333 = 200000 near-late slack + 100000 late
+        self.assertEqual(attributed, 300000)
+        self.assertEqual([s["key"] for s in sites], ["syscall|NtWait|A", "syscall|NtWait|B"])
+        a, b = sites
+        self.assertEqual((a["late_blocks"], a["n_in_late_blocks"], a["total_ns_in_late_blocks"]), (1, 2, 300000))
+        self.assertEqual((b["n_all_blocks"], b["total_ns_all_blocks"], b["max_ns"]), (6, 600000, 100000))
+        self.assertAlmostEqual(a["share_of_lost_slack"], 0.75)
+
+    def test_lost_slack_goes_to_top_level_audio_crossings(self):
+        # one late block (lost = 200000 + 100000): an audio worker's wait (top level, 200000 ns) with the NTSync
+        # wait inside it (nested, 190000 ns), the callback's syscall (100000 ns) and an idle GUI wait (1 s)
+        wait = {"kind": "syscall", "id": "NtWaitForSingleObject", "caller": "W"}
+        blocks = [{"seq": 1, "late": True, "near_late": False, "slack_ns": -100000, "period_ns": 1333333, "crossings": [
+            dict(wait, tid=2, role="audio_worker", n=1, total_ns=200000, max_ns=200000),
+            {"tid": 2, "role": "audio_worker", "kind": "ntsync_wait", "id": "WAIT_ANY", "caller": "W", "n": 1,
+             "total_ns": 190000, "max_ns": 190000, "parent": {"kind": "syscall", "id": "NtWaitForSingleObject"}},
+            {"tid": 1, "role": "pipeasio_callback", "kind": "syscall", "id": "NtSetEvent", "caller": "S", "n": 2,
+             "total_ns": 100000, "max_ns": 60000},
+            {"tid": 3, "role": "main", "kind": "syscall", "id": "NtUserMsgWaitForMultipleObjectsEx", "caller": "G",
+             "n": 1, "total_ns": 1000000000, "max_ns": 1000000000}]}]
+        ranker = S.SiteRanker(0.15, lambda role: role in ("audio_worker", "pipeasio_callback"))
+        for block in blocks:
+            ranker.add(block)
+        self.assertEqual((ranker.lost_total, int(ranker.attributed_total)), (300000, 300000))
+        top = {s["key"]: s for s in ranker.ranked()}
+        self.assertEqual(sorted(top), ["syscall|NtSetEvent|S", "syscall|NtUserMsgWaitForMultipleObjectsEx|G",
+                                       "syscall|NtWaitForSingleObject|W"])
+        self.assertAlmostEqual(top["syscall|NtWaitForSingleObject|W"]["share_of_lost_slack"], 2 / 3, places=4)
+        self.assertAlmostEqual(top["syscall|NtSetEvent|S"]["share_of_lost_slack"], 1 / 3, places=4)
+        gui = top["syscall|NtUserMsgWaitForMultipleObjectsEx|G"]
+        self.assertEqual((gui["share_of_lost_slack"], gui["rank"], gui["late_blocks"]), (0.0, 1, 1))
+        nested = ranker.ranked_nested()
+        self.assertEqual([(s["key"], s["parent"], s["total_ns_in_late_blocks"]) for s in nested],
+                         [("ntsync_wait|WAIT_ANY|syscall:NtWaitForSingleObject|W",
+                           {"kind": "syscall", "id": "NtWaitForSingleObject"}, 190000)])
+        self.assertNotIn("share_of_lost_slack", nested[0])
+        # the default matcher is roles.toml's audio_roles
+        self.assertTrue(S.default_is_audio()("plugin:Serum.vst3"))
+        self.assertFalse(S.default_is_audio()("main"))
+
+    def test_split_hotspots_by_the_threads_callers(self):
+        index = self.index()
+        hot = [{"role": "live:MIDI", "kind": "syscall", "name": "NtWaitForSingleObject", "caller": "*", "n": 8,
+                "total_ns": 800, "by_tid": [[4301, 8, 800]]},
+               {"role": "live:Net", "kind": "server_req", "name": "select", "caller": "*", "n": 2, "total_ns": 50,
+                "parent": {"kind": "syscall", "id": "NtClose"}, "by_tid": [[4302, 2, 50]]}]
+        out = S.split_hotspots(hot, index)
+        self.assertEqual([(h["caller"], h["n"], h["total_ns"]) for h in out], [("A", 6, 600), ("B", 2, 200), ("C", 2, 50)])
+        self.assertEqual(out[2]["caller_basis"], "parent-run")
+        # reduce.py's hotspots (no by_tid) stay as they are
+        self.assertIs(S.split_hotspots([{"caller": "x"}], index)[0]["caller"], "x")
+
+    def test_cli_assigns_callers_and_rewrites_the_summary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _root, maps_path, _paths = CLITests().write_tree(tmp)
+            stacks = os.path.join(tmp, "stacks.jsonl")
+            with open(stacks, "w", encoding="utf-8") as fh:
+                fh.write(json.dumps({"type": "header", "monotonic_start_ns": 1}) + "\n")
+                fh.write(json.dumps({"type": "stack", "ref": 1, "t": 0.5, "tid": 4301, "pid": PID, "kind": "syscall",
+                                     "id": "NtWaitForSingleObject", "rip": NTDLL_BASE + STUB_WAIT + 0x14, "rsp": RSP0,
+                                     "regs": [0] * 19 + [RSP0 + 0x28], "stack_hex": main_window().hex(),
+                                     "samples": 2, "tids": [[4301, 2]]}) + "\n")
+            blocks = os.path.join(tmp, "blocks.jsonl")
+            with open(blocks, "w", encoding="utf-8") as fh:
+                fh.write(json.dumps({"type": "header", "monotonic_start_ns": 1}) + "\n")
+                fh.write(json.dumps({"seq": 1, "t_start": 0.4, "late": True, "near_late": False, "slack_ns": -5000,
+                                     "period_ns": 1333333,
+                                     "stacks": [{"ref": 1, "t": 0.5, "tid": 4301, "kind": "syscall",
+                                                 "id": "NtWaitForSingleObject"}],
+                                     "crossings": [{"tid": 4301, "role": "audio_worker", "kind": "syscall",
+                                                    "id": "NtWaitForSingleObject", "n": 3, "total_ns": 30000,
+                                                    "max_ns": 20000}]}) + "\n")
+            summary = os.path.join(tmp, "summary.json")
+            with open(summary, "w", encoding="utf-8") as fh:
+                json.dump({"thresholds": {"near_late_fraction": 0.15},
+                           "call_sites": [{"key": "syscall|NtWaitForSingleObject|*", "caller": "*"}],
+                           "hotspots_non_audio": [{"role": "live:MIDI", "kind": "syscall", "name": "NtWaitForSingleObject",
+                                                   "caller": "*", "n": 4, "total_ns": 40, "by_tid": [[4301, 4, 40]]}]}, fh)
+            out = os.path.join(tmp, "blocks.symbolized.jsonl")
+            self.assertEqual(S.main(["--blocks", blocks, "--stacks", stacks, "--maps", maps_path, "--out", out,
+                                     "--summary", summary, "--symcache", os.path.join(tmp, "symcache.json"),
+                                     "--quiet"]), 0)
+            with open(out, encoding="utf-8") as fh:
+                block = [json.loads(line) for line in fh][1]
+            crossing = block["crossings"][0]
+            self.assertEqual(crossing["caller"], "Ableton Live 12 Trial.exe+0x1040")
+            self.assertEqual(crossing["caller_basis"], "block")
+            self.assertEqual(block["stacks"][0]["site"], "Ableton Live 12 Trial.exe+0x1040")
+            with open(summary, encoding="utf-8") as fh:
+                s = json.load(fh)
+            self.assertEqual(s["call_sites"][0]["key"], "syscall|NtWaitForSingleObject|Ableton Live 12 Trial.exe+0x1040")
+            self.assertEqual(s["call_sites"][0]["late_blocks"], 1)
+            # the audio worker's crossing: all its 30000 ns of the block's 205000 ns of lost slack
+            self.assertEqual(s["call_sites"][0]["share_of_lost_slack"], round(30000 / 205000, 4))
+            self.assertEqual(s["nested_call_sites"], [])
+            self.assertEqual(s["hotspots_non_audio"][0]["caller"], "Ableton Live 12 Trial.exe+0x1040")
+            self.assertEqual(s["callers"]["events_by_basis"], {"block": 3})
+            self.assertTrue(s["symbolized"])
+
+
 class RolesTests(unittest.TestCase):
     ROLES_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "roles.toml")
 
