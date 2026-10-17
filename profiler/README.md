@@ -55,7 +55,7 @@ need no flags. `--list-phases` prints this table along with each phase's done-ma
 | 05 | `session` | packages | Plasma Login Manager (or SDDM) autologin, no lock/DPMS/suspend, inhibit unit, laptop lid policy, Wi-Fi power save off, `with-session-env` |
 | 06 | `audio` | packages | PipeWire clock (min-quantum 32, 48 kHz), `profiler-null` sink, the PipeASIO device (`--audio-device`: `builtin` = the speaker sink, muted), recorded as `audio_node=` |
 | 07 | `repo` | packages | branch `profiler`, `aceb236` ancestry, LF config, `bench/` restored and excluded |
-| 08 | `media` | – | Live 12 Trial installer + 3 slices, pinned sha256 |
+| 08 | `media` | – | Live 12 Trial installer (12.4.6) + 4 slices, pinned sha256 |
 | 09 | `build` | podman, repo, media | `./build.sh` (Wine + PipeASIO, rootless podman, ~1 h cold) under `build.lock`, then `scripts/build-audit.sh` |
 | 10 | `install` | build, session, audio | `scripts/installer.sh install` (runtime, prefix, Live 12; baremetal: `--power=performance --audio-buffer=64`), PipeASIO pointed at `audio_node` |
 | 11 | `plugins` | install | Dexed + K1v VST3 from `plugins.lock` |

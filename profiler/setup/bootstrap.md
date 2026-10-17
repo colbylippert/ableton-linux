@@ -83,8 +83,10 @@ scp (Get-ChildItem C:\src\AbletonLinux\AbletonInstaller\*).FullName ableton-lapt
 ssh ableton-laptop "bash -lc 'ls -l ~/Proprietary/ableton && sha256sum ~/Proprietary/ableton/*.exe'"
 ```
 
-Expected: `Ableton Live 12 Trial Installer.exe` (about 6.5 MB, sha256 starting
-`a2652ee454fcf788`) and `…-1.bin`, `…-2.bin`, `…-3.bin` (each over 1 GiB). Phase `media`
+Expected: Live 12.4.6's `Ableton Live 12 Trial Installer.exe` (about 6.6 MB, sha256
+starting `e4e334774046d861`) and `…-1.bin` … `…-4.bin` (the first three over 1 GiB,
+the last about 182 MB). Live 12.4.3 or newer is required: the canonical bench Sets
+were saved by 12.4.3 and older Live refuses them. Phase `media`
 checks this and refuses incomplete media. Never commit or redistribute these files.
 
 ## 4. Run the setup
