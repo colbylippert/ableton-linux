@@ -172,7 +172,7 @@ revert = critical ✗, others dim with no label until hovered).
 
 ## 4. Views
 
-All six views are default-exported components with the same props
+All seven views are default-exported components with the same props
 (`src/views/ViewProps.ts`):
 
 ```ts
@@ -252,6 +252,25 @@ list + table carry identity.
 |---|---|---|
 | `DataTable` (runs) | started (UTC), run id, tag, machine/hostname, environment `Badge`, structure/scenario, trace `Badge`, switches, trial/arm `Badge`, commit, duration, Sets; `selectable: { max: 2 }`; default sort started desc | `applyFilter` (machine `null` allowed here) |
 | `RunDelta` | `{ a: Run, b: Run }` → identity guard (`runDelta()` returns `{ ok: false, reason }` for trace-mode / virtualisation / structure-scenario / machine mismatch, rendered as a `.ribbon`) or a table: Set × metric, A, B, Δ (signed, positive = improvement, diverging cell bar), source column | `runDelta()` |
+
+### 4.7 Architecture — "how does the profiler measure Live, and how does code reach the laptop?"
+
+A static reference page: it reads neither the runs nor the filter, so its `TabDef` sets
+`filtered: false` and `App` hides the `FilterBar` on this tab.
+
+| Component | Props | Data |
+|---|---|---|
+| legend | trace point (diamond), audio path, call or data flow, control or lookup | — |
+| three figures | `FIGURES` in `src/views/Architecture.tsx`: runtime stack and trace points, one benchmark run, machines + build + agent loop; each a `.card` with the drawing (horizontal scroll inside the card under 1040 px, never the page) and a caption | `src/architecture/*.svg`, imported with `?raw` |
+| status table | `DataTable`: part, paths, state `Badge` (working → good, in progress → warning, written / planned → dim), note | `src/architecture/status.ts` (hand-maintained; bump `STATUS_AS_OF`) |
+
+The drawings are hand-written SVG with classes only: no inline colour, no `<style>`,
+`<script>` or `<foreignObject>`. `src/architecture/architecture.css` colours every class from
+the theme tokens (diamonds `--series-2`, audio path `--series-1`, layer bands mixed from
+`--text-primary` into `--surface-1`, status colours on dots only), so the drawings follow
+light / dark like the charts. Marker ids are unique per figure (`f1a`, `f2a`, …) because all
+three share one document. `Architecture.test.tsx` enforces these rules (no inline colour,
+every class styled, unique ids).
 
 ---
 
@@ -571,7 +590,8 @@ dark)')`) so a theme switch re-renders charts; jsdom tests get the same hex with
 - Header: title, counts (`N runs · M trials · K load warnings`), theme toggle
   (System / Light / Dark; stored as `profiler-dashboard.theme`, applied before first paint by
   the inline script in `index.html`). Dark is a selected palette, not an inverted one.
-- `FilterBar` row under the tabs (one row, wraps), then the panel. Views use `.grid`
+- `FilterBar` row under the tabs (one row, wraps; hidden on Architecture, which ignores the
+  filter), then the panel. Views use `.grid`
   (`auto-fit, minmax(280px, 1fr)`) for cards and `.grid-kpi` (`minmax(180px, 1fr)`) for tiles.
 - Cards: `--surface-1`, hairline border ring, 8 px radius, 16 px padding (12 px ≤ 480 px).
 - Exactly one hero figure per view (Overview only); 48 px (40 px on phones), proportional
@@ -620,8 +640,10 @@ nulls everywhere; ledger: T0007 keep, T0008 revert, one `tooling` line, one bad 
 Components (`src/components/*.test.tsx`, React 18 `act` + `react-dom/client`, no
 testing-library):
 
-- `App.test.tsx` (scaffold, exists): six tabs in order, default Overview, click + hash,
-  hash deep link, empty state vs counts, theme attribute.
+- `App.test.tsx` (scaffold, exists): seven tabs in order, default Overview, click + hash,
+  hash deep link, FilterBar hidden on Architecture, empty state vs counts, theme attribute.
+- `Architecture.test.tsx`: one labelled, captioned figure per drawing, status rows, unique
+  ids, no inline colour / style / script in the SVG sources, every SVG class styled.
 - `TrendChart`: renders one `<path>` per series, the baseline line and band only when
   provided, markers with status class, no legend for a single series and a legend for two,
   table twin lists every point with formatted values, nulls as `—`.

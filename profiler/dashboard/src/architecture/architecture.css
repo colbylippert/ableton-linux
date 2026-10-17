@@ -1,0 +1,293 @@
+/*
+ * Architecture view (DESIGN.md §4.7). The drawings in this directory carry classes only;
+ * every colour below is a token from src/theme.css, so they follow the light / dark choice
+ * like the charts do. Status colours sit on dots only, never on text.
+ */
+
+/* view-local tokens, derived from the theme */
+.view-architecture {
+  --arch-band-a: color-mix(in srgb, var(--text-primary) 3%, var(--surface-1));
+  --arch-band-b: color-mix(in srgb, var(--text-primary) 6%, var(--surface-1));
+  --arch-probe: var(--series-2);
+  --arch-audio: var(--series-1);
+  --arch-busy: var(--ord-before);
+  --arch-on-busy: var(--text-primary); /* dark ink on the light busy bar, in both modes */
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme='light']) .view-architecture {
+    --arch-on-busy: var(--page);
+  }
+}
+
+:root[data-theme='dark'] .view-architecture {
+  --arch-on-busy: var(--page);
+}
+
+/* ---------- legend, figures ---------- */
+
+.arch-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 20px;
+  margin: 0;
+  padding: 10px 12px;
+  list-style: none;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface-1);
+  color: var(--text-secondary);
+  font-size: 13px;
+}
+
+.arch-legend li {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.arch-legend svg {
+  flex: none;
+}
+
+.arch-legend .lg-probe {
+  fill: var(--arch-probe);
+}
+
+.arch-legend .lg-audio {
+  fill: none;
+  stroke: var(--arch-audio);
+  stroke-width: 3;
+}
+
+.arch-legend .lg-line,
+.arch-legend .lg-dash {
+  fill: none;
+  stroke: var(--text-secondary);
+  stroke-width: 1.5;
+}
+
+.arch-legend .lg-dash {
+  stroke-dasharray: 4 3;
+}
+
+.arch-legend .lg-head {
+  fill: var(--text-secondary);
+}
+
+.arch-figure {
+  margin: 0;
+}
+
+/* the drawing scrolls inside its card on narrow screens, never the page */
+.arch-scroll {
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+  scrollbar-width: thin;
+}
+
+.arch-scroll svg {
+  display: block;
+  width: 100%;
+  min-width: 1000px;
+  height: auto;
+}
+
+.arch-hint {
+  display: none;
+  margin: 0 0 8px;
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+@media (max-width: 1040px) {
+  .arch-hint {
+    display: block;
+  }
+}
+
+.arch-figure figcaption {
+  max-width: 110ch;
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid var(--grid);
+  color: var(--text-secondary);
+  font-size: 13px;
+}
+
+.arch-paths {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.arch-paths code {
+  font-family: var(--mono);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+/* ---------- diagram marks ---------- */
+
+.arch-svg {
+  color: var(--text-primary);
+  font-family: var(--font);
+}
+
+.arch-svg text {
+  fill: currentColor;
+  font-size: 12px;
+}
+
+.arch-svg .tt {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.arch-svg .ttm {
+  font-family: var(--mono);
+  font-size: 12.5px;
+  font-weight: 600;
+}
+
+.arch-svg .ts {
+  fill: var(--text-secondary);
+  font-size: 11px;
+}
+
+.arch-svg .tm {
+  font-family: var(--mono);
+  font-size: 11px;
+}
+
+.arch-svg .tmm,
+.arch-svg .tp,
+.arch-svg .tnum {
+  fill: var(--text-secondary);
+  font-family: var(--mono);
+  font-size: 11px;
+}
+
+.arch-svg .tb {
+  fill: var(--text-secondary);
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.09em;
+}
+
+.arch-svg .tonbar {
+  fill: var(--arch-on-busy);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.arch-svg .box {
+  fill: var(--surface-1);
+  stroke: var(--text-secondary);
+  stroke-width: 1.1;
+}
+
+.arch-svg .boxe {
+  fill: var(--surface-1);
+  stroke: var(--text-primary);
+  stroke-width: 1.9;
+}
+
+.arch-svg .cb {
+  fill: var(--surface-2);
+  stroke: var(--grid);
+  stroke-width: 1;
+}
+
+.arch-svg .ba {
+  fill: var(--arch-band-a);
+}
+
+.arch-svg .bb {
+  fill: var(--arch-band-b);
+}
+
+.arch-svg .pnl {
+  fill: none;
+  stroke: var(--text-muted);
+  stroke-width: 1.2;
+  stroke-dasharray: 6 5;
+}
+
+.arch-svg .e {
+  fill: none;
+  stroke: var(--text-secondary);
+  stroke-width: 1.4;
+}
+
+.arch-svg .ed {
+  fill: none;
+  stroke: var(--text-secondary);
+  stroke-width: 1.3;
+  stroke-dasharray: 5 4;
+}
+
+.arch-svg .ea {
+  fill: none;
+  stroke: var(--arch-audio);
+  stroke-width: 3;
+}
+
+.arch-svg .ez {
+  fill: none;
+  stroke: var(--text-muted);
+  stroke-width: 1;
+  stroke-dasharray: 3 4;
+}
+
+.arch-svg .pr {
+  fill: var(--arch-probe);
+  stroke: var(--surface-1);
+  stroke-width: 1.5;
+}
+
+.arch-svg .mk {
+  fill: var(--text-secondary);
+}
+
+.arch-svg .mka {
+  fill: var(--arch-audio);
+}
+
+.arch-svg .sw {
+  fill: var(--text-muted);
+  opacity: 0.45;
+}
+
+.arch-svg .sl {
+  fill: var(--arch-busy);
+}
+
+.arch-svg .ss {
+  fill: var(--surface-2);
+  stroke: var(--axis);
+  stroke-width: 1;
+}
+
+.arch-svg .tk,
+.arch-svg .dl {
+  fill: none;
+  stroke: var(--text-primary);
+  stroke-width: 1.2;
+}
+
+.arch-svg .dl {
+  stroke-dasharray: 4 3;
+}
+
+.arch-svg .dot-ok {
+  fill: var(--status-good);
+}
+
+.arch-svg .dot-wip {
+  fill: var(--status-warning);
+}
+
+.arch-svg .dot-plan {
+  fill: var(--text-muted);
+}

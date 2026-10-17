@@ -9,16 +9,19 @@ import TrialsView from './views/Trials';
 import CallSitesView from './views/CallSites';
 import ScenariosView from './views/Scenarios';
 import RunsView from './views/Runs';
+import ArchitectureView from './views/Architecture';
 
-export type TabId = 'overview' | 'trends' | 'trials' | 'callsites' | 'scenarios' | 'runs';
+export type TabId = 'overview' | 'trends' | 'trials' | 'callsites' | 'scenarios' | 'runs' | 'architecture';
 
 interface TabDef {
   id: TabId;
   label: string;
   view: ComponentType<ViewProps>;
+  /** false: the view ignores the filter, so the FilterBar is hidden on this tab. */
+  filtered?: boolean;
 }
 
-/** Tab order is the reading order: headline → trends → what changed → why → diagnostics → raw. */
+/** Tab order is the reading order: headline → trends → what changed → why → diagnostics → raw → reference. */
 export const TABS: readonly TabDef[] = [
   { id: 'overview', label: 'Overview', view: OverviewView },
   { id: 'trends', label: 'Trends', view: TrendsView },
@@ -26,6 +29,7 @@ export const TABS: readonly TabDef[] = [
   { id: 'callsites', label: 'Call sites', view: CallSitesView },
   { id: 'scenarios', label: 'Scenarios', view: ScenariosView },
   { id: 'runs', label: 'Runs', view: RunsView },
+  { id: 'architecture', label: 'Architecture', view: ArchitectureView, filtered: false },
 ];
 
 export type ThemeChoice = 'system' | 'light' | 'dark';
@@ -224,10 +228,12 @@ export default function App({ data }: AppProps) {
         ))}
       </div>
 
-      {/* One row above the panel; it scopes every view. */}
-      <div className="filterbar-slot">
-        <FilterBar filter={filter} options={options} onChange={setFilter} runsInSlice={slice.length} />
-      </div>
+      {/* One row above the panel; it scopes every view that reads runs. */}
+      {active.filtered !== false ? (
+        <div className="filterbar-slot">
+          <FilterBar filter={filter} options={options} onChange={setFilter} runsInSlice={slice.length} />
+        </div>
+      ) : null}
 
       <main id={`panel-${active.id}`} className="tabpanel" role="tabpanel" aria-labelledby={`tab-${active.id}`}>
         <View data={data} filter={filter} onFilterChange={setFilter} />

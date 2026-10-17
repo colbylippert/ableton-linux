@@ -71,11 +71,11 @@ describe('App shell', () => {
     container.remove();
   });
 
-  it('renders the six tabs in reading order and opens Overview by default', () => {
+  it('renders the seven tabs in reading order and opens Overview by default', () => {
     act(() => root.render(<App data={emptyData} />));
     const tabs = Array.from(container.querySelectorAll('[role="tab"]')).map((el) => el.textContent);
-    expect(tabs).toEqual(['Overview', 'Trends', 'Trials', 'Call sites', 'Scenarios', 'Runs']);
-    expect(TABS.map((t) => t.id)).toEqual(['overview', 'trends', 'trials', 'callsites', 'scenarios', 'runs']);
+    expect(tabs).toEqual(['Overview', 'Trends', 'Trials', 'Call sites', 'Scenarios', 'Runs', 'Architecture']);
+    expect(TABS.map((t) => t.id)).toEqual(['overview', 'trends', 'trials', 'callsites', 'scenarios', 'runs', 'architecture']);
     const selected = container.querySelector('[role="tab"][aria-selected="true"]');
     expect(selected?.textContent).toBe('Overview');
     expect(container.querySelector('[role="tabpanel"] h2')?.textContent).toBe('Overview');
@@ -93,6 +93,16 @@ describe('App shell', () => {
     window.location.hash = '#runs';
     act(() => root.render(<App data={emptyData} />));
     expect(container.querySelector('[role="tab"][aria-selected="true"]')?.textContent).toBe('Runs');
+  });
+
+  it('hides the FilterBar on the Architecture tab, which ignores the filter', () => {
+    act(() => root.render(<App data={emptyData} />));
+    expect(container.querySelector('.filterbar-slot')).not.toBeNull();
+    act(() => tabButton(container, 'Architecture').click());
+    expect(container.querySelector('.filterbar-slot')).toBeNull();
+    expect(window.location.hash).toBe('#architecture');
+    act(() => tabButton(container, 'Overview').click());
+    expect(container.querySelector('.filterbar-slot')).not.toBeNull();
   });
 
   it('shows the empty state without runs and the counts with data', () => {
@@ -133,7 +143,7 @@ describe('App shell', () => {
   });
 });
 
-describe('App integration (six views, one filter)', () => {
+describe('App integration (seven views, one filter)', () => {
   let container: HTMLDivElement;
   let root: Root;
   let consoleError: ReturnType<typeof vi.spyOn>;

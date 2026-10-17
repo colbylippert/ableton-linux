@@ -1,0 +1,141 @@
+<svg xmlns="http://www.w3.org/2000/svg" class="arch-svg" viewBox="0 0 1160 520" role="img" aria-label="One benchmark run. The bench wrapper starts bench-suite.sh, which repeats launch, measure, optional trace and quit for each Set; per-Set measurements feed the report, the comparison guard, the history files and the dashboard. Inside one Set, five sources are observed during a single window, 30 seconds by default, and written to measurement.json and raw/interface/.">
+  <!-- Figure 2. Classes only, no colours: styled by architecture.css (dashboard) or the snapshot page. -->
+  <defs>
+    <marker id="f2a" viewBox="0 0 10 10" refX="9" refY="5" markerUnits="userSpaceOnUse" markerWidth="9" markerHeight="9" orient="auto-start-reverse"><path class="mk" d="M0 1 L10 5 L0 9 z"/></marker>
+  </defs>
+
+  <!-- pipeline -->
+  <rect class="box" x="20" y="30" width="140" height="84" rx="6"/>
+  <text class="tt" x="32" y="48">bench wrapper</text>
+  <text class="tm" x="32" y="63">profiler/bin/bench</text>
+  <text class="ts" x="32" y="78">OSC on 11000/11001</text>
+  <text class="ts" x="32" y="92">performance hold</text>
+  <text class="ts" x="32" y="106">dialog watcher</text>
+  <rect class="box" x="183" y="30" width="140" height="84" rx="6"/>
+  <text class="tt" x="195" y="48">suite runner</text>
+  <text class="tm" x="195" y="63">bench-suite.sh</text>
+  <text class="ts" x="195" y="78">5 Sets or --sets</text>
+  <text class="ts" x="195" y="92">--trace · --scenario</text>
+  <text class="ts" x="195" y="106">graceful quit</text>
+  <rect class="boxe" x="346" y="30" width="140" height="84" rx="6"/>
+  <text class="tt" x="358" y="48">each Set</text>
+  <text class="ts" x="358" y="66">launch · observe 30 s</text>
+  <text class="ts" x="358" y="80">optional trace</text>
+  <text class="ts" x="358" y="94">quit · about 1 min</text>
+  <rect class="box" x="509" y="30" width="140" height="84" rx="6"/>
+  <text class="tt" x="521" y="48">report</text>
+  <text class="tm" x="521" y="63">bench-report.py</text>
+  <text class="ts" x="521" y="78">report.md / .json</text>
+  <text class="ts" x="521" y="92">Interface tables</text>
+  <text class="ts" x="521" y="106">CSV export</text>
+  <rect class="box" x="672" y="30" width="140" height="84" rx="6"/>
+  <text class="tt" x="684" y="48">compare</text>
+  <text class="tm" x="684" y="63">bench-report.py</text>
+  <text class="ts" x="684" y="78">refuses traced vs</text>
+  <text class="ts" x="684" y="92">untraced pairs</text>
+  <text class="ts" x="684" y="106">flags confounders</text>
+  <rect class="box" x="835" y="30" width="140" height="84" rx="6"/>
+  <text class="tt" x="847" y="48">history</text>
+  <text class="tm" x="847" y="63">history-add</text>
+  <text class="tm" x="847" y="78">runs/&lt;id&gt;.json</text>
+  <text class="tm" x="847" y="92">baselines.json</text>
+  <text class="tm" x="847" y="106">ledger.jsonl</text>
+  <rect class="box" x="998" y="30" width="140" height="84" rx="6"/>
+  <text class="tt" x="1010" y="48">dashboard</text>
+  <text class="ts" x="1010" y="66">Vite + React</text>
+  <text class="ts" x="1010" y="80">port 5173</text>
+  <text class="ts" x="1010" y="94">browser on Windows</text>
+  <line class="e" x1="161" y1="72" x2="181" y2="72" marker-end="url(#f2a)"/>
+  <line class="e" x1="324" y1="72" x2="344" y2="72" marker-end="url(#f2a)"/>
+  <line class="e" x1="487" y1="72" x2="507" y2="72" marker-end="url(#f2a)"/>
+  <line class="e" x1="650" y1="72" x2="670" y2="72" marker-end="url(#f2a)"/>
+  <line class="e" x1="813" y1="72" x2="833" y2="72" marker-end="url(#f2a)"/>
+  <line class="e" x1="976" y1="72" x2="996" y2="72" marker-end="url(#f2a)"/>
+
+  <!-- zoom into one Set -->
+  <path class="ez" d="M346 115 L20 150 M486 115 L1140 150"/>
+  <rect class="pnl" x="20" y="150" width="1120" height="356" rx="8"/>
+  <text class="tb" x="36" y="172">INSIDE ONE SET</text>
+
+  <!-- observed sources -->
+  <rect class="box" x="36" y="186" width="220" height="54" rx="5"/>
+  <text class="tt" x="48" y="206">Live + AbletonOSC</text>
+  <text class="ts" x="48" y="224">CPU reports, every 0.5 s</text>
+  <rect class="box" x="272" y="186" width="190" height="54" rx="5"/>
+  <text class="tt" x="284" y="206">PipeWire graph</text>
+  <text class="ts" x="284" y="224">pw-top: quantum, busy, errors</text>
+  <rect class="box" x="478" y="186" width="190" height="54" rx="5"/>
+  <text class="ttm" x="490" y="206">/proc</text>
+  <text class="ts" x="490" y="224">CPU, threads, switches, IRQs</text>
+  <rect class="box" x="684" y="186" width="190" height="54" rx="5"/>
+  <text class="tt" x="696" y="206">Live Log.txt</text>
+  <text class="ts" x="696" y="224">xruns, driver errors</text>
+  <rect class="box" x="890" y="186" width="234" height="54" rx="5"/>
+  <text class="tt" x="902" y="206">BPF tracer (if --trace)</text>
+  <text class="ts" x="902" y="224">events per audio block</text>
+  <line class="e" x1="146" y1="241" x2="650" y2="293" marker-end="url(#f2a)"/>
+  <line class="e" x1="367" y1="241" x2="695" y2="293" marker-end="url(#f2a)"/>
+  <line class="e" x1="573" y1="241" x2="745" y2="293" marker-end="url(#f2a)"/>
+  <line class="e" x1="779" y1="241" x2="795" y2="293" marker-end="url(#f2a)"/>
+  <line class="e" x1="1007" y1="241" x2="913" y2="293" marker-end="url(#f2a)"/>
+  <text class="ts" x="200" y="284">observed during the window</text>
+
+  <!-- steps -->
+  <rect class="box" x="36" y="296" width="126" height="64" rx="5"/>
+  <text class="tt" x="99" y="316" text-anchor="middle">start Live</text>
+  <text class="ts" x="99" y="332" text-anchor="middle">launcher + Set</text>
+  <text class="ts" x="99" y="347" text-anchor="middle">run token in env</text>
+  <rect class="box" x="180" y="296" width="126" height="64" rx="5"/>
+  <text class="tt" x="243" y="316" text-anchor="middle">trial dialog</text>
+  <text class="ts" x="243" y="332" text-anchor="middle">clicks</text>
+  <text class="ts" x="243" y="347" text-anchor="middle">Save/Export Disabled</text>
+  <rect class="box" x="324" y="296" width="126" height="64" rx="5"/>
+  <text class="tt" x="387" y="316" text-anchor="middle">OSC probe</text>
+  <text class="ts" x="387" y="332" text-anchor="middle">ping → pong</text>
+  <text class="ts" x="387" y="347" text-anchor="middle">rewind · play</text>
+  <rect class="box" x="468" y="296" width="126" height="64" rx="5"/>
+  <text class="tt" x="531" y="316" text-anchor="middle">trace start</text>
+  <text class="ts" x="531" y="332" text-anchor="middle">if --trace</text>
+  <text class="ts" x="531" y="347" text-anchor="middle">attach to pids</text>
+  <rect class="boxe" x="612" y="296" width="220" height="64" rx="5"/>
+  <text class="tt" x="722" y="316" text-anchor="middle">measure 30 s</text>
+  <text class="ts" x="722" y="332" text-anchor="middle">collectors in parallel</text>
+  <text class="ts" x="722" y="347" text-anchor="middle">one monotonic window</text>
+  <rect class="box" x="850" y="296" width="126" height="64" rx="5"/>
+  <text class="tt" x="913" y="316" text-anchor="middle">trace stop</text>
+  <text class="ts" x="913" y="332" text-anchor="middle">reduce · symbolize</text>
+  <text class="ts" x="913" y="347" text-anchor="middle">write interface/</text>
+  <rect class="box" x="994" y="296" width="126" height="64" rx="5"/>
+  <text class="tt" x="1057" y="316" text-anchor="middle">quit Live</text>
+  <text class="ts" x="1057" y="332" text-anchor="middle">Ctrl+Q · Exit Live</text>
+  <text class="ts" x="1057" y="347" text-anchor="middle">prefix idle again</text>
+  <line class="e" x1="163" y1="328" x2="178" y2="328" marker-end="url(#f2a)"/>
+  <line class="e" x1="307" y1="328" x2="322" y2="328" marker-end="url(#f2a)"/>
+  <line class="e" x1="451" y1="328" x2="466" y2="328" marker-end="url(#f2a)"/>
+  <line class="e" x1="595" y1="328" x2="610" y2="328" marker-end="url(#f2a)"/>
+  <line class="e" x1="833" y1="328" x2="848" y2="328" marker-end="url(#f2a)"/>
+  <line class="e" x1="977" y1="328" x2="992" y2="328" marker-end="url(#f2a)"/>
+
+  <!-- outputs -->
+  <rect class="boxe" x="600" y="400" width="246" height="66" rx="5"/>
+  <text class="ttm" x="612" y="419">measurement.json</text>
+  <text class="ts" x="612" y="435">CPU · threads · PipeWire · DSP · xruns</text>
+  <text class="ts" x="612" y="451">raw/: pw-top · osc · proc · logs</text>
+  <rect class="box" x="870" y="400" width="254" height="66" rx="5"/>
+  <text class="ttm" x="882" y="419">raw/interface/</text>
+  <text class="tm" x="882" y="435">blocks.jsonl · threads.jsonl</text>
+  <text class="tm" x="882" y="451">summary.json · tracer.json</text>
+  <line class="e" x1="722" y1="361" x2="722" y2="398" marker-end="url(#f2a)"/>
+  <text class="ts" x="732" y="384">capture writes</text>
+  <line class="e" x1="913" y1="361" x2="913" y2="398" marker-end="url(#f2a)"/>
+  <text class="ts" x="923" y="384">stop writes</text>
+  <line class="e" x1="869" y1="433" x2="848" y2="433" marker-end="url(#f2a)"/>
+  <text class="ts" x="858" y="488" text-anchor="middle">bench-report.py interface copies the summary into measurement["interface"]</text>
+
+  <!-- window rules -->
+  <text class="tt" x="48" y="418">One window for everything</text>
+  <text class="ts" x="48" y="436">30 s by default, on CLOCK_MONOTONIC, shared by Python, PipeWire and BPF</text>
+  <text class="ts" x="48" y="452">every collector must reach both edges of the window (within about 1 s)</text>
+  <text class="ts" x="48" y="468">the next Set waits until the Wine prefix is idle</text>
+  <text class="ts" x="48" y="484">traced and untraced runs are never compared</text>
+</svg>

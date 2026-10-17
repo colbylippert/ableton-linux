@@ -117,7 +117,8 @@ profiler/dashboard/
     ├── data/
     │   ├── types.ts     Run, SetMetrics, Baselines, Trial + dashboard contracts (FilterState, MetricDef, GainRow, …)
     │   └── load.ts      loadDashboardData() seam — replaced by the real loaders (history / baselines / ledger)
-    └── views/           Overview, Trends, Trials, CallSites, Scenarios, Runs (default-exported components, props = ViewProps)
+    ├── architecture/    Architecture tab: hand-drawn SVG diagrams (classes only), architecture.css, status.ts
+    └── views/           Overview, Trends, Trials, CallSites, Scenarios, Runs, Architecture (default-exported components, props = ViewProps)
 ```
 
 Dependencies are deliberately minimal: `react`, `react-dom`, `recharts` at runtime;

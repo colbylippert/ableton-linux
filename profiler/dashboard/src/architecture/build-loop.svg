@@ -1,0 +1,149 @@
+<svg xmlns="http://www.w3.org/2000/svg" class="arch-svg" viewBox="0 0 1160 670" role="img" aria-label="Machines and build. Code is edited and committed on the Windows workstation by Claude Code and its workflow subagents, shipped to the laptop as git bundles, built in a pinned rootless podman container, audited and installed as the Wine runtime. The golden snapshot holds the state every trial restores to. The planned agent loop on the laptop will build trials with wine-dev, run A/B and traced suites, and record results in the ledger and history that the dashboard shows.">
+  <!-- Figure 3. Classes only, no colours: styled by architecture.css (dashboard) or the snapshot page. -->
+  <defs>
+    <marker id="f3a" viewBox="0 0 10 10" refX="9" refY="5" markerUnits="userSpaceOnUse" markerWidth="9" markerHeight="9" orient="auto-start-reverse"><path class="mk" d="M0 1 L10 5 L0 9 z"/></marker>
+  </defs>
+
+  <!-- Windows -->
+  <rect class="pnl" x="20" y="20" width="300" height="640" rx="8"/>
+  <text class="tb" x="36" y="42">WINDOWS WORKSTATION</text>
+  <rect class="box" x="52" y="56" width="252" height="58" rx="5"/>
+  <text class="tt" x="64" y="76">ableton-linux checkout</text>
+  <text class="tm" x="64" y="92">C:\src\AbletonLinux\ableton-linux</text>
+  <text class="ts" x="64" y="107">branch profiler · canonical commits</text>
+  <rect class="box" x="52" y="134" width="252" height="46" rx="5"/>
+  <text class="ttm" x="64" y="154">plans/</text>
+  <text class="ts" x="64" y="171">plan · designs · findings</text>
+  <rect class="boxe" x="52" y="210" width="252" height="58" rx="5"/>
+  <text class="tt" x="64" y="230">Claude Code · orchestrator</text>
+  <text class="ts" x="64" y="246">plans blocks, runs workflows</text>
+  <text class="ts" x="64" y="261">commits, decides reboots</text>
+  <rect class="box" x="52" y="288" width="252" height="58" rx="5"/>
+  <text class="tt" x="64" y="308">workflow subagents</text>
+  <text class="ts" x="64" y="324">author → review → fix → verify</text>
+  <text class="ts" x="64" y="339">one block at a time</text>
+  <rect class="box" x="52" y="380" width="252" height="46" rx="5"/>
+  <text class="ttm" x="64" y="400">AbletonInstaller/</text>
+  <text class="ts" x="64" y="417">Live 12.4.6 Trial installer</text>
+  <rect class="box" x="52" y="598" width="252" height="46" rx="5"/>
+  <text class="tt" x="64" y="618">browser</text>
+  <text class="tm" x="64" y="635">http://10.0.0.86:5173</text>
+  <line class="e" x1="178" y1="269" x2="178" y2="286" marker-end="url(#f3a)"/>
+  <text class="ts" x="188" y="282">launches</text>
+  <path class="e" d="M51 317 H40 V85 H50" marker-end="url(#f3a)"/>
+  <text class="ts" text-anchor="middle" transform="translate(33 200) rotate(-90)">edits + commits</text>
+
+  <!-- Windows to laptop -->
+  <line class="e" x1="305" y1="83" x2="378" y2="83" marker-end="url(#f3a)"/>
+  <text class="ts" x="341" y="76" text-anchor="middle">bundle</text>
+  <line class="e" x1="305" y1="317" x2="358" y2="317" marker-end="url(#f3a)"/>
+  <text class="ts" x="331" y="310" text-anchor="middle">ssh</text>
+  <line class="e" x1="305" y1="403" x2="358" y2="403" marker-end="url(#f3a)"/>
+  <text class="ts" x="331" y="396" text-anchor="middle">scp</text>
+
+  <!-- laptop -->
+  <rect class="pnl" x="360" y="20" width="780" height="640" rx="8"/>
+  <text class="tb" x="376" y="42">CACHYOS LAPTOP · BARE METAL</text>
+  <text class="tmm" x="592" y="42">ssh ableton-laptop</text>
+
+  <!-- column 1: checkout, setup, state -->
+  <rect class="box" x="380" y="56" width="230" height="54" rx="5"/>
+  <text class="ttm" x="392" y="76">~/Projects/ableton-linux</text>
+  <text class="ts" x="392" y="93">fast-forwarded from bundles</text>
+  <line class="e" x1="495" y1="111" x2="495" y2="130" marker-end="url(#f3a)"/>
+  <rect class="box" x="380" y="132" width="230" height="90" rx="5"/>
+  <text class="ttm" x="392" y="152">setup-machine.sh</text>
+  <text class="ts" x="392" y="169">19 idempotent phases</text>
+  <text class="ts" x="392" y="184">packages · podman · autologin</text>
+  <text class="ts" x="392" y="199">audio · build · install · golden</text>
+  <text class="ts" x="392" y="214">verify.sh re-checks it all</text>
+  <rect class="boxe" x="380" y="244" width="230" height="74" rx="5"/>
+  <text class="ttm" x="392" y="264">profiler/bin/state</text>
+  <text class="ts" x="392" y="281">golden snapshot (btrfs reflink)</text>
+  <text class="ts" x="392" y="296">prefix · configs · runtime</text>
+  <text class="ts" x="392" y="311">restore before every trial</text>
+  <rect class="box" x="470" y="340" width="140" height="52" rx="5"/>
+  <text class="tt" x="482" y="360">root helper</text>
+  <text class="ts" x="482" y="377">knobs · tracer</text>
+  <line class="e" x1="611" y1="159" x2="658" y2="159" marker-end="url(#f3a)"/>
+  <text class="ts" x="634" y="152" text-anchor="middle">runs</text>
+  <line class="e" x1="420" y1="319" x2="420" y2="498" marker-start="url(#f3a)" marker-end="url(#f3a)"/>
+  <text class="ts" x="430" y="430">snapshot / restore</text>
+  <line class="e" x1="540" y1="393" x2="540" y2="498" marker-end="url(#f3a)"/>
+  <text class="ts" x="548" y="462">tracer as root</text>
+
+  <!-- column 2: build chain -->
+  <rect class="box" x="660" y="56" width="220" height="54" rx="5"/>
+  <text class="tt" x="672" y="74">pinned inputs</text>
+  <text class="tm" x="672" y="90">Containerfile · vendor/</text>
+  <text class="ts" x="672" y="104">Wine base 5c23dd1c · patches/</text>
+  <line class="e" x1="770" y1="111" x2="770" y2="130" marker-end="url(#f3a)"/>
+  <text class="ts" x="780" y="125">build context</text>
+  <rect class="box" x="660" y="132" width="220" height="54" rx="5"/>
+  <text class="ttm" x="672" y="150">build.sh</text>
+  <text class="ts" x="672" y="166">rootless podman · Ubuntu 22.04</text>
+  <text class="ts" x="672" y="180">gcc + clang 21 · ccache</text>
+  <line class="e" x1="770" y1="187" x2="770" y2="204" marker-end="url(#f3a)"/>
+  <rect class="boxe" x="660" y="206" width="220" height="54" rx="5"/>
+  <text class="tt" x="672" y="226">Wine 11.13 + 112 patches</text>
+  <text class="tp" x="672" y="244">0108 USDT · pipeasio 0017</text>
+  <line class="e" x1="770" y1="261" x2="770" y2="278" marker-end="url(#f3a)"/>
+  <rect class="box" x="660" y="280" width="220" height="46" rx="5"/>
+  <text class="tt" x="672" y="300">build-audit</text>
+  <text class="ts" x="672" y="317">fingerprints · 8 + 6 probes</text>
+  <line class="e" x1="770" y1="327" x2="770" y2="344" marker-end="url(#f3a)"/>
+  <rect class="box" x="660" y="346" width="220" height="46" rx="5"/>
+  <text class="ttm" x="672" y="366">dist/ tarball</text>
+  <text class="ts" x="672" y="383">verified runtime package</text>
+  <line class="e" x1="770" y1="393" x2="770" y2="410" marker-end="url(#f3a)"/>
+  <text class="ts" x="780" y="406">runtime install</text>
+  <rect class="box" x="660" y="412" width="220" height="54" rx="5"/>
+  <text class="tt" x="672" y="432">installed runtime</text>
+  <text class="tm" x="672" y="449">~/.local/opt/wine-d2d1-…</text>
+  <line class="e" x1="770" y1="467" x2="770" y2="498" marker-end="url(#f3a)"/>
+
+  <!-- column 3: dev loop and agent loop -->
+  <rect class="box" x="910" y="56" width="214" height="68" rx="5"/>
+  <text class="ttm" x="922" y="74">wine-dev.sh</text>
+  <text class="ts" x="922" y="90">persistent build container</text>
+  <text class="ts" x="922" y="104">incremental make</text>
+  <text class="ts" x="922" y="118">→ …-dev runtime for trials</text>
+  <rect class="box" x="950" y="144" width="174" height="52" rx="5"/>
+  <text class="ttm" x="962" y="164">build-official.sh</text>
+  <text class="ts" x="962" y="181">full build · keep gate</text>
+  <rect class="boxe" x="910" y="228" width="214" height="328" rx="6"/>
+  <text class="ttm" x="922" y="248">/profiler-loop</text>
+  <text class="ts" x="922" y="264">Claude Code on the laptop</text>
+  <circle class="dot-plan" cx="926" cy="276" r="4"/>
+  <text class="ts" x="935" y="280">planned (block B7)</text>
+  <text x="922" y="306"><tspan class="tnum">1</tspan><tspan dx="10">restore golden</tspan></text>
+  <text x="922" y="328"><tspan class="tnum">2</tspan><tspan dx="10">traced baseline</tspan></text>
+  <text x="922" y="350"><tspan class="tnum">3</tspan><tspan dx="10">pick top call site</tspan></text>
+  <text x="922" y="372"><tspan class="tnum">4</tspan><tspan dx="10">opt-in switch + PE probe</tspan></text>
+  <text x="922" y="394"><tspan class="tnum">5</tspan><tspan dx="10">dev build (wine-dev)</tspan></text>
+  <text x="922" y="416"><tspan class="tnum">6</tspan><tspan dx="10">A/A, then ABAB untraced</tspan></text>
+  <text x="922" y="438"><tspan class="tnum">7</tspan><tspan dx="10">traced confirmation</tspan></text>
+  <text x="922" y="460"><tspan class="tnum">8</tspan><tspan dx="10">keep or revert · ledger</tspan></text>
+  <path class="e" d="M1100 456 H1114 V302 H1102" marker-end="url(#f3a)"/>
+  <text class="ts" x="922" y="490">stops after 3 misses in a row</text>
+  <text class="ts" x="922" y="505">or when the time budget ends</text>
+  <line class="e" x1="930" y1="227" x2="930" y2="126" marker-end="url(#f3a)"/>
+  <line class="e" x1="1037" y1="227" x2="1037" y2="198" marker-end="url(#f3a)"/>
+  <line class="e" x1="909" y1="520" x2="882" y2="520" marker-end="url(#f3a)"/>
+  <text class="ts" x="895" y="512" text-anchor="middle">runs</text>
+
+  <!-- runtime, history -->
+  <rect class="boxe" x="380" y="500" width="500" height="56" rx="6"/>
+  <text class="tt" x="392" y="520">Live · Wine runtime · PipeASIO · tracer · bench</text>
+  <text class="ts" x="392" y="537">see Figures 1 and 2</text>
+  <line class="e" x1="630" y1="557" x2="630" y2="588" marker-end="url(#f3a)"/>
+  <text class="ts" x="640" y="577">history-add</text>
+  <rect class="box" x="380" y="590" width="500" height="56" rx="5"/>
+  <text class="tt" x="392" y="608">history + dashboard</text>
+  <text class="tm" x="392" y="625">profiler/history/runs · ledger.jsonl</text>
+  <text class="ts" x="392" y="640">Vite dashboard on port 5173</text>
+  <path class="e" d="M1017 557 V618 H882" marker-end="url(#f3a)"/>
+  <text class="ts" x="950" y="611" text-anchor="middle">ledger + history</text>
+  <line class="e" x1="379" y1="621" x2="306" y2="621" marker-end="url(#f3a)"/>
+  <text class="ts" x="342" y="614" text-anchor="middle">HTTP</text>
+</svg>
