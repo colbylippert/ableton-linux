@@ -114,7 +114,7 @@ _lp_live_pids() {
     local pid cmd
     while IFS= read -r pid; do
         [ -n "$pid" ] || continue
-        cmd="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)"
+        cmd="$(tr '\0' ' ' 2>/dev/null < "/proc/$pid/cmdline" || true)"
         case "$cmd" in *"Ableton Live"*.exe*) printf '%s\n' "$pid" ;; esac
     done < <(_lp_prefix_pids "${1:-}")
     return 0
@@ -145,7 +145,7 @@ _lp_mem_jobs() {
 }
 
 # ------------------------------------------------------------- build ----
-_build_version() { tr -d '[:space:]' < "$REPO_DIR/VERSION" 2>/dev/null || true; }
+_build_version() { tr -d '[:space:]' 2>/dev/null < "$REPO_DIR/VERSION" || true; }
 _build_tarball() { printf '%s/dist/wine-d2d1-nspa-11.13-%s.tar.zst\n' "$REPO_DIR" "$1"; }
 _build_record() { printf '%s/build-audit.env\n' "$PROFILER_STATE_DIR"; }
 _build_official_record() { printf '%s/dev/last-official-build\n' "$PROFILER_STATE_DIR"; }
@@ -268,7 +268,7 @@ _build_lock_acquire() {
     local lock
     lock="$(_build_lock)"
     if _build_dev_loop_running; then
-        fail "profiler/dev/wine-dev.sh is running ($(tr '\n' ' ' < "$(_build_dev_busy)" 2>/dev/null || echo 'details unknown')): it shares the image tag and .ccache with ./build.sh — wait for it" || return 1
+        fail "profiler/dev/wine-dev.sh is running ($(tr '\n' ' ' 2>/dev/null < "$(_build_dev_busy)" || echo 'details unknown')): it shares the image tag and .ccache with ./build.sh — wait for it" || return 1
     fi
     ok "wine-dev.sh is not running"
     if is_dry_run; then

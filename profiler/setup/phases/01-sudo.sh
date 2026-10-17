@@ -82,7 +82,7 @@ _p1_live_pids() {
     for proc in /proc/[0-9]*; do
         pid="${proc#/proc/}"
         [ "$pid" != "$$" ] && [ "$pid" != "${BASHPID:-$$}" ] && [ "$pid" != "$PPID" ] || continue
-        cmd="$(tr '\0' ' ' < "$proc/cmdline" 2>/dev/null || true)"
+        cmd="$(tr '\0' ' ' 2>/dev/null < "$proc/cmdline" || true)"
         case "$cmd" in *"Ableton Live"*.[eE][xX][eE]*) ;; *) continue ;; esac
         exe="$(readlink -f -- "$proc/exe" 2>/dev/null || true)"
         case "${exe##*/}" in
@@ -316,7 +316,8 @@ phase_sudo_apply() {
         step "tracer tools from the checkout ($P1_ALLOW_USER_TOOLS)"
         roots="$(_sudo_tool_roots)"
         if [ -z "$roots" ]; then
-            warn "neither $PROFILER_ROOT nor $REPO_DIR/profiler lies under $HOME: the helper accepts user tools only from the invoking user's home; use install-tracer"
+            if [ "$PROFILER_ROOT" = "$REPO_DIR/profiler" ]; then r="$PROFILER_ROOT does not lie"; else r="neither $PROFILER_ROOT nor $REPO_DIR/profiler lies"; fi
+            warn "$r under $HOME: the helper accepts user tools only from the invoking user's home; use install-tracer"
         else
             [ -d "${P1_ALLOW_USER_TOOLS%/*}" ] || run --sudo -- install -d -m 0755 -o root -g root "${P1_ALLOW_USER_TOOLS%/*}" || return 1
             while IFS= read -r r; do

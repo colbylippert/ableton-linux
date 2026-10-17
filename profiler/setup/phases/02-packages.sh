@@ -60,12 +60,15 @@ _pkg_missing() {
 }
 
 # 0 when the installed kernel package owns the running kernel's module directory
+# (pacman -Qqo, not `pacman -Ql | grep -q`: under pipefail grep's early exit
+# would SIGPIPE pacman and turn a match into a failure)
 _pkg_kernel_current() {
-    local kver pkgbase
+    local kver pkgbase owner
     kver="$(uname -r)"
     [ -r "/usr/lib/modules/$kver/pkgbase" ] || return 1
     pkgbase="$(cat "/usr/lib/modules/$kver/pkgbase")"
-    pacman -Ql "$pkgbase" 2>/dev/null | grep -qxF "$pkgbase /usr/lib/modules/$kver/"
+    owner="$(pacman -Qqo -- "/usr/lib/modules/$kver/pkgbase" 2>/dev/null || true)"
+    [ -n "$pkgbase" ] && [ "$owner" = "$pkgbase" ]
 }
 
 # on | off | absent — the same rule as the helper's `knob get ananicy`

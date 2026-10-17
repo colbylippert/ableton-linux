@@ -244,6 +244,23 @@ _record() {   # last-official-build marker
     printf '%s\n' "$@" > "$DEV_STATE/last-official-build" 2>/dev/null || true
 }
 
+# build-audit.env — the record setup phase build (09-build.sh) and verify.sh read,
+# in the same format phase build writes, so neither re-audits this tarball
+_record_audit() {   # RESULT
+    local tmp rec="$STATE_DIR/build-audit.env"
+    _is_dry && return 0
+    mkdir -p -- "$STATE_DIR" 2>/dev/null || true
+    tmp="$(mktemp "$STATE_DIR/.build-audit.XXXXXX" 2>/dev/null)" || { warn "cannot write $rec"; return 0; }
+    {
+        printf '# written by profiler/dev/build-official.sh after scripts/build-audit.sh (result=ok|failed)\n'
+        printf 'ts=%s\nversion=%s\ntarball=%s\ntarball_sha256=%s\nbuild_log=%s\nbuild_seconds=%s\njobs=%s\nresult=%s\n' \
+            "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${VERSION:-}" "$REPO/${RUNTIME_TARBALL:-}" \
+            "$(cut -d' ' -f1 "${RUNTIME_TARBALL:-/nonexistent}.sha256" 2>/dev/null || true)" \
+            "${RAWLOG:-}" "${build_secs:-}" "${JOBS:-}" "$1"
+    } > "$tmp" && chmod 0644 "$tmp" && mv -f -- "$tmp" "$rec" || { rm -f -- "$tmp"; warn "cannot write $rec"; return 0; }
+    info "audit result ($1) recorded in $rec"
+}
+
 _on_exit() {
     local rc=$?
     if [ "${#SUMMARY_NAMES[@]}" -gt 0 ]; then summary_table; fi
@@ -322,7 +339,7 @@ if command -v flock >/dev/null 2>&1; then
         pf "another official build is running (lock $BUILD_LOCK is held); wait for it"
     fi
     if _dev_loop_running; then
-        pf "wine-dev.sh is running ($(tr '\n' ' ' < "$DEV_BUSY" 2>/dev/null || echo 'details unknown')): it shares the image tag and the ccache — wait for it"
+        pf "wine-dev.sh is running ($(tr '\n' ' ' 2>/dev/null < "$DEV_BUSY" || echo 'details unknown')): it shares the image tag and the ccache — wait for it"
     else
         ok "wine-dev.sh is not running"
     fi
@@ -469,8 +486,10 @@ else
     if run -- env "TMPDIR=$CACHE_TMP" ./scripts/build-audit.sh "$RUNTIME_TARBALL"; then
         summary_add audit "$(_st)" $(( $(_now) - t0 ))
         _is_dry || ok "audit passed: patch stack, fingerprints and source-tree digest match the tarball"
+        _record_audit ok
     else
         summary_add audit failed $(( $(_now) - t0 ))
+        _record_audit failed
         die "build-audit.sh failed (exit $RUN_STATUS): if a file in the repository changed after the build, the source-tree digest no longer matches — rebuild" 1
     fi
 fi

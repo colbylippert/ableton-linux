@@ -205,7 +205,11 @@ die() {
     _emit "$C_RED" "$G_FAIL" "" "$C_BOLD$C_RED$msg$C_RESET"
     exit "$code"
 }
-action_required() { ACTIONS+=("$*"); }
+action_required() {   # each distinct action is listed once
+    local a
+    for a in ${ACTIONS[@]+"${ACTIONS[@]}"}; do [ "$a" != "$*" ] || return 0; done
+    ACTIONS+=("$*")
+}
 
 # ---------------------------------------------------------------- run ----
 # shell-safe rendering of a command line for display

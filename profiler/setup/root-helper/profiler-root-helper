@@ -16,6 +16,8 @@
 #   snapshot [--force]            record the host knobs → /var/lib/profiler/baseline.env
 #                                 (first call only; --force retakes it)
 #   reset                         restore every knob recorded in baseline.env; idempotent
+#                                 (persistent config wins: sysctl.d drop-ins and a
+#                                 NetworkManager wifi.powersave override the baseline)
 #   knob get KEY | knob set KEY VALUE
 #       thp                       always | madvise | never
 #       governor                  a cpufreq governor name, applied to every CPU
@@ -311,6 +313,30 @@ wifi_ps_set() {
     command -v iw >/dev/null 2>&1 || unavailable "iw is not installed"
     iw dev "$1" set power_save "$2" || die "iw dev $1 set power_save $2 failed"
 }
+# on | off | "" — the global wifi.powersave that NetworkManager's persistent
+# configuration sets in a [connection*] section (2 = disable → off, 3 = enable
+# → on; anything else, or no setting, → ""). Files are read in NetworkManager's
+# order (lib, run, etc conf.d, each sorted; the main file last) and the last
+# setting wins. Phase 05 writes /etc/NetworkManager/conf.d/90-profiler-wifi-powersave.conf.
+nm_wifi_ps_persistent() {
+    local f line sect="" val=""
+    for f in /usr/lib/NetworkManager/conf.d/*.conf /run/NetworkManager/conf.d/*.conf \
+             /etc/NetworkManager/conf.d/*.conf /etc/NetworkManager/NetworkManager.conf; do
+        [ -f "$f" ] && [ -r "$f" ] || continue
+        sect=""
+        while IFS= read -r line || [ -n "$line" ]; do
+            line="${line#"${line%%[![:space:]]*}"}"
+            case "$line" in
+                \[*\]*) sect="${line%%]*}]" ;;
+                wifi.powersave*=*)
+                    case "$sect" in \[connection*\]) ;; *) continue ;; esac
+                    line="${line#*=}"; line="${line//[[:space:]]/}"
+                    case "$line" in 2) val=off ;; 3) val=on ;; *) val="" ;; esac ;;
+            esac
+        done < "$f"
+    done
+    printf '%s\n' "$val"
+}
 
 sysctl_allowed() { local k; for k in "${SYSCTL_ALLOW[@]}"; do [ "$1" = "$k" ] && return 0; done; return 1; }
 sysctl_get() { sysctl -n -- "$1" 2>/dev/null || printf 'unavailable\n'; }
@@ -508,7 +534,7 @@ do_snapshot() {
 
 # ------------------------------------------------------------------ reset ----
 do_reset() {
-    local line key val cur sub f tid changed=0 failed=0 base_en="" base_act="" now_en now_act
+    local line key val cur sub f tid persist changed=0 failed=0 base_en="" base_act="" now_en now_act
     [ -s "$BASELINE" ] || die "no baseline at $BASELINE (take one first: sudo -n profiler-root-helper snapshot)"
     while IFS= read -r line || [ -n "$line" ]; do
         case "$line" in ''|'#'*) continue ;; esac
@@ -548,6 +574,11 @@ do_reset() {
                 [[ "$sub" =~ $RE_IFACE ]] && [[ "$val" =~ ^(on|off)$ ]] || continue
                 [ -d "/sys/class/net/$sub/wireless" ] || [ -e "/sys/class/net/$sub/phy80211" ] || continue
                 command -v iw >/dev/null 2>&1 || continue
+                # a persistent NetworkManager wifi.powersave (phase 05's drop-in)
+                # describes the configured state and wins over the baseline, as
+                # the sysctl.d drop-ins do below
+                persist="$(nm_wifi_ps_persistent)"
+                [ -n "$persist" ] && val="$persist"
                 cur="$(wifi_ps_get "$sub")"
                 [ "$cur" = "$val" ] && continue
                 if iw dev "$sub" set power_save "$val" 2>/dev/null; then

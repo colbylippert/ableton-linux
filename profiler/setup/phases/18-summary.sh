@@ -23,7 +23,7 @@ phase_summary_apply() {
     host="$(hostname 2>/dev/null || uname -n)"
     rt="$(_lp_runtime_root)"; prefix="$(_lp_prefix)"; launcher="$(_lp_launcher)"; st="$PROFILER_ROOT/bin/state"
     step "machine state"
-    kv "profile" "$PROFILE on $host ($(systemd-detect-virt 2>/dev/null || echo unknown) virtualization)"
+    kv "profile" "$PROFILE on $host ($(systemd-detect-virt 2>/dev/null || true) virtualization)"
     if on_laptop && declare -F host_power_summary >/dev/null; then kv "power" "$(host_power_summary)"; fi
     kv "repo" "$REPO_DIR ($(git -C "$REPO_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo 'no git'))"
     if [ -x "$rt/bin/wine" ]; then kv "runtime" "$rt ($("$rt/bin/wine" --version 2>/dev/null | head -n1 || true))"; else kv "runtime" "$rt (missing)"; fi
@@ -60,7 +60,7 @@ phase_summary_apply() {
         info "audio_node is not recorded in $PROFILER_SETUP_CONF yet: setup-machine.sh --only audio"; outstanding=1
     fi
     if [ "$mute" = unmuted ]; then info "$node is not muted (profiler/bin/bench mutes it before every run)"; fi
-    if [ "$osc" != installed ]; then info "AbletonOSC: $osc — re-run phase osc once profiler/control/install.sh exists, then select it in Live"; outstanding=1; fi
+    if [ "$osc" != installed ]; then info "AbletonOSC: $osc — setup-machine.sh --only osc, then select it in Live (Control Surface)"; outstanding=1; fi
     if [ -n "$exe" ] && ! _human_evidence; then info "the Live first-launch checklist is not complete: setup-machine.sh --only human"; outstanding=1; fi
     if ! "$st" list --names 2>/dev/null | grep -qx golden; then info "no golden snapshot yet: setup-machine.sh --only golden (after the checklist)"; outstanding=1; fi
     [ "$WARN_COUNT" -eq 0 ] || info "$WARN_COUNT warning(s) so far — listed under WARNINGS below"

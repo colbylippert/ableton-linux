@@ -114,7 +114,7 @@ step_series() {   # container-build.sh:254-261 (patch -p1, every *.patch sorted;
         step_unpack
     fi
     cd "$PIPEASIO"
-    nasio="$(ls "$SRC"/patches/pipeasio/*.patch 2>/dev/null | wc -l)"
+    nasio="$( { ls "$SRC"/patches/pipeasio/*.patch 2>/dev/null || true; } | wc -l)"
     [ "$nasio" -gt 0 ] || die "no pipeasio patches found in $SRC/patches/pipeasio"
     say "[pipeasio series] apply $nasio patch(es) with patch -p1"
     for p in "$SRC"/patches/pipeasio/*.patch; do

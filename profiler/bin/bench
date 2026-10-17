@@ -10,10 +10,14 @@
 #   * ABLETON_WINE_ROOT is honoured (A/B against the dev runtime) and shown
 #   * bare metal: before every run the audio node PipeASIO drives (audio_node=
 #     in ~/.config/profiler/setup.conf — the built-in speaker sink with
-#     --audio-device builtin) is muted again with `wpctl set-mute ID 1`, so the
-#     real hardware clock runs and nothing is heard; a configured node that is
-#     not in PipeWire stops the run (exit 2), because PipeASIO would fall back
-#     to another device and clock. --no-audio-check skips this.
+#     --audio-device builtin) is muted again with `wpctl set-mute ID 1` when
+#     setup phase audio recorded audio_mute=1 (builtin; a setup.conf without
+#     audio_mute= mutes every node except profiler-null), so the real hardware
+#     clock runs and nothing is heard; a configured node that is not in
+#     PipeWire stops the run (exit 2), because PipeASIO would fall back to
+#     another device and clock, and so does a PipeASIO config.ini whose
+#     output_device is not that node (exit 2; `state restore` and setup phase
+#     audio point it at audio_node). --no-audio-check skips this.
 #   * a laptop (a Battery power supply) refuses to start on battery: the CPU
 #     clocks and EPP follow the battery policy and the numbers are not
 #     comparable (exit 2). --allow-battery overrides.
@@ -43,7 +47,8 @@ $runs_root/<UTC>-<tag>/bench
 and prints the run directory at the end. ABLETON_WINE_ROOT selects the runtime.
 
 Before every run it mutes the audio node PipeASIO drives (audio_node= in
-$setup_conf) and, on a laptop, refuses to run on battery.
+$setup_conf), refuses when PipeASIO's output_device names another node and,
+on a laptop, refuses to run on battery.
   --allow-battery     measure on battery anyway (numbers are not comparable)
   --no-audio-check    do not check or mute the audio node
 Everything else is passed through; the suite's own help follows.
@@ -66,6 +71,8 @@ cfg() {   # KEY → last value in setup.conf ("" when absent)
 [ -r "$host_lib" ] || die "missing $host_lib"
 # shellcheck source=../setup/lib/host.sh
 . "$host_lib"
+# PipeWire (pw-cli, wpctl) needs the user's runtime dir, also from a bare SSH session
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 export ABL_BENCH_OSC_SEND="${ABL_BENCH_OSC_SEND:-11000}"
 export ABL_BENCH_OSC_RECV="${ABL_BENCH_OSC_RECV:-11001}"
 
@@ -118,6 +125,7 @@ say "cpufreq  governor $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_govern
 # ------------------------------------------------------------- audio ----
 audio_device="$(cfg audio_device)"
 audio_node="$(cfg audio_node)"
+audio_mute="$(cfg audio_mute)"     # 1|0 from setup phase audio; "" in an older setup.conf
 if [ "$audio_check" -eq 1 ] && [ -z "$audio_node" ] && [ -n "$audio_device" ] && [ "$audio_device" != null ]; then
     audio_node="$(pwa_resolve_device "$audio_device" || true)"
     [ -z "$audio_node" ] || say "WARNING: audio_node is not recorded in $setup_conf (setup phase audio); --audio-device $audio_device resolves to $audio_node"
@@ -129,11 +137,13 @@ elif [ -z "$audio_node" ] || [ "$audio_node" = profiler-null ]; then
 else
     pipeasio_ini="${XDG_CONFIG_HOME:-$HOME/.config}/pipeasio/config.ini"
     configured="$(sed -n 's/^[[:space:]]*output_device[[:space:]]*=[[:space:]]*//p' "$pipeasio_ini" 2>/dev/null | tail -n1 | sed 's/[[:space:]]*$//' || true)"
-    [ "$configured" = "$audio_node" ] || say "WARNING: PipeASIO's output_device is '${configured:-unset}', not $audio_node ($pipeasio_ini; setup phase install)"
+    [ "$configured" = "$audio_node" ] || die "PipeASIO's output_device is '${configured:-unset}', not $audio_node (audio_node= in $setup_conf): the run would measure another device and clock — fix $pipeasio_ini with setup-machine.sh --only audio (or state restore), or pass --no-audio-check"
     if ! node_id="$(pwa_node_id "$audio_node")"; then
         die "audio node $audio_node (audio_node= in $setup_conf) is not in PipeWire: PipeASIO would fall back to another device and clock — check wpctl status / setup-machine.sh --only audio, or pass --no-audio-check"
     fi
-    if [ "$suite_dry" -eq 1 ]; then
+    if [ "$audio_mute" = 0 ]; then
+        say "audio    $audio_node (id $node_id, $(pwa_mute_state "$audio_node")); not muted (audio_mute=0 in $setup_conf)"
+    elif [ "$suite_dry" -eq 1 ]; then
         say "audio    $audio_node (id $node_id, $(pwa_mute_state "$audio_node")); dry run: would run  wpctl set-mute $node_id 1"
     else
         wpctl set-mute "$node_id" 1 || die "wpctl set-mute $node_id 1 failed for $audio_node"

@@ -15,7 +15,7 @@ phase_register 17 dashboard "Vite dashboard: npm ci + user unit profiler-dashboa
 _dash_dir() { printf '%s/dashboard\n' "$PROFILER_ROOT"; }
 _dash_unit() { printf '%s/systemd/user/profiler-dashboard.service\n' "${XDG_CONFIG_HOME:-$HOME/.config}"; }
 _dash_url() { printf 'http://%s:%s/\n' "$(hostname 2>/dev/null || echo localhost)" "$PROFILER_DASHBOARD_PORT"; }
-_dash_unit_sum() { sha256sum < "$1" 2>/dev/null | cut -c1-16 || true; }
+_dash_unit_sum() { [ -r "$1" ] || return 0; sha256sum 2>/dev/null < "$1" | cut -c1-16 || true; }
 # _dash_responds [TRIES] — one quick probe by default (check, verify.sh); apply
 # waits up to ~40 s right after starting the unit
 _dash_responds() {
@@ -73,7 +73,7 @@ phase_dashboard_apply() {
     unit="$(_dash_unit)"
     before="$(_dash_unit_sum "$unit")"
     systemctl --user is-active -q profiler-dashboard.service 2>/dev/null && was_active=1
-    PROFILER_DASHBOARD_DIR="$dir" PROFILER_NPM="$(command -v npm)" \
+    PROFILER_DASHBOARD_DIR="$dir" PROFILER_NPM="$(command -v npm || printf /usr/bin/npm)" \
         write_template "$TEMPLATES_DIR/profiler-dashboard.service" "$unit" --mode 0644 || return 1
     after="$(_dash_unit_sum "$unit")"
     run -- systemctl --user daemon-reload || return 1

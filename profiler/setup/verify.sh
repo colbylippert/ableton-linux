@@ -363,7 +363,7 @@ v_prefix_busy() {
     if declare -F _lp_prefix_busy >/dev/null; then _lp_prefix_busy "$1"; return; fi
     return 1
 }
-v_repo_version() { tr -d '[:space:]' < "$REPO_DIR/VERSION" 2>/dev/null || true; }
+v_repo_version() { tr -d '[:space:]' 2>/dev/null < "$REPO_DIR/VERSION" || true; }
 first_line() { head -n1 2>/dev/null | tr -d '\r' || true; }
 pw_setting() { sed -n "s/.*key:'$1' value:'\([^']*\)'.*/\1/p" <<< "$2" | head -n1 || true; }
 logind_prop() { busctl get-property org.freedesktop.login1 /org/freedesktop/login1 org.freedesktop.login1.Manager "$1" 2>/dev/null | sed -n 's/^s "\(.*\)"$/\1/p' || true; }
@@ -395,13 +395,16 @@ dm_value() {
 # `set -e` does not apply inside; every hard failure is explicit.
 
 probe_kernel() {
-    local kver pkgbase pkgver hver rc=0
+    local kver pkgbase pkgver hver owner rc=0
     kver="$(uname -r)"
     kv "kernel" "$kver"
     if [ -r "/usr/lib/modules/$kver/pkgbase" ]; then
         pkgbase="$(cat "/usr/lib/modules/$kver/pkgbase")"
         pkgver="$(pacman -Q "$pkgbase" 2>/dev/null | awk '{print $2}' || true)"
-        if pacman -Ql "$pkgbase" 2>/dev/null | grep -qxF "$pkgbase /usr/lib/modules/$kver/"; then
+        # ownership query, not `pacman -Ql | grep -q` (grep's early exit SIGPIPEs
+        # pacman and pipefail turns the match into a failure)
+        owner="$(pacman -Qqo -- "/usr/lib/modules/$kver/pkgbase" 2>/dev/null || true)"
+        if [ -n "$pkgbase" ] && [ "$owner" = "$pkgbase" ]; then
             ok "running kernel is the installed $pkgbase ${pkgver:-?}"
         else
             fail "installed $pkgbase ${pkgver:-?} does not own /usr/lib/modules/$kver/: reboot into the installed kernel (headers and bcc must match the running kernel)" || true
@@ -445,6 +448,11 @@ probe_laptop() {
             warn "closing the lid on AC would '$eff' the laptop"
         fi
         if [ "$dock" = ignore ]; then ok "closing the lid while docked is ignored"; else warn "HandleLidSwitchDocked is '${dock:-?}', expected ignore"; fi
+        if [ -f /etc/systemd/logind.conf.d/90-profiler-lid.conf ]; then
+            ok "logind drop-in /etc/systemd/logind.conf.d/90-profiler-lid.conf present"
+        elif [ "$PROFILE" = baremetal ]; then
+            warn "no logind drop-in /etc/systemd/logind.conf.d/90-profiler-lid.conf (phase session writes it on a laptop)"
+        fi
     else
         warn "busctl not found: the lid-switch policy was not checked"
     fi
@@ -467,6 +475,7 @@ probe_laptop() {
     if [ "$n" -gt 0 ]; then
         nmv="$(grep -rhsE '^[[:space:]]*wifi\.powersave[[:space:]]*=' /etc/NetworkManager/conf.d /usr/lib/NetworkManager/conf.d 2>/dev/null | tail -n1 | sed 's/.*=[[:space:]]*//' || true)"
         if [ "$nmv" = 2 ]; then ok "NetworkManager keeps Wi-Fi power save off (wifi.powersave = 2)"; else warn "no NetworkManager drop-in with wifi.powersave = 2 (power save comes back on reconnect)"; fi
+        [ ! -f /etc/NetworkManager/conf.d/90-profiler-wifi-powersave.conf ] || kv "nm drop-in" "/etc/NetworkManager/conf.d/90-profiler-wifi-powersave.conf"
     fi
     # schedulers and cpufreq policy (facts; ananicy-cpp renices Wine/Live by rule)
     st="$(systemctl is-active ananicy-cpp.service 2>/dev/null || true)"
@@ -694,10 +703,17 @@ probe_pipewire() {
 }
 
 probe_audio_device() {
-    local rc=0 node="" rec res id="" state ini out_dev in_dev
+    local rc=0 node="" rec res id="" state ini out_dev in_dev input mute
     kv "audio device" "$AUDIO_DEVICE"
     if ! pwa_available; then fail "PipeWire is not reachable (pw-cli): the audio device cannot be checked" || true; return 1; fi
     rec="$(cfg_get audio_node)"
+    # phase audio records the pair PipeASIO uses (audio_node + audio_input, "" =
+    # input_device unset) and whether the sink is muted (audio_mute=1: builtin)
+    input="$(cfg_get audio_input)"
+    mute="$(cfg_get audio_mute)"
+    if [ -z "$rec" ] && [ "$AUDIO_DEVICE" = null ]; then input=profiler-null; fi
+    if [ -z "$mute" ]; then if [ "$AUDIO_DEVICE" = builtin ]; then mute=1; else mute=0; fi; fi
+    kv "recorded" "audio_node=${rec:-unset} audio_input=${input:-unset} audio_mute=$mute"
     case "$AUDIO_DEVICE" in
         null)
             node=profiler-null
@@ -726,23 +742,25 @@ probe_audio_device() {
         alsa_output.*Speaker*|profiler-null) ;;
         *) [ "$AUDIO_DEVICE" != builtin ] || warn "$node has no \"Speaker\" in its name: --audio-device builtin fell back to the default sink" ;;
     esac
-    if [ "$AUDIO_DEVICE" != null ] && [ -n "$id" ]; then
+    if [ "$mute" = 1 ] && [ -n "$id" ]; then
         state="$(pwa_mute_state "$node")"
         case "$state" in
             muted) ok "$node is muted (the real clock runs, nothing is heard)" ;;
             unmuted) warn "$node is NOT muted (phase audio mutes it; profiler/bin/bench re-applies the mute before every run)" ;;
             *) warn "mute state of $node: $state" ;;
         esac
+    elif [ -n "$id" ]; then
+        kv "mute" "not required (audio_mute=$mute): $(pwa_mute_state "$node")"
     fi
     ini="${XDG_CONFIG_HOME:-$HOME/.config}/pipeasio/config.ini"
     if [ -r "$ini" ]; then
         out_dev="$(sed -n 's/^[[:space:]]*output_device[[:space:]]*=[[:space:]]*//p' "$ini" | tail -n1 | sed 's/[[:space:]]*$//' || true)"
         in_dev="$(sed -n 's/^[[:space:]]*input_device[[:space:]]*=[[:space:]]*//p' "$ini" | tail -n1 | sed 's/[[:space:]]*$//' || true)"
         kv "pipeasio" "$ini: output_device ${out_dev:-unset}, input_device ${in_dev:-unset}, buffer_size $(sed -n 's/^[[:space:]]*buffer_size[[:space:]]*=[[:space:]]*//p' "$ini" | tail -n1 || true)"
-        if [ "$out_dev" = "$node" ] && [ "$in_dev" = "$node" ]; then
-            ok "PipeASIO drives $node (output_device and input_device)"
+        if [ "$out_dev" = "$node" ] && [ "$in_dev" = "$input" ]; then
+            ok "PipeASIO drives $node (output_device)${input:+, input_device $input}$([ -n "$input" ] || printf ', input_device unset')"
         else
-            fail "PipeASIO is not pointed at $node (phase install sets output_device/input_device = $node in $ini)" || true; rc=1
+            fail "PipeASIO is not pointed at output_device = $node / input_device = ${input:-unset} (phases audio and install write $ini)" || true; rc=1
         fi
     else
         warn "no PipeASIO config at $ini yet (phase install; the installer seeds it)"
@@ -846,7 +864,7 @@ probe_runtime() {
     else
         warn "installed runtime is ${dv:-unknown}, the repo builds ${repo_v:-?} (scripts/installer.sh runtime install --yes, or profiler/dev/build-official.sh)"
     fi
-    data_v="$(tr -d '[:space:]' < "${XDG_DATA_HOME:-$HOME/.local/share}/ableton-wine/VERSION" 2>/dev/null || true)"
+    data_v="$(tr -d '[:space:]' 2>/dev/null < "${XDG_DATA_HOME:-$HOME/.local/share}/ableton-wine/VERSION" || true)"
     [ -z "$data_v" ] || [ "$data_v" = "$dv" ] || warn "~/.local/share/ableton-wine/VERSION ($data_v) differs from the runtime's dist-version (${dv:-?})"
     for f in bin/wineserver lib/wine/x86_64-unix/ntdll.so lib/wine/x86_64-unix/pipeasio64.dll.so lib/wine/x86_64-windows/pipeasio64.dll; do
         if [ -f "$rt/$f" ]; then :; else fail "$rt/$f is missing" || true; rc=1; fi
@@ -933,7 +951,7 @@ _tmpdir >/dev/null
 verify_log_init
 printf '%s%sWine Interface Profiler — verify%s  %s(%s profile, %s)%s\n' "$C_BOLD" "$C_CYAN" "$C_RESET" "$C_DIM" "$PROFILE" "$PROFILE_SOURCE" "$C_RESET" >&"$LOG_FD"
 _log_file "Wine Interface Profiler — verify ($PROFILE profile, $PROFILE_SOURCE)"
-kv "host" "$(hostname 2>/dev/null || uname -n) · $(id -un) · $(systemd-detect-virt 2>/dev/null || echo unknown) virtualization$([ "$LAPTOP" = 1 ] && printf ' · laptop')"
+kv "host" "$(hostname 2>/dev/null || uname -n) · $(id -un) · $(systemd-detect-virt 2>/dev/null || true) virtualization$([ "$LAPTOP" = 1 ] && printf ' · laptop')"
 kv "repo" "$REPO_DIR"
 kv "runtime / prefix" "$(v_runtime_root) · $(v_prefix)"
 kv "audio" "buffer $AUDIO_BUFFER · device $AUDIO_DEVICE"
@@ -963,7 +981,7 @@ elif [ "$NEED_RELOGIN" = 1 ] || [ "$NEED_REBOOT" = 1 ]; then
     rc=3
     warn "verify: all hard checks passed, but a re-login or reboot is required first (see ACTIONS REQUIRED)"
 else
-    ok "verify: all ${#SELECTED[@]} check(s) passed${WARN_COUNT:+ ($WARN_COUNT warning(s))}"
+    ok "verify: all ${#SELECTED[@]} check(s) passed$([ "$WARN_COUNT" -eq 0 ] || printf ' (%s warning(s))' "$WARN_COUNT")"
 fi
 
 # a machine-readable trace of this run for the agent loop (not with --no-log)

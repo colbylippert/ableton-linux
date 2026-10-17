@@ -33,9 +33,11 @@ phase_register 04 limits "realtime/audio groups, RT limits (scripts/setup-realti
 : "${P4_UDEV:=/etc/udev/rules.d/99-profiler-zram-swappiness.rules}"
 
 _lim_in_group() {   # USER GROUP → 0 when GROUP lists USER (the account, not this session)
-    getent group "$2" 2>/dev/null | cut -d: -f4 | tr ',' '\n' | grep -qxF -- "$1"
+    local members
+    members="$(getent group "$2" 2>/dev/null | cut -d: -f4)" || return 1
+    grep -qxF -- "$1" <<< "${members//,/$'\n'}"
 }
-_lim_session_has() { id -nG 2>/dev/null | tr ' ' '\n' | grep -qxF -- "$1"; }
+_lim_session_has() { local g; g="$(id -nG 2>/dev/null)" || return 1; grep -qxF -- "$1" <<< "${g// /$'\n'}"; }
 # the swappiness the RT profile asks for (90-ableton-rt.conf; 10 before it exists)
 _lim_swappiness() {
     local v

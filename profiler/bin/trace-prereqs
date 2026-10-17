@@ -150,7 +150,12 @@ usdt_count() {   # FILE → number of stapsdt notes (0 when absent/unreadable)
 }
 usdt_row() {   # LABEL FILE PATCH
     local label="$1" file="$2" patch="$3" n listed
-    if [ ! -f "$file" ]; then row FAIL "$label" "missing: $file"; return; fi
+    if [ ! -f "$file" ]; then
+        # no runtime at all: the "runtime" row above already fails; the probes are pending on it
+        if [ ! -x "$RT/bin/wine" ]; then row PENDING "$label" "runtime not installed yet: ${file##*/} is checked once it is ($patch)"
+        else row FAIL "$label" "missing: $file"; fi
+        return
+    fi
     n="$(usdt_count "$file")"
     if [ "$n" -eq 0 ]; then
         row PENDING "$label" "no .note.stapsdt yet ($patch not built): run the dev loop / official build after the patch lands"

@@ -21,6 +21,8 @@
 #   prefix/                ~/.wine-ableton            (ABLETON_WINEPREFIX > ~/.config/ableton-wine/config prefix= > default)
 #   config-ableton-wine/   ~/.config/ableton-wine
 #   pipeasio-config.ini    ~/.config/pipeasio/config.ini
+#                          (restore/diff take output_device/input_device from
+#                          setup.conf audio_node/audio_input, not the snapshot)
 #   pipewire.conf.d/       ~/.config/pipewire/pipewire.conf.d   (PipeWire reads it at start only)
 #   data/                  ~/.local/share/ableton-wine
 #   ableton-live           ~/.local/bin/ableton-live
@@ -70,6 +72,11 @@ LOG_LIB="$here/../setup/lib/log.sh"
 LOG_FD=1; LOGFILE=""; CURRENT_PHASE=""
 # shellcheck source=../setup/lib/log.sh
 . "$LOG_LIB"
+HOST_LIB="$here/../setup/lib/host.sh"
+[ -r "$HOST_LIB" ] || { printf 'state: missing %s
+' "$HOST_LIB" >&2; exit 2; }
+# shellcheck source=../setup/lib/host.sh
+. "$HOST_LIB"      # pipeasio_ini_render (the renderer setup phase audio uses)
 
 usage() {
     cat <<'EOF'
@@ -169,7 +176,7 @@ live_pids() {   # PREFIX → the Live processes among prefix_pids
     local pid cmd
     while IFS= read -r pid; do
         [ -n "$pid" ] || continue
-        cmd="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)"
+        cmd="$(tr '\0' ' ' 2>/dev/null < "/proc/$pid/cmdline" || true)"
         case "$cmd" in *"Ableton Live"*.exe*) printf '%s\n' "$pid" ;; esac
     done < <(prefix_pids "$1")
     return 0
@@ -199,7 +206,7 @@ refuse_if_busy() {   # PREFIX WHAT
 
 # --------------------------------------------------------------- runtime ----
 binfo_field() { sed -n "s/^$2:[[:space:]]*//p" "$1" 2>/dev/null | head -n1 || true; }
-file_sha() { sha256sum < "$1" 2>/dev/null | cut -d' ' -f1 || true; }
+file_sha() { sha256sum 2>/dev/null < "$1" | cut -d' ' -f1 || true; }
 # the installed runtime's identity: "sha256 dist-version patch-head" (empty fields as -)
 runtime_identity() {
     local bi="$1/ABLETON-WINE-BUILD-INFO.txt" sha
@@ -250,6 +257,38 @@ copy_tree() {   # SRC DST (DST must not exist)
     else
         run -- cp -a -- "$src" "$dst" || return 1
     fi
+}
+# PipeASIO's device keys follow setup.conf, not the snapshot: audio_node /
+# audio_input (setup phase audio) are the audio contract, so a later
+# `setup-machine.sh --only audio --audio-device NODE` survives every restore.
+# pipeasio_expected FILE → FILE's text with output_device/input_device set from
+# setup.conf (FILE verbatim when no audio_node is recorded)
+pipeasio_expected() {
+    local node input
+    node="$(setup_cfg audio_node)"; input="$(setup_cfg audio_input)"
+    if [ -n "$node" ]; then pipeasio_ini_render "$1" "$node" "$input"; else cat -- "$1"; fi
+}
+# point the restored config.ini at setup.conf's audio_node / audio_input
+pipeasio_repoint() {
+    local ini="$CONFIG_HOME/pipeasio/config.ini" node input tmp mode
+    node="$(setup_cfg audio_node)"; input="$(setup_cfg audio_input)"
+    [ -n "$node" ] || { info "pipeasio: no audio_node in setup.conf; config.ini kept as restored"; return 0; }
+    if [ -L "$ini" ] || { [ -e "$ini" ] && [ ! -f "$ini" ]; }; then
+        warn "pipeasio: $ini is not a regular file; output_device left alone"; return 0
+    fi
+    if [ ! -f "$ini" ]; then
+        dry && { info "dry run: would point $ini (when restored) at output_device = $node"; return 0; }
+        warn "pipeasio: $ini is absent after the restore; PipeASIO uses its default device (setup-machine.sh --only audio)"; return 0
+    fi
+    tmp="$(mktemp "${TMPDIR:-/tmp}/state-pipeasio.XXXXXX")" || die "mktemp failed" 1
+    pipeasio_ini_render "$ini" "$node" "$input" > "$tmp" || { rm -f -- "$tmp"; die "cannot render $ini" 1; }
+    if cmp -s -- "$tmp" "$ini"; then
+        rm -f -- "$tmp"; ok "pipeasio: output_device = $node (setup.conf)"; return 0
+    fi
+    mode="$(stat -c %a -- "$ini" 2>/dev/null || echo 644)"
+    run -- install -m "$mode" "$tmp" "$ini" || { rm -f -- "$tmp"; exit 1; }
+    rm -f -- "$tmp"
+    dry || ok "pipeasio: re-pointed at output_device = $node${input:+, input_device = $input} (setup.conf audio_node/audio_input)"
 }
 show_lines() {   # TEXT [MAX]: indented listing (first MAX lines)
     local max="${2:-200}" n=0 line
@@ -405,6 +444,7 @@ cmd_restore() {
         done < <(find "$keep" -type f)
         rm -rf -- "$keep"
     fi
+    pipeasio_repoint
     [ "$pw_changed" -eq 0 ] || warn "pipewire.conf.d differed from the snapshot and was restored: PipeWire reads it only at start (systemctl --user restart pipewire.service wireplumber.service)"
     run --allow-fail -- pw-metadata -n settings 0 clock.force-quantum 0 || warn "could not reset clock.force-quantum (PipeWire not running?)"
     do_clean_crash
@@ -441,13 +481,18 @@ cmd_diff() {
                 show_lines "$out"
                 total=$(( total + 1 ))
             fi
+        elif [ "${ITEM_KEY[i]}" = pipeasio ] && [ -f "$dest" ] && [ -f "$src" ]; then
+            # the snapshot as restore leaves it: device keys from setup.conf
+            a="$(pipeasio_expected "$dest"; printf x)"; b="$(cat -- "$src"; printf x)"
+            if [ "$a" = "$b" ]; then ok "${ITEM_KEY[i]}: identical (device keys from setup.conf)"; else warn "${ITEM_KEY[i]}: differs ($src)"; total=$(( total + 1 )); fi
         else
             if cmp -s -- "$dest" "$src"; then ok "${ITEM_KEY[i]}: identical"; else warn "${ITEM_KEY[i]}: differs ($src)"; total=$(( total + 1 )); fi
         fi
     done
     for r in system.reg user.reg userdef.reg; do
         a="$(file_sha "$snap/prefix/$r")"; b="$(file_sha "$PREFIX/$r")"
-        if [ "$a" = "$b" ]; then ok "registry $r: identical"; else warn "registry $r: differs (snapshot ${a:0:12}… live ${b:0:12}…)"; fi
+        # by content: rsync's size+mtime listing above misses a same-size rewrite within one second
+        if [ "$a" = "$b" ]; then ok "registry $r: identical"; else warn "registry $r: differs (snapshot ${a:0:12}… live ${b:0:12}…)"; total=$(( total + 1 )); fi
     done
     runtime_report "$snap" "$RUNTIME"      # informational: restore never changes the runtime
     if [ "$total" -eq 0 ]; then ok "no drift from '$name'"; return 0; fi

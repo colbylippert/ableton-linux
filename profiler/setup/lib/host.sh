@@ -2,7 +2,7 @@
 # profiler/setup/lib/host.sh — read-only host probes shared by setup-machine.sh
 # (every phase), verify.sh and profiler/bin/bench: the PipeWire audio node the
 # profiler drives and the power-supply state of a laptop. Sourced, never
-# executed; defines functions only (prefixes pwa_ and host_), needs no other
+# executed; defines functions only (prefixes pwa_, pipeasio_ and host_), needs no other
 # library, works under `set -euo pipefail` and never changes the host —
 # callers that mute a node run `wpctl set-mute ID 1` themselves (the setup
 # phases through `run`, so --dry-run prints it).
@@ -26,10 +26,20 @@
 #                            (wpctl get-volume ID: "Volume: 0.40 [MUTED]")
 #
 # Power supply (/sys/class/power_supply)
-#   host_has_battery         0 when any supply's type is Battery (a laptop: LAPTOP=1)
+#   host_has_battery         0 when a system battery exists (a laptop: LAPTOP=1): a
+#                            supply of type Battery whose scope is not "Device" (a
+#                            wireless mouse or headset reports type=Battery,
+#                            scope=Device and does not make a desktop a laptop)
 #   host_on_ac               0 when a Mains/USB supply is online, or no battery exists
 #   host_power_summary       one line, e.g. "AC online (ADP1); BAT1 91% Not charging"
 #   host_battery_facts       KEY=VALUE lines: ac_online battery battery_capacity battery_status
+#
+# PipeASIO (~/.config/pipeasio/config.ini; text only, the caller writes the file)
+#   pipeasio_ini_render FILE OUT IN
+#                            FILE's text with output_device = OUT and input_device = IN
+#                            in [pipeasio] (input_device removed when IN is empty; the
+#                            section appended when absent). The one renderer for setup
+#                            phase audio (_aud_point_pipeasio) and `state restore`/`diff`
 
 [ -n "${BASH_VERSION:-}" ] || { echo "host.sh needs bash" >&2; return 1 2>/dev/null || exit 1; }
 
@@ -114,11 +124,16 @@ pwa_mute_state() {
 }
 
 # ----------------------------------------------------------------- power ----
+# 0 when the power supply directory D is a system battery (not a peripheral's)
+_host_is_sys_battery() {
+    [ "$(cat -- "$1/type" 2>/dev/null || true)" = Battery ] || return 1
+    [ "$(cat -- "$1/scope" 2>/dev/null || true)" != Device ]
+}
 host_has_battery() {
-    local t
-    for t in /sys/class/power_supply/*/type; do
-        [ -r "$t" ] || continue
-        [ "$(cat -- "$t" 2>/dev/null)" = Battery ] && return 0
+    local d
+    for d in /sys/class/power_supply/*; do
+        [ -d "$d" ] || continue
+        _host_is_sys_battery "$d" && return 0
     done
     return 1
 }
@@ -134,7 +149,7 @@ host_on_ac() {
     done
     # no online adapter listed: trust the battery's own status
     for d in /sys/class/power_supply/*; do
-        [ "$(cat -- "$d/type" 2>/dev/null || true)" = Battery ] || continue
+        _host_is_sys_battery "$d" || continue
         case "$(cat -- "$d/status" 2>/dev/null || true)" in Charging|Full|"Not charging") return 0 ;; esac
     done
     return 1
@@ -148,6 +163,7 @@ host_battery_facts() {
         case "$type" in
             Mains|USB|USB_C|USB_PD) [ "$(cat -- "$d/online" 2>/dev/null || true)" = 1 ] && ac=1 ;;
             Battery)
+                _host_is_sys_battery "$d" || continue
                 if [ -z "$bat" ]; then
                     bat="${d##*/}"
                     cap="$(cat -- "$d/capacity" 2>/dev/null || true)"
@@ -168,8 +184,35 @@ host_power_summary() {
             Mains|USB|USB_C|USB_PD)
                 if [ "$(cat -- "$d/online" 2>/dev/null || true)" = 1 ]; then out+="${out:+; }AC online ($name)"; else out+="${out:+; }AC offline ($name)"; fi ;;
             Battery)
+                _host_is_sys_battery "$d" || continue
                 out+="${out:+; }$name $(cat -- "$d/capacity" 2>/dev/null || echo '?')% $(cat -- "$d/status" 2>/dev/null || echo '?')" ;;
         esac
     done
     printf '%s\n' "${out:-no power-supply information}"
+}
+
+# -------------------------------------------------------------- pipeasio ----
+pipeasio_ini_render() {
+    awk -v out="$2" -v inp="$3" '
+        function emit() {
+            if (!dout) { print "output_device = " out; dout = 1 }
+            if (inp != "" && !din) { print "input_device = " inp; din = 1 }
+        }
+        /^[[:space:]]*\[[^]]*\][[:space:]]*$/ {
+            if (insec) { emit(); printf "%s", blanks; blanks = "" }
+            s = $0; gsub(/^[[:space:]]*\[|\][[:space:]]*$/, "", s)
+            insec = (s == "pipeasio"); if (insec) found = 1
+            print; next
+        }
+        insec {
+            if ($0 ~ /^[[:space:]]*$/) { blanks = blanks $0 "\n"; next }
+            printf "%s", blanks; blanks = ""
+            if ($0 ~ /^[[:space:]]*output_device[[:space:]]*=/) { if (!dout) { print "output_device = " out; dout = 1 }; next }
+            if ($0 ~ /^[[:space:]]*input_device[[:space:]]*=/) { if (inp != "" && !din) { print "input_device = " inp; din = 1 }; next }
+        }
+        { print }
+        END {
+            if (insec) { emit(); printf "%s", blanks }
+            else if (!found) { if (NR > 0 && $0 !~ /^[[:space:]]*$/) print ""; print "[pipeasio]"; emit() }
+        }' "$1"
 }

@@ -1,7 +1,7 @@
 # ~/.config/systemd/user/profiler-dashboard.service — written by
 # profiler/setup/phases/17-dashboard.sh (template: profiler/setup/templates/).
 # Vite dev server for the profiler gains dashboard; reachable from the Windows
-# host as http://abletonlinux:@@PROFILER_DASHBOARD_PORT@@/ . Runs under the user
+# host as http://<this machine>:@@PROFILER_DASHBOARD_PORT@@/ (e.g. http://ableton-laptop:…). Runs under the user
 # manager, so with `loginctl enable-linger` it survives logouts and reboots.
 [Unit]
 Description=Wine interface profiler dashboard (Vite dev server, port @@PROFILER_DASHBOARD_PORT@@)

@@ -6,7 +6,10 @@
 #     point origin at GitHub — or, without a bundle, clone GitHub
 #   * core.autocrlf=false, core.eol=lf (the scripts must stay LF)
 #   * branch profiler checked out (a trial/* branch of the agent loop is left
-#     alone); aceb236 must be an ancestor of HEAD
+#     alone); aceb236 must be an ancestor of HEAD, and HEAD must carry the
+#     profiler/ tree (a clone made before the bootstrap — branch profiler at
+#     aceb236 — is fast-forwarded from the bundle: git fetch BUNDLE profiler,
+#     git merge --ff-only FETCH_HEAD)
 #   * bench/ (deleted upstream in aceb236, still used by scripts/bench-suite.sh)
 #     restored from aceb236^ with `git archive | tar -x`, verified against
 #     bench/SHA256SUMS, and kept out of git and out of build.sh's source snapshot
@@ -33,6 +36,10 @@ _repo_exclude_file() {
     printf '%s\n' "$p"
 }
 _repo_bench_ok() { [ -f "$REPO_DIR/bench/SHA256SUMS" ] && ( cd -- "$REPO_DIR" && sha256sum -c --status bench/SHA256SUMS ) >/dev/null 2>&1; }
+# 0 when HEAD carries the profiler tree (the setup driver itself)
+_repo_has_profiler() { [ -f "$REPO_DIR/profiler/setup/setup-machine.sh" ]; }
+# HEAD of the checkout this setup script runs from ("" when it is not a git checkout)
+_repo_own_head() { git -C "$(dirname -- "$PROFILER_ROOT")" --no-optional-locks rev-parse -q --verify HEAD 2>/dev/null || true; }
 # 0 when REPO_DIR is the checkout this setup script runs from
 _repo_is_own_checkout() { [ "$(readlink -f -- "$REPO_DIR" 2>/dev/null)" = "$(readlink -f -- "$(dirname -- "$PROFILER_ROOT")" 2>/dev/null)" ]; }
 
@@ -48,6 +55,13 @@ phase_repo_check() {
     esac
     _repo_git merge-base --is-ancestor "$P7_BASE" HEAD 2>/dev/null || { info "$P7_BASE is not an ancestor of HEAD: not the fork's history"; return 1; }
     ok "$P7_BASE is an ancestor of HEAD"
+    if ! _repo_has_profiler; then
+        info "$REPO_DIR has no profiler/ tree at HEAD (a clone from before the bootstrap): it is fast-forwarded from the bundle"
+        return 1
+    fi
+    if ! _repo_is_own_checkout && [ -n "$(_repo_own_head)" ] && [ "$(_repo_own_head)" != "$(_repo_git rev-parse HEAD 2>/dev/null)" ]; then
+        warn "setup runs from $(dirname -- "$PROFILER_ROOT") at $(_repo_own_head | cut -c1-12), but $REPO_DIR is at $(_repo_git rev-parse --short=12 HEAD 2>/dev/null): the build uses $REPO_DIR"
+    fi
     if [ "$(_repo_git config --get core.autocrlf 2>/dev/null)" != false ] || [ "$(_repo_git config --get core.eol 2>/dev/null)" != lf ]; then
         info "core.autocrlf / core.eol are not false / lf"
         return 1
@@ -111,6 +125,24 @@ phase_repo_apply() {
     if ! is_dry_run && ! _repo_git merge-base --is-ancestor "$P7_BASE" HEAD 2>/dev/null; then
         fail "$P7_BASE is not an ancestor of HEAD in $REPO_DIR: this is not the fork's history (re-clone from the bootstrap bundle)"
         return 1
+    fi
+    if ! _repo_has_profiler && { _repo_present || ! is_dry_run; }; then
+        step "profiler/ tree (HEAD $(_repo_git rev-parse --short HEAD 2>/dev/null || echo ?) predates the bootstrap)"
+        branch="$(_repo_branch)"
+        if [ "$branch" != profiler ] && ! is_dry_run; then
+            fail "$REPO_DIR is on '${branch:-detached HEAD}' without a profiler/ tree: switch to branch profiler and re-run"
+            return 1
+        fi
+        if [ ! -f "$bundle" ]; then
+            prereq_fail "$REPO_DIR has no profiler/ tree and there is no bootstrap bundle at $bundle (profiler/setup/bootstrap.md: git bundle create … profiler, scp it here)" || return 1
+        fi
+        run -- git -C "$REPO_DIR" fetch -- "$bundle" profiler || return 1
+        run -- git -C "$REPO_DIR" merge --ff-only FETCH_HEAD || {
+            info "not a fast-forward, or local changes are in the way: resolve by hand (git -C $REPO_DIR status), then re-run"
+            return 1
+        }
+        if ! is_dry_run && ! _repo_has_profiler; then fail "the bundle's branch profiler has no profiler/ tree either"; return 1; fi
+        is_dry_run || ok "fast-forwarded $REPO_DIR to $(_repo_git rev-parse --short HEAD) from $bundle"
     fi
     step "bench/ from $P7_BENCH_REV (kept out of git through info/exclude)"
     if excl="$(_repo_exclude_file)"; then

@@ -64,7 +64,7 @@ if [ -z "${DISPLAY:-}" ]; then
     cat >&2 <<EOF
 with-session-env: no DISPLAY in the user session (systemctl --user show-environment) or in the environment.
   Nothing with a window can run. Log in to the desktop session on the console
-  (profiler setup phase "session" enables SDDM autologin), then retry.
+  (setup phase "session" enables display-manager autologin: Plasma Login Manager or SDDM), then retry.
 EOF
     exit 3
 fi

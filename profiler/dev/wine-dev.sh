@@ -371,7 +371,7 @@ _lock_dev() {
     if ! command -v flock >/dev/null 2>&1; then warn "flock not found: the wine-dev lock is not enforced"; return 0; fi
     exec 9>>"$DEV_LOCK" || { warn "cannot open $DEV_LOCK; the wine-dev lock is not enforced"; return 0; }
     if ! flock -n 9; then
-        die "another wine-dev.sh is running ($(tr '\n' ' ' < "$DEV_BUSY" 2>/dev/null || echo 'details unknown')); wait for it or check  wine-dev.sh logs" 2
+        die "another wine-dev.sh is running ($(tr '\n' ' ' 2>/dev/null < "$DEV_BUSY" || echo 'details unknown')); wait for it or check  wine-dev.sh logs" 2
     fi
     printf 'pid=%s\ncmd=%s\nstarted=%s\nlog=%s\n' "$$" "$CMD" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${LOGFILE:-}" > "$DEV_BUSY" 2>/dev/null || true
     DEV_LOCKED=1
@@ -1030,7 +1030,7 @@ cmd_sync() {
             ok "dev runtime already matches the stage"
         else
             info "$n file(s) to update$([ "$n" -gt 40 ] && echo ' (first 40 shown)'):"
-            printf '%s\n' "$changes" | head -n 40 | _lines
+            printf '%s\n' "$changes" | sed -n '1,40p' | _lines     # sed reads to EOF: no SIGPIPE under pipefail
         fi
     else
         n="?"
@@ -1336,7 +1336,7 @@ cmd_status() {
         if _wine_tag_ok; then
             kv "$MAIN_TAG" "$(git -C "$WINE_SRC" log -1 --format='%h %s' "refs/tags/$MAIN_TAG" 2>/dev/null || echo 'absent (tree initialised before the tag existed)') — the numbered series ends here; the official build applies performance/* after it"
             kv "since $SERIES_TAG" "$(_wine_since) commit(s)"
-            git -C "$WINE_SRC" log --format='  %h %s' "$SERIES_TAG..HEAD" 2>/dev/null | head -n 10 | _lines
+            git -C "$WINE_SRC" log --format='  %h %s' "$SERIES_TAG..HEAD" 2>/dev/null | sed -n '1,10p' | _lines || true
         else
             warn "tag $SERIES_TAG missing: the series step did not complete (run init again)"
         fi
@@ -1367,7 +1367,7 @@ cmd_status() {
         kv "path" "$DEV_ROOT$([ -x "$DEV_ROOT/bin/wine" ] || echo ' (INCOMPLETE: no bin/wine)')"
         info_file="$DEV_ROOT/PROFILER-DEV-INFO.txt"
         if [ -r "$info_file" ]; then
-            grep -E '^(synced|head|dirty|commits_since_series|stripped|mode|seeded_from)=' "$info_file" | _lines
+            grep -E '^(synced|head|dirty|commits_since_series|stripped|mode|seeded_from)=' "$info_file" | _lines || true
         else
             kv "PROFILER-DEV-INFO" "missing (never synced)"
         fi

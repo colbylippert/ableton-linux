@@ -9,9 +9,11 @@
 #     (pipewire, pipewire-pulse, wireplumber) — refused while Live runs
 #   * the PipeASIO device, from AUDIO_DEVICE (driver option --audio-device;
 #     default builtin on baremetal, null on vm):
-#       builtin   the default ALSA Audio/Sink whose node.name contains "Speaker",
-#                 else the lowest-id ALSA "Speaker" sink, else the default sink
-#                 when it is an ALSA sink; input = the Mic source on the same
+#       builtin   lib/host.sh's pwa_resolve_device (the rule verify.sh and bench
+#                 share): the ALSA Audio/Sink whose node.name contains "Speaker"
+#                 (the default sink when it is one, else the highest
+#                 priority.session), else the default sink when it is an ALSA
+#                 sink; input = the Mic source on the same
 #                 PipeWire device (the default source first), else unset. The
 #                 sink is MUTED (wpctl set-mute <id> 1): the graph keeps the
 #                 card's hardware clock, the room stays quiet.
@@ -60,7 +62,7 @@ _aud_setting() { sed -n "s/.*key:'$1' value:'\([^']*\)'.*/\1/p" <<< "$2" | head 
 # mismatches between the live settings metadata and the template ("" when none)
 _aud_clock_drift() {
     local md k want have out=""
-    md="$(pw-metadata -n settings 2>/dev/null || true)"
+    md="$(timeout 5 pw-metadata -n settings 2>/dev/null || true)"
     [ -n "$md" ] || { printf 'pw-metadata -n settings printed nothing\n'; return 0; }
     for k in rate quantum min-quantum max-quantum; do
         want="$(_aud_tpl_clock "$k")"; have="$(_aud_setting "clock.$k" "$md")"
@@ -71,8 +73,9 @@ _aud_clock_drift() {
     [ -z "$want" ] || [ "$have" = "$want" ] || out="${out:+$out, }clock.allowed-rates=[${have:-unset}] (want [$want])"
     printf '%s\n' "$out"
 }
-_aud_force_quantum() { _aud_setting clock.force-quantum "$(pw-metadata -n settings 2>/dev/null || true)"; }
-_aud_null_present() { pw-cli ls Node 2>/dev/null | grep -q 'node.name = "profiler-null"'; }
+_aud_force_quantum() { _aud_setting clock.force-quantum "$(timeout 5 pw-metadata -n settings 2>/dev/null || true)"; }
+# captured first: under pipefail `pw-cli … | grep -q` can fail with SIGPIPE after a match
+_aud_null_present() { local out; out="$(timeout 10 pw-cli ls Node 2>/dev/null || true)"; grep -q 'node.name = "profiler-null"' <<< "$out"; }
 # user PipeWire units that exist here, in restart order
 _aud_units() {
     local u
@@ -99,7 +102,7 @@ _aud_resolve() {
     local mode="$1" dump nodes def_sink def_src line dev
     AUD_NODE="" AUD_NODE_ID="" AUD_INPUT="" AUD_MUTE=0 AUD_WHY=""
     if ! command -v pw-dump >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1; then AUD_WHY="pw-dump or jq is missing (phase packages)"; return 1; fi
-    dump="$(pw-dump 2>/dev/null || true)"
+    dump="$(timeout 10 pw-dump 2>/dev/null || true)"
     [ -n "$dump" ] || { AUD_WHY="pw-dump printed nothing (PipeWire not running for $(_p1_user)?)"; return 1; }
     nodes="$(_aud_nodes "$dump")"
     def_sink="$(_aud_default "$dump" default.audio.sink)"
@@ -108,18 +111,19 @@ _aud_resolve() {
         null) AUD_NODE=profiler-null; AUD_INPUT=profiler-null ;;
         builtin)
             AUD_MUTE=1
-            AUD_NODE="$(awk -F'\t' -v def="$def_sink" '
-                $2 == "Audio/Sink" && $3 ~ /^alsa_output\./ && $3 ~ /Speaker/ {
-                    if ($3 == def) d = $3
-                    else if (first == "" || $1 + 0 < fid) { first = $3; fid = $1 + 0 }
-                }
-                END { if (d != "") print d; else if (first != "") print first }' <<< "$nodes")"
-            if [ -z "$AUD_NODE" ]; then
-                case "$def_sink" in
-                    alsa_output.*) AUD_NODE="$def_sink"; AUD_WHY="no ALSA sink named *Speaker*: using the default ALSA sink" ;;
-                    *) AUD_WHY="no ALSA sink named *Speaker*, and the default sink '${def_sink:-none}' is not an ALSA sink"; return 1 ;;
-                esac
-            fi ;;
+            # lib/host.sh's rule, shared with verify.sh and profiler/bin/bench: the
+            # ALSA "Speaker" sink (the default one first, else the highest
+            # priority.session), else the default sink — which must be an ALSA
+            # sink here ("builtin" means a hardware clock)
+            if declare -F pwa_resolve_device >/dev/null 2>&1; then
+                AUD_NODE="$(pwa_resolve_device builtin 2>/dev/null || true)"
+            fi
+            [ -n "$AUD_NODE" ] || AUD_NODE="$def_sink"
+            case "$AUD_NODE" in
+                alsa_output.*Speaker*) ;;
+                alsa_output.*) AUD_WHY="no ALSA sink named *Speaker*: using the default ALSA sink" ;;
+                *) AUD_WHY="no ALSA sink named *Speaker*, and the default sink '${AUD_NODE:-none}' is not an ALSA sink (pass --audio-device <node.name>)"; AUD_NODE=""; return 1 ;;
+            esac ;;
         *) AUD_NODE="$mode" ;;
     esac
     line="$(awk -F'\t' -v n="$AUD_NODE" '$2 == "Audio/Sink" && $3 == n { print; exit }' <<< "$nodes")"
@@ -136,35 +140,12 @@ _aud_resolve() {
     fi
     return 0
 }
-_aud_muted() { wpctl get-volume "$1" 2>/dev/null | grep -q '\[MUTED\]'; }
+_aud_muted() { local out; out="$(timeout 5 wpctl get-volume "$1" 2>/dev/null || true)"; grep -q '\[MUTED\]' <<< "$out"; }
 
 # ------------------------------------------------ PipeASIO config.ini ----
 # FILE OUT IN → FILE's text with output_device = OUT and input_device = IN in
 # [pipeasio] (input_device removed when IN is empty; the section appended when absent)
-_aud_ini_render() {
-    awk -v out="$2" -v inp="$3" '
-        function emit() {
-            if (!dout) { print "output_device = " out; dout = 1 }
-            if (inp != "" && !din) { print "input_device = " inp; din = 1 }
-        }
-        /^[[:space:]]*\[[^]]*\][[:space:]]*$/ {
-            if (insec) { emit(); printf "%s", blanks; blanks = "" }
-            s = $0; gsub(/^[[:space:]]*\[|\][[:space:]]*$/, "", s)
-            insec = (s == "pipeasio"); if (insec) found = 1
-            print; next
-        }
-        insec {
-            if ($0 ~ /^[[:space:]]*$/) { blanks = blanks $0 "\n"; next }
-            printf "%s", blanks; blanks = ""
-            if ($0 ~ /^[[:space:]]*output_device[[:space:]]*=/) { if (!dout) { print "output_device = " out; dout = 1 }; next }
-            if ($0 ~ /^[[:space:]]*input_device[[:space:]]*=/) { if (inp != "" && !din) { print "input_device = " inp; din = 1 }; next }
-        }
-        { print }
-        END {
-            if (insec) { emit(); printf "%s", blanks }
-            else if (!found) { if (NR > 0 && $0 !~ /^[[:space:]]*$/) print ""; print "[pipeasio]"; emit() }
-        }' "$1"
-}
+_aud_ini_render() { pipeasio_ini_render "$@"; }   # lib/host.sh
 _aud_ini_current() {   # FILE OUT IN
     local want have
     [ -r "$1" ] || return 1

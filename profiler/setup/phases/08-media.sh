@@ -76,9 +76,11 @@ _med_structure() {
     shopt -u nullglob
     n="${#extra[@]}"
     [ "$n" -eq 3 ] || { info "found $n '${base%.*}-*.bin' slices beside the .exe, expected exactly 3"; return 1; }
-    if head -c 4194304 -- "$exe" | grep -qaF '.wixburn'; then info "$base is a WiX bundle (.wixburn), not the Inno Setup installer of Live 12"; return 1; fi
-    head -c 4194304 -- "$exe" | grep -qa 'Inno Setup' || { info "no 'Inno Setup' signature in the first 4 MiB of $base"; return 1; }
-    { strings -a -- "$exe"; strings -a -el -- "$exe"; } 2>/dev/null | grep -Eqi 'Ableton[ _-]*Live[ _-]*12' \
+    # process substitution, not a pipe: under pipefail grep -q's early exit would
+    # SIGPIPE head/strings and turn a match into a failure
+    if grep -qaF '.wixburn' < <(head -c 4194304 -- "$exe"); then info "$base is a WiX bundle (.wixburn), not the Inno Setup installer of Live 12"; return 1; fi
+    grep -qa 'Inno Setup' < <(head -c 4194304 -- "$exe") || { info "no 'Inno Setup' signature in the first 4 MiB of $base"; return 1; }
+    grep -Eqi 'Ableton[ _-]*Live[ _-]*12' < <({ strings -a -- "$exe"; strings -a -el -- "$exe"; } 2>/dev/null) \
         || { info "no 'Ableton Live 12' string in $base (8-bit or UTF-16)"; return 1; }
     return 0
 }

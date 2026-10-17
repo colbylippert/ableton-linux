@@ -104,7 +104,8 @@ _pf_cpu() {
     else
         kv "ananicy-cpp" "${st:-not installed}"
     fi
-    kv "irqbalance / rtkit" "$(systemctl is-active irqbalance.service 2>/dev/null || echo '?') / $(systemctl is-active rtkit-daemon.service 2>/dev/null || echo '?')"
+    # is-active prints "inactive" AND exits non-zero: never append a fallback to its output
+    kv "irqbalance / rtkit" "$(systemctl is-active irqbalance.service 2>/dev/null || true) / $(systemctl is-active rtkit-daemon.service 2>/dev/null || true)"
 }
 
 # graphics adapters: the Intel iGPU drives the desktop (Xwayland :0, where Live
@@ -376,7 +377,9 @@ _preflight_audit() {
         kv "kernel package" "$pkgbase ${pkgver:-(not installed?)}"
         _pf_fact kernel_pkgbase "$pkgbase"
         _pf_fact kernel_pkgver "${pkgver:-}"
-        if pacman -Ql "$pkgbase" 2>/dev/null | grep -qxF "$pkgbase /usr/lib/modules/$kver/"; then
+        # ownership query, not `pacman -Ql | grep -q` (grep's early exit SIGPIPEs
+        # pacman and pipefail turns the match into a failure)
+        if [ -n "$pkgbase" ] && [ "$(pacman -Qqo -- "/usr/lib/modules/$kver/pkgbase" 2>/dev/null || true)" = "$pkgbase" ]; then
             ok "running kernel matches the installed $pkgbase package"
         else
             warn "installed $pkgbase ${pkgver:-?} is not the running kernel $kver: reboot before building (headers/bcc must match)"
