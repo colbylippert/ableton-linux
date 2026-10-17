@@ -131,12 +131,13 @@ _aud_resolve() {
     AUD_NODE_ID="$(cut -f1 <<< "$line")"
     dev="$(cut -f4 <<< "$line")"
     if [ "$mode" = builtin ] && [ -n "$dev" ]; then
-        AUD_INPUT="$(awk -F'\t' -v dev="$dev" -v def="$def_src" '
+        # Stable choice: node ids and the default source both change when PipeWire
+        # restarts, so pick the lexically first *Mic* source on the sink's card.
+        AUD_INPUT="$(awk -F'\t' -v dev="$dev" '
             $2 == "Audio/Source" && $4 == dev && $3 ~ /Mic/ {
-                if ($3 == def) d = $3
-                else if (first == "" || $1 + 0 < fid) { first = $3; fid = $1 + 0 }
+                if (first == "" || $3 < first) first = $3
             }
-            END { if (d != "") print d; else if (first != "") print first }' <<< "$nodes")"
+            END { if (first != "") print first }' <<< "$nodes")"
     fi
     return 0
 }
