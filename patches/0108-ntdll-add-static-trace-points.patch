@@ -1,4 +1,4 @@
-From dce595918404f3e26325f35b94bc34646d3ef6c2 Mon Sep 17 00:00:00 2001
+From e734dc1b08179b839ad5414e5bf8c4ae6d2560ef Mon Sep 17 00:00:00 2001
 From: dist <build@localhost>
 Date: Fri, 16 Oct 2026 13:59:55 -0400
 Subject: [PATCH] ntdll: add static USDT trace points on the syscall, unix-call
@@ -27,7 +27,8 @@ dlls/ntdll/unix/sdt-config.h replaces the autoconf-generated file and
 enables the "?" and "R" section flags (binutils 2.36 and later). Both
 headers are private to the ntdll unix side; dlls/ntdll/Makefile.in lists
 no headers and is unchanged. sync.c is untouched, so performance/0001
-keeps applying.
+keeps applying. A pre-C99 -std stops signal_x86_64.c with one #error,
+because its raw templates need the variadic STAP_PROBE_ASM of sdt.h.
 
 Probes in the dispatchers (signal_x86_64.c), as asm templates with
 decimal displacements, no commas and a single % (basic asm):
@@ -89,10 +90,12 @@ The patch applies to a fresh checkout of the series with git apply
 --check and git am --3way.
 ---
  dlls/ntdll/unix/sdt-config.h    |  10 +
- dlls/ntdll/unix/sdt.h           | 547 ++++++++++++++++++++++++++++++++++++++++
+ dlls/ntdll/unix/sdt.h           | 547 ++++++++++++++++++++++++++++++++
  dlls/ntdll/unix/server.c        |  14 +-
- dlls/ntdll/unix/signal_x86_64.c |   9 +
- 4 files changed, 578 insertions(+), 2 deletions(-)
+ dlls/ntdll/unix/signal_x86_64.c |  12 +
+ 4 files changed, 581 insertions(+), 2 deletions(-)
+ create mode 100644 dlls/ntdll/unix/sdt-config.h
+ create mode 100644 dlls/ntdll/unix/sdt.h
 
 diff --git a/dlls/ntdll/unix/sdt-config.h b/dlls/ntdll/unix/sdt-config.h
 new file mode 100644
@@ -713,18 +716,21 @@ index 730a0cd..c53f349 100644
      while (ret == STATUS_USER_APC || ret == STATUS_KERNEL_APC);
  
 diff --git a/dlls/ntdll/unix/signal_x86_64.c b/dlls/ntdll/unix/signal_x86_64.c
-index 0023abf..478b17d 100644
+index 0023abf..8f3814c 100644
 --- a/dlls/ntdll/unix/signal_x86_64.c
 +++ b/dlls/ntdll/unix/signal_x86_64.c
-@@ -83,6 +83,7 @@ extern void _thread_set_tsd_base(uint64_t);
+@@ -83,6 +83,10 @@ extern void _thread_set_tsd_base(uint64_t);
  #include "wine/asm.h"
  #include "unix_private.h"
  #include "wine/debug.h"
 +#include "sdt.h"
++#if !defined(__STDC_VERSION__) || __STDC_VERSION__ < 199901L
++#error "the STAP_PROBE_ASM raw templates below need the C99 variadic form of sdt.h: build the unix side with -std=gnu99 or later"
++#endif
  
  WINE_DEFAULT_DEBUG_CHANNEL(unwind);
  WINE_DECLARE_DEBUG_CHANNEL(seh);
-@@ -3092,6 +3093,8 @@ __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher,
+@@ -3092,6 +3096,8 @@ __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher,
                     "leaq -0x98(%rbp),%rcx\n"
  #endif
                     "ldmxcsr 0x33c(%r13)\n\t"       /* amd64_thread_data()->mxcsr */
@@ -733,7 +739,7 @@ index 0023abf..478b17d 100644
                     "movl 0xb0(%rcx),%eax\n\t"      /* frame->syscall_id */
                     "movq 0x18(%rcx),%r11\n\t"      /* 2nd argument */
                     "movl %eax,%ebx\n\t"
-@@ -3129,6 +3132,8 @@ __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher,
+@@ -3129,6 +3135,8 @@ __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher,
                     /* push rbp-based kernel stack cfi */
                     __ASM_CFI(".cfi_remember_state\n\t")
                     __ASM_CFI_CFA_IS_AT2(rcx, 0xa8, 0x01) /* frame->syscall_cfa */
@@ -742,7 +748,7 @@ index 0023abf..478b17d 100644
                     "leaq 0x70(%rcx),%rsp\n\t"      /* %rsp > frame means no longer inside syscall */
  #ifdef __linux__
                     "movb $1,0x340(%r13)\n\t"       /* amd64_thread_data()->syscall_dispatch */
-@@ -3382,8 +3387,12 @@ __ASM_GLOBAL_FUNC( __wine_unix_call_dispatcher,
+@@ -3382,8 +3390,12 @@ __ASM_GLOBAL_FUNC( __wine_unix_call_dispatcher,
  #endif
                     "ldmxcsr 0x33c(%r13)\n\t"       /* amd64_thread_data()->mxcsr */
                     "movq %r8,%rdi\n\t"             /* args */
