@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Unit tests for profiler/tracer/validate.py.
 
-Run:  python -I -m unittest discover -s profiler/tracer/tests -t profiler/tracer
+Run from the repository root:  python3 -I -m unittest discover -s profiler/tracer/tests -v
 """
 
 from __future__ import annotations

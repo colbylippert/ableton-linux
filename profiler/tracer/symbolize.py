@@ -1992,7 +1992,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--classify", metavar="COMM", help="classify one thread with roles.toml")
     p.add_argument("--exe")
     p.add_argument("--tid", type=int)
-    p.add_argument("--process-comm")
+    p.add_argument("--process-comm", help="the process's own comm (main-thread comm); rules with `named` need it")
     p.add_argument("--roles", help="roles.toml path (default: next to this script)")
     p.add_argument("--verbose", "-v", action="store_true")
     p.add_argument("--quiet", "-q", action="store_true")

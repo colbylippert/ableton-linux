@@ -150,7 +150,8 @@ _preflight_audit() {
     mem_kb="$(awk '/^MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
     avail_kb="$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
     swap_kb="$(awk '/^SwapTotal:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
-    mem_gib=$(( mem_kb / 1048576 )); avail_gib=$(( avail_kb / 1048576 ))
+    # GiB figures are rounded for display only (8084712 kB is "8 GiB", not 7); every threshold below compares raw kB
+    mem_gib=$(( (mem_kb + 524288) / 1048576 )); avail_gib=$(( (avail_kb + 524288) / 1048576 ))
     kv "memory" "${mem_gib} GiB total, ${avail_gib} GiB available"
     _pf_fact mem_total_kb "$mem_kb"
     if [ "$mem_kb" -lt $(( 12 * 1048576 )) ]; then
@@ -164,7 +165,7 @@ _preflight_audit() {
     fi
     kv "build jobs" "${JOBS:-?} (${JOBS_SOURCE:-auto})"
     _pf_fact jobs "${JOBS:-}"
-    if [ "$swap_kb" -gt 0 ]; then ok "swap present ($(( swap_kb / 1048576 )) GiB)"; else warn "no swap: a -j${JOBS:-?} Wine build may run out of memory"; fi
+    if [ "$swap_kb" -gt 0 ]; then ok "swap present ($(( (swap_kb + 524288) / 1048576 )) GiB)"; else warn "no swap: a -j${JOBS:-?} Wine build may run out of memory"; fi
     home_avail="$(df -B1 --output=avail -- "$HOME" 2>/dev/null | tail -n1 | tr -d ' ')"
     home_fs="$(stat -f -c %T -- "$HOME" 2>/dev/null || echo ?)"
     [[ "$home_avail" =~ ^[0-9]+$ ]] || home_avail=0

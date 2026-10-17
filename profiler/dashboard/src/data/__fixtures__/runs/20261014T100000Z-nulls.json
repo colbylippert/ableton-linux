@@ -1,0 +1,48 @@
+{
+  "schema": "ableton-linux-profiler-history/v1",
+  "run_id": "20261014T100000Z-nulls",
+  "tag": "nulls",
+  "started_at": "2026-10-14T10:00:00Z",
+  "machine_id": "m1-studio",
+  "hostname": "studio",
+  "virtualization": "none",
+  "structure": "benchmark",
+  "scenario": null,
+  "trace_mode": "off",
+  "duration_s": null,
+  "runtime": {
+    "dist_version": null,
+    "source_tree_sha": null,
+    "dev_info": null
+  },
+  "switches": {},
+  "harness_sha": null,
+  "commit": null,
+  "trial": null,
+  "arm": null,
+  "source_dir": null,
+  "sets": {
+    "Benchmark_VSTs": {
+      "mode": "playback",
+      "host_cpu_pct": null,
+      "live_cpu_pct_per_core": null,
+      "wine_cpu_pct_per_core": null,
+      "pipewire_cpu_pct": null,
+      "irq_per_s": null,
+      "softirq_per_s": null,
+      "pipewire_errors": null,
+      "xruns": null,
+      "dsp_avg": null,
+      "dsp_peak": null,
+      "audio_workers": null,
+      "voluntary_switches_per_s": null,
+      "late_blocks": null,
+      "near_late_blocks": null,
+      "slack_p01_ns": null,
+      "slack_p50_ns": null,
+      "lost_slack_total_ns": null,
+      "call_sites_top": null,
+      "hotspots_non_audio_top": null
+    }
+  }
+}

@@ -22,6 +22,10 @@ name ends in ``func``/``funcs``; else the first enum whose enumerators are mostl
 else the enum of a directly included ``../<module>/unixlib.h`` (winealsa/wineoss/winecoreaudio
 share mmdevapi's).  Initialisers are resolved when they are integers or enumerators defined
 earlier in the same header (or its include); anything else stops that enum with a warning.
+The trailing "number of codes" sentinel (``unix_funcs_count``, ``funcs_count``,
+``unix_wg_funcs_count``, ``waylanddrv_unix_func_count``) is dropped; it is recognised only in
+the last position, because other ``*_count`` enumerators are real codes (dwrite's
+``unix_get_glyph_count``, winegstreamer's ``unix_wg_parser_get_stream_count``).
 The table key is the unix library name without ``.so`` (``winealsa.drv`` -> ``winealsa``,
 ``mountmgr.sys`` -> ``mountmgr``, ``libusb-1.0`` -> ``libusb-1.0``).
 
@@ -45,6 +49,7 @@ SYSCALL_ENTRY_RE = re.compile(
 ENUM_RE = re.compile(r"\benum\s+([A-Za-z_][A-Za-z0-9_]*)\s*\{(.*?)\}\s*;", re.DOTALL)
 INCLUDE_RE = re.compile(r'^\s*#\s*include\s+"\.\./([^/"]+)/unixlib\.h"', re.MULTILINE)
 FUNCS_NAME_RE = re.compile(r"funcs?$", re.IGNORECASE)
+SENTINEL_RE = re.compile(r"funcs?_count$|_COUNT$")
 INT_RE = re.compile(r"^(?:0[xX][0-9a-fA-F]+|\d+)$")
 VERSION_RE = re.compile(r"^Wine version\s+(\S+)")
 
@@ -187,6 +192,17 @@ def code_name(enumerator: str) -> str:
     return enumerator[5:] if enumerator.startswith("unix_") else enumerator
 
 
+def strip_sentinel(items: list) -> list:
+    """Drop the trailing ``*funcs_count`` sentinel of a [(name, value)] enum, if present.
+
+    Only the last enumerator is a candidate: ``unix_get_glyph_count`` (dwrite code 5) and
+    ``unix_wg_parser_get_stream_count`` (winegstreamer code 7) are real codes.
+    """
+    if items and SENTINEL_RE.search(items[-1][0]):
+        return items[:-1]
+    return items
+
+
 def parse_unixlib(path: str, warnings: list):
     """Return (enum_name, [(name, value)], include_module_or_None) for one unixlib.h."""
     raw = read_text(path)
@@ -221,10 +237,8 @@ def parse_all_unixlibs(wine_src: str, warnings: list):
             continue
         key = module_key(dll_dir)
         codes = {}
-        for enumerator, value in items:
+        for enumerator, value in strip_sentinel(items):
             if value < 0:
-                continue
-            if enumerator.endswith("_count") or enumerator.endswith("_COUNT"):
                 continue
             codes.setdefault(str(value), code_name(enumerator))
         tables[key] = codes

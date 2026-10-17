@@ -32,7 +32,10 @@
 #                              prints "[dry-run]" and returns 0 without executing.
 #                              Otherwise streams stdout+stderr into the log file and,
 #                              unless --quiet, to the terminal indented "    │ ".
-#                              --sudo prefixes `sudo -n --` (never prompts);
+#                              --sudo prefixes `sudo -n --` (never prompts itself;
+#                              when lib/phase.sh is loaded, the first --sudo use of a
+#                              run calls sudo_keepalive_start, which asks for the
+#                              password once unless NOPASSWD is in force);
 #                              --timeout wraps the command in `timeout -k 10 S`.
 #                              On a non-zero exit it calls `fail` with the exit code
 #                              and shows the last 20 output lines, and returns 1 —
@@ -244,6 +247,9 @@ run() {
         _emit "$C_CYAN" "[dry-run]" "  " "$C_DIM\$ $shown$C_RESET"
         RUN_STATUS=0
         return 0
+    fi
+    if [ "$use_sudo" -eq 1 ] && declare -F sudo_keepalive_start >/dev/null 2>&1; then
+        sudo_keepalive_start || true     # lib/phase.sh: first use prompts once / starts the refresher; a failure surfaces below
     fi
     _emit "$C_DIM" "\$" "  " "$C_DIM$shown$C_RESET"
     tailf="$(mktemp "${PROFILER_TMPDIR:-${TMPDIR:-/tmp}}/profiler-run.XXXXXX")" || { fail "run: mktemp failed"; return 1; }

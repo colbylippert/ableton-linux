@@ -1,4 +1,4 @@
-From f52a75a23566ae6a02037a1bd37773e7032af514 Mon Sep 17 00:00:00 2001
+From 755fbf8bb3386b2a2b7ff20aa5316ebf250d564a Mon Sep 17 00:00:00 2001
 From: Profiler Workbench <profiler@localhost>
 Date: Fri, 16 Oct 2026 14:03:35 -0400
 Subject: [PATCH] asio: add USDT block markers and name the driver threads
@@ -35,21 +35,21 @@ SDK on the check host).
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
 ---
- README.md                      |  34 ++-
+ README.md                      |  38 ++-
  include/audio.h                |  14 ++
  include/pipeasio_block_clock.h |  50 ++++
  include/pipeasio_probe.h       |  66 +++++
  include/pipeasio_telemetry.h   |   2 +
  include/sdt-config.h           |  15 ++
- include/sdt.h                  | 532 +++++++++++++++++++++++++++++++++++++++++
+ include/sdt.h                  | 534 +++++++++++++++++++++++++++++++++++++++++
  src/asio.c                     |  78 +++++-
  src/audio.c                    | 110 ++++++---
  tests/unit/CMakeLists.txt      |   3 +
  tests/unit/test_block_clock.c  |  61 +++++
- 11 files changed, 928 insertions(+), 37 deletions(-)
+ 11 files changed, 934 insertions(+), 37 deletions(-)
 
 diff --git a/README.md b/README.md
-index baf97ee..7ac35af 100644
+index baf97ee..61e51d8 100644
 --- a/README.md
 +++ b/README.md
 @@ -569,7 +569,11 @@ A full area drops the next sample, and audio continues. The lifecycle worker
@@ -65,18 +65,22 @@ index baf97ee..7ac35af 100644
  When that output is full, PipeASIO drops the current report.
  Stop and Destroy continue. Clock reads and fixed sample
  writes add CPU work. Use telemetry during
-@@ -692,6 +696,34 @@ The driver has its own COM identity: CLSID
+@@ -692,6 +696,38 @@ The driver has its own COM identity: CLSID
  `HKCU\Software\ASIO\PipeASIO`, and DLL filename `pipeasio64.dll`. That is why
  it coexists with WineASIO: neither overrides the other.
  
 +### Trace points
 +
-+The ELF driver halves (`pipeasio64.dll.so`, and `pipeasio32.so` for WoW64)
-+carry static USDT trace points under the provider `pipeasio`. Each one is a
-+5-byte `nop` plus an ELF note, so it costs nothing until a tracer attaches a
-+uprobe to a chosen process; the probes are always compiled in and need no
-+setting. `readelf -n lib/wine/x86_64-unix/pipeasio64.dll.so` lists them and
++The ELF driver half `pipeasio64.dll.so` carries six static USDT trace points
++under the provider `pipeasio`. Each one is a 5-byte `nop` plus an ELF note, so
++it costs nothing until a tracer attaches a uprobe to a chosen process; the
++probes are always compiled in and need no setting.
++`readelf -n lib/wine/x86_64-unix/pipeasio64.dll.so` lists them and
 +`bpftrace -l 'usdt:/path/to/pipeasio64.dll.so:pipeasio:*'` attaches to them.
++The optional WoW64 unixlib `pipeasio32.so` (`-DBUILD_WOW64_32=ON`, default
++OFF) carries only `cycle_start` and `cycle_end`: the block markers live in
++`src/asio.c`, which the WoW64 build compiles only into the mingw PE front end
++`pipeasio32.dll`, where `PIPEASIO_PROBE` is a no-op.
 +
 +| Probe | Arguments | Site |
 +|---|---|---|
@@ -289,10 +293,10 @@ index 0000000..eedf746
 +#define _SDT_ASM_SECTION_RETAIN_SUPPORT 1
 diff --git a/include/sdt.h b/include/sdt.h
 new file mode 100644
-index 0000000..f0fbb77
+index 0000000..957abb5
 --- /dev/null
 +++ b/include/sdt.h
-@@ -0,0 +1,532 @@
+@@ -0,0 +1,534 @@
 +/* <sys/sdt.h> - Systemtap static probe definition macros.
 +
 +   This file is dedicated to the public domain, pursuant to CC0
@@ -300,12 +304,14 @@ index 0000000..f0fbb77
 +*/
 +
 +/* PipeASIO vendored copy of systemtap's sys/sdt.h (pipeasio-usdt-block-markers).
-+   Changes against upstream, both marked with _SDT_DEF_NOP:
++   Changes against upstream:
 +   1. On x86_64 the probe site is the 5-byte nop 0f 1f 44 00 00
 +      ("nopl 0x0(%rax,%rax,1)") instead of the 1-byte "nop", so the kernel's
 +      optimized uprobe path (5-byte-nop emulation) can apply; a kernel without
-+      it single-steps the site as before.
++      it single-steps the site as before.  Marked with _SDT_DEF_NOP.
 +   2. "sdt-config.h" is the sibling file in this directory.
++   3. One line of trailing whitespace (after the __sdt_type template) is
++      blank, so the patch applies without a whitespace warning.
 +   Nothing else differs; keep it that way so the file stays diffable against
 +   upstream.  Both files remain CC0. */
 +
@@ -440,7 +446,7 @@ index 0000000..f0fbb77
 +{
 +  static const bool __sdt_signed = false;
 +};
-+  
++
 +#define __SDT_ALWAYS_SIGNED(T) \
 +template<> struct __sdt_type<T> { static const bool __sdt_signed = true; };
 +#define __SDT_COND_SIGNED(T,CT)						\

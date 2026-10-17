@@ -188,8 +188,20 @@ fi
 default_repo="$HOME/Projects/ableton-linux"
 if [ ! -d "$default_repo/.git" ] && [ -d "$OWN_CHECKOUT/.git" ]; then default_repo="$OWN_CHECKOUT"; fi
 
-MEDIA_DIR="${opt_media:-$(cfg_get media_dir "$HOME/Proprietary/ableton")}"
-LIVE_INSTALLER="${opt_installer:-$(cfg_get live_installer "$MEDIA_DIR/Ableton Live 12 Trial Installer.exe")}"
+saved_media="$(cfg_get media_dir "$HOME/Proprietary/ableton")"
+MEDIA_DIR="${opt_media:-$saved_media}"
+# The installer path follows MEDIA_DIR unless --live-installer chose it explicitly, now or on an
+# earlier run. The saved value is only honoured when it is not simply the derived default of the
+# saved media_dir, so a later --media-dir moves the installer along with it.
+live_installer_name="Ableton Live 12 Trial Installer.exe"
+saved_installer="$(cfg_get live_installer)"
+if [ -n "$opt_installer" ]; then
+    LIVE_INSTALLER="$opt_installer"
+elif [ -n "$saved_installer" ] && [ "$saved_installer" != "$saved_media/$live_installer_name" ]; then
+    LIVE_INSTALLER="$saved_installer"
+else
+    LIVE_INSTALLER="$MEDIA_DIR/$live_installer_name"
+fi
 REPO_DIR="${opt_repo:-$(cfg_get repo_dir "$default_repo")}"
 AUDIO_BUFFER="${opt_buffer:-$(cfg_get audio_buffer "$def_buffer")}"
 PASSWORDLESS_SUDO="${opt_pwsudo:-$(cfg_get passwordless_sudo "$def_pwsudo")}"
@@ -217,6 +229,9 @@ export PROFILE MEDIA_DIR LIVE_INSTALLER REPO_DIR AUDIO_BUFFER PASSWORDLESS_SUDO 
 
 # ------------------------------------------------------------- go ----
 log_init
+# one scratch directory for the whole run, created here (in this shell, so the EXIT
+# trap in lib/phase.sh removes it) and inherited by every phase as PROFILER_TMPDIR
+_tmpdir >/dev/null || exit 2
 printf '%s%sWine Interface Profiler — machine setup%s  %s(%s profile)%s\n' "$C_BOLD" "$C_CYAN" "$C_RESET" "$C_DIM" "$PROFILE" "$C_RESET" >&"$LOG_FD"
 _log_file "Wine Interface Profiler — machine setup ($PROFILE profile)"
 kv "host" "$(hostname 2>/dev/null || uname -n) · $(id -un)"

@@ -9,7 +9,8 @@
 #   /work/wine-src   vendor/wine-base-5c23dd1c.tar.zst + patches/NNNN-*.patch then
 #                    patches/performance/*.patch, applied with `git am --3way` (a
 #                    synthetic "From: dist <build@localhost>" + "Date:" header is
-#                    prepended when a patch has none), then tagged series-aceb236
+#                    prepended when a patch has none); tagged series-main after the
+#                    numbered series and series-aceb236 after the performance series
 #   /work/build      CPPFLAGS=-I/opt/ntsync-uapi ../wine-src/configure
 #                    --prefix=/opt/wine-d2d1-nspa-11.13 --enable-archs=i386,x86_64
 #                    --disable-tests; make -j$JOBS
@@ -45,20 +46,28 @@
 #                                    the staged Wine
 #   pipeasio-build [--test]          cmake --build + install into the stage (--test also
 #                                    runs the non-integration CTest scope)
-#   sync [--strip] [--artifacts] [--dir DIR]… [--fast]
+#   sync [--strip] [--artifacts --dir DIR…] [--fast]
 #                                    first run: reflink-copy the official runtime to the
 #                                    dev runtime; every run: rsync the stage over it
 #                                    (checksum compare; --fast: size+mtime), list the
 #                                    changed files, write PROFILER-DEV-INFO.txt.
 #                                    --artifacts: first copy the freshly built modules
-#                                    from /work/build/DIR into the stage (no make install
-#                                    needed). --strip: strip like the official build;
-#                                    default unstripped so the tracer/perf see symbols.
+#                                    of every --dir from /work/build into the stage (no
+#                                    make install needed): DIR/<arch>-windows/* → lib/
+#                                    wine/<arch>-windows/ and the unix half DIR/<mod>.so
+#                                    (Wine builds it in DIR itself) → lib/wine/x86_64-unix/.
+#                                    --strip: strip like the official build; default
+#                                    unstripped so the tracer/perf see symbols.
 #                                    Refuses while any process runs from either runtime.
 #   format-patch [--number NNNN] [--name SLUG] [--pipeasio] [--out DIR] [--force]
 #                                    export HEAD as patches/NNNN-SLUG.patch (or
-#                                    patches/pipeasio/NNNN-SLUG.patch) and print the
-#                                    build-audit checklist
+#                                    patches/pipeasio/NNNN-SLUG.patch) with the host
+#                                    ~/.gitconfig masked (container-identical diff
+#                                    settings), rehearse the OFFICIAL order (numbered
+#                                    series + this patch + performance/*, which the dev
+#                                    tree applied before your change) in a throwaway
+#                                    index — refused on conflict unless --force — and
+#                                    print the build-audit checklist
 #   shell [CMD…]                     interactive bash in the container, or run CMD there
 #   status [--deep]                  container, tree, build, runtime, locks, processes
 #   logs [-n N] [--follow] [--list]  the latest wine-dev log
@@ -125,10 +134,13 @@ Subcommands:
   build [--dir DIR]... [--install]   incremental make (+ make install into the stage)
   pipeasio-init                      unpack + patch + configure PipeASIO
   pipeasio-build [--test]            build + install PipeASIO into the stage
-  sync [--strip] [--artifacts] [--dir DIR]... [--fast]
+  sync [--strip] [--artifacts --dir DIR...] [--fast]
                                      update ~/.local/opt/wine-d2d1-nspa-11.13-dev from the stage
+                                     (--artifacts: copy the modules built in each DIR into the
+                                     stage first — PE files and the unix DIR/<module>.so)
   format-patch [--number NNNN] [--name SLUG] [--pipeasio] [--out DIR] [--force]
-                                     export HEAD into patches/ + print the audit checklist
+                                     export HEAD into patches/ (host git config masked), rehearse
+                                     the official patch order, print the audit checklist
   shell [CMD...]                     bash (or CMD) inside the container
   status [--deep]                    what exists, what is pending, what is running
   logs [-n N] [--follow] [--list]    the latest log
@@ -195,8 +207,21 @@ DEV_LOCK="$STATE_DIR/wine-dev.lock"
 DEV_BUSY="$STATE_DIR/wine-dev.building"
 OFFICIAL_LOCK="$STATE_DIR/build.lock"
 SERIES_TAG="series-aceb236"
+MAIN_TAG="series-main"          # end of patches/NNNN-*.patch, before patches/performance/* (container/init.sh)
 PIPEASIO_TAG="series-pipeasio"
 RUNTIME_NAME="wine-d2d1-nspa-11.13"
+
+# Host git with the user's ~/.gitconfig and /etc/gitconfig masked out and the
+# diff/format settings pinned: a patch exported here must be exactly what the
+# container's clean config (HOME=/work, container-build.sh:149) would produce
+# and what its `git am --3way` (:156) and `patch -p1` (pipeasio, :260) consume.
+# A host diff.noprefix, diff.mnemonicPrefix, format.signOff, format.subjectPrefix
+# or commit.gpgsign must leak neither into patches/ nor into the dev tree's
+# commits (apply). Needs git >= 2.32 for GIT_CONFIG_GLOBAL/GIT_CONFIG_SYSTEM.
+GIT_CLEAN=(env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_CONFIG_NOSYSTEM=1
+           git -c diff.noprefix=false -c diff.mnemonicPrefix=false -c diff.renames=true
+           -c format.signOff=false -c format.subjectPrefix=PATCH -c format.thread=false
+           -c commit.gpgsign=false)
 
 # last "key=value" line of a key=value file (setup.conf, ableton-wine/config)
 _kv_file_get() {   # _kv_file_get FILE KEY [DEFAULT]
@@ -512,16 +537,21 @@ _image_build() {
 
 # ---------------------------------------------------------- tree facts ----
 _wine_head() { git -C "$WINE_SRC" log -1 --format='%h %s' 2>/dev/null || printf 'unknown\n'; }
-_wine_dirty() { git -C "$WINE_SRC" status --porcelain 2>/dev/null | wc -l | tr -d ' '; }
+# _wine_dirty [DIR] — number of uncommitted changes. Never fails: a non-zero git
+# status would, through pipefail, abort every `n="$(_wine_dirty)"` caller.
+_wine_dirty() { { git -C "${1:-$WINE_SRC}" status --porcelain 2>/dev/null || true; } | wc -l | tr -d ' '; }
 _wine_since() { git -C "$WINE_SRC" rev-list --count "$SERIES_TAG..HEAD" 2>/dev/null || printf '?\n'; }
 _wine_tag_ok() { git -C "$WINE_SRC" rev-parse -q --verify "refs/tags/$SERIES_TAG" >/dev/null 2>&1; }
 
-# patches/ changed since init? prints the differing file names (empty = no drift)
+# patches/ changed since init? prints the differing file names (empty = no drift).
+# diff exits 1 exactly when there IS drift; under pipefail that status would
+# abort the `drift="$(_series_drift)"` callers, so it is neutralised in-pipeline.
 _series_drift() {
     [ -r "$MARK_DIR/series.sha256" ] || return 0
-    diff <(sort -k2 -- "$MARK_DIR/series.sha256") \
-         <(cd "$REPO/patches" 2>/dev/null && sha256sum [0-9][0-9][0-9][0-9]-*.patch performance/*.patch 2>/dev/null | sort -k2) 2>/dev/null \
+    { diff <(sort -k2 -- "$MARK_DIR/series.sha256") \
+           <(cd "$REPO/patches" 2>/dev/null && sha256sum [0-9][0-9][0-9][0-9]-*.patch performance/*.patch 2>/dev/null | sort -k2) 2>/dev/null || true; } \
         | awk '/^[<>]/ {print $3}' | sort -u | tr '\n' ' '
+    return 0
 }
 _warn_series_drift() {
     local drift

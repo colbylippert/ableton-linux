@@ -65,9 +65,11 @@ role = "main"
 exe = "\\.exe$"
 main = true
 
-# Every other thread of the Live process (named or not: Wine 11.13 gives unnamed threads the
-# process comm, so they appear as live:Ableton Live 12), matching reduce.py's classifier.
-# Add `named = true` to restrict this to SetThreadDescription-named threads.
+# Every other *named* thread of the Live process (design B section 5 reserves live:<comm> for
+# SetThreadDescription-named threads).  Wine 11.13 gives unnamed threads the process comm, so
+# they fall through to the fallback (unknown:Ableton Live 12), matching reduce.py's built-in
+# rules.  `named` needs a known process comm: without one the thread stays unknown:<comm>.
 [[rule]]
 role = "live:{comm}"
 exe = "^Ableton Live"
+named = true

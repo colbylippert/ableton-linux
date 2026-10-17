@@ -7,7 +7,7 @@ indirect entries), a synthetic /proc/PID/maps snapshot and a synthetic stack
 window, then asserts the recovered frames, the symbol strings, the caches, the
 roles table and the perf rewrite.
 
-Run:  python -I -m unittest discover -s profiler/tracer/tests -t profiler/tracer
+Run from the repository root:  python3 -I -m unittest discover -s profiler/tracer/tests -v
 """
 
 from __future__ import annotations
@@ -1016,6 +1016,7 @@ class RolesTests(unittest.TestCase):
         self.assertEqual(subset["rule"][0]["role"], "wineserver")
         self.assertEqual(subset["rule"][-1]["role"], "live:{comm}")
         self.assertEqual(subset["rule"][-1]["exe"], "^Ableton Live")
+        self.assertIs(subset["rule"][-1]["named"], True)   # live:<comm> is for named threads only
         self.assertEqual(subset["audio_roles"][0], "pipeasio_callback")
         self.assertIn("pipeasio_callback", subset["dynamic"])
         try:
@@ -1048,8 +1049,11 @@ class RolesTests(unittest.TestCase):
         self.assertEqual(table.classify("AudioCalc", live, 4200, 4301, pc), "audio_worker")
         self.assertEqual(table.classify(pc, live, 4200, 4200, pc), "main")
         self.assertEqual(table.classify("MIDI", live, 4200, 4310, pc), "live:MIDI")
-        self.assertEqual(table.classify(pc, live, 4200, 4311, pc), "live:Ableton Live 12")   # unnamed, like reduce.py
-        # the `named` field is honoured when a rule uses it
+        # an unnamed Live thread (comm == process comm) is not live:<comm> (design B section 5),
+        # matching reduce.py's built-in rules; without a known process comm it is unknown too
+        self.assertEqual(table.classify(pc, live, 4200, 4311, pc), "unknown:Ableton Live 12")
+        self.assertEqual(table.classify("MIDI", live, 4200, 4310, None), "unknown:MIDI")
+        # the `named` field is honoured on a hand-built table as well
         strict = S.RoleTable({"rule": [{"role": "live:{comm}", "exe": "^Ableton Live", "named": True}]})
         self.assertEqual(strict.classify("MIDI", live, 4200, 4310, pc), "live:MIDI")
         self.assertEqual(strict.classify(pc, live, 4200, 4311, pc), "unknown:Ableton Live 12")

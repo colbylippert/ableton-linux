@@ -43,6 +43,9 @@
 #   * Output only through step/ok/warn/fail/skip/info/kv (never a raw echo), and
 #     commands that change the host only through `run`. `run --sudo -- cmd` uses
 #     `sudo -n` (phase 01 "sudo" guarantees it works; the keepalive renews it).
+#     The keepalive starts lazily at the first `run --sudo` (or --sudo probe of
+#     write_template/ensure_line): NOPASSWD → nothing to do, otherwise one
+#     `sudo -v` prompt on the terminal, so a selection without sudo never asks.
 #     Read-only probes in `check` call commands directly (they must still work
 #     under --dry-run, when `run` executes nothing). `run` gives the command
 #     stdin from /dev/null and waits until its stdout/stderr close, so a command
@@ -64,19 +67,23 @@
 #     LIVE_INSTALLER, JOBS, AUDIO_BUFFER, PASSWORDLESS_SUDO (0|1), AUTOLOGIN (0|1),
 #     VM_RAM_CHECK (0|1), ASSUME_YES (0|1), DRY_RUN (0|1), FORCE (0|1), SETUP_ROOT
 #     (profiler/setup), PROFILER_ROOT (profiler/), TEMPLATES_DIR (profiler/setup/
-#     templates), PROFILER_STATE_DIR, PROFILER_TMPDIR (scratch, removed on exit).
+#     templates), PROFILER_STATE_DIR, PROFILER_TMPDIR (scratch directory the driver
+#     creates before the first phase and removes on exit; use it for temp files).
 #     Helpers: profile_is vm|baremetal, is_dry_run, require_cmd CMD… .
 #   * Templates: write_template SRC DST [--sudo] [--mode M] [--owner U:G] renders
 #     @@VAR@@ tokens from the environment (unresolved tokens are an error), does
 #     nothing when DST already has that content, otherwise installs it through
 #     `run` (temp file + install -D). ensure_line FILE LINE [--sudo] appends a
-#     line once.
+#     line once. With --sudo both probe and read DST as root (`sudo -n test/cat`),
+#     so files in root-only directories such as /etc/sudoers.d are seen; under
+#     --dry-run sudo is never invoked and such files count as absent.
 #
 # Public API (besides the above): phase_select, phase_run NAME, phases_run_all,
 # phase_list, phase_is_done NAME, sudo_keepalive_start, sudo_keepalive_stop.
 # Variables owned: PHASE_NUMS[] PHASE_NAMES[] PHASE_DESCS[] PHASE_DEPS[]
 # PHASE_INDEX[] PHASES_SELECTED[] CURRENT_PHASE PHASE_NOTE NEED_RELOGIN NEED_REBOOT
-# SUDO_KEEPALIVE_PID PHASE_SUMMARY_ON_EXIT. Selection inputs: ONLY SKIP FROM FORCE.
+# SUDO_KEEPALIVE_PID SUDO_KEEPALIVE_TRIED PROFILER_TMPDIR_OWNER PHASE_SUMMARY_ON_EXIT.
+# Selection inputs: ONLY SKIP FROM FORCE.
 # ==========================================================================
 
 [ -n "${BASH_VERSION:-}" ] || { echo "phase.sh needs bash" >&2; return 1 2>/dev/null || exit 1; }
@@ -89,6 +96,7 @@ declare -A PHASE_INDEX=()
 : "${NEED_RELOGIN:=0}"
 : "${NEED_REBOOT:=0}"
 : "${SUDO_KEEPALIVE_PID:=}"
+: "${SUDO_KEEPALIVE_TRIED:=0}"
 : "${PHASE_SUMMARY_ON_EXIT:=0}"
 : "${ONLY:=}"
 : "${SKIP:=}"
@@ -103,6 +111,7 @@ declare -A PHASE_INDEX=()
 : "${PROFILER_CONFIG_DIR:=${XDG_CONFIG_HOME:-$HOME/.config}/profiler}"
 : "${PROFILER_SETUP_CONF:=$PROFILER_CONFIG_DIR/setup.conf}"
 : "${PROFILER_TMPDIR:=}"
+: "${PROFILER_TMPDIR_OWNER:=}"      # pid of the shell that created PROFILER_TMPDIR (only it removes the dir)
 export PROFILER_STATE_DIR PROFILER_SHARE_DIR PROFILER_CACHE_DIR PROFILER_CONFIG_DIR PROFILER_SETUP_CONF
 
 # ------------------------------------------------------------ helpers ----
@@ -126,9 +135,16 @@ require_cmd() {
 # true when /dev/tty can actually be opened (permission bits alone lie without a controlling terminal)
 _have_tty() { { : < /dev/tty; } 2>/dev/null && { : > /dev/tty; } 2>/dev/null; }
 
+# _tmpdir: create the per-run scratch directory once (in THIS shell — never call it
+# inside a command substitution, or the variable stays empty in the parent and the
+# directory leaks past the EXIT trap) and print its path. The driver calls it right
+# after log_init so every phase inherits PROFILER_TMPDIR; write_template calls it
+# again for its side effect, which is a no-op once the directory exists.
 _tmpdir() {
     if [ -z "$PROFILER_TMPDIR" ] || [ ! -d "$PROFILER_TMPDIR" ]; then
-        PROFILER_TMPDIR="$(mktemp -d "${TMPDIR:-/tmp}/profiler-setup.XXXXXX")" || die "cannot create a temporary directory"
+        PROFILER_TMPDIR="$(mktemp -d "${TMPDIR:-/tmp}/profiler-setup.XXXXXX")" \
+            || { PROFILER_TMPDIR=""; fail "cannot create a temporary directory under ${TMPDIR:-/tmp}"; return 1; }
+        PROFILER_TMPDIR_OWNER="$$"
         export PROFILER_TMPDIR
     fi
     printf '%s\n' "$PROFILER_TMPDIR"
@@ -200,7 +216,7 @@ render_template() {
 }
 
 write_template() {
-    local src="$1" dst="$2" use_sudo=0 mode="" owner="" rendered current tmp n
+    local src="$1" dst="$2" use_sudo=0 mode="" owner="" rendered current exists tmp n line
     local -a inst=() runopt=()
     shift 2
     while [ $# -gt 0 ]; do
@@ -216,17 +232,26 @@ write_template() {
     done
     rendered="$(render_template "$src" && printf x)" || return 1
     rendered="${rendered%x}"
-    current=""
+    current=""; exists=0
     if [ -r "$dst" ]; then
+        exists=1
         current="$(cat -- "$dst"; printf x)"; current="${current%x}"
-    elif [ -e "$dst" ] && [ "$use_sudo" -eq 1 ] && ! is_dry_run; then
-        current="$(sudo -n cat -- "$dst" 2>/dev/null; printf x)"; current="${current%x}"
+    elif [ "$use_sudo" -eq 1 ] && ! is_dry_run; then
+        # a root-only parent (e.g. /etc/sudoers.d, 0750) hides its entries from this user: probe and read as root
+        sudo_keepalive_start || true
+        if sudo -n test -e "$dst" 2>/dev/null; then
+            exists=1
+            current="$(sudo -n cat -- "$dst" 2>/dev/null; printf x)"; current="${current%x}"
+        fi
+    elif [ -e "$dst" ]; then
+        exists=1      # present but unreadable without sudo: treated as different
     fi
-    if [ -e "$dst" ] && [ "$rendered" = "$current" ]; then
+    if [ "$exists" -eq 1 ] && [ "$rendered" = "$current" ]; then
         skip "$dst already up to date"
         return 0
     fi
-    tmp="$(mktemp "$(_tmpdir)/tpl.XXXXXX")" || { fail "write_template: mktemp failed"; return 1; }
+    _tmpdir >/dev/null || return 1      # in this shell, so the directory is removed on exit
+    tmp="$(mktemp "$PROFILER_TMPDIR/tpl.XXXXXX")" || { fail "write_template: mktemp failed"; return 1; }
     printf '%s' "$rendered" > "$tmp"
     if is_dry_run; then
         n="$(wc -l < "$tmp" | tr -d ' ')"
@@ -257,7 +282,9 @@ ensure_line() {
     done
     if [ -r "$file" ]; then
         if grep -qxF -- "$line" "$file"; then skip "$file already contains: $line"; return 0; fi
-    elif [ -e "$file" ] && [ "$use_sudo" -eq 1 ] && ! is_dry_run; then
+    elif [ "$use_sudo" -eq 1 ] && ! is_dry_run; then
+        # the file may sit in a root-only directory, so look as root (a missing file just fails the grep)
+        sudo_keepalive_start || true
         if sudo -n grep -qxF -- "$line" "$file" 2>/dev/null; then skip "$file already contains: $line"; return 0; fi
     fi
     if [ "$use_sudo" -eq 1 ]; then
@@ -269,14 +296,22 @@ ensure_line() {
 }
 
 # ------------------------------------------------------------- sudo ----
+# Started lazily: `run --sudo` (lib/log.sh) and the --sudo probes above call it on
+# first use, so a selection that never needs sudo (e.g. --only claude) neither
+# prompts nor warns. Decided once per run (SUDO_KEEPALIVE_TRIED): NOPASSWD in force
+# → nothing to keep alive; otherwise `sudo -v` once on the terminal (unless a
+# credential is already cached) and a background refresher that dies with this shell.
 sudo_keepalive_start() {
-    [ -z "$SUDO_KEEPALIVE_PID" ] || return 0
+    [ "$SUDO_KEEPALIVE_TRIED" -eq 0 ] || return 0
     is_dry_run && return 0
     command -v sudo >/dev/null 2>&1 || return 0
-    if sudo -n true 2>/dev/null; then return 0; fi          # NOPASSWD (or cached) → nothing to keep alive
-    if ! _have_tty; then warn "sudo needs a password but there is no terminal (use ssh -t); sudo commands will fail"; return 0; fi
-    info "sudo needs your password once; the credential is refreshed in the background"
-    sudo -v < /dev/tty || { fail "sudo -v failed"; return 1; }
+    SUDO_KEEPALIVE_TRIED=1
+    if sudo -n -k true 2>/dev/null; then return 0; fi       # -k ignores the cache: succeeds only with NOPASSWD
+    if ! sudo -n true 2>/dev/null; then                      # no cached credential either: ask once
+        if ! _have_tty; then warn "sudo needs a password but there is no terminal (use ssh -t); sudo commands will fail"; return 0; fi
+        info "sudo needs your password once; the credential is refreshed in the background"
+        sudo -v < /dev/tty || { fail "sudo -v failed"; return 1; }
+    fi
     ( while kill -0 "$$" 2>/dev/null; do sudo -n -v 2>/dev/null || exit; sleep 50; done ) &
     SUDO_KEEPALIVE_PID=$!
     disown "$SUDO_KEEPALIVE_PID" 2>/dev/null || true
@@ -435,16 +470,12 @@ phase_run() {
 }
 
 phases_run_all() {
-    local n failed=0 i started=0
+    local n failed=0 i
     [ "${#PHASES_SELECTED[@]}" -gt 0 ] || phase_select
     for (( i = 0; i < ${#PHASES_SELECTED[@]}; i++ )); do
         n="${PHASES_SELECTED[i]}"
         if [ "$failed" -eq 1 ]; then summary_add "$n" "not-run" 0 "after failure"; continue; fi
-        if [ "$started" -eq 0 ] && [ "$n" != preflight ]; then
-            sudo_keepalive_start || true
-            started=1
-        fi
-        phase_run "$n" || failed=1
+        phase_run "$n" || failed=1          # the sudo keepalive starts at the first `run --sudo`, not here
     done
     if [ "$failed" -eq 1 ]; then return 1; fi
     if [ "$NEED_RELOGIN" = 1 ] || [ "$NEED_REBOOT" = 1 ]; then return 3; fi
@@ -459,7 +490,11 @@ _phase_on_exit() {
         [ -z "$CURRENT_PHASE" ] || summary_add "$CURRENT_PHASE" "failed" 0 "interrupted (exit $rc)"
         summary_table
     fi
-    [ -z "$PROFILER_TMPDIR" ] || rm -rf -- "$PROFILER_TMPDIR" 2>/dev/null || true
+    # only the shell that created the scratch dir removes it (a child that sources
+    # this file inherits the exported path and must leave it alone)
+    if [ -n "$PROFILER_TMPDIR" ] && [ "$PROFILER_TMPDIR_OWNER" = "$$" ]; then
+        rm -rf -- "$PROFILER_TMPDIR" 2>/dev/null || true
+    fi
     return 0
 }
 _phase_on_int() {
