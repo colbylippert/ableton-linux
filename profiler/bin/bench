@@ -157,6 +157,17 @@ say "runtime  ${ABLETON_WINE_ROOT:-(configured default: ~/.config/ableton-wine/c
 say "osc      send $ABL_BENCH_OSC_SEND / recv $ABL_BENCH_OSC_RECV"
 say "output   $output"
 
+# An unauthorised Trial shows a demo-mode dialog at every launch that blocks control
+# surfaces until answered: answer it ("Save/Export Disabled") for the whole suite.
+watcher=""
+if [ "${PROFILER_NO_TRIAL_WATCH:-0}" != 1 ] && [ -x "$here/live-trial-dialog" ] && \
+   ! printf '%s\n' ${args[@]+"${args[@]}"} | grep -qx -- '--dry-run'; then
+    "$here/with-session-env" "$here/live-trial-dialog" watch --for 86400 >/dev/null 2>&1 &
+    watcher=$!
+    trap '[ -z "$watcher" ] || kill "$watcher" 2>/dev/null || true' EXIT
+    say "trial    demo-mode dialog watcher running (pid $watcher)"
+fi
+
 rc=0
 "$here/with-session-env" "$suite" ${args[@]+"${args[@]}"} || rc=$?
 say "run directory $run_dir (exit $rc)"
