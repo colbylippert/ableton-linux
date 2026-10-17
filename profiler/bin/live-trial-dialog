@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+# live-trial-dialog -- answer Live's demo-mode welcome dialog without a human.
+#
+# An unauthorised Live Trial shows "Welcome to Ableton Live 12 / Trial" with two
+# buttons when it starts and again when it quits: "Save/Export Disabled" (keep
+# running in demo mode) and "Exit Live".  The dialog is a separate top-level
+# window titled exactly "Ableton Live 12 Trial" (the main window carries the Set
+# name: "Untitled - Ableton Live 12 Trial").
+#
+# Clicks go through Wine's own input queue with tools' liveinject.exe (SendInput),
+# because KWin's Wayland session drops XTEST pointer events aimed at Xwayland
+# clients.  Button positions are fractions of the dialog's geometry, so they
+# follow DPI scaling: both buttons sit at 93.5% of the height, Save/Export
+# Disabled at 23% and Exit Live at 77% of the width.
+#
+#   live-trial-dialog present                 exit 0 when the dialog is open
+#   live-trial-dialog continue [--wait S]     click Save/Export Disabled
+#   live-trial-dialog exit [--wait S]         click Exit Live
+#   live-trial-dialog quit-live [--timeout S] Ctrl+Q, Exit Live on the dialog, wait for Live to exit
+#   live-trial-dialog watch [--for S]         answer "continue" whenever the dialog appears
+#
+# Environment: ABLETON_WINE_ROOT, ABLETON_WINEPREFIX (defaults as the launcher's),
+# LIVEINJECT (default: the repo's beta/tester-kit/probes/advanced/windows/liveinject.exe).
+# Exit codes: 0 ok, 1 not done (no dialog / Live still running), 2 usage, 3 no session.
+set -euo pipefail
+
+here="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+repo="$(cd "$here/../.." && pwd)"
+RT="${ABLETON_WINE_ROOT:-$HOME/.local/opt/wine-d2d1-nspa-11.13}"
+PREFIX="${ABLETON_WINEPREFIX:-$HOME/.wine-ableton}"
+LIVEINJECT="${LIVEINJECT:-$repo/beta/tester-kit/probes/advanced/windows/liveinject.exe}"
+TITLE='^Ableton Live 12 Trial$'
+
+usage() { sed -n '2,/^set -euo/p' "${BASH_SOURCE[0]}" | sed '$d;s/^# \{0,1\}//'; }
+log() { printf 'live-trial-dialog: %s\n' "$*" >&2; }
+
+session_env() {
+    local env
+    [ -n "${DISPLAY:-}" ] && [ -n "${XAUTHORITY:-}" ] && return 0
+    env="$(systemctl --user show-environment 2>/dev/null || true)"
+    export DISPLAY="${DISPLAY:-$(sed -n 's/^DISPLAY=//p' <<< "$env")}"
+    export XAUTHORITY="${XAUTHORITY:-$(sed -n 's/^XAUTHORITY=//p' <<< "$env")}"
+    [ -n "$DISPLAY" ] || { log "no desktop session (DISPLAY unset)"; exit 3; }
+}
+
+# Prints the dialog's window id; exit 1 when none is open.  A window whose
+# geometry is not dialog-sized is ignored so a Set-less main window never matches.
+dialog_id() {
+    local w WIDTH HEIGHT X Y SCREEN
+    for w in $(xdotool search --name "$TITLE" 2>/dev/null || true); do
+        eval "$(xdotool getwindowgeometry --shell "$w" 2>/dev/null)" || continue
+        [ "${WIDTH:-0}" -gt 200 ] && [ "${WIDTH:-0}" -lt 1000 ] && [ "${HEIGHT:-0}" -gt 200 ] && [ "${HEIGHT:-0}" -lt 1000 ] || continue
+        printf '%s\n' "$w"; return 0
+    done
+    return 1
+}
+
+live_running() { pgrep -f 'Ableton Live 12[^\\/]*\.exe' >/dev/null 2>&1; }
+
+inject() {   # liveinject arguments…
+    [ -x "$RT/bin/wine" ] || { log "Wine runtime missing: $RT"; return 1; }
+    [ -f "$LIVEINJECT" ] || { log "liveinject.exe missing: $LIVEINJECT"; return 1; }
+    WINEPREFIX="$PREFIX" timeout 30 "$RT/bin/wine" "$LIVEINJECT" "$@" >/dev/null 2>&1
+}
+
+click_button() {   # continue|exit, wait seconds
+    local which="$1" wait="${2:-0}" w X Y WIDTH HEIGHT SCREEN fx t=0
+    while ! w="$(dialog_id)"; do
+        [ "$t" -lt "$wait" ] || { log "no trial dialog open"; return 1; }
+        sleep 1; t=$((t + 1))
+    done
+    eval "$(xdotool getwindowgeometry --shell "$w")"
+    case "$which" in continue) fx=23 ;; exit) fx=77 ;; esac
+    inject click $((X + WIDTH * fx / 100)) $((Y + HEIGHT * 935 / 1000)) || return 1
+    for t in 1 2 3 4 5 6 7 8 9 10; do dialog_id >/dev/null || { log "clicked '$which'"; return 0; }; sleep 0.5; done
+    log "clicked '$which' but the dialog is still open"; return 1
+}
+
+cmd="${1:-}"; [ $# -gt 0 ] && shift
+wait=0; dur=0; timeout=60
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --wait) wait="${2:?}"; shift 2 ;;
+        --for) dur="${2:?}"; shift 2 ;;
+        --timeout) timeout="${2:?}"; shift 2 ;;
+        -h|--help) usage; exit 0 ;;
+        *) log "unknown option: $1"; exit 2 ;;
+    esac
+done
+case "$cmd" in present|continue|exit|quit-live|watch) ;; -h|--help|help) usage; exit 0 ;; *) usage >&2; exit 2 ;; esac
+command -v xdotool >/dev/null || { log "xdotool missing (setup phase packages)"; exit 1; }
+session_env
+
+case "$cmd" in
+    present) dialog_id >/dev/null ;;
+    continue) click_button continue "$wait" ;;
+    exit) click_button exit "$wait" ;;
+    quit-live)
+        live_running || { log "Live is not running"; exit 0; }
+        dialog_id >/dev/null || inject ctrlq || true
+        click_button exit 15 || true
+        for ((t = 0; t < timeout; t += 2)); do live_running || { log "Live exited"; exit 0; }; sleep 2; done
+        log "Live still running after ${timeout}s"; exit 1 ;;
+    watch)
+        # Until --for elapses (0 = until Live exits): answer every dialog with "continue".
+        start=$SECONDS
+        while :; do
+            if dialog_id >/dev/null; then click_button continue 0 || true; fi
+            if [ "$dur" -gt 0 ]; then [ $((SECONDS - start)) -lt "$dur" ] || exit 0
+            elif [ $((SECONDS - start)) -gt 30 ] && ! live_running; then exit 0; fi
+            sleep 1
+        done ;;
+esac

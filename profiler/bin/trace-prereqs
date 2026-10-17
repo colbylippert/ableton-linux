@@ -225,7 +225,7 @@ if [ "$NO_SUDO" -eq 1 ]; then
     else
         row WARN "privilege route" "not probed (--no-sudo): $helper not installed yet (setup phase sudo)"
     fi
-elif [ -x "$helper" ] && hv="$(sudo -n "$helper" version 2>/dev/null | first_line)" && [ -n "$hv" ]; then
+elif [ -x "$helper" ] && hv="$(sudo -n "$helper" version 2>/dev/null)" && hv="$(first_line <<< "$hv")" && [ -n "$hv" ]; then
     row OK "privilege route" "sudo -n profiler-root-helper version → $hv"
 elif sudo -n true 2>/dev/null; then
     if [ -x "$helper" ]; then row WARN "privilege route" "passwordless sudo works, but 'sudo -n $helper version' fails (sudoers 91-profiler-helper?)"; else row WARN "privilege route" "passwordless sudo works; profiler-root-helper not installed (setup phase sudo)"; fi
