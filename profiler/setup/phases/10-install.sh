@@ -217,7 +217,7 @@ phase_install_apply() {
     else
         prereq_fail "--audio-device ${AUDIO_DEVICE:-?} names no PipeWire node (phase audio records audio_node=; wpctl status lists the sinks)" || return 1
     fi
-    info "optional, not run here: cd $REPO_DIR && make check && make test (22 scripts)"
+    info "optional, not run here: cd $REPO_DIR && make check && make test (23 scripts)"
     phase_note "Live 12 installed (buffer $AUDIO_BUFFER, power $power${node:+, PipeASIO → $node})"
     return 0
 }

@@ -348,18 +348,23 @@ class ReduceTest(unittest.TestCase):
         b2 = self.block(2)
         wait = self.crossing(b2, "syscall", "NtWaitForSingleObject")
         self.assertEqual(wait["total_ns"], 302_000)
+        self.assertNotIn("parent", wait)
         nt = self.crossing(b2, "ntsync_wait", "WAIT_ANY")
         self.assertEqual(nt["total_ns"], 300_000)
         self.assertEqual(nt["caller"], "ntdll.dll!NtWaitForSingleObject+0x14")
+        self.assertEqual(nt["parent"], {"kind": "syscall", "id": "NtWaitForSingleObject"})
         self.assertEqual(nt["woken_by"], {"tid": TID_CALLBACK, "role": "pipeasio_callback", "count": 1})
         req = self.crossing(b2, "server_req", "create_event")
         self.assertEqual(req["tid"], TID_MIDI)
         self.assertEqual(req["role"], "live:MIDI")
         self.assertEqual(req["total_ns"], 8_000)
         self.assertEqual(req["caller"], "ntdll.dll!NtCreateEvent+0x14")
+        self.assertEqual(req["parent"], {"kind": "syscall", "id": "NtCreateEvent"})
         wake = self.crossing(b2, "ntsync_wake", "EVENT_SET")
         self.assertEqual(wake["role"], "wineserver")
         self.assertEqual(wake["n"], 1)
+        self.assertNotIn("parent", wake)                  # no open entry on the wineserver thread
+        self.assertEqual(self.out["blocks_header"]["nesting"], "parent")
         self.assertEqual(b2["offcpu"], [{"tid": TID_AUDIO, "role": "audio_worker", "ns": 249_500, "intervals": 1,
                                          "max_run_delay_ns": 1_500}])
 
@@ -406,9 +411,14 @@ class ReduceTest(unittest.TestCase):
         self.assertEqual(blocks["deadline_ns"], {"min": PERIOD, "max": PERIOD})
         self.assertEqual(blocks["missed_cycles"], 1)
         lost = summary["lost_slack"]
+        # The libbpf tracer's rule (BUILD.md, "Lost slack"): block 2's 326667 ns go to the top-level
+        # crossings of its audio-role threads only, i.e. AudioCalc's NtWaitForSingleObject (302000 ns,
+        # the cap); the NTSync wait inside it, MIDI's NtCreateEvent and its create_event request, and
+        # the wineserver's wake get no share.  Block 3 (near-late) has no crossings at all.
         self.assertEqual(lost["total_ns"], 326_667 + 26_667)
-        self.assertEqual(lost["attributed_ns"], 326_667)
-        self.assertEqual(lost["unattributed_ns"], 26_667)
+        self.assertEqual(lost["attributed_ns"], 302_000)
+        self.assertEqual(lost["unattributed_ns"], 326_667 + 26_667 - 302_000)
+        self.assertIn("top-level crossings of audio-role threads", lost["attribution"])
         sites = summary["call_sites"]
         self.assertEqual(sites[0]["rank"], 1)
         self.assertEqual(sites[0]["key"], "syscall|NtWaitForSingleObject|ntdll.dll!NtWaitForSingleObject+0x14")
@@ -419,13 +429,28 @@ class ReduceTest(unittest.TestCase):
         self.assertEqual(sites[0]["total_ns_in_late_blocks"], 302_000)
         self.assertEqual(sites[0]["max_ns"], 302_000)
         self.assertEqual(sites[0]["n_all_blocks"], 1)
-        self.assertEqual(sites[1]["kind"], "ntsync_wait")
-        self.assertEqual(sites[1]["woken_by"], [{"tid": TID_CALLBACK, "role": "pipeasio_callback", "count": 1}])
+        self.assertAlmostEqual(sites[0]["share_of_lost_slack"], round(302_000 / (326_667 + 26_667), 4))
+        self.assertEqual([site["kind"] for site in sites], ["syscall", "syscall", "ntsync_wake"])
+        self.assertEqual(sites[1]["name"], "NtCreateEvent")
+        self.assertEqual((sites[1]["share_of_lost_slack"], sites[2]["share_of_lost_slack"]), (0.0, 0.0))
+        self.assertNotIn("parent", sites[2])          # the wineserver's wake had no enclosing call
         shares = sum(site["share_of_lost_slack"] for site in sites)
         self.assertLessEqual(shares, 1.0)
-        self.assertAlmostEqual(shares, 326_667 / (326_667 + 26_667), places=3)
+        self.assertAlmostEqual(shares, 302_000 / (326_667 + 26_667), places=3)
         keys = set(site["key"] for site in sites)
         self.assertNotIn("syscall|NtReleaseSemaphore|ntdll.dll!NtReleaseSemaphore+0x14", keys)
+        # nested kinds are ranked apart, keyed by their parent, without a share: one wait is never
+        # counted twice (B5b: NtWaitForSingleObject 37.7 % and WAIT_ANY 37.4 % for the same waits)
+        nested = summary["nested_call_sites"]
+        self.assertEqual([(site["kind"], site["name"]) for site in nested],
+                         [("ntsync_wait", "WAIT_ANY"), ("server_req", "create_event")])
+        self.assertEqual(nested[0]["key"], "ntsync_wait|WAIT_ANY|syscall:NtWaitForSingleObject|"
+                                           "ntdll.dll!NtWaitForSingleObject+0x14")
+        self.assertEqual(nested[0]["parent"], {"kind": "syscall", "id": "NtWaitForSingleObject"})
+        self.assertEqual(nested[0]["total_ns_in_late_blocks"], 300_000)
+        self.assertEqual(nested[0]["woken_by"], [{"tid": TID_CALLBACK, "role": "pipeasio_callback", "count": 1}])
+        self.assertEqual(nested[1]["parent"], {"kind": "syscall", "id": "NtCreateEvent"})
+        self.assertTrue(all("share_of_lost_slack" not in site for site in nested))
         self.assertEqual(summary["kinds"]["syscall"]["n"], 7)
         self.assertEqual(summary["kinds"]["server_req"], {"n": 1, "total_ns": 8_000})
         self.assertIn("main", summary["roles"])
@@ -459,6 +484,8 @@ class ReduceTest(unittest.TestCase):
         self.assertEqual(waits[0]["status"], 0)
         self.assertEqual(waits[0]["count"], 1)
         self.assertEqual(waits[0]["woken_by"], {"tid": TID_CALLBACK, "role": "pipeasio_callback"})
+        self.assertEqual(waits[0]["parent"], {"kind": "syscall", "id": "NtWaitForSingleObject"})
+        self.assertNotIn("parent", [event for event in events if event["kind"] == "syscall"][0])
         unix = [event for event in events if event["kind"] == "unixcall"][0]
         self.assertEqual(unix["id"], "winscard.so:scard_establish_context")
         self.assertEqual(unix["caller"], "pe!0x140001234")

@@ -77,7 +77,15 @@ printf '  %s%-9s %-30s %s%s\n' "$CD" "status" "check" "detail" "$C0"
 # ---------------------------------------------------------------- kernel ----
 kver="$(uname -r)"; kmaj="${kver%%.*}"; rest="${kver#*.}"; kmin="${rest%%[^0-9]*}"
 [[ "$kmaj" =~ ^[0-9]+$ ]] || kmaj=0; [[ "$kmin" =~ ^[0-9]+$ ]] || kmin=0
-if (( kmaj > 6 || (kmaj == 6 && kmin >= 14) )); then row OK "kernel" "$kver"; else row FAIL "kernel" "$kver is older than 6.14 (NTSync, optimized uprobes)"; fi
+if (( kmaj > 7 || (kmaj == 7 && kmin >= 2) )); then
+    row OK "kernel" "$kver"
+elif (( kmaj == 7 || (kmaj == 6 && kmin >= 14) )); then
+    # NTSync works, but the 10-byte USDT sites of patches 0108/0017 need 7.2's
+    # optimized-uprobe support: older kernels refuse every site (ENOTSUPP).
+    row FAIL "kernel" "$kver is older than 7.2: the runtime's 10-byte USDT probe sites cannot be attached (patches 0108/0017)"
+else
+    row FAIL "kernel" "$kver is older than 6.14 (NTSync) and 7.2 (10-byte USDT probe sites)"
+fi
 
 if [ -r /sys/kernel/btf/vmlinux ]; then
     row OK "kernel BTF" "/sys/kernel/btf/vmlinux ($(( $(stat -c %s /sys/kernel/btf/vmlinux 2>/dev/null || echo 0) / 1048576 )) MiB)"

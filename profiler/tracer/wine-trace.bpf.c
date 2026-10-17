@@ -28,11 +28,13 @@
  * the preempted run gets overwritten (the B5 oops in wine_syscall_exit).  Any per-CPU
  * map used as scratch has the same problem.  So, in every uprobe program and every
  * subprogram they call:
- *   * the BPF frame stays below 64 bytes: the only stack variable is the tid used as a
- *     map key; everything else lives in map values or ring-buffer records;
- *   * per-thread scratch (map keys and values under construction, USDT arguments) is in
- *     the thread's own `struct tstate`, a hash map value keyed by tid: no other thread
- *     ever touches it, and a thread cannot run two of its programs at once;
+ *   * the BPF frame stays below 64 bytes: the stack holds only small scalars (a map key,
+ *     the syscall id read from the frame); everything else lives in map values or
+ *     ring-buffer records;
+ *   * per-thread scratch (USDT arguments, NTSync wait arguments, accumulator, in-flight
+ *     stack) is in the thread's own `struct tstate`, an array slot claimed by the thread:
+ *     no other thread ever writes it (the scheduler programs use their own fields), and a
+ *     thread cannot run two of its programs at once;
  *   * ring-buffer records are reserved first and filled in place (bpf_usdt_arg and
  *     bpf_probe_read_user write straight into them; each reservation is private memory);
  *   * counters are atomic adds on global data (no in-flight pointers, no lost updates);
@@ -41,6 +43,29 @@
  * attach when a uprobe program landed on a private stack (wine-trace.c: stack_self_check).
  * fentry/fexit/tp_btf programs have the kernel's per-program recursion guard and the
  * scheduler tracepoints run non-preemptible; they follow the same rules anyway.
+ *
+ * ---- Cost per hit (B5c) ---------------------------------------------------------------
+ * Live makes ~1000 probe hits per 1.33 ms block, so every program is on a budget of tens of
+ * nanoseconds.  `perf record` of a traced Live run (B5c) put the BPF time into: the user
+ * reads of bpf_probe_read_user (and page faults of stack windows that ran off the top of a
+ * stack), bpf_ktime_get_ns, the tid hash-map lookup (jhash + a bcmp call), the per-crossing
+ * agg-map update, and ring-buffer lock contention when every AudioCalc worker flushed at the
+ * same moment.  Hence:
+ *   * thread state is an array slot (inlined lookup, see struct tstate);
+ *   * a completed crossing is folded into the thread's accumulator (hashed slots, one key
+ *     and one value line); the accumulator goes to user space as one REC_AGG record per
+ *     thread about every second block, at a blocking wait (the workers reach their waits at
+ *     different times) rather than at their first commit of a block (they all wake together);
+ *   * NTSync hit counts are per-thread fields, not atomic adds on a shared counter;
+ *   * the random stack sampler counts down per thread (one prandom per sample); a stack
+ *     window stops at the first unreadable page found for the thread (one fault per stack,
+ *     not one per sample);
+ *   * the slack trigger reads its per-block budget before the atomic add, which has a cache
+ *     line of its own (struct global);
+ *   * the NTSync programs find a traced thread through its slot and check the pid map only
+ *     for threads without one;
+ *   * records never force a consumer wakeup (the loader polls every 25 ms).
+ * The agg hash maps remain for the scheduler programs (drill-down, --sched on).
  */
 #include "vmlinux.h"
 #include <bpf/bpf_helpers.h>
@@ -61,12 +86,13 @@ const volatile struct wt_config CFG = {
 	.offcpu_min_ns = OFFCPU_MIN_NS_DEFAULT, .callback_return_id = NO_SYSCALL_ID,
 };
 
-/* zero image of a new thread's state (the update source must not be on the BPF stack) */
-const volatile struct tstate ZERO_TSTATE = {};
-
 struct global gl = {};
 __u64 counters[CT__COUNT] = {};
 __u64 hits[HIT__COUNT] = {};
+/* bumped by the loader after every change of the `tids` map (audio-role threads): a thread
+ * re-reads its own entry only then (ts_audio).  A cache line of its own: every wait reads it,
+ * the loader writes it when a thread's role changes. */
+__u32 role_gen __attribute__((aligned(64))) = 0;
 
 /* ------------------------------------------------------------------------
  * maps
@@ -82,8 +108,9 @@ struct agg_map agg1 SEC(".maps");
 struct agg_map agg2 SEC(".maps");
 struct agg_map agg3 SEC(".maps");
 
-/* agg[4]: time ring.  Every key is written at its completion time `now` into
- * agg[(now / AGG_SLOT_NS) & 3] (the key's seq still says which block or window the
+/* agg[4]: time ring of the scheduler keys (on-CPU / off-CPU intervals, --sched on; the
+ * crossings travel in REC_AGG records).  Every key is written at its completion time `now`
+ * into agg[(now / AGG_SLOT_NS) & 3] (the key's seq still says which block or window the
  * event belongs to, decided at entry).  While the clock is in slot window W, only
  * agg[W & 3] receives writes, so user space drains agg[(W - 2) & 3] without racing
  * the BPF side (which updates values in place) and merges keys by their seq. */
@@ -96,8 +123,9 @@ struct {
 	.values = { [0] = &agg0, [1] = &agg1, [2] = &agg2, [3] = &agg3 },
 };
 
+/* thread state: MAX_TIDS slots, see struct tstate and ts_find / ts_claim */
 struct {
-	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(type, BPF_MAP_TYPE_ARRAY);
 	__uint(max_entries, MAX_TIDS);
 	__type(key, __u32);
 	__type(value, struct tstate);
@@ -137,36 +165,134 @@ struct {
 } trigger_ids SEC(".maps");
 
 /* ------------------------------------------------------------------------
- * small helpers (always inlined; nothing here declares a stack variable)
+ * small helpers
  * ---------------------------------------------------------------------- */
 #define cnt(i)        __sync_fetch_and_add(&counters[(i)], 1)
 #define cnt_add(i, n) __sync_fetch_and_add(&counters[(i)], (n))
 #define hit(i)        do { if (CFG.count_hits) __sync_fetch_and_add(&hits[(i)], 1); } while (0)
 
-/* The consumer polls the ring every 25 ms on its own; waking it for each record would cost a
- * context switch per block phase.  Wake it only when the ring is more than a quarter full. */
-static __always_inline __u64 rb_flags(void)
+/* The consumer polls the ring every 25 ms whatever happens; a forced wakeup per record would
+ * cost a context switch, and asking the ring how full it is (two bpf_ringbuf_query calls)
+ * reads cache lines that the consumer and every producer write.  At 16 MiB (summary) or
+ * 64 MiB (drill-down) the ring holds far more than 25 ms of records. */
+#define RB_FLAGS BPF_RB_NO_WAKEUP
+
+/* ---- thread state slots ---- */
+static __always_inline struct tstate *ts_slot(__u32 i)
 {
-	return bpf_ringbuf_query(&rb, BPF_RB_AVAIL_DATA) > bpf_ringbuf_query(&rb, BPF_RB_RING_SIZE) / 4 ?
-		BPF_RB_FORCE_WAKEUP : BPF_RB_NO_WAKEUP;
+	__u32 key = i & (MAX_TIDS - 1);
+
+	return bpf_map_lookup_elem(&tstate, &key);
 }
 
-static __always_inline struct tstate *ts_get(__u32 *tid)
+/* the thread's slot, or NULL; never claims (scheduler programs, exits) */
+static __always_inline struct tstate *ts_find(__u32 tid)
 {
-	struct tstate *t = bpf_map_lookup_elem(&tstate, tid);
+	__u32 h = (tid * TSTATE_HASH) >> (32 - MAX_TIDS_BITS);
+	struct tstate *t;
+	int k;
 
-	if (t)
-		return t;
-	bpf_map_update_elem(&tstate, tid, (const void *)&ZERO_TSTATE, BPF_NOEXIST);
-	t = bpf_map_lookup_elem(&tstate, tid);
-	if (!t)
-		cnt(CT_TSTATE_FULL);
-	return t;
+	if (!tid)
+		return NULL;
+#pragma unroll
+	for (k = 0; k < TSTATE_PROBES; k++) {
+		t = ts_slot(h + k);
+		if (!t)
+			return NULL;
+		if (t->tid == tid)
+			return t;
+	}
+	return NULL;
+}
+
+/* a freshly claimed slot: forget the previous owner (the in-flight stack and the accumulator
+ * are empty with depth = acc_mask = 0) */
+static __noinline int ts_reset(struct tstate *t)
+{
+	t->depth = 0;
+	t->seen = 0;
+	t->sample_cd = 0;
+	t->acc_mask = 0;
+	t->acc_n = 0;
+	t->acc_epoch = 0;
+	t->acc_t0 = 0;
+	t->role_gen = ~0u;      /* read the role at the first wait */
+	t->role_audio = 0;
+	t->stack_top = 0;
+	t->unmatched = 0;
+	t->first_exit = 0;
+	t->abandoned = 0;
+	t->overflow = 0;
+	t->open_at_exit = 0;
+	t->never_returned = 0;
+	t->nt_wait_hits = 0;
+	t->nt_wake_hits = 0;
+	t->off_ts = 0;
+	t->on_ts = 0;
+	t->wake_ts = 0;
+	t->off_seq = 0;
+	t->last_wake_ts = 0;
+	t->waker_tid = 0;
+	t->last_waker = 0;
+	t->off_flags = 0;
+	t->wakeups = 0;
+	t->cycle_ts = 0;
+	t->now0 = 0;
+	return 0;
+}
+
+/* The thread's slot, claimed if it has none.  Only ever called in the thread's own context (its
+ * USDT probes and its NTSync calls), so two claims for one tid cannot race; the compare-and-swap
+ * settles threads whose tids hash onto the same slot. */
+static __always_inline struct tstate *ts_claim(__u32 tid)
+{
+	__u32 h = (tid * TSTATE_HASH) >> (32 - MAX_TIDS_BITS);
+	struct tstate *t;
+	int k;
+
+	if (!tid)
+		return NULL;
+#pragma unroll
+	for (k = 0; k < TSTATE_PROBES; k++) {
+		t = ts_slot(h + k);
+		if (!t)
+			return NULL;
+		if (t->tid == tid)
+			return t;
+	}
+#pragma unroll
+	for (k = 0; k < TSTATE_PROBES; k++) {
+		t = ts_slot(h + k);
+		if (!t)
+			return NULL;
+		if (t->tid == 0 && __sync_val_compare_and_swap(&t->tid, 0, tid) == 0) {
+			ts_reset(t);
+			return t;
+		}
+	}
+	cnt(CT_TSTATE_FULL);
+	return NULL;
 }
 
 static __always_inline bool pid_traced(__u32 *pid)
 {
 	return bpf_map_lookup_elem(&pids, pid) != NULL;
+}
+
+/* The kernel-side probes fire for every process.  A thread with a slot belongs to a traced
+ * process (slots are claimed only from probes of traced pids and released when their thread
+ * exits), so the common case costs one array lookup; the pid map is consulted only for a thread
+ * without a slot (its first NTSync call, or an untraced process). */
+static __always_inline struct tstate *ts_traced(__u64 pt)
+{
+	__u32 key = (__u32)(pt >> 32);
+	struct tstate *t = ts_find((__u32)pt);
+
+	if (t)
+		return t;
+	if (!pid_traced(&key))
+		return NULL;
+	return ts_claim((__u32)pt);
 }
 
 /* --roles audio: USDT crossings only for audio-role threads (+ the callback tid) */
@@ -180,6 +306,25 @@ static __always_inline bool tid_wanted(__u32 *tid)
 		return true;
 	r = bpf_map_lookup_elem(&tids, tid);
 	return r && ROLE_IS_AUDIO(*r);
+}
+
+/* Whether the thread has an audio role (the callback thread, or `tids`, which the loader keeps in
+ * step with its classifier in every mode).  The entry is looked up again only after the loader
+ * bumped role_gen, so a wait costs a compare, not a hash lookup.  The key is the slot's own tid
+ * (map value memory, never the stack). */
+static __always_inline bool ts_audio(struct tstate *t)
+{
+	__u32 g = role_gen;
+	__u8 *r;
+
+	if (t->tid == gl.callback_tid)
+		return true;
+	if (t->role_gen != g) {
+		r = bpf_map_lookup_elem(&tids, &t->tid);
+		t->role_audio = (r && ROLE_IS_AUDIO(*r)) ? 1 : 0;
+		t->role_gen = g;
+	}
+	return t->role_audio != 0;
 }
 
 static __always_inline __u16 ntstatus_flags(__u32 st)
@@ -242,7 +387,7 @@ static __noinline int emit_anomaly(struct tstate *t, __u32 what_kind, __u32 id, 
 		r->ids[i] = t->s[i].id;
 		r->frames[i] = t->s[i].frame;
 	}
-	bpf_ringbuf_submit(r, rb_flags());
+	bpf_ringbuf_submit(r, RB_FLAGS);
 	return 0;
 }
 
@@ -250,7 +395,7 @@ static __noinline int emit_anomaly(struct tstate *t, __u32 what_kind, __u32 id, 
 	do { if (CFG.mode == MODE_DRILLDOWN) emit_anomaly((t), (what) | ((__u32)(kind) << 8), (id), (frame), (aux)); } while (0)
 
 /* ------------------------------------------------------------------------
- * aggregation: one key/value under construction in a map value (struct aggscratch)
+ * scheduler keys: one key/value under construction in a map value (struct aggscratch)
  * ---------------------------------------------------------------------- */
 static __noinline int agg_commit(struct aggscratch *s)
 {
@@ -274,7 +419,7 @@ static __noinline int agg_commit(struct aggscratch *s)
 		if (!v)
 			return 0;
 	}
-	/* keys are per tid: only the owning thread (or the CPU switching it) updates them */
+	/* keys are per tid: only the CPU switching that thread updates them */
 	v->count += s->val.count;
 	v->total_ns += s->val.total_ns;
 	if (s->val.max_ns > v->max_ns)
@@ -287,7 +432,7 @@ static __noinline int agg_commit(struct aggscratch *s)
 	return 0;
 }
 
-/* fill s for a count-only / duration key and commit it */
+/* fill s for a duration key and commit it */
 static __always_inline void agg_add(struct aggscratch *s, __u64 now, __u64 seq, __u32 tid, __u8 kind,
 				    __u16 flags, __u32 id, __u64 dur, __u64 oncpu, __u64 aux, __u32 waker)
 {
@@ -309,50 +454,213 @@ static __always_inline void agg_add(struct aggscratch *s, __u64 now, __u64 seq, 
 	agg_commit(s);
 }
 
-/* count-only key (wakes, --no-exit entries) for the block / window in progress */
-static __always_inline void agg_count(struct aggscratch *s, __u32 tid, __u8 kind, __u32 id)
+/* ------------------------------------------------------------------------
+ * per-thread crossing accumulator (struct tstate ak[] / av[], ACC_SLOTS slots)
+ *
+ * A completed crossing (or a count-only point event) is folded into the thread's own table: no
+ * hash map, no atomic, no cache line another thread writes.  A key's slot is found by hashing
+ * it and probing linearly; acc_mask says which slots are in use.  The table goes to user space
+ * as one REC_AGG ring-buffer record (acc_flush)
+ *   * before the thread blocks in an NTSync or wineserver wait: always for a thread without an
+ *     audio role (ts_audio), and for an audio-role thread once it holds keys of two blocks or
+ *     more, or half a table (the AudioCalc workers each reach their waits at their own time,
+ *     so their records do not all contend for the ring at the block start, and a worker
+ *     flushes about every second block);
+ *   * at a commit when its keys are three blocks old (threads that never wait) or
+ *     ACC_MAX_AGE_NS old (between blocks, and when Live is not playing);
+ *   * when a new key finds the table full;
+ *   * when the thread exits (on_sched_process_exit, or on_sched_switch for a dead task whose
+ *     slot the exit program did not release);
+ * and user space drains what is left from the slots at stop.  An AudioCalc worker makes ~60
+ * crossings and 4-6 distinct keys per block (B5b): one record replaces ~60 hash updates.  Keys
+ * are complete (seq, tid, kind, id, parent, flags), so user space merges partial aggregates of
+ * one key exactly as it merged agg-map keys.  Still late: the keys of a thread that sleeps
+ * outside those waits (nanosleep, poll: NtDelayExecution, unix-side calls) travel at its next
+ * probe, and user space moves keys of a block it already wrote to the thread's 100 ms window
+ * (tracer.json counters.keys_for_flushed_block; _audio counts those of audio-role threads).
+ * ---------------------------------------------------------------------- */
+static __always_inline __u32 acc_hash(__u64 seq, __u64 idp, __u32 kfl)
 {
-	__u64 now = bpf_ktime_get_ns();
-
-	assoc_into(&s->key.seq, &s->key.flags, tid, now);
-	agg_add(s, now, s->key.seq, tid, kind, s->key.flags, id, 0, 0, 0, 0);
+	return (__u32)(((seq ^ idp ^ ((__u64)kfl << 17)) * 0x9E3779B97F4A7C15ULL) >> (64 - ACC_BITS));
 }
 
-/* count-only key of a point event inside the thread's innermost open syscall / unix call (an
- * NTSync wake inside NtSetEvent): the parent gives it its caller */
-static __noinline int agg_point(struct tstate *t, __u32 tid, __u32 kind, __u32 id)
+static __noinline int acc_flush(struct tstate *t)
 {
-	struct aggscratch *s = &t->ag;
+	struct rec_agg *r;
+	__u32 mask = t->acc_mask, n = 0;
+	int i;
+
+	t->acc_mask = 0;
+	t->acc_n = 0;
+	if (!mask)
+		return 0;
+	r = bpf_ringbuf_reserve(&rb, sizeof(*r), 0);
+	if (!r) {
+		__u64 lost = 0;
+
+#pragma unroll
+		for (i = 0; i < ACC_SLOTS; i++)
+			if (mask & (1u << i))
+				lost += t->av[i].count;
+		cnt_add(CT_RB_DROP_AGG, lost);
+		return 0;
+	}
+	r->h.type = REC_AGG;
+	r->h.len = sizeof(*r);
+	r->h.tid = t->tid;
+	r->h.ts = bpf_ktime_get_ns();
+	r->pad = 0;
+#pragma unroll
+	for (i = 0; i < ACC_SLOTS; i++) {
+		if (mask & (1u << i)) {
+			struct acc_ent *o = &r->e[n & (ACC_SLOTS - 1)];
+
+			o->seq = t->ak[i].seq;
+			o->idp = t->ak[i].idp;
+			o->kfl = t->ak[i].kfl;
+			o->waker = t->av[i].waker;
+			o->count = t->av[i].count;
+			o->total_ns = t->av[i].total_ns;
+			o->max_ns = t->av[i].max_ns;
+			o->oncpu_ns = t->av[i].oncpu_ns;
+			n++;
+		}
+	}
+	r->n = n;
+	bpf_ringbuf_submit(r, RB_FLAGS);
+	return 0;
+}
+
+/* Fold the crossing in t->s[idx] (entered at s[idx].ts, completed at now) into the accumulator.
+ * Everything is read from the entry after the possible flush calls, so nothing but t, idx and
+ * now lives across them (a tiny frame). */
+#define ACC_FULL 0xffu       /* acc_commit's slot search: no hit, no free slot */
+#define ACC_NEW  0x80u       /* ... a free slot (| its index) */
+
+static __noinline int acc_commit(struct tstate *t, __u32 idx, __u64 now)
+{
+	struct inflight_ent *e;
+	struct acc_key *k;
+	struct acc_val *v;
+	__u64 seq, idp, dur;
+	__u32 kfl, h, s, slot = ACC_FULL, j;
+
+	if (t->acc_mask && (gl.blocks - t->acc_epoch >= 3 || now - t->acc_t0 >= ACC_MAX_AGE_NS))
+		acc_flush(t);
+	e = &t->s[idx & (INFLIGHT_DEPTH - 1)];
+	seq = e->seq;
+	idp = ACC_IDP(e->id, e->pid_);
+	kfl = ACC_KFL(e->kind, e->pkind, e->flags);
+	h = acc_hash(seq, idp, kfl);
+#pragma unroll
+	for (j = 0; j < ACC_SLOTS; j++) {
+		s = (h + j) & (ACC_SLOTS - 1);
+		if (!(t->acc_mask & (1u << s))) {
+			slot = s | ACC_NEW;             /* free slot: install */
+			break;
+		}
+		k = &t->ak[s];
+		if (k->seq == seq && k->idp == idp && k->kfl == kfl) {
+			slot = s;                       /* hit: update */
+			break;
+		}
+	}
+	if (slot == ACC_FULL) {                         /* table full */
+		acc_flush(t);
+		e = &t->s[idx & (INFLIGHT_DEPTH - 1)];
+		seq = e->seq;
+		idp = ACC_IDP(e->id, e->pid_);
+		kfl = ACC_KFL(e->kind, e->pkind, e->flags);
+		slot = acc_hash(seq, idp, kfl) | ACC_NEW;
+	}
+	dur = now - e->ts;
+	v = &t->av[slot & (ACC_SLOTS - 1)];
+	if (slot & ACC_NEW) {
+		if (!t->acc_mask) {
+			t->acc_epoch = gl.blocks;
+			t->acc_t0 = now;
+		}
+		t->acc_mask |= 1u << (slot & (ACC_SLOTS - 1));
+		t->acc_n++;
+		k = &t->ak[slot & (ACC_SLOTS - 1)];
+		k->seq = seq;
+		k->idp = idp;
+		k->kfl = kfl;
+		v->count = 1;
+		v->total_ns = dur;
+		v->max_ns = dur;
+		v->oncpu_ns = dur > e->off_ns ? dur - e->off_ns : 0;
+		v->waker = t->last_wake_ts >= e->ts ? t->last_waker : 0;
+		return 0;
+	}
+	v->count += 1;
+	v->total_ns += dur;
+	if (dur > v->max_ns)
+		v->max_ns = dur;
+	v->oncpu_ns += dur > e->off_ns ? dur - e->off_ns : 0;
+	if (t->last_wake_ts >= e->ts && t->last_waker)
+		v->waker = t->last_waker;
+	return 0;
+}
+
+/* The thread is about to block (NTSync wait, wineserver wait).  A thread without an audio role
+ * ships its keys now: it may sleep for seconds, and keys that reach user space after their block
+ * was written (BLOCK_FLUSH_NS in wine-trace.c) lose the block (they go to the thread's 100 ms
+ * window instead).  An audio-role thread waits about a block at most while the audio runs, so it
+ * batches: keys of two blocks, half a table or old keys go now, the rest after the wait (the
+ * AudioCalc workers reach their waits at different times, so they do not meet at the ring-buffer
+ * lock at the block start). */
+static __always_inline void acc_before_block(struct tstate *t, __u64 now)
+{
+	if (t->acc_mask && (gl.blocks - t->acc_epoch >= 2 || t->acc_n >= ACC_SLOTS / 2 ||
+			    now - t->acc_t0 >= ACC_MAX_AGE_NS || !ts_audio(t)))
+		acc_flush(t);
+}
+
+/* A count-only key for the block / window in progress: NtCallbackReturn, --no-exit entries,
+ * NTSync wakes.  The key is built in the free in-flight slot s[depth] (never visible: depth
+ * does not move) and folded in like a zero-length crossing.  nested = 1: inside the thread's
+ * innermost open syscall / unix call, whose kind and id become the key's parent (an NTSync
+ * wake inside NtSetEvent gets NtSetEvent's caller).  Returns the scratch slot index for
+ * emit_point_event, or -1 (in-flight stack full: the event is counted as an overflow). */
+static __noinline int acc_point(struct tstate *t, __u32 kind, __u32 id, __u32 nested)
+{
+	struct inflight_ent *e;
 	__u64 now = bpf_ktime_get_ns();
 	__u32 d = t->depth;
 	int i;
 
-	assoc_into(&s->key.seq, &s->key.flags, tid, now);
-	s->key.tid = tid;
-	s->key.kind = (__u8)kind;
-	s->key.id = id;
-	s->key.pkind = 0;
-	s->key.pid_ = 0;
+	if (d >= INFLIGHT_DEPTH) {
+		t->overflow++;
+		cnt(CT_INFLIGHT_OVERFLOW);
+		return -1;
+	}
+	e = &t->s[d & (INFLIGHT_DEPTH - 1)];
+	e->ts = now;
+	e->off_ns = 0;
+	e->aux = 0;
+	e->frame = 0;
+	e->id = id;
+	e->pid_ = 0;
+	e->kind = (__u8)kind;
+	e->pkind = 0;
+	e->sampled = 0;
+	assoc_into(&e->seq, &e->flags, t->tid, now);
+	if (nested) {
 #pragma unroll
-	for (i = 0; i < INFLIGHT_DEPTH; i++) {
-		if ((__u32)i < d && (t->s[i].kind == KIND_SYSCALL || t->s[i].kind == KIND_UNIXCALL)) {
-			s->key.pkind = t->s[i].kind;
-			s->key.pid_ = t->s[i].id;
+		for (i = 0; i < INFLIGHT_DEPTH; i++) {
+			if ((__u32)i < d && (t->s[i].kind == KIND_SYSCALL || t->s[i].kind == KIND_UNIXCALL)) {
+				e->pkind = t->s[i].kind;
+				e->pid_ = t->s[i].id;
+			}
 		}
 	}
-	s->val.count = 1;
-	s->val.total_ns = 0;
-	s->val.max_ns = 0;
-	s->val.oncpu_ns = 0;
-	s->val.aux_ns = 0;
-	s->val.last_waker = 0;
-	s->val.pad = 0;
-	s->slot = (__u32)((now / AGG_SLOT_NS) & (AGG_SLOTS - 1));
-	return agg_commit(s);
+	acc_commit(t, d, now);
+	return (int)d;
 }
 
 /* ------------------------------------------------------------------------
- * in-flight stack per tid (depth INFLIGHT_DEPTH), entry/exit pairing
+ * in-flight stack per thread (depth INFLIGHT_DEPTH), entry/exit pairing
  * ---------------------------------------------------------------------- */
 
 /* The next free slot of t's in-flight stack, initialised (association, timestamp, id, pairing
@@ -441,7 +749,8 @@ static __always_inline int find_entry(struct tstate *t, __u8 kind, __u64 frame, 
 	return found;
 }
 
-static __noinline int emit_event(struct tstate *t, __u32 tid, __u32 idx, __u64 now, __s32 status)
+/* drill-down record of the completed entry idx (its flags include the exit's) */
+static __noinline int emit_event(struct tstate *t, __u32 idx, __u64 now, __s32 status)
 {
 	struct inflight_ent *e = &t->s[idx & (INFLIGHT_DEPTH - 1)];
 	struct rec_event *r;
@@ -454,7 +763,7 @@ static __noinline int emit_event(struct tstate *t, __u32 tid, __u32 idx, __u64 n
 	}
 	r->h.type = REC_EVENT;
 	r->h.len = sizeof(*r);
-	r->h.tid = tid;
+	r->h.tid = t->tid;
 	r->h.ts = now;
 	r->seq = e->seq;
 	r->entry_ts = e->ts;
@@ -463,9 +772,9 @@ static __noinline int emit_event(struct tstate *t, __u32 tid, __u32 idx, __u64 n
 	r->pid_ = e->pid_;
 	r->kind = e->kind;
 	r->pkind = e->pkind;
-	r->flags = t->ag.key.flags;
+	r->flags = e->flags;
 	r->status = status;
-	r->waker_tid = t->ag.val.last_waker;
+	r->waker_tid = t->last_wake_ts >= e->ts ? t->last_waker : 0;
 	r->pad = 0;
 	/* this entry's sample, or the innermost enclosing sampled entry's (server_req / ntsync
 	 * inside a syscall inherit the enclosing stack sample) */
@@ -477,47 +786,32 @@ static __noinline int emit_event(struct tstate *t, __u32 tid, __u32 idx, __u64 n
 	}
 	if (e->sampled)
 		r->stack_ts = e->ts;
-	bpf_ringbuf_submit(r, rb_flags());
+	bpf_ringbuf_submit(r, RB_FLAGS);
 	return 0;
 }
 
-/* pop entry idx (and everything nested above it), aggregate it, emit the drill-down record */
-static __noinline int complete(struct tstate *t, __u32 tid, __u32 idx, __u32 extra, __s32 status)
+/* pop entry idx (and everything nested above it), fold it into the accumulator, emit the
+ * drill-down record */
+static __noinline int complete(struct tstate *t, __u32 idx, __u32 extra, __s32 status)
 {
 	struct inflight_ent *e;
-	struct aggscratch *s = &t->ag;
 	__u32 d = t->depth;
-	__u64 now, dur;
+	__u64 now;
 
 	idx &= INFLIGHT_DEPTH - 1;
 	if (idx >= d || d > INFLIGHT_DEPTH)
 		return 0;
 	e = &t->s[idx];
 	now = bpf_ktime_get_ns();
-	dur = now - e->ts;
 	if (d - 1 - idx) {
 		anomaly(t, AN_ABANDONED, e->kind, e->id, e->frame, idx);
 		t->abandoned += d - 1 - idx;
 		cnt_add(CT_ABANDONED, d - 1 - idx);
 	}
-	s->key.seq = e->seq;
-	s->key.tid = tid;
-	s->key.kind = e->kind;
-	s->key.pkind = e->pkind;
-	s->key.flags = e->flags | (__u16)extra;
-	s->key.id = e->id;
-	s->key.pid_ = e->pid_;
-	s->val.count = 1;
-	s->val.total_ns = dur;
-	s->val.max_ns = dur;
-	s->val.oncpu_ns = dur > e->off_ns ? dur - e->off_ns : 0;
-	s->val.aux_ns = 0;
-	s->val.last_waker = t->last_wake_ts >= e->ts ? t->last_waker : 0;
-	s->val.pad = 0;
-	s->slot = (__u32)((now / AGG_SLOT_NS) & (AGG_SLOTS - 1));
-	agg_commit(s);
+	e->flags |= (__u16)extra;
+	acc_commit(t, idx, now);
 	if (CFG.mode == MODE_DRILLDOWN)
-		emit_event(t, tid, idx, now, status);
+		emit_event(t, idx, now, status);
 	t->depth = idx;
 	return 0;
 }
@@ -525,16 +819,26 @@ static __noinline int complete(struct tstate *t, __u32 tid, __u32 idx, __u32 ext
 /* ------------------------------------------------------------------------
  * stack sampling (rec_stack), reserved and filled in place
  * ---------------------------------------------------------------------- */
-static __always_inline bool want_sample(struct inflight_ent *e)
+static __always_inline bool want_sample(struct tstate *t, struct inflight_ent *e)
 {
 	if (CFG.mode == MODE_SAMPLE)
 		return false;
-	if (CFG.sample_n && bpf_get_prandom_u32() % CFG.sample_n == 0) {
-		cnt(CT_SAMPLE_RANDOM);
-		return true;
+	if (CFG.sample_n) {
+		/* the random sampler counts down per thread: the next sample comes after 1 .. 2N-1 entries
+		 * (uniform, mean N), so it costs one prandom per sample instead of one (and a division)
+		 * per entry, and the random spacing cannot alias with periodic call patterns */
+		if (t->sample_cd > 1) {
+			t->sample_cd--;
+		} else {
+			t->sample_cd = 1 + bpf_get_prandom_u32() % (2 * CFG.sample_n - 1);
+			cnt(CT_SAMPLE_RANDOM);
+			return true;
+		}
 	}
-	if (CFG.slack_thresh_pct && e->seq == gl.cur_seq && gl.sample_after_ns && e->ts >= gl.sample_after_ns &&
-	    __sync_fetch_and_add(&gl.trig_used, 1) < CFG.slack_samples) {
+	/* the per-block budget is read before the atomic add: once it is spent, entries of the
+	 * block's tail do not write the shared line at all */
+	if (CFG.slack_thresh_pct && gl.sample_after_ns && e->ts >= gl.sample_after_ns && e->seq == gl.cur_seq &&
+	    gl.trig_used < CFG.slack_samples && __sync_fetch_and_add(&gl.trig_used, 1) < CFG.slack_samples) {
 		cnt(CT_SAMPLE_SLACK);
 		return true;
 	}
@@ -549,11 +853,16 @@ static __always_inline bool want_sample(struct inflight_ent *e)
 
 /* The register block is Wine's syscall_frame, read through the entry's frame pointer.  Its rsp
  * (regs[17]) and rip (regs[14]) are exactly the probes' user_rsp/user_rip (syscall: NtXxx+0x14)
- * and caller_rip (unix call: the PE caller) operands, so no argument fetch is needed here. */
-static __noinline int sample_stack(struct pt_regs *ctx, struct tstate *t, __u32 idx, __u32 tid)
+ * and caller_rip (unix call: the PE caller) operands, so no argument fetch is needed here.
+ * The window starts at rsp and stops at t->stack_top, the first page above a sampled rsp that
+ * did not read: a thread whose wait sits near the top of its stack (the AudioCalc workers) used
+ * to take a page fault on every sample before the halved retry succeeded (B5c perf: ~8% of
+ * wine_syscall_entry's cycles); now it takes one per stack. */
+static __noinline int sample_stack(struct tstate *t, __u32 idx)
 {
 	struct inflight_ent *e = &t->s[idx & (INFLIGHT_DEPTH - 1)];
 	struct rec_stack *r;
+	__u64 rsp, lim, pend;
 	__u32 got = 0;
 
 	r = bpf_ringbuf_reserve(&rb, sizeof(struct rec_stack) + SB, 0);
@@ -562,7 +871,7 @@ static __noinline int sample_stack(struct pt_regs *ctx, struct tstate *t, __u32 
 		return 0;
 	}
 	r->h.type = REC_STACK;
-	r->h.tid = tid;
+	r->h.tid = t->tid;
 	r->h.ts = e->ts;
 	r->seq = e->seq;
 	r->frame = e->frame;
@@ -575,16 +884,27 @@ static __noinline int sample_stack(struct pt_regs *ctx, struct tstate *t, __u32 
 	bpf_probe_read_user(r->regs, sizeof(r->regs), (const void *)e->frame);
 	r->rsp = r->regs[SYSCALL_FRAME_RSP_OFF / 8];
 	r->rip = r->regs[SYSCALL_FRAME_RIP_OFF / 8];
-	/* a thread near the top of its stack cannot supply the full window: halve on EFAULT */
-	if (r->rsp) {
-		if (bpf_probe_read_user(r->bytes, SB, (const void *)r->rsp) == 0)
-			got = SB;
-		else if (bpf_probe_read_user(r->bytes, SB / 2, (const void *)r->rsp) == 0)
-			got = SB / 2;
-		else if (bpf_probe_read_user(r->bytes, SB / 4, (const void *)r->rsp) == 0)
-			got = SB / 4;
-		else if (bpf_probe_read_user(r->bytes, SB / 8, (const void *)r->rsp) == 0)
-			got = SB / 8;
+	rsp = r->rsp;
+	if (rsp) {
+		lim = SB;
+		if (t->stack_top > rsp && t->stack_top - rsp < lim)
+			lim = t->stack_top - rsp;
+		if (lim > SB)
+			lim = SB;
+		if (lim >= 8 && bpf_probe_read_user(r->bytes, lim, (const void *)rsp) == 0) {
+			got = (__u32)lim;
+		} else {
+			/* the window ran into the next page: it is not mapped (the top of this stack) */
+			pend = (rsp | 4095) + 1;
+			if (pend - rsp < lim) {
+				t->stack_top = pend;
+				lim = pend - rsp;
+				if (lim > SB)
+					lim = SB;
+				if (lim >= 8 && bpf_probe_read_user(r->bytes, lim, (const void *)rsp) == 0)
+					got = (__u32)lim;
+			}
+		}
 	}
 	if (!got) {
 		bpf_ringbuf_discard(r, BPF_RB_NO_WAKEUP);
@@ -593,7 +913,7 @@ static __noinline int sample_stack(struct pt_regs *ctx, struct tstate *t, __u32 
 	}
 	r->nbytes = (__u16)got;
 	r->h.len = (__u16)(sizeof(struct rec_stack) + got);
-	bpf_ringbuf_submit(r, rb_flags());
+	bpf_ringbuf_submit(r, RB_FLAGS);
 	e->sampled = 1;
 	cnt(CT_STACKS);
 	return 0;
@@ -609,45 +929,47 @@ int wine_syscall_entry(struct pt_regs *ctx)
 	__u32 tid = (__u32)bpf_get_current_pid_tgid();
 	struct inflight_ent *e;
 	struct tstate *t;
-	__u32 d;
+	__u32 d, id = 0;
 
 	hit(HIT_SYSCALL_ENTRY);
 	if (!tid_wanted(&tid)) {
 		cnt(CT_FILTERED);
 		return 0;
 	}
-	t = ts_get(&tid);
+	t = ts_claim(tid);
 	if (!t)
 		return 0;
 	t->seen = 1;
 	if (CFG.fast_args) {                             /* -4@176(%rcx) 8@%rcx */
-		t->arg[0] = 0;
+		/* the id goes to the BPF stack: copy_from_user's destination check is cheapest there */
 		t->arg[1] = ctx->cx;
-		bpf_probe_read_user(&t->arg[0], 4, (const void *)(t->arg[1] + SYSCALL_FRAME_ID_OFF));
+		bpf_probe_read_user(&id, 4, (const void *)(ctx->cx + SYSCALL_FRAME_ID_OFF));
 	} else {
 		bpf_usdt_arg(ctx, 0, (long *)&t->arg[0]);    /* id */
 		bpf_usdt_arg(ctx, 1, (long *)&t->arg[1]);    /* frame */
+		id = (__u32)t->arg[0];
 	}
 	if (CFG.no_exit) {
-		agg_count(&t->ag, tid, KIND_SYSCALL, (__u32)t->arg[0]);
+		acc_point(t, KIND_SYSCALL, id, 0);
 		return 0;
 	}
-	if ((__u32)t->arg[0] == CFG.callback_return_id) {
+	if (id == CFG.callback_return_id) {
 		/* NtCallbackReturn resumes the user callback's caller inside the outer syscall and never
 		 * exits through its own frame: pushing it would stack one dead entry per callback until
 		 * the outer exit (GUI threads overflowed INFLIGHT_DEPTH) */
-		agg_count(&t->ag, tid, KIND_SYSCALL, (__u32)t->arg[0]);
+		acc_point(t, KIND_SYSCALL, id, 0);
 		cnt(CT_CALLBACK_RETURN);
 		return 0;
 	}
-	pop_stale(t, KIND_SYSCALL, (__u32)t->arg[0], t->arg[1]);
+	if (t->depth)            /* nothing can be stale on an empty in-flight stack (the common case) */
+		pop_stale(t, KIND_SYSCALL, id, t->arg[1]);
 	d = t->depth;
-	e = push_slot(t, tid, KIND_SYSCALL, bpf_ktime_get_ns(), (__u32)t->arg[0], t->arg[1]);
+	e = push_slot(t, tid, KIND_SYSCALL, bpf_ktime_get_ns(), id, t->arg[1]);
 	if (!e)
 		return 0;
 	t->depth = d + 1;
-	if (want_sample(e))
-		sample_stack(ctx, t, d, tid);
+	if (want_sample(t, e))
+		sample_stack(t, d);
 	return 0;
 }
 
@@ -674,11 +996,11 @@ int wine_syscall_exit(struct pt_regs *ctx)
 #endif
 	if (!tid_wanted(&tid))
 		return 0;
-	t = bpf_map_lookup_elem(&tstate, &tid);
+	t = ts_find(tid);
 	if (!t || !t->seen) {
 		/* init_syscall_frame's tail jumps to the return label: one exit without entry per
 		 * thread start (and per thread that was inside a syscall when tracing began) */
-		t = ts_get(&tid);
+		t = ts_claim(tid);
 		if (t) {
 			t->seen = 1;
 			t->first_exit++;
@@ -722,7 +1044,7 @@ int wine_syscall_exit(struct pt_regs *ctx)
 		t->arg[0] = (__u32)ctx->ax;                  /* status */
 	else
 		bpf_usdt_arg(ctx, 0, (long *)&t->arg[0]);
-	complete(t, tid, (__u32)i,
+	complete(t, (__u32)i,
 		 ntstatus_flags((__u32)t->arg[0]) |
 		 (((__u32)t->arg[3] & WT_RESTORE_FLAGS_INCOMPLETE_FRAME_CONTEXT) ? AGGF_INCOMPLETE : 0),
 		 (__s32)t->arg[0]);
@@ -752,7 +1074,7 @@ static __noinline __u32 unixlib_index(struct tstate *t, __u32 tid)
 			r->handle = t->ukey.handle;
 			r->pid = t->ukey.pid;
 			r->idx = idx;
-			bpf_ringbuf_submit(r, rb_flags());
+			bpf_ringbuf_submit(r, RB_FLAGS);
 		} else {
 			cnt(CT_RB_DROP_OTHER);
 		}
@@ -775,7 +1097,7 @@ int wine_unixcall_entry(struct pt_regs *ctx)
 		cnt(CT_FILTERED);
 		return 0;
 	}
-	t = ts_get(&tid);
+	t = ts_claim(tid);
 	if (!t)
 		return 0;
 	if (CFG.fast_args) {                             /* 8@%r10 -4@%edx 8@%rsp 8@112(%rsp) */
@@ -791,11 +1113,12 @@ int wine_unixcall_entry(struct pt_regs *ctx)
 	t->ukey.pad = 0;
 	idx = unixlib_index(t, tid);
 	if (CFG.no_exit) {
-		agg_count(&t->ag, tid, KIND_UNIXCALL, (idx << 16) | ((__u32)t->arg[1] & 0xffff));
+		acc_point(t, KIND_UNIXCALL, (idx << 16) | ((__u32)t->arg[1] & 0xffff), 0);
 		return 0;
 	}
 	/* the unix-call frame is the dispatcher's frame of this level too (8@%rsp == the syscall frame) */
-	pop_stale(t, KIND_UNIXCALL, (idx << 16) | ((__u32)t->arg[1] & 0xffff), t->arg[2]);
+	if (t->depth)
+		pop_stale(t, KIND_UNIXCALL, (idx << 16) | ((__u32)t->arg[1] & 0xffff), t->arg[2]);
 	d = t->depth;
 	e = push_slot(t, tid, KIND_UNIXCALL, bpf_ktime_get_ns(), (idx << 16) | ((__u32)t->arg[1] & 0xffff), t->arg[2]);
 	if (!e)
@@ -807,8 +1130,8 @@ int wine_unixcall_entry(struct pt_regs *ctx)
 			bpf_usdt_arg(ctx, 3, (long *)&e->aux);
 	}
 	t->depth = d + 1;
-	if (want_sample(e))
-		sample_stack(ctx, t, d, tid);
+	if (want_sample(t, e))
+		sample_stack(t, d);
 	return 0;
 }
 
@@ -822,7 +1145,7 @@ int wine_unixcall_exit(struct pt_regs *ctx)
 	hit(HIT_UNIXCALL_EXIT);
 	if (!tid_wanted(&tid))
 		return 0;
-	t = bpf_map_lookup_elem(&tstate, &tid);
+	t = ts_find(tid);
 	if (!t)
 		return 0;
 	if (CFG.fast_args)                               /* -4@%eax 8@%rcx */
@@ -840,7 +1163,7 @@ int wine_unixcall_exit(struct pt_regs *ctx)
 		t->arg[0] = (__u32)ctx->ax;                  /* status */
 	else
 		bpf_usdt_arg(ctx, 0, (long *)&t->arg[0]);
-	complete(t, tid, (__u32)i, ntstatus_flags((__u32)t->arg[0]), (__s32)t->arg[0]);
+	complete(t, (__u32)i, ntstatus_flags((__u32)t->arg[0]), (__s32)t->arg[0]);
 	return 0;
 }
 
@@ -856,16 +1179,19 @@ static __always_inline int nested_start(struct pt_regs *ctx, __u8 kind)
 		cnt(CT_FILTERED);
 		return 0;
 	}
-	t = ts_get(&tid);
+	t = ts_claim(tid);
 	if (!t)
 		return 0;
 	bpf_usdt_arg(ctx, 0, (long *)&t->arg[0]);
 	if (CFG.no_exit) {
-		agg_count(&t->ag, tid, kind, (__u32)t->arg[0]);
+		acc_point(t, kind, (__u32)t->arg[0], 0);
 		return 0;
 	}
+	t->arg[5] = bpf_ktime_get_ns();
+	if (kind == KIND_SERVER_WAIT)       /* wait_select_reply: the thread is about to block */
+		acc_before_block(t, t->arg[5]);
 	d = t->depth;
-	e = push_slot(t, tid, kind, bpf_ktime_get_ns(), (__u32)t->arg[0], (__u32)t->arg[0]);
+	e = push_slot(t, tid, kind, t->arg[5], (__u32)t->arg[0], (__u32)t->arg[0]);
 	if (!e)
 		return 0;
 	set_parent(t, e);
@@ -882,7 +1208,7 @@ static __always_inline int nested_end(struct pt_regs *ctx, __u8 kind, bool match
 
 	if (!tid_wanted(&tid))
 		return 0;
-	t = bpf_map_lookup_elem(&tstate, &tid);
+	t = ts_find(tid);
 	if (!t)
 		return 0;
 	if (match_id) {
@@ -901,7 +1227,7 @@ static __always_inline int nested_end(struct pt_regs *ctx, __u8 kind, bool match
 		anomaly(t, AN_UNMATCHED_EXIT, kind, match_id ? (__u32)t->arg[0] : 0, 0, st);
 		return 0;
 	}
-	complete(t, tid, (__u32)i, ntstatus_flags(st), (__s32)st);
+	complete(t, (__u32)i, ntstatus_flags(st), (__s32)st);
 	return 0;
 }
 
@@ -940,6 +1266,7 @@ int wine_server_wait_end(struct pt_regs *ctx)
 static __always_inline struct rec_block *block_rec(__u32 tid, __u32 phase)
 {
 	struct rec_block *r = bpf_ringbuf_reserve(&rb, sizeof(*r), 0);
+	int i;
 
 	if (!r) {
 		cnt(CT_RB_DROP_BLOCK);
@@ -950,44 +1277,39 @@ static __always_inline struct rec_block *block_rec(__u32 tid, __u32 phase)
 	r->h.tid = tid;
 	r->h.ts = bpf_ktime_get_ns();
 	r->seq = 0;
-	r->a[0] = 0;
-	r->a[1] = 0;
-	r->a[2] = 0;
-	r->a[3] = 0;
-	r->a[4] = 0;
+#pragma unroll
+	for (i = 0; i < 9; i++)
+		r->a[i] = 0;
 	r->phase = phase;
 	r->pad = 0;
 	return r;
 }
 
-/* t->arg[] = seq, nframes, rate, clock_nsec, deadline_ns, flags; t->now0 = probe time */
+/* t->arg[] = seq, nframes, rate, clock_nsec, deadline_ns, flags; t->now0 = probe time.  Only
+ * struct global is written: block_end ships the block in one record. */
 static __noinline int block_begin(struct tstate *t, __u32 tid)
 {
-	struct rec_block *r;
 	__u64 margin;
 
 	gl.callback_tid = tid;
 	gl.block_start_ts = t->now0;
 	gl.deadline_ns = t->arg[4];
-	gl.nframes = (__u32)t->arg[1];
-	gl.rate = (__u32)t->arg[2];
-	gl.period_ns = gl.rate ? ((__u64)gl.nframes * 1000000000ULL + gl.rate / 2) / gl.rate : 0;
-	margin = gl.period_ns * CFG.slack_thresh_pct / 100;
+	gl.clock_nsec = t->arg[3];
+	gl.start_flags = (__u32)t->arg[5];
+	gl.before_ts = 0;
+	gl.after_ts = 0;
+	if ((__u32)t->arg[1] != gl.nframes || (__u32)t->arg[2] != gl.rate || !gl.period_ns) {
+		/* the two 64-bit divisions only when the buffer size or rate changes */
+		gl.nframes = (__u32)t->arg[1];
+		gl.rate = (__u32)t->arg[2];
+		gl.period_ns = gl.rate ? ((__u64)gl.nframes * 1000000000ULL + gl.rate / 2) / gl.rate : 0;
+		gl.slack_margin_ns = gl.period_ns * CFG.slack_thresh_pct / 100;
+	}
+	margin = gl.slack_margin_ns;
 	gl.sample_after_ns = gl.deadline_ns > margin ? gl.deadline_ns - margin : 0;
 	gl.trig_used = 0;
 	gl.blocks++;
 	gl.cur_seq = t->arg[0];          /* last: entries of other threads now join this block */
-	r = block_rec(tid, PHASE_BLOCK_START);
-	if (!r)
-		return 0;
-	r->h.ts = t->now0;
-	r->seq = t->arg[0];
-	r->a[0] = t->arg[1];
-	r->a[1] = t->arg[2];
-	r->a[2] = t->arg[3];
-	r->a[3] = t->arg[4];
-	r->a[4] = t->arg[5];
-	bpf_ringbuf_submit(r, rb_flags());
 	return 0;
 }
 
@@ -1000,7 +1322,7 @@ int pipeasio_block_start(struct pt_regs *ctx)
 	hit(HIT_BLOCK_START);
 	if (gl.stopping)        /* the loader is detaching (block_start goes first): no new block */
 		return 0;
-	t = ts_get(&tid);
+	t = ts_claim(tid);
 	if (!t)
 		return 0;
 	t->now0 = bpf_ktime_get_ns();
@@ -1014,19 +1336,22 @@ int pipeasio_block_start(struct pt_regs *ctx)
 }
 
 /* Only blocks whose block_start this tracer saw (gl.cur_seq set) get their other phases: a block
- * in progress at attach, or one that started after gl.stopping, would be an END without a START. */
-static __always_inline int block_mark(struct pt_regs *ctx, __u32 phase)
+ * in progress at attach, or one that started after gl.stopping, would be an END without a START.
+ * before / after only stamp struct global (the callback thread is its only writer); block_end
+ * ships the whole block. */
+static __always_inline int block_mark(struct pt_regs *ctx, bool after)
 {
-	__u32 tid = (__u32)bpf_get_current_pid_tgid();
-	struct rec_block *r;
+	long seq = 0;
 
 	if (!gl.cur_seq)
 		return 0;
-	r = block_rec(tid, phase);
-	if (!r)
+	bpf_usdt_arg(ctx, 0, &seq);
+	if ((__u64)seq != gl.cur_seq)
 		return 0;
-	bpf_usdt_arg(ctx, 0, (long *)&r->seq);
-	bpf_ringbuf_submit(r, rb_flags());
+	if (after)
+		gl.after_ts = bpf_ktime_get_ns();
+	else
+		gl.before_ts = bpf_ktime_get_ns();
 	return 0;
 }
 
@@ -1034,14 +1359,14 @@ SEC("usdt")
 int pipeasio_block_before_live(struct pt_regs *ctx)
 {
 	hit(HIT_BLOCK_BEFORE_LIVE);
-	return block_mark(ctx, PHASE_BEFORE_LIVE);
+	return block_mark(ctx, false);
 }
 
 SEC("usdt")
 int pipeasio_block_after_live(struct pt_regs *ctx)
 {
 	hit(HIT_BLOCK_AFTER_LIVE);
-	return block_mark(ctx, PHASE_AFTER_LIVE);
+	return block_mark(ctx, true);
 }
 
 SEC("usdt")
@@ -1056,15 +1381,25 @@ int pipeasio_block_end(struct pt_regs *ctx)
 	r = block_rec(tid, PHASE_BLOCK_END);
 	if (r) {
 		bpf_usdt_arg(ctx, 0, (long *)&r->seq);
-		bpf_usdt_arg(ctx, 1, (long *)&r->a[0]);   /* flags */
-		bpf_usdt_arg(ctx, 2, (long *)&r->a[1]);   /* missed */
-		if (r->seq == gl.cur_seq) {               /* gl describes this block: rebuild data */
-			r->a[2] = gl.block_start_ts;
-			r->a[3] = gl.deadline_ns;
-			r->a[4] = (__u64)gl.nframes | ((__u64)gl.rate << 32);
+		bpf_usdt_arg(ctx, 1, (long *)&r->a[7]);   /* flags */
+		bpf_usdt_arg(ctx, 2, (long *)&r->a[8]);   /* missed */
+		if (r->seq == gl.cur_seq) {               /* gl describes this block: the whole block */
+			r->phase = PHASE_BLOCK;
+			r->a[0] = (__u64)gl.nframes | ((__u64)gl.rate << 32);
+			r->a[1] = gl.clock_nsec;
+			r->a[2] = gl.deadline_ns;
+			r->a[3] = gl.start_flags;
+			r->a[4] = gl.block_start_ts;
+			r->a[5] = gl.before_ts;
+			r->a[6] = gl.after_ts;
+		} else {                                  /* an end whose start we did not see */
+			r->a[0] = r->a[7];
+			r->a[1] = r->a[8];
+			r->a[7] = 0;
+			r->a[8] = 0;
 		}
 		gl.last_seq = r->seq;
-		bpf_ringbuf_submit(r, rb_flags());
+		bpf_ringbuf_submit(r, RB_FLAGS);
 	} else {
 		gl.last_seq = gl.cur_seq;
 	}
@@ -1072,29 +1407,21 @@ int pipeasio_block_end(struct pt_regs *ctx)
 	return 0;
 }
 
+/* The cycle start only stamps the thread: cycle_end's record carries that stamp (a[2]), which
+ * is all the loader uses (blocks.jsonl cycle.t_start / pre_ns).  The five operands
+ * (clock_nsec, next_nsec, duration, position, cycle_flags) and a record of its own made this
+ * the most expensive program per run (1.1-1.9 us in B5b/B5c's Live runs). */
 SEC("usdt")
 int pipeasio_cycle_start(struct pt_regs *ctx)
 {
 	__u32 tid = (__u32)bpf_get_current_pid_tgid();
-	struct rec_block *r;
 	struct tstate *t;
 
+	(void)ctx;
 	hit(HIT_CYCLE_START);
-	t = ts_get(&tid);
+	t = ts_claim(tid);
 	if (t)
 		t->cycle_ts = bpf_ktime_get_ns();
-	r = block_rec(tid, PHASE_CYCLE_START);
-	if (!r)
-		return 0;
-	if (t)
-		r->h.ts = t->cycle_ts;
-	/* clock_nsec, next_nsec, duration, position, cycle_flags */
-	bpf_usdt_arg(ctx, 0, (long *)&r->a[0]);
-	bpf_usdt_arg(ctx, 1, (long *)&r->a[1]);
-	bpf_usdt_arg(ctx, 2, (long *)&r->a[2]);
-	bpf_usdt_arg(ctx, 3, (long *)&r->a[3]);
-	bpf_usdt_arg(ctx, 4, (long *)&r->a[4]);
-	bpf_ringbuf_submit(r, rb_flags());
 	return 0;
 }
 
@@ -1106,7 +1433,7 @@ int pipeasio_cycle_end(struct pt_regs *ctx)
 	struct tstate *t;
 
 	hit(HIT_CYCLE_END);
-	t = bpf_map_lookup_elem(&tstate, &tid);
+	t = ts_find(tid);
 	r = block_rec(tid, PHASE_CYCLE_END);
 	if (!r)
 		return 0;
@@ -1118,7 +1445,7 @@ int pipeasio_cycle_end(struct pt_regs *ctx)
 	}
 	bpf_usdt_arg(ctx, 0, (long *)&r->a[0]);       /* missed */
 	bpf_usdt_arg(ctx, 1, (long *)&r->a[1]);       /* delivered */
-	bpf_ringbuf_submit(r, rb_flags());
+	bpf_ringbuf_submit(r, RB_FLAGS);
 	return 0;
 }
 
@@ -1129,35 +1456,33 @@ int pipeasio_cycle_end(struct pt_regs *ctx)
 static __noinline int ntsync_wait_enter(__u32 cmd, __u64 parm)
 {
 	__u64 pt = bpf_get_current_pid_tgid();
-	__u32 key = (__u32)(pt >> 32);
+	__u32 key = (__u32)pt;
 	struct inflight_ent *e;
 	struct nt_wait_args *wa;
 	struct tstate *t;
 	__u32 d;
 
-	/* kernel-side probes fire for every process: only the traced ones count */
-	if (!pid_traced(&key))
+	t = ts_traced(pt);
+	if (!t)
 		return 0;
-	cnt(CT_NTSYNC_WAIT_HITS);
-	key = (__u32)pt;
-	if (!tid_wanted(&key)) {
+	if (CFG.roles_audio && !tid_wanted(&key)) {
 		cnt(CT_FILTERED);
 		return 0;
 	}
-	t = ts_get(&key);
-	if (!t)
-		return 0;
+	t->nt_wait_hits++;
 	wa = (struct nt_wait_args *)t->wa;
 	if (bpf_probe_read_user(wa, sizeof(*wa), (const void *)parm)) {
 		wa->count = 0xff;
 		wa->alert = 0;
 	}
 	if (CFG.no_exit) {
-		agg_count(&t->ag, (__u32)pt, KIND_NTSYNC_WAIT, NTSYNC_WAIT_ID(cmd == NTSYNC_IOC_WAIT_ALL, wa->alert, wa->count));
+		acc_point(t, KIND_NTSYNC_WAIT, NTSYNC_WAIT_ID(cmd == NTSYNC_IOC_WAIT_ALL, wa->alert, wa->count), 0);
 		return 0;
 	}
+	t->arg[5] = bpf_ktime_get_ns();
+	acc_before_block(t, t->arg[5]);                 /* the thread is about to block */
 	d = t->depth;
-	e = push_slot(t, (__u32)pt, KIND_NTSYNC_WAIT, bpf_ktime_get_ns(),
+	e = push_slot(t, (__u32)pt, KIND_NTSYNC_WAIT, t->arg[5],
 		      NTSYNC_WAIT_ID(cmd == NTSYNC_IOC_WAIT_ALL, wa->alert, wa->count), parm);
 	if (!e)
 		return 0;
@@ -1172,18 +1497,15 @@ static __noinline int ntsync_wait_enter(__u32 cmd, __u64 parm)
  * is the innermost in-flight entry of the thread and return silently otherwise. */
 static __noinline int ntsync_wait_exit(long ret, bool strict)
 {
-	__u64 pt = bpf_get_current_pid_tgid();
-	__u32 key = (__u32)(pt >> 32);
 	struct inflight_ent *e;
 	struct nt_wait_args *wa;
 	struct tstate *t;
 	__u32 extra = 0;
 	int i;
 
-	if (!pid_traced(&key))
-		return 0;
-	key = (__u32)pt;
-	t = bpf_map_lookup_elem(&tstate, &key);
+	/* a thread without a slot has no in-flight wait to complete (slots exist only for traced
+	 * pids, see ts_traced): one lookup, no pid map */
+	t = ts_find((__u32)bpf_get_current_pid_tgid());
 	if (!t)
 		return 0;
 	i = find_entry(t, KIND_NTSYNC_WAIT, 0, false);
@@ -1211,7 +1533,7 @@ static __noinline int ntsync_wait_exit(long ret, bool strict)
 	} else {
 		extra = AGGF_ERROR;
 	}
-	complete(t, (__u32)pt, (__u32)i, extra, (__s32)ret);
+	complete(t, (__u32)i, extra, (__s32)ret);
 	return 0;
 }
 
@@ -1226,10 +1548,11 @@ static __always_inline __u32 wake_id(__u32 cmd)
 	}
 }
 
-/* drill-down record of a point event (an NTSync wake: no duration) whose association and
- * timestamp agg_count just left in t->ag; parent = the innermost open syscall / unix call */
-static __noinline int emit_point_event(struct tstate *t, __u32 tid, __u32 kind, __u32 id)
+/* drill-down record of a point event (an NTSync wake: no duration) whose key acc_point left in
+ * the scratch slot s[idx] */
+static __noinline int emit_point_event(struct tstate *t, __u32 idx)
 {
+	struct inflight_ent *e = &t->s[idx & (INFLIGHT_DEPTH - 1)];
 	struct rec_event *r;
 	__u32 d = t->depth;
 	int i;
@@ -1241,53 +1564,45 @@ static __noinline int emit_point_event(struct tstate *t, __u32 tid, __u32 kind, 
 	}
 	r->h.type = REC_EVENT;
 	r->h.len = sizeof(*r);
-	r->h.tid = tid;
-	r->h.ts = bpf_ktime_get_ns();
-	r->seq = t->ag.key.seq;
-	r->entry_ts = r->h.ts;
+	r->h.tid = t->tid;
+	r->h.ts = e->ts;
+	r->seq = e->seq;
+	r->entry_ts = e->ts;
 	r->stack_ts = 0;
 	r->aux = 0;
-	r->id = id;
-	r->pid_ = 0;
-	r->kind = (__u8)kind;
-	r->pkind = 0;
-	r->flags = t->ag.key.flags;
+	r->id = e->id;
+	r->pid_ = e->pid_;
+	r->kind = e->kind;
+	r->pkind = e->pkind;
+	r->flags = e->flags;
 	r->status = 0;
 	r->waker_tid = 0;
 	r->pad = 0;
 #pragma unroll
 	for (i = 0; i < INFLIGHT_DEPTH; i++) {
-		if ((__u32)i < d && (t->s[i].kind == KIND_SYSCALL || t->s[i].kind == KIND_UNIXCALL)) {
-			r->pkind = t->s[i].kind;
-			r->pid_ = t->s[i].id;
-		}
 		if ((__u32)i < d && t->s[i].sampled)
 			r->stack_ts = t->s[i].ts;
 	}
-	bpf_ringbuf_submit(r, rb_flags());
+	bpf_ringbuf_submit(r, RB_FLAGS);
 	return 0;
 }
 
 static __noinline int ntsync_wake(__u32 cmd)
 {
-	__u64 pt = bpf_get_current_pid_tgid();
-	__u32 key = (__u32)(pt >> 32);
 	struct tstate *t;
 	__u32 id;
+	int idx;
 
 	id = wake_id(cmd);
 	if (!id)
 		return 0;
-	if (!pid_traced(&key))
-		return 0;
-	cnt(CT_NTSYNC_WAKE_HITS);
-	key = (__u32)pt;
-	t = ts_get(&key);
+	t = ts_traced(bpf_get_current_pid_tgid());
 	if (!t)
 		return 0;
-	agg_point(t, (__u32)pt, KIND_NTSYNC_WAKE, id);
-	if (CFG.mode == MODE_DRILLDOWN)
-		emit_point_event(t, (__u32)pt, KIND_NTSYNC_WAKE, id);
+	t->nt_wake_hits++;
+	idx = acc_point(t, KIND_NTSYNC_WAKE, id, 1);
+	if (CFG.mode == MODE_DRILLDOWN && idx >= 0)
+		emit_point_event(t, (__u32)idx);
 	return 0;
 }
 
@@ -1364,7 +1679,8 @@ int tp_sys_exit_ioctl(struct trace_event_raw_sys_exit *ctx)
 }
 
 /* ------------------------------------------------------------------------
- * scheduler (tp_btf: non-preemptible, recursion-guarded)
+ * scheduler (tp_btf: non-preemptible, recursion-guarded).  They only use slots the threads
+ * claimed themselves (a thread is traced from its first probe hit or NTSync call on).
  * ---------------------------------------------------------------------- */
 static __noinline int emit_offcpu(__u32 tid, __u64 now, __u64 off_ts, __u64 run_delay, __u32 waker)
 {
@@ -1383,7 +1699,7 @@ static __noinline int emit_offcpu(__u32 tid, __u64 now, __u64 off_ts, __u64 run_
 	r->run_delay_ns = run_delay;
 	r->waker_tid = waker;
 	r->pad = 0;
-	bpf_ringbuf_submit(r, rb_flags());
+	bpf_ringbuf_submit(r, RB_FLAGS);
 	return 0;
 }
 
@@ -1421,7 +1737,9 @@ static __noinline int switch_in(struct tstate *t, __u32 tid, __u64 now)
 			if ((__u32)i < t->depth)
 				t->s[i].off_ns += off;
 		}
-		if (CFG.mode == MODE_DRILLDOWN && off >= CFG.offcpu_min_ns)
+		/* the per-interval records are opt-in (--sched-records): the loader only counts them, and
+		 * off-CPU time already reaches blocks.offcpu / threads.jsonl through the agg keys */
+		if (CFG.mode == MODE_DRILLDOWN && CFG.sched_records && off >= CFG.offcpu_min_ns)
 			emit_offcpu(tid, now, t->off_ts, rd, t->waker_tid);
 		t->off_ts = 0;
 	}
@@ -1430,16 +1748,12 @@ static __noinline int switch_in(struct tstate *t, __u32 tid, __u64 now)
 }
 
 /* A thread past exit_signals() (PF_EXITING) is about to reach, or has passed,
- * on_sched_process_exit, which deletes its state: the scheduler programs only update an existing
- * entry then, never create one (its final switches recreated it, and nothing deleted it again). */
-#define WT_PF_EXITING 0x00000004u     /* include/linux/sched.h */
+ * on_sched_process_exit, which releases its slot. */
 #define WT_TASK_DEAD  0x00000080u
 
-static __always_inline bool task_exiting(struct task_struct *p)
-{
-	return (p->flags & WT_PF_EXITING) || p->exit_state;
-}
-
+/* Every context switch of the machine runs this.  The small pid map (hot in every cache) comes
+ * first: a slot lookup of an untraced task would probe TSTATE_PROBES cold slots before it fails
+ * (open addressing with released slots cannot stop at a free one). */
 SEC("tp_btf/sched_switch")
 int BPF_PROG(on_sched_switch, bool preempt, struct task_struct *prev, struct task_struct *next,
 	     unsigned int prev_state)
@@ -1451,22 +1765,27 @@ int BPF_PROG(on_sched_switch, bool preempt, struct task_struct *prev, struct tas
 	(void)preempt;
 	key = prev->tgid;
 	if (pid_traced(&key)) {
-		key = prev->pid;
-		if ((prev_state & WT_TASK_DEAD) || prev->exit_state) {
-			/* past on_sched_process_exit (exit_notify / do_task_dead): the last switch-outs */
-			bpf_map_delete_elem(&tstate, &key);
-		} else {
-			t = task_exiting(prev) ? bpf_map_lookup_elem(&tstate, &key) : ts_get(&key);
-			if (t)
-				switch_out(t, key, now, prev_state);
+		t = ts_find(prev->pid);
+		if (t) {
+			if ((prev_state & WT_TASK_DEAD) || prev->exit_state) {
+				/* past on_sched_process_exit, which normally released the slot (not when
+				 * its link was gone first, e.g. in the teardown): ship the accumulator
+				 * before the slot goes back to the pool, read_tstates() skips free slots.
+				 * Safe: this program is not preemptible, and a dead task runs none of
+				 * its own programs. */
+				if (t->acc_mask)
+					acc_flush(t);
+				t->tid = 0;
+			} else {
+				switch_out(t, prev->pid, now, prev_state);
+			}
 		}
 	}
 	key = next->tgid;
 	if (pid_traced(&key)) {
-		key = next->pid;
-		t = task_exiting(next) ? bpf_map_lookup_elem(&tstate, &key) : ts_get(&key);
+		t = ts_find(next->pid);
 		if (t)
-			switch_in(t, key, now);
+			switch_in(t, next->pid, now);
 	}
 	return 0;
 }
@@ -1481,7 +1800,7 @@ static __always_inline int sched_waking_common(struct task_struct *p, bool irq)
 	if (!pid_traced(&key))
 		return 0;
 	key = p->pid;
-	t = task_exiting(p) ? bpf_map_lookup_elem(&tstate, &key) : ts_get(&key);
+	t = ts_find(key);
 	if (!t)
 		return 0;
 	now = bpf_ktime_get_ns();
@@ -1498,7 +1817,7 @@ static __always_inline int sched_waking_common(struct task_struct *p, bool irq)
 	t->last_wake_ts = now;
 	t->last_waker = waker_tid;
 	t->wakeups++;
-	if (CFG.mode == MODE_DRILLDOWN) {
+	if (CFG.mode == MODE_DRILLDOWN && CFG.sched_records) {     /* opt-in, see switch_in */
 		r = bpf_ringbuf_reserve(&rb, sizeof(*r), 0);
 		if (!r) {
 			cnt(CT_RB_DROP_OTHER);
@@ -1515,7 +1834,7 @@ static __always_inline int sched_waking_common(struct task_struct *p, bool irq)
 			__builtin_memcpy(r->waker_comm, "<irq>\0\0\0\0\0\0\0\0\0\0", 16);
 		else
 			bpf_get_current_comm(r->waker_comm, sizeof(r->waker_comm));
-		bpf_ringbuf_submit(r, rb_flags());
+		bpf_ringbuf_submit(r, RB_FLAGS);
 	}
 	return 0;
 }
@@ -1575,6 +1894,8 @@ static __always_inline struct rec_task *task_rec(__u16 type, __u32 tid, __u32 pi
 	r->overflow = 0;
 	r->open_at_exit = 0;
 	r->never_returned = 0;
+	r->nt_wait_hits = 0;
+	r->nt_wake_hits = 0;
 	return r;
 }
 
@@ -1601,10 +1922,12 @@ int BPF_PROG(on_sched_process_fork, struct task_struct *parent, struct task_stru
 	if (!r)
 		return 0;
 	BPF_CORE_READ_STR_INTO(&r->comm, child, comm);
-	bpf_ringbuf_submit(r, rb_flags());
+	bpf_ringbuf_submit(r, RB_FLAGS);
 	return 0;
 }
 
+/* Runs in the exiting thread's own context: its last accumulated crossings, its counters, and
+ * the slot goes back to the pool. */
 SEC("tp_btf/sched_process_exit")
 int BPF_PROG(on_sched_process_exit, struct task_struct *p, bool group_dead)
 {
@@ -1614,11 +1937,12 @@ int BPF_PROG(on_sched_process_exit, struct task_struct *p, bool group_dead)
 
 	if (!pid_traced(&key))
 		return 0;
-	r = task_rec(REC_EXIT, tid, key, 0, 0, group_dead ? 1 : 0);
+	t = ts_find(tid);
+	if (t && t->acc_mask)
+		acc_flush(t);
+	r = task_rec(REC_EXIT, tid, p->tgid, 0, 0, group_dead ? 1 : 0);
 	if (r)
 		__builtin_memset(r->comm, 0, sizeof(r->comm));
-	key = tid;
-	t = bpf_map_lookup_elem(&tstate, &key);
 	if (t) {
 		/* the thread's last calls (NtTerminateThread/Process) never return: open, not abandoned */
 		if (t->depth && t->depth <= INFLIGHT_DEPTH) {
@@ -1632,16 +1956,19 @@ int BPF_PROG(on_sched_process_exit, struct task_struct *p, bool group_dead)
 			r->overflow = t->overflow;
 			r->open_at_exit = t->open_at_exit;
 			r->never_returned = t->never_returned;
+			r->nt_wait_hits = t->nt_wait_hits;
+			r->nt_wake_hits = t->nt_wake_hits;
 		}
-		bpf_map_delete_elem(&tstate, &key);
+		t->tid = 0;
 	}
+	key = tid;
 	bpf_map_delete_elem(&tids, &key);
 	if (group_dead) {
 		key = p->tgid;
 		bpf_map_delete_elem(&pids, &key);
 	}
 	if (r)
-		bpf_ringbuf_submit(r, rb_flags());
+		bpf_ringbuf_submit(r, RB_FLAGS);
 	return 0;
 }
 
@@ -1664,7 +1991,7 @@ int BPF_PROG(on_task_rename, struct task_struct *task, const char *comm)
 	r->h.ts = bpf_ktime_get_ns();
 	r->pid = key;
 	bpf_probe_read_kernel_str(r->comm, sizeof(r->comm), comm);
-	bpf_ringbuf_submit(r, rb_flags());
+	bpf_ringbuf_submit(r, RB_FLAGS);
 	return 0;
 }
 
@@ -1748,7 +2075,7 @@ int on_perf_sample(struct bpf_perf_event_data *ctx)
 	}
 	r->nbytes = (__u16)got;
 	r->h.len = (__u16)(sizeof(struct rec_stack) + got);
-	bpf_ringbuf_submit(r, rb_flags());
+	bpf_ringbuf_submit(r, RB_FLAGS);
 	cnt(CT_STACKS);
 	return 0;
 }

@@ -47,8 +47,11 @@ Pairing rules: ``E``/``X`` records are paired per tid in LIFO order by the frame
 ``abandoned`` (user-mode callbacks return through ``NtCallbackReturn`` without an exit); an ``X``
 matching nothing is an ``unmatched`` exit (the first one on a tid is normally the thread start,
 which jumps to the dispatcher return label).  ``S`` (server requests/waits), ``W``/``w``
-(NTSync waits) and ``K`` (NTSync wakes) are nested inside the innermost open entry of their tid
-and inherit its caller.  Block association follows the entry-time ``seq`` printed by the probe:
+(NTSync waits) and ``K`` (NTSync wakes) are nested inside the innermost open entry of their tid,
+inherit its caller and record it as their ``parent``.  Lost slack follows the libbpf tracer's rule
+(BUILD.md, "Lost slack"): a late or near-late block's lost slack is shared among its top-level
+crossings of audio-role threads only; nested crossings are ranked in ``nested_call_sites``
+without a share, so one wait is never counted twice.  Block association follows the entry-time ``seq`` printed by the probe:
 the block in progress at entry (``seq`` > 0) or the 100 ms window bucket (``seq`` == 0); events
 of the callback thread with ``seq`` == 0 are flagged ``between_blocks``.
 
@@ -71,7 +74,7 @@ import shutil
 import sys
 import tempfile
 
-REDUCER_VERSION = "reduce.py/2"
+REDUCER_VERSION = "reduce.py/3"   # 3: nested crossings carry their enclosing call ("parent")
 SUMMARY_SCHEMA = "ableton-linux-tracer-summary/v1"
 HEADER_RE = re.compile(r"^hdr\s+mono_start_ns=(\d+)")
 HEADER_FORMAT_RE = re.compile(r"\bformat=(\d+)")
@@ -109,6 +112,25 @@ MAX_DURATION_NS = 600 * 10**9
 
 class ReduceError(Exception):
     pass
+
+
+def is_audio_role(role):
+    """The roles whose top-level crossings share a late block's lost slack (roles.toml audio_roles)."""
+    return isinstance(role, str) and (role in AUDIO_ROLES or role.startswith("plugin:"))
+
+
+def parent_extra(enclosing):
+    """extra of a nested crossing (server request/wait, NTSync wait/wake): its enclosing syscall /
+    unix call, or None when the thread had no open entry (the crossing is then top-level)."""
+    if enclosing is None:
+        return None
+    return {"parent": (enclosing[0], enclosing[1])}
+
+
+def event_parent(extra):
+    """(kind, id) of a crossing's enclosing call, or None (top-level)."""
+    parent = extra.get("parent") if extra else None
+    return tuple(parent) if parent else None
 
 
 def kv_fields(tokens):
@@ -712,7 +734,7 @@ class Reducer:
                     caller = "none"
                 else:
                     caller = enclosing[2]
-                emit((ekind, name, caller, tid, ts - dur, ts, seq, status, None))
+                emit((ekind, name, caller, tid, ts - dur, ts, seq, status, parent_extra(enclosing)))
             elif kind == "W":
                 _, _, tid, cmd, count, alert, owner, seq = rec
                 if tid in pending_wait:
@@ -734,6 +756,8 @@ class Reducer:
                 woken = self.find_waker(tid, t0, ts)
                 if woken is not None:
                     extra["woken_by"] = woken
+                if enclosing is not None:
+                    extra["parent"] = (enclosing[0], enclosing[1])
                 emit(("ntsync_wait", name, caller, tid, t0, ts, seq, ret, extra))
             elif kind == "K":
                 _, _, tid, pid, cmd, seq = rec
@@ -741,7 +765,7 @@ class Reducer:
                 name = NTSYNC_WAKE_CMDS.get(cmd, "cmd_0x%x" % cmd)
                 enclosing = stacks[tid][-1] if stacks[tid] else None
                 caller = enclosing[2] if enclosing else "none"
-                emit(("ntsync_wake", name, caller, tid, ts, ts, seq, 0, None))
+                emit(("ntsync_wake", name, caller, tid, ts, ts, seq, 0, parent_extra(enclosing)))
             elif kind == "B":
                 _, _, tid, phase, seq, fields = rec
                 block = self.blocks.setdefault(seq, {})
@@ -835,7 +859,8 @@ class Reducer:
         total = self.kinds_total[kind]
         total[0] += 1
         total[1] += dur
-        site_key = (kind, name, caller)
+        # a nested crossing is a site of its own per enclosing call (nested_call_sites)
+        site_key = (kind, name, caller, event_parent(extra))
         site = self.site_all[site_key]
         site[0] += 1
         site[1] += dur
@@ -844,7 +869,7 @@ class Reducer:
         woken = extra.get("woken_by") if extra else None
         if woken is not None:
             self.site_woken[site_key][woken] += 1
-        hot = self.hot_by_tid[(tid, kind, name, caller)]
+        hot = self.hot_by_tid[(tid, kind, name, caller, event_parent(extra))]
         hot[0] += 1
         hot[1] += dur
         if not seq:
@@ -883,9 +908,10 @@ class Reducer:
         if not block["start"][0] - window_ns <= t0 <= block["end"][0] + window_ns:
             self.counters["events_outside_their_block"] += 1
         dur = t1 - t0
-        agg = self.block_agg[seq].get((tid, kind, name, caller))
+        key = (tid, kind, name, caller, event_parent(extra))
+        agg = self.block_agg[seq].get(key)
         if agg is None:
-            agg = self.block_agg[seq][(tid, kind, name, caller)] = [0, 0, 0, None]
+            agg = self.block_agg[seq][key] = [0, 0, 0, None]
         agg[0] += 1
         agg[1] += dur
         if dur > agg[2]:
@@ -1020,6 +1046,13 @@ class Reducer:
         self.finish_blocks()
 
     def finish_blocks(self):
+        """Block crossings and the lost-slack rule shared with the libbpf tracer (BUILD.md, "Lost
+        slack"): a late or near-late block's lost slack is shared among its TOP-LEVEL crossings of
+        AUDIO-ROLE threads in proportion to their time, capped at that time.  A nested crossing
+        (server request/wait, NTSync wait/wake inside a syscall or unix call: it carries a
+        ``parent``) is already part of its enclosing call's time, so it gets no share and is ranked
+        in ``nested_call_sites``; crossings of other threads keep their call-site ranking without
+        a share."""
         lost_total = 0
         attributed_total = 0
         sites = collections.defaultdict(lambda: {
@@ -1029,37 +1062,51 @@ class Reducer:
         self.sites = sites
         for record in self.block_records.values():
             crossings = []
-            for (tid, kind, name, caller), (n, total, maximum, woken) in record["_agg"].items():
+            for (tid, kind, name, caller, parent), (n, total, maximum, woken) in record["_agg"].items():
                 crossing = {
                     "tid": tid, "role": self.role_of(tid), "kind": kind, "id": name, "caller": caller,
                     "n": n, "total_ns": total, "max_ns": maximum,
                 }
+                if parent:
+                    crossing["parent"] = {"kind": parent[0], "id": parent[1]}
                 if woken:
                     waker, count = woken.most_common(1)[0]
                     crossing["woken_by"] = {"tid": waker, "role": self.role_of(waker), "count": count}
                 crossings.append(crossing)
-            crossings.sort(key=lambda item: (-item["total_ns"], item["tid"], item["kind"], item["id"]))
+            crossings.sort(key=lambda item: (-item["total_ns"], item["tid"], item["kind"], item["id"],
+                                             json.dumps(item.get("parent"), sort_keys=True)))
             record["crossings"] = crossings
             record["offcpu"] = self.block_offcpu(record)
             if record["late"] or record["near_late"]:
                 lost = self.near_late_slack_ns - record["slack_ns"]
-                crossing_total = sum(item["total_ns"] for item in crossings)
+                attributable = [item for item in crossings
+                                if "parent" not in item and is_audio_role(item["role"])]
+                crossing_total = sum(item["total_ns"] for item in attributable)
                 attributed = min(lost, crossing_total)
                 lost_total += lost
                 attributed_total += attributed
+                seen = set()
                 for item in crossings:
-                    site = sites[(item["kind"], item["id"], item["caller"])]
-                    site["blocks_with_site"] += 1
-                    if record["late"]:
-                        site["late_blocks"] += 1
-                    else:
-                        site["near_late_blocks"] += 1
+                    parent = item.get("parent")
+                    key = (item["kind"], item["id"], item["caller"],
+                           (parent["kind"], parent["id"]) if parent else None)
+                    site = sites[key]
+                    if key not in seen:   # one site may appear for several threads
+                        seen.add(key)
+                        site["blocks_with_site"] += 1
+                        if record["late"]:
+                            site["late_blocks"] += 1
+                        else:
+                            site["near_late_blocks"] += 1
                     site["n_in_late_blocks"] += item["n"]
                     site["total_ns_in_late_blocks"] += item["total_ns"]
-                    if crossing_total:
+                    if crossing_total and not parent and is_audio_role(item["role"]):
                         site["attributed_ns"] += attributed * item["total_ns"] / crossing_total
         self.lost_slack = {
             "definition": "sum over late and near-late blocks of (near_late_slack_ns - slack_ns)",
+            "attribution": "each block's lost slack is shared among its top-level crossings of audio-role "
+                           "threads in proportion to their time, capped at that time; nested crossings "
+                           "(nested_call_sites) are part of their enclosing call's time and get no share",
             "total_ns": lost_total,
             "attributed_ns": int(round(attributed_total)),
             "unattributed_ns": lost_total - int(round(attributed_total)),
@@ -1177,6 +1224,9 @@ class Reducer:
             "sample": {"rate": tracer.get("sample_rate", 1)},
             "near_late_fraction": self.opt.near_late_fraction,
             "window_ms": self.opt.window_ms,
+            # nested crossings (server requests/waits, NTSync waits/wakes) name their enclosing
+            # syscall / unix call in "parent" (bench-report.py: crossings without one are top-level)
+            "nesting": "parent",
         }
 
     def loss_accounting(self):
@@ -1265,15 +1315,22 @@ class Reducer:
         minutes = span_ns / 60e9 if span_ns > 0 else 0
         lost_total = self.lost_slack["total_ns"]
         call_sites = []
-        for (kind, name, caller), site in self.sites.items():
-            overall = self.site_all.get((kind, name, caller), [0, 0, 0])
+        nested_call_sites = []
+        for (kind, name, caller, parent), site in self.sites.items():
+            overall = self.site_all.get((kind, name, caller, parent), [0, 0, 0])
             woken = [{"tid": tid, "role": self.role_of(tid), "count": count}
-                     for tid, count in self.site_woken.get((kind, name, caller), collections.Counter()).most_common(5)]
-            call_sites.append({
+                     for tid, count in self.site_woken.get((kind, name, caller, parent), collections.Counter()).most_common(5)]
+            entry = {
                 "rank": 0,
-                "key": "%s|%s|%s" % (kind, name, caller),
+                # symbolize.py's and bench-report.py's key forms: nested sites carry their parent
+                "key": ("%s|%s|%s:%s|%s" % (kind, name, parent[0], parent[1], caller) if parent
+                        else "%s|%s|%s" % (kind, name, caller)),
                 "kind": kind,
                 "name": name,
+            }
+            if parent:
+                entry["parent"] = {"kind": parent[0], "id": parent[1]}
+            entry.update({
                 "caller": caller,
                 "late_blocks": site["late_blocks"],
                 "near_late_blocks": site["near_late_blocks"],
@@ -1281,14 +1338,19 @@ class Reducer:
                 "per_late_block": round(site["n_in_late_blocks"] / site["blocks_with_site"], 3) if site["blocks_with_site"] else 0.0,
                 "total_ns_in_late_blocks": site["total_ns_in_late_blocks"],
                 "max_ns": overall[2],
-                "share_of_lost_slack": round(site["attributed_ns"] / lost_total, 4) if lost_total else 0.0,
+            })
+            if not parent:
+                entry["share_of_lost_slack"] = round(site["attributed_ns"] / lost_total, 4) if lost_total else 0.0
+            entry.update({
                 "n_all_blocks": overall[0],
                 "total_ns_all_blocks": overall[1],
                 "woken_by": woken,
             })
-        call_sites.sort(key=lambda item: (-item["total_ns_in_late_blocks"], -item["n_in_late_blocks"], item["key"]))
-        for rank, site in enumerate(call_sites, 1):
-            site["rank"] = rank
+            (nested_call_sites if parent else call_sites).append(entry)
+        for ranked in (call_sites, nested_call_sites):
+            ranked.sort(key=lambda item: (-item["total_ns_in_late_blocks"], -item["n_in_late_blocks"], item["key"]))
+            for rank, site in enumerate(ranked, 1):
+                site["rank"] = rank
         kinds = {kind: {"n": n, "total_ns": total} for kind, (n, total) in sorted(self.kinds_total.items())}
         roles = self.role_summary(windows)
         hotspots = self.hotspots()
@@ -1340,6 +1402,7 @@ class Reducer:
             },
             "lost_slack": self.lost_slack,
             "call_sites": call_sites,
+            "nested_call_sites": nested_call_sites,
             "kinds": kinds,
             "roles": roles,
             "hotspots_non_audio": hotspots,
@@ -1377,18 +1440,22 @@ class Reducer:
     def hotspots(self):
         """Top (role, kind, id, caller) sites of the non-audio threads over the whole trace."""
         agg = collections.defaultdict(lambda: [0, 0])
-        for (tid, kind, name, caller), (n, total) in self.hot_by_tid.items():
+        for (tid, kind, name, caller, parent), (n, total) in self.hot_by_tid.items():
             role = self.role_of(tid)
-            if role in AUDIO_ROLES:
+            if is_audio_role(role):
                 continue
-            entry = agg[(role, kind, name, caller)]
+            entry = agg[(role, kind, name, caller, parent)]
             entry[0] += n
             entry[1] += total
-        items = [
-            {"role": role, "kind": kind, "name": name, "caller": caller, "n": n, "total_ns": total}
-            for (role, kind, name, caller), (n, total) in agg.items()
-        ]
-        items.sort(key=lambda item: (-item["total_ns"], item["role"], item["kind"], item["name"]))
+        items = []
+        for (role, kind, name, caller, parent), (n, total) in agg.items():
+            item = {"role": role, "kind": kind, "name": name}
+            if parent:
+                item["parent"] = {"kind": parent[0], "id": parent[1]}
+            item.update({"caller": caller, "n": n, "total_ns": total})
+            items.append(item)
+        items.sort(key=lambda item: (-item["total_ns"], item["role"], item["kind"], item["name"],
+                                     json.dumps(item.get("parent"), sort_keys=True)))
         return items[: self.opt.top]
 
     # -- output -------------------------------------------------------------------------------
@@ -1418,7 +1485,9 @@ class Reducer:
                 "seq": seq,
             }
             if extra:
-                event.update({key: value for key, value in extra.items() if key != "woken_by"})
+                event.update({key: value for key, value in extra.items() if key not in ("woken_by", "parent")})
+                if extra.get("parent"):
+                    event["parent"] = {"kind": extra["parent"][0], "id": extra["parent"][1]}
                 if "woken_by" in extra:
                     event["woken_by"] = {"tid": extra["woken_by"], "role": self.role_of(extra["woken_by"])}
             yield event

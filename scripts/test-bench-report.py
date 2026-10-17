@@ -1311,6 +1311,21 @@ ERR:          5
 
 
 class ProfilerTests(unittest.TestCase):
+    def test_interface_tracer_keeps_the_trap_cost_range(self):
+        tracer = interface_tracer()
+        tracer["overhead"] = {
+            "trap_ns_per_hit": 451, "trap_ns_source": "calibration", "trap_ns_assumed": False,
+            "bpf_ns_per_block": 101_100, "trap_ns_per_block": 335_500, "trap_ns_per_hit_max": 598,
+            "trap_ns_per_block_max": 444_700, "estimate_ns_per_block_max": 545_800, "note": "not copied",
+        }
+        overhead = report.interface_tracer(tracer, {}, FIXTURE_TRACER_START_NS,
+                                           FIXTURE_TRACER_START_NS + 30_000_000_000)["overhead"]
+        self.assertEqual((overhead["trap_ns_per_hit"], overhead["trap_ns_per_hit_max"],
+                          overhead["trap_ns_per_block_max"], overhead["estimate_ns_per_block_max"]),
+                         (451, 598, 444_700, 545_800))
+        self.assertEqual(overhead["estimate_ns_per_block"], 500)
+        self.assertNotIn("note", overhead)
+
     def test_interface_window_filtering_and_counts(self):
         section = fixture_interface_section()
         self.assertEqual(section["schema"], report.INTERFACE_SCHEMA)
@@ -1401,10 +1416,20 @@ class ProfilerTests(unittest.TestCase):
             section = json.loads((set_dir / "measurement.json").read_text())["interface"]
             summary = tracer_out["summary"]
             self.assertEqual(section["lost_slack"]["total_ns"], summary["lost_slack"]["total_ns"])
+            # one attribution rule in reduce.py's summary and here: same attributed slack, same shares,
+            # the nested crossings ranked apart under the same keys
+            self.assertEqual(section["lost_slack"]["attributed_ns"], summary["lost_slack"]["attributed_ns"])
             ours = {site["key"]: site for site in section["call_sites"]}
             for site in summary["call_sites"]:
                 self.assertIn(site["key"], ours)
                 self.assertEqual(ours[site["key"]]["total_ns_in_late_blocks"], site["total_ns_in_late_blocks"])
+                self.assertAlmostEqual(ours[site["key"]]["share_of_lost_slack"], site["share_of_lost_slack"], places=4)
+            nested = {site["key"]: site for site in section["nested_call_sites"]}
+            self.assertEqual(sorted(nested), sorted(site["key"] for site in summary["nested_call_sites"]))
+            for site in summary["nested_call_sites"]:
+                self.assertEqual(nested[site["key"]]["total_ns_in_late_blocks"], site["total_ns_in_late_blocks"])
+                self.assertEqual(nested[site["key"]]["parent"], site["parent"])
+                self.assertNotIn(site["key"], ours)
             self.assertNotIn("unsampled", [site["caller"] for site in section["call_sites"]])
             self.assertEqual(section["hotspots_non_audio"], summary["hotspots_non_audio"])
             self.assertEqual(section["evidence"]["events"], "raw/interface/events.jsonl")
@@ -1487,6 +1512,108 @@ class ProfilerTests(unittest.TestCase):
         self.assertTrue(section["tracer"]["lost_events_lower_bound"])
         for kind in section["confounders"]:
             self.assertIn(kind, report.INTERFACE_CONFOUNDERS)
+
+    def test_interface_nested_crossings_are_not_counted_twice(self):
+        """B5b's report showed NtWaitForSingleObject 37.7 % and ntsync_wait WAIT_ANY 37.4 % of the lost
+        slack for the same waits: the wait inside the syscall now has no share and is listed apart."""
+        caller = "kernelbase.dll!WaitForSingleObject+0x49 <- Ableton Live 12 Trial.exe+0x4f8c119"
+        parent = {"kind": "syscall", "id": "NtWaitForSingleObject"}
+        syscall = interface_crossing(4301, "audio_worker", "syscall", "NtWaitForSingleObject", 2, 300_000, 200_000,
+                                     caller=caller)
+        wait = dict(interface_crossing(4301, "audio_worker", "ntsync_wait", "WAIT_ANY", 2, 290_000, 195_000,
+                                       caller=caller), parent=parent)
+        main = interface_crossing(4200, "main", "syscall", "NtUserMsgWaitForMultipleObjectsEx", 1, 500_000, 500_000,
+                                  caller="win32u.dll!NtUserMsgWaitForMultipleObjectsEx+0x14")
+        blocks = [interface_block(1, 1.0, -100_000, [syscall, wait, main])]
+        section = fixture_interface_section(blocks=blocks)
+        lost = section["lost_slack"]
+        # lost 300000 ns (200000 near-late threshold + 100000 late); only the audio worker's top-level
+        # syscall is attributable (300000 ns), so everything is attributed to it
+        self.assertEqual((lost["total_ns"], lost["attributed_ns"]), (300_000, 300_000))
+        self.assertIn("top-level crossings of audio-role threads", lost["attribution"])
+        keys = [site["key"] for site in section["call_sites"]]
+        self.assertEqual(keys, [f"syscall|NtUserMsgWaitForMultipleObjectsEx|win32u.dll!NtUserMsgWaitForMultipleObjectsEx+0x14",
+                                f"syscall|NtWaitForSingleObject|{caller}"])
+        shares = {site["name"]: site["share_of_lost_slack"] for site in section["call_sites"]}
+        self.assertEqual(shares, {"NtUserMsgWaitForMultipleObjectsEx": 0.0, "NtWaitForSingleObject": 1.0})
+        self.assertEqual(len(section["nested_call_sites"]), 1)
+        nested = section["nested_call_sites"][0]
+        self.assertEqual(nested["key"], f"ntsync_wait|WAIT_ANY|syscall:NtWaitForSingleObject|{caller}")
+        self.assertEqual(nested["parent"], parent)
+        self.assertEqual(nested["total_ns_in_late_blocks"], 290_000)
+        self.assertNotIn("share_of_lost_slack", nested)
+        markdown = "\n".join(report.interface_markdown({
+            "run": {"trace": {"mode": "interface"}}, "sets": [{"set": "Benchmark_VSTs", "interface": section}],
+        }))
+        share_table, _, nested_table = markdown.partition("Nested crossings")
+        self.assertNotIn("WAIT_ANY", share_table)
+        self.assertIn("| 1 | ntsync_wait WAIT_ANY | syscall NtWaitForSingleObject |", nested_table)
+        self.assertIn("100.0%", share_table)
+
+    def test_interface_infers_nesting_for_legacy_reducer_blocks(self):
+        """Blocks of a reduce.py older than reduce.py/3 carry no parent: a nested kind whose caller was
+        inherited from an enclosing entry is nested there, a nested kind without one is top-level."""
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = Path(temporary) / "run"
+            write_benchmark_run(run_dir, trace_mode="interface")
+            set_dir = next((run_dir / "sets").glob("*-Benchmark_Empty"))
+            stub = "ntdll.dll!NtWaitForSingleObject+0x14"
+            blocks = [
+                {"type": "header", "monotonic_start_ns": FIXTURE_TRACER_START_NS, "reducer": "reduce.py/2"},
+                interface_block(1, 1.0, -100_000, [
+                    interface_crossing(4301, "audio_worker", "syscall", "NtWaitForSingleObject", 1, 300_000, 300_000,
+                                       caller=stub),
+                    interface_crossing(4301, "audio_worker", "ntsync_wait", "WAIT_ANY", 1, 290_000, 290_000, caller=stub),
+                    interface_crossing(4100, "wineserver", "ntsync_wake", "EVENT_SET", 1, 0, 0, caller="none"),
+                ]),
+            ]
+            write_interface_files(set_dir, blocks=blocks)
+            args = type("Args", (), {"set_dir": str(set_dir), "near_late_fraction": 0.15, "top": 20})()
+            self.assertEqual(report.interface(args), 0)
+            section = json.loads((set_dir / "measurement.json").read_text())["interface"]
+            self.assertEqual([site["kind"] for site in section["call_sites"]], ["syscall", "ntsync_wake"])
+            self.assertEqual(section["nested_call_sites"][0]["parent"], {"kind": "syscall", "id": "NtWaitForSingleObject"})
+            self.assertEqual(section["lost_slack"]["attributed_ns"], 300_000)
+            # the same blocks from a reducer that records parents: no inference
+            blocks[0] = dict(blocks[0], reducer="reduce.py/3", nesting="parent")
+            write_interface_files(set_dir, blocks=blocks)
+            self.assertEqual(report.interface(args), 0)
+            section = json.loads((set_dir / "measurement.json").read_text())["interface"]
+            self.assertEqual(section["nested_call_sites"], [])
+            self.assertIn("ntsync_wait", [site["kind"] for site in section["call_sites"]])
+
+    def test_interface_lost_events_threshold(self):
+        def section_for(loss, lost):
+            tracer = dict(interface_tracer(lost_events=lost), loss=loss)
+            return fixture_interface_section(tracer=tracer)
+
+        # B5b's every-run case: only the NTSync fentry recursion misses, 1e-4 of the hits
+        misses = {"source": "bpf_counters", "by_kind": {"recursion_misses": 100}, "recursion_misses": 100,
+                  "ringbuf_drops": 0, "probe_hits": 1_000_000}
+        section = section_for(misses, 100)
+        self.assertEqual(section["confounders"], [])
+        tracer = section["tracer"]
+        self.assertEqual((tracer["lost_events"], tracer["lost_events_fraction"], tracer["ringbuf_drops"]), (100, 0.0001, 0))
+        self.assertEqual(tracer["lost_events_threshold"], report.LOST_EVENTS_CONFOUNDER_FRACTION)
+        self.assertFalse(tracer["lost_events_confounded"])
+        # any ring-buffer drop confounds the run
+        self.assertEqual(section_for(dict(misses, ringbuf_drops=1), 101)["confounders"], ["interface-lost-events"])
+        # so does a loss above 0.1 % of the hits, whatever its source
+        self.assertEqual(section_for(dict(misses, recursion_misses=5_000), 5_000)["confounders"], ["interface-lost-events"])
+        # B5b-era loss without the ringbuf_drops field: the ringbuf_drops_* kinds count
+        old = {"source": "bpf_counters", "by_kind": {"ringbuf_drops_block": 2, "recursion_misses": 50},
+               "recursion_misses": 52, "probe_hits": 1_000_000}
+        self.assertEqual(section_for(old, 52)["tracer"]["ringbuf_drops"], 2)
+        self.assertEqual(section_for(old, 52)["confounders"], ["interface-lost-events"])
+        # without loss.probe_hits the tracer.json probe_hits are summed (all-process runs excluded)
+        tracer = dict(interface_tracer(lost_events=1), loss={"recursion_misses": 1},
+                      probe_hits={"syscall_entry": 500_000, "syscall_exit": 500_000, "sched_switch_all_processes": 9})
+        self.assertEqual(fixture_interface_section(tracer=tracer)["tracer"]["lost_events_fraction"], 0.000001)
+        self.assertEqual(fixture_interface_section(tracer=tracer)["confounders"], [])
+        markdown = "\n".join(report.interface_markdown({
+            "run": {"trace": {"mode": "interface"}}, "sets": [{"set": "Benchmark_VSTs", "interface": section}],
+        }))
+        self.assertIn("lost events 100 (0.0100% of probe hits, 0 ring-buffer drops)", markdown)
 
     def test_interface_subcommand_rewrites_measurement(self):
         with tempfile.TemporaryDirectory() as temporary:

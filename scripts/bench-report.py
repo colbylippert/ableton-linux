@@ -66,12 +66,20 @@ AUDIO_ROLE_PREFIXES = ("plugin:",)
 INTERFACE_BLOCK_FILES = ("blocks.symbolized.jsonl", "blocks.jsonl")
 DRILLDOWN_EVENTS_PER_BLOCK = 50
 INTERFACE_KINDS = ("syscall", "unixcall", "server_req", "ntsync_wait")
+# Kinds that nest inside a syscall / unix call (the tracers record the enclosing call as "parent").
+NESTED_INTERFACE_KINDS = frozenset({"server_req", "server_wait", "ntsync_wait", "ntsync_wake"})
+# interface-lost-events fires when the lost events exceed this fraction of the probe hits, or when
+# the ring buffer dropped records at all.  The kernel's recursion misses on the preemptible NTSync
+# fentry programs alone are ~1e-4 of the hits on every Live run (B5b): reported, not a confounder.
+LOST_EVENTS_CONFOUNDER_FRACTION = 0.001
+NESTED_MARKDOWN_ROWS = 5
 INTERFACE_CONFOUNDERS = {
     "interface-tracer-coverage-incomplete": (
         "The interface tracer did not run for the whole measurement window."
     ),
     "interface-lost-events": (
-        "The interface tracer lost events, so crossing counts and lost-slack shares are lower bounds."
+        "The interface tracer lost more than 0.1% of its probe hits, or its ring buffer dropped records, "
+        "so crossing counts and lost-slack shares are lower bounds."
     ),
     "interface-tracer-output-missing": (
         "The measurement requested tracing but the tracer output is missing."
@@ -2641,6 +2649,48 @@ def load_tracer_records(path: Path, tracer: dict[str, Any]) -> tuple[int | None,
     return base_ns, records
 
 
+def load_tracer_header(path: Path) -> dict[str, Any]:
+    """The {"type": "header"} record of a tracer JSON lines file ({} when there is none)."""
+    try:
+        with path.open(errors="replace") as source:
+            for line in source:
+                line = line.strip()
+                if not line:
+                    continue
+                value = json.loads(line)
+                return value if isinstance(value, dict) and value.get("type") == "header" else {}
+    except (OSError, ValueError):
+        return {}
+    return {}
+
+
+def legacy_nesting(header: dict[str, Any]) -> bool:
+    """True for blocks written by reduce.py before it recorded the enclosing call ("parent") of nested
+    crossings (reducer reduce.py/1 or /2, no "nesting" field): their nested kinds are then inferred.
+    The libbpf tracer has always written "parent"."""
+    reducer = header.get("reducer")
+    return (isinstance(reducer, str) and reducer.startswith("reduce.py/")
+            and header.get("nesting") != "parent")
+
+
+def crossing_parent(crossing: dict[str, Any], legacy: bool = False) -> tuple[str, str] | None:
+    """(kind, id) of the syscall / unix call a nested crossing ran inside, or None (top-level).
+
+    Legacy reducer output has no parent field: a nested kind whose caller was inherited from an
+    enclosing entry (anything but "none") counts as nested there, its parent named from the
+    ntdll/win32u stub placeholder when it has one."""
+    parent = crossing.get("parent")
+    if isinstance(parent, dict):
+        return str(parent.get("kind")), str(parent.get("id"))
+    if not legacy or str(crossing.get("kind")) not in NESTED_INTERFACE_KINDS:
+        return None
+    caller = crossing.get("caller")
+    if not isinstance(caller, str) or not caller or caller == "none":
+        return None
+    match = re.match(r"^(?:ntdll|win32u)\.dll!(\w+)\+0x[0-9a-fA-F]+$", caller)
+    return ("syscall", match.group(1)) if match else ("enclosing", "?")
+
+
 def records_in_window(
     records: list[dict[str, Any]], field: str, base_ns: int, start_ns: int, deadline_ns: int,
 ) -> list[dict[str, Any]]:
@@ -2697,11 +2747,15 @@ def stack_caller(frames: Any) -> str:
     return " <- ".join(str(frame) for frame in frames[:CALL_SITE_DEPTH])
 
 
-def block_sites(block: dict[str, Any]) -> list[dict[str, Any]]:
+def block_sites(block: dict[str, Any], legacy: bool = False) -> list[dict[str, Any]]:
     """One site per crossing aggregate, keyed by the caller the tracer recorded on it.
 
     reduce.py puts a ``caller`` on every crossing (and leaves ``stacks`` empty). Only a crossing
-    without one is split across the stack samples of its thread, kind and id, if any.
+    without one is split across the stack samples of its thread, kind and id, if any.  A nested
+    crossing (``parent``: a server request/wait or NTSync wait/wake inside a syscall or unix call)
+    is keyed by its parent too (symbolize.py's ``kind|id|pkind:pid|caller``) and is never
+    ``attributable``: its time is already inside the enclosing call's.  Top-level crossings of
+    audio-role threads (or without a role, as in inputs older than roles) are attributable.
     """
     samples: dict[tuple[Any, Any, Any], collections.Counter] = {}
     for stack in block.get("stacks") or []:
@@ -2716,6 +2770,9 @@ def block_sites(block: dict[str, Any]) -> list[dict[str, Any]]:
         count = crossing.get("n") if is_number(crossing.get("n")) else 0
         total_ns = crossing.get("total_ns") if is_number(crossing.get("total_ns")) else 0
         max_ns = crossing.get("max_ns") if is_number(crossing.get("max_ns")) else 0
+        parent = crossing_parent(crossing, legacy)
+        role = crossing.get("role")
+        attributable = parent is None and (not isinstance(role, str) or not role or is_audio_role(role))
         recorded = crossing.get("caller")
         if isinstance(recorded, str) and recorded:
             callers = collections.Counter({recorded: 1})
@@ -2726,9 +2783,11 @@ def block_sites(block: dict[str, Any]) -> list[dict[str, Any]]:
         sampled = sum(callers.values())
         for caller, hits in callers.items():
             fraction = hits / sampled
+            key = f"{kind}|{name}|{parent[0]}:{parent[1]}|{caller}" if parent else f"{kind}|{name}|{caller}"
             sites.append({
-                "key": f"{kind}|{name}|{caller}", "kind": kind, "name": name, "caller": caller,
-                "role": crossing.get("role"), "n": count * fraction, "total_ns": total_ns * fraction,
+                "key": key, "kind": kind, "name": name, "caller": caller, "parent": parent,
+                "attributable": attributable,
+                "role": role, "n": count * fraction, "total_ns": total_ns * fraction,
                 "max_ns": max_ns, "woken_by": crossing.get("woken_by"),
             })
     return sites
@@ -2748,31 +2807,39 @@ def wake_counts(woken_by: Any, count: float) -> list[tuple[tuple[Any, Any], floa
 
 
 def interface_call_sites(
-    classified: list[dict[str, Any]], top: int,
-) -> tuple[list[dict[str, Any]], int, list[dict[str, Any]]]:
+    classified: list[dict[str, Any]], top: int, legacy: bool = False,
+) -> tuple[list[dict[str, Any]], int, list[dict[str, Any]], list[dict[str, Any]]]:
     """Rank crossing sites by their time in late and near-late blocks.
 
-    Each block's lost slack is shared among its crossings in proportion to
-    their time, so a site's share never exceeds the block's lost slack.
+    The tracers' rule (profiler/tracer/BUILD.md, "Lost slack"): each block's lost slack is shared
+    among its top-level crossings of audio-role threads in proportion to their time, capped at that
+    time, so a site's share never exceeds the block's lost slack.  Nested crossings (server
+    requests/waits, NTSync waits/wakes inside a syscall or unix call) are already part of their
+    enclosing call's time: they are ranked apart (nested call sites, keyed by their parent) without
+    a share, so one wait is never counted twice.  Crossings of other threads keep their ranking
+    without a share.  Returns (call sites, attributed ns, hotspots, nested call sites).
     """
-    sites: dict[str, dict[str, Any]] = {}
+    tables: dict[bool, dict[str, dict[str, Any]]] = {False: {}, True: {}}
     hotspots: dict[tuple[str, str, str, str], dict[str, Any]] = {}
     attributed_total = 0.0
     lost_total = sum(item["lost_ns"] for item in classified)
     for item in classified:
-        block_site_list = block_sites(item["block"])
+        block_site_list = block_sites(item["block"], legacy)
         stressed = item["late"] or item["near_late"]
         weight = 0.0
         if stressed:
-            crossing_total = sum(site["total_ns"] for site in block_site_list)
+            crossing_total = sum(site["total_ns"] for site in block_site_list if site["attributable"])
             weight = min(1.0, item["lost_ns"] / crossing_total) if crossing_total > 0 else 0.0
             attributed_total += min(item["lost_ns"], crossing_total)
         counted: set[str] = set()
         for site in block_site_list:
+            nested = site["parent"] is not None
+            sites = tables[nested]
             record = sites.get(site["key"])
             if record is None:
                 record = sites[site["key"]] = {
                     "key": site["key"], "kind": site["kind"], "name": site["name"], "caller": site["caller"],
+                    "parent": site["parent"],
                     "late_blocks": 0, "near_late_blocks": 0, "n_in_late_blocks": 0.0,
                     "total_ns_in_late_blocks": 0.0, "max_ns": 0, "attributed_ns": 0.0,
                     "n_all_blocks": 0.0, "total_ns_all_blocks": 0.0, "woken_by": collections.Counter(),
@@ -2785,7 +2852,8 @@ def interface_call_sites(
             if stressed:
                 record["n_in_late_blocks"] += site["n"]
                 record["total_ns_in_late_blocks"] += site["total_ns"]
-                record["attributed_ns"] += site["total_ns"] * weight
+                if site["attributable"]:
+                    record["attributed_ns"] += site["total_ns"] * weight
                 if site["key"] not in counted:
                     counted.add(site["key"])
                     record["late_blocks" if item["late"] else "near_late_blocks"] += 1
@@ -2797,38 +2865,48 @@ def interface_call_sites(
                 })
                 hotspot["n"] += site["n"]
                 hotspot["total_ns"] += site["total_ns"]
-    ranked = sorted(sites.values(), key=lambda record: (
-        -record["total_ns_in_late_blocks"], -record["n_in_late_blocks"], record["key"],
-    ))
-    call_sites = []
-    for rank, record in enumerate(ranked[:top], 1):
-        stressed_blocks = record["late_blocks"] + record["near_late_blocks"]
-        wakers = sorted(record["woken_by"].items(), key=lambda entry: (-entry[1], str(entry[0])))
-        call_sites.append({
-            "rank": rank, "key": record["key"], "kind": record["kind"], "name": record["name"],
-            "caller": record["caller"],
-            "late_blocks": record["late_blocks"], "near_late_blocks": record["near_late_blocks"],
-            "n_in_late_blocks": int(round(record["n_in_late_blocks"])),
-            "per_late_block": (
-                round(record["n_in_late_blocks"] / stressed_blocks, 4) if stressed_blocks else None
-            ),
-            "total_ns_in_late_blocks": int(round(record["total_ns_in_late_blocks"])),
-            "max_ns": int(round(record["max_ns"])),
-            "share_of_lost_slack": round(record["attributed_ns"] / lost_total, 4) if lost_total > 0 else None,
-            "n_all_blocks": int(round(record["n_all_blocks"])),
-            "total_ns_all_blocks": int(round(record["total_ns_all_blocks"])),
-            "woken_by": [
-                {"tid": tid, "role": role, "count": int(round(hits))}
-                for (tid, role), hits in wakers[:5] if int(round(hits)) > 0
-            ],
-        })
+
+    def ranked_sites(nested: bool) -> list[dict[str, Any]]:
+        ranked = sorted(tables[nested].values(), key=lambda record: (
+            -record["total_ns_in_late_blocks"], -record["n_in_late_blocks"], record["key"],
+        ))
+        out = []
+        for rank, record in enumerate(ranked[:top], 1):
+            stressed_blocks = record["late_blocks"] + record["near_late_blocks"]
+            wakers = sorted(record["woken_by"].items(), key=lambda entry: (-entry[1], str(entry[0])))
+            site = {
+                "rank": rank, "key": record["key"], "kind": record["kind"], "name": record["name"],
+                "caller": record["caller"],
+                "late_blocks": record["late_blocks"], "near_late_blocks": record["near_late_blocks"],
+                "n_in_late_blocks": int(round(record["n_in_late_blocks"])),
+                "per_late_block": (
+                    round(record["n_in_late_blocks"] / stressed_blocks, 4) if stressed_blocks else None
+                ),
+                "total_ns_in_late_blocks": int(round(record["total_ns_in_late_blocks"])),
+                "max_ns": int(round(record["max_ns"])),
+            }
+            if nested:
+                site["parent"] = {"kind": record["parent"][0], "id": record["parent"][1]}
+            else:
+                site["share_of_lost_slack"] = round(record["attributed_ns"] / lost_total, 4) if lost_total > 0 else None
+            site.update({
+                "n_all_blocks": int(round(record["n_all_blocks"])),
+                "total_ns_all_blocks": int(round(record["total_ns_all_blocks"])),
+                "woken_by": [
+                    {"tid": tid, "role": role, "count": int(round(hits))}
+                    for (tid, role), hits in wakers[:5] if int(round(hits)) > 0
+                ],
+            })
+            out.append(site)
+        return out
+
     hotspot_list = sorted(hotspots.values(), key=lambda item: (
         -item["total_ns"], -item["n"], item["role"], item["kind"], item["name"], item["caller"],
     ))[:top]
     hotspot_list = [
         {**item, "n": int(round(item["n"])), "total_ns": int(round(item["total_ns"]))} for item in hotspot_list
     ]
-    return call_sites, int(round(attributed_total)), hotspot_list
+    return ranked_sites(False), int(round(attributed_total)), hotspot_list, ranked_sites(True)
 
 
 def interface_kinds(classified: list[dict[str, Any]]) -> dict[str, dict[str, int]]:
@@ -2868,6 +2946,45 @@ def interface_roles(records: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     return roles
 
 
+def lost_events_evidence(tracer: dict[str, Any], loss: dict[str, Any]) -> dict[str, Any]:
+    """The lost-event figures behind interface-lost-events and whether they cross its threshold.
+
+    Ring-buffer drops: the libbpf tracer's loss.ringbuf_drops (or, before B5c, its ringbuf_drops_*
+    by_kind entries); for the bpftrace prototype every lost line except the recursion misses is a
+    ring-buffer drop.  Probe hits: loss.probe_hits, else the sum of tracer.json probe_hits (the
+    scheduler programs' all-process run counts excluded).  The confounder fires when events were
+    lost and the ring buffer dropped records, or the loss exceeds LOST_EVENTS_CONFOUNDER_FRACTION
+    of the hits, or the hits are unknown.  The kernel's recursion misses on the NTSync fentry
+    programs (~1e-4 of the hits on Live, B5b) stay reported without confounding the run.
+    """
+    lost = tracer.get("lost_events")
+    if not is_number(lost):
+        return {"lost_events_fraction": None, "ringbuf_drops": None,
+                "lost_events_threshold": LOST_EVENTS_CONFOUNDER_FRACTION, "lost_events_confounded": False}
+    by_kind = loss.get("by_kind") if isinstance(loss.get("by_kind"), dict) else {}
+    misses = loss.get("recursion_misses") if is_number(loss.get("recursion_misses")) else 0
+    drops = loss.get("ringbuf_drops")
+    if not is_number(drops):
+        if loss.get("source") == "bpf_counters":
+            drops = sum(value for key, value in by_kind.items()
+                        if str(key).startswith("ringbuf_drops") and is_number(value))
+        else:
+            drops = max(0, int(lost) - int(misses))
+    hits = loss.get("probe_hits")
+    if not is_number(hits) or hits <= 0:
+        probe_hits = tracer.get("probe_hits") if isinstance(tracer.get("probe_hits"), dict) else {}
+        hits = sum(value for key, value in probe_hits.items()
+                   if is_number(value) and not str(key).endswith("_all_processes") and key != "perf_sample")
+    fraction = round(lost / hits, 6) if is_number(hits) and hits > 0 else None
+    confounded = bool(lost) and (drops > 0 or fraction is None or fraction > LOST_EVENTS_CONFOUNDER_FRACTION)
+    return {
+        "lost_events_fraction": fraction,
+        "ringbuf_drops": int(drops),
+        "lost_events_threshold": LOST_EVENTS_CONFOUNDER_FRACTION,
+        "lost_events_confounded": confounded,
+    }
+
+
 def interface_tracer(
     tracer: dict[str, Any], summary: dict[str, Any], start_ns: int, deadline_ns: int,
 ) -> dict[str, Any]:
@@ -2884,7 +3001,15 @@ def interface_tracer(
         value = summary.get(key, tracer.get(key))
         if is_number(value):
             overhead[key] = value
+    # the libbpf tracer's trap cost and its provenance (wine-trace calibrate, or the assumed fallback);
+    # the calibration's first CPU (a P-core) gives a lower bound, *_max its slowest CPU (an E-core)
+    tracer_overhead = tracer.get("overhead") if isinstance(tracer.get("overhead"), dict) else {}
+    for key in ("trap_ns_per_hit", "trap_ns_source", "trap_ns_assumed", "bpf_ns_per_block", "trap_ns_per_block",
+                "trap_ns_per_hit_max", "trap_ns_per_block_max", "estimate_ns_per_block_max"):
+        if key in tracer_overhead:
+            overhead[key] = tracer_overhead[key]
     loss = tracer.get("loss") if isinstance(tracer.get("loss"), dict) else {}
+    evidence = lost_events_evidence(tracer, loss)
     risky = tracer.get("private_stack_risky")
     # Unclean: the tracer said so (wine-trace stop's tracer_exit, reduce.py's clean_exit) or the
     # lost-event count is unknown, which reduce.py reports only for a trace without its END output.
@@ -2901,6 +3026,7 @@ def interface_tracer(
         "attach": tracer.get("attach") if isinstance(tracer.get("attach"), list) else [],
         "lost_events": int(lost) if is_number(lost) else None,
         "lost_events_lower_bound": bool(loss.get("lower_bound")),
+        **evidence,
         "clean_exit": clean,
         "tracer_exit": tracer_exit,
         "private_stack_risky": [str(item) for item in risky] if isinstance(risky, list) else [],
@@ -2927,12 +3053,14 @@ def interface_section(
     top: int = INTERFACE_TOP,
     blocks_file: str = "blocks.jsonl",
     has_events: bool = False,
+    legacy_nested: bool = False,
 ) -> dict[str, Any]:
     """Summarise the tracer output for the blocks inside the measurement window.
 
     ``hotspots_non_audio`` is the tracer's whole-trace list from summary.json (non-audio threads
     cross mostly between blocks); without summary.json it falls back to the crossings recorded
-    inside the window's blocks.
+    inside the window's blocks.  ``legacy_nested``: the blocks come from a reduce.py that did not
+    record the enclosing call of nested crossings (see crossing_parent).
     """
     start_ns, deadline_ns = measurement_window(measurement)
     duration = (deadline_ns - start_ns) / 1_000_000_000
@@ -2946,7 +3074,7 @@ def interface_section(
     late = sum(item["late"] for item in classified)
     near_late = sum(item["near_late"] for item in classified)
     lost_total = sum(item["lost_ns"] for item in classified)
-    call_sites, attributed, hotspots = interface_call_sites(classified, top)
+    call_sites, attributed, hotspots, nested_call_sites = interface_call_sites(classified, top, legacy_nested)
     hotspots_source = "blocks-in-window"
     if isinstance(summary.get("hotspots_non_audio"), list):
         hotspots = [item for item in summary["hotspots_non_audio"] if isinstance(item, dict)][:top]
@@ -2966,7 +3094,7 @@ def interface_section(
     confounders = []
     if not tracer_value["coverage_complete"]:
         confounders.append("interface-tracer-coverage-incomplete")
-    if tracer_value["lost_events"]:
+    if tracer_value["lost_events_confounded"]:
         confounders.append("interface-lost-events")
     if not tracer_value["clean_exit"]:
         confounders.append("interface-tracer-unclean")
@@ -3000,11 +3128,15 @@ def interface_section(
         },
         "lost_slack": {
             "definition": "sum over late and near-late blocks of (near_late_slack_ns - slack_ns)",
+            "attribution": "each block's lost slack is shared among its top-level crossings of audio-role "
+                           "threads in proportion to their time, capped at that time; nested crossings "
+                           "(nested_call_sites) are part of their enclosing call's time and get no share",
             "total_ns": lost_total,
             "attributed_ns": attributed,
             "unattributed_ns": lost_total - attributed,
         },
         "call_sites": call_sites,
+        "nested_call_sites": nested_call_sites,
         "kinds": interface_kinds(classified),
         "roles": interface_roles(records_in_window(threads, "t", threads_base_ns, start_ns, deadline_ns)),
         "hotspots_non_audio": hotspots,
@@ -3052,6 +3184,7 @@ def interface(args: argparse.Namespace) -> int:
             measurement, tracer, summary, blocks, base_ns, threads, threads_base_ns or base_ns,
             near_late_fraction=args.near_late_fraction, top=args.top,
             blocks_file=blocks_path.name, has_events=(directory / "events.jsonl").is_file(),
+            legacy_nested=legacy_nesting(load_tracer_header(blocks_path)),
         )
         for kind in section["confounders"]:
             confounders.append({"kind": kind, "effect": INTERFACE_CONFOUNDERS[kind]})
@@ -3217,7 +3350,10 @@ def interface_markdown(report: dict[str, Any]) -> list[str]:
         "",
         "Late blocks ended after their deadline. Near-late blocks kept less slack than the near-late "
         "fraction of the block period. Site values sum over late and near-late blocks. Each block's lost "
-        "slack is shared among its crossings in proportion to their time, so shares never exceed one.",
+        "slack is shared among the top-level crossings of its audio-role threads in proportion to their "
+        "time, so shares never exceed one. Server requests and waits, NTSync waits and wakes inside a "
+        "syscall or unix call are part of that call's time: they are listed as nested crossings without "
+        "a share, so one wait is never counted twice.",
     ]
     for item in sets:
         interface_value = item.get("interface")
@@ -3233,13 +3369,19 @@ def interface_markdown(report: dict[str, Any]) -> list[str]:
             attributed_label = f"{attributed / total * 100:.1f}%"
         else:
             attributed_label = "none lost" if total == 0 else "pending"
+        lost_events = markdown_cell(tracer.get("lost_events"))
+        if is_number(tracer.get("lost_events_fraction")):
+            lost_events += f" ({tracer['lost_events_fraction'] * 100:.4f}% of probe hits"
+            if is_number(tracer.get("ringbuf_drops")):
+                lost_events += f", {tracer['ringbuf_drops']} ring-buffer drops"
+            lost_events += ")"
         lines.append(
             f"- Blocks {markdown_cell(blocks.get('count'))}, late {markdown_cell(blocks.get('late'))}, "
             f"near-late {markdown_cell(blocks.get('near_late'))}, slack p01 "
             f"{markdown_cell(nested(blocks, 'slack_ns', 'p01'))} ns, lost slack attributed {attributed_label}; "
             f"tracer `{tracer.get('mode') or 'pending'}` coverage "
             f"{'complete' if tracer.get('coverage_complete') else 'incomplete'}, "
-            f"lost events {markdown_cell(tracer.get('lost_events'))}"
+            f"lost events {lost_events}"
         )
         if interface_value.get("confounders"):
             lines.append(f"- Confounders: {', '.join(interface_value['confounders'])}")
@@ -3258,6 +3400,22 @@ def interface_markdown(report: dict[str, Any]) -> list[str]:
                 f"{markdown_cell(site.get('caller'))} | {markdown_number(site.get('per_late_block'))} | "
                 f"{markdown_percent(site.get('share_of_lost_slack'))} |"
             )
+        nested_sites = [site for site in interface_value.get("nested_call_sites") or [] if isinstance(site, dict)]
+        if nested_sites:
+            lines.extend([
+                "",
+                "Nested crossings (part of the enclosing call's time above; no share):",
+                "",
+                "| Rank | Crossing | Inside | Caller | Per late block |",
+                "|---:|---|---|---|---:|",
+            ])
+            for site in nested_sites[:NESTED_MARKDOWN_ROWS]:
+                parent = site.get("parent") if isinstance(site.get("parent"), dict) else {}
+                lines.append(
+                    f"| {site.get('rank')} | {markdown_cell(site.get('kind'))} {markdown_cell(site.get('name'))} | "
+                    f"{markdown_cell(parent.get('kind'))} {markdown_cell(parent.get('id'))} | "
+                    f"{markdown_cell(site.get('caller'))} | {markdown_number(site.get('per_late_block'))} |"
+                )
     return lines
 
 

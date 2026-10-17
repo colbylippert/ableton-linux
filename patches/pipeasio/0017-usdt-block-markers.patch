@@ -6,13 +6,22 @@ Subject: [PATCH] asio: add USDT block markers and name the driver threads
 A tracer can see Live's syscalls but cannot tell which audio block they
 belong to or whether that block came in late. Add static trace points
 (USDT, provider "pipeasio"; systemtap's sdt.h vendored under include/ with
-the x86-64 site widened to a 5-byte nop) around the PipeWire cycle and the
-host callback: cycle_start and cycle_end in audio_on_process, block_start,
-block_before_live, block_after_live and block_end on the ASIO process path.
-They are keyed by a per-instance block sequence and carry the cycle
-deadline, PipeWire's next wakeup. Each site is one 5-byte nop plus an ELF
-note, so nothing runs until a tracer attaches to a chosen process; the
-probes are always compiled in and need no setting.
+the x86-64 site widened to the 10-byte nop that Linux 7.2 optimizes)
+around the PipeWire cycle and the host callback: cycle_start and cycle_end
+in audio_on_process, block_start, block_before_live, block_after_live and
+block_end on the ASIO process path. They are keyed by a per-instance block
+sequence and carry the cycle deadline, PipeWire's next wakeup. Each site
+is one 10-byte nop plus an ELF note, so nothing runs until a tracer
+attaches to a chosen process; the probes are always compiled in and need
+no setting. Attached, the kernel rewrites a site on its first hit to
+"lea -0x80(%rsp),%rsp; call" into its uprobe trampoline, and every later
+hit costs a syscall instead of an int3 trap (about 170 instead of 430 ns
+on the profiling laptop). The sites are 16-byte aligned, which keeps each
+inside one 4 KiB page: Linux 7.2.9 puts no uprobe at all on a 10-byte nop
+that crosses one. An older kernel refuses a uprobe on this nop altogether
+(its %cs prefix makes uprobe_init_insn() return -ENOTSUPP, error 524), so
+tracing the driver needs Linux 7.2 or later. src/audio.c carries the
+literal PIPEASIO_USDT_V2 for the build audit.
 
 The deadline arithmetic lives in include/pipeasio_block_clock.h, shared
 with telemetry: every sample now records the block sequence and its slack
@@ -26,30 +35,33 @@ never sees sdt.h: PIPEASIO_PROBE is a no-op there.
 
 Verification: test_block_clock passes with gcc 16 and clang 23 (24 checks,
 also under ASan/UBSan). A probe-only unit built with the driver's flags
-carries all six notes and 5-byte nops under gcc and clang, keeps them
-through strip --strip-unneeded, and compiles to nothing with
-PIPEASIO_WOW64_PE (also for an i686 mingw target). src/audio.c compiles in
+carries all six notes and 10-byte nops on 16-byte boundaries under gcc and
+clang, keeps them through strip --strip-unneeded, and compiles to nothing
+with PIPEASIO_WOW64_PE (also for an i686 mingw target). On the profiling
+laptop (Linux 7.2.9) a test program built against include/sdt.h had every
+site rewritten to 48 8d 64 24 80 e8 and a call into [uprobes-trampoline]
+once bpftrace attached, with the arguments intact. src/audio.c compiles in
 the unixlib configuration against PipeWire 1.6.9 headers with gcc and
 clang without new warnings; src/asio.c awaits the container build (no Wine
 SDK on the check host).
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
 ---
- README.md                      |  38 ++-
- include/audio.h                |  14 ++
+ README.md                      |  40 ++-
+ include/audio.h                |  14 +
  include/pipeasio_block_clock.h |  50 ++++
- include/pipeasio_probe.h       |  66 +++++
+ include/pipeasio_probe.h       |  67 +++++
  include/pipeasio_telemetry.h   |   2 +
  include/sdt-config.h           |  15 ++
- include/sdt.h                  | 534 +++++++++++++++++++++++++++++++++++++++++
+ include/sdt.h                  | 565 +++++++++++++++++++++++++++++++++++++++++
  src/asio.c                     |  78 +++++-
- src/audio.c                    | 110 ++++++---
+ src/audio.c                    | 114 +++++++--
  tests/unit/CMakeLists.txt      |   3 +
  tests/unit/test_block_clock.c  |  61 +++++
- 11 files changed, 934 insertions(+), 37 deletions(-)
+ 11 files changed, 972 insertions(+), 37 deletions(-)
 
 diff --git a/README.md b/README.md
-index baf97ee..61e51d8 100644
+index baf97ee..edd6664 100644
 --- a/README.md
 +++ b/README.md
 @@ -569,7 +569,11 @@ A full area drops the next sample, and audio continues. The lifecycle worker
@@ -65,14 +77,14 @@ index baf97ee..61e51d8 100644
  When that output is full, PipeASIO drops the current report.
  Stop and Destroy continue. Clock reads and fixed sample
  writes add CPU work. Use telemetry during
-@@ -692,6 +696,38 @@ The driver has its own COM identity: CLSID
+@@ -692,6 +696,40 @@ The driver has its own COM identity: CLSID
  `HKCU\Software\ASIO\PipeASIO`, and DLL filename `pipeasio64.dll`. That is why
  it coexists with WineASIO: neither overrides the other.
  
 +### Trace points
 +
 +The ELF driver half `pipeasio64.dll.so` carries six static USDT trace points
-+under the provider `pipeasio`. Each one is a 5-byte `nop` plus an ELF note, so
++under the provider `pipeasio`. Each one is a 10-byte `nop` plus an ELF note, so
 +it costs nothing until a tracer attaches a uprobe to a chosen process; the
 +probes are always compiled in and need no setting.
 +`readelf -n lib/wine/x86_64-unix/pipeasio64.dll.so` lists them and
@@ -98,8 +110,10 @@ index baf97ee..61e51d8 100644
 +`pipeasio-worker` (`/proc/<pid>/task/<tid>/comm`), so a tracer can tell them
 +apart. The 32-bit mingw front end has no trace points. `include/pipeasio_probe.h`
 +is the contract; `include/sdt.h` is the vendored systemtap header (CC0) with
-+the x86-64 probe site widened to a 5-byte `nop` so recent kernels can use their
-+optimized uprobe path.
++the x86-64 probe site widened to the 10-byte `nop` that Linux 7.2 turns into a
++call to its uprobe trampoline, instead of a trap on every hit. Older kernels
++cannot put a uprobe on that `nop` at all (error 524), so tracing the driver
++needs Linux 7.2 or later.
 +
  ### Testing
  
@@ -187,10 +201,10 @@ index 0000000..ebad3bb
 +}
 diff --git a/include/pipeasio_probe.h b/include/pipeasio_probe.h
 new file mode 100644
-index 0000000..1bfcc2a
+index 0000000..12ec2e4
 --- /dev/null
 +++ b/include/pipeasio_probe.h
-@@ -0,0 +1,66 @@
+@@ -0,0 +1,67 @@
 +/*
 + * SPDX-License-Identifier: GPL-3.0-or-later
 + *
@@ -214,8 +228,9 @@ index 0000000..1bfcc2a
 +#pragma once
 +
 +/*
-+ * PIPEASIO_PROBE(name, args...) expands to one 5-byte nop in the instruction
-+ * stream plus a .note.stapsdt ELF note that describes the argument locations.
++ * PIPEASIO_PROBE(name, args...) expands to one 10-byte nop in the instruction
++ * stream (the form the kernel's optimized uprobe takes, see sdt.h) plus a
++ * .note.stapsdt ELF note that describes the argument locations.
 + * Nothing runs at the site until a tracer (bpftrace, libbpf) turns the nop
 + * into a uprobe for the processes it selects, so the probes are compiled in
 + * unconditionally and cost nothing while unattached.  List them with
@@ -293,10 +308,10 @@ index 0000000..eedf746
 +#define _SDT_ASM_SECTION_RETAIN_SUPPORT 1
 diff --git a/include/sdt.h b/include/sdt.h
 new file mode 100644
-index 0000000..957abb5
+index 0000000..f9df8b0
 --- /dev/null
 +++ b/include/sdt.h
-@@ -0,0 +1,534 @@
+@@ -0,0 +1,565 @@
 +/* <sys/sdt.h> - Systemtap static probe definition macros.
 +
 +   This file is dedicated to the public domain, pursuant to CC0
@@ -305,12 +320,31 @@ index 0000000..957abb5
 +
 +/* PipeASIO vendored copy of systemtap's sys/sdt.h (pipeasio-usdt-block-markers).
 +   Changes against upstream:
-+   1. On x86_64 the probe site is the 5-byte nop 0f 1f 44 00 00
-+      ("nopl 0x0(%rax,%rax,1)") instead of the 1-byte "nop", so the kernel's
-+      optimized uprobe path (5-byte-nop emulation) can apply; a kernel without
-+      it single-steps the site as before.  Marked with _SDT_DEF_NOP.
-+   2. "sdt-config.h" is the sibling file in this directory.
-+   3. One line of trailing whitespace (after the __sdt_type template) is
++   1. On x86_64 the probe site is the 10-byte nop 66 2e 0f 1f 84 00 00 00 00 00
++      ("nopw %cs:0x0(%rax,%rax,1)") instead of the 1-byte "nop", written as
++      .byte (the assembler may encode a nop mnemonic differently) and aligned
++      to 16 bytes, with the 990 label on its first byte.  Marked with
++      _SDT_DEF_NOP.  Linux 7.2 optimizes a uprobe on exactly this instruction
++      and on no other (arch/x86/kernel/uprobes.c, can_optimize and
++      is_optimizable_nop10): the first hit rewrites the site to
++      "lea -0x80(%rsp),%rsp; call" into the process's [uprobes-trampoline]
++      page (48 8d 64 24 80 e8 and a rel32), and later hits enter the kernel
++      through a syscall instead of an int3 trap.  The lea steps over the
++      128-byte red zone: an optimized hit writes only the 32 bytes below it
++      (the return address and the trampoline's saved %rcx, %r11 and %rax).
++      A 10-byte nop that crosses a 4 KiB page gets no uprobe at all on Linux
++      7.2.9: attaching to a running process fails with ENOTSUPP, and a
++      process started after the attach never gets the breakpoint.  With the
++      alignment the last start in a page is offset 4080, so no site can
++      cross.  The sites need Linux 7.2 or later to be traced at all: a
++      kernel that does not optimize this exact nop (Linux before 7.2)
++      refuses a uprobe on it, because the %cs segment prefix makes
++      uprobe_init_insn() return -ENOTSUPP (bpftrace: "Unknown error 524").
++      Upstream's 1-byte nop traps through int3 on any kernel.
++   2. _SDT_ASM_10, the ten-argument sibling of _SDT_ASM_5, carries the byte
++      list: _SDT_ASM_1 would split it at the commas.
++   3. "sdt-config.h" is the sibling file in this directory.
++   4. One line of trailing whitespace (after the __sdt_type template) is
 +      blank, so the patch applies without a whitespace warning.
 +   Nothing else differs; keep it that way so the file stays diffable against
 +   upstream.  Both files remain CC0. */
@@ -360,6 +394,7 @@ index 0000000..957abb5
 +# define _SDT_ASM_2(a, b)		a,b;
 +# define _SDT_ASM_3(a, b, c)		a,b,c;
 +# define _SDT_ASM_5(a, b, c, d, e)	a,b,c,d,e;
++# define _SDT_ASM_10(a, b, c, d, e, f, g, h, i, j)	a,b,c,d,e,f,g,h,i,j;
 +# define _SDT_ASM_STRING_1(x)		.asciz #x;
 +# define _SDT_ASM_SUBSTR_1(x)		.ascii #x;
 +# define _SDT_DEPAREN_0()				/* empty */
@@ -398,6 +433,12 @@ index 0000000..957abb5
 +# define _SDT_ASM_5(a, b, c, d, e)	_SDT_S(a) "," _SDT_S(b) "," \
 +					_SDT_S(c) "," _SDT_S(d) "," \
 +					_SDT_S(e) "\n"
++# define _SDT_ASM_10(a, b, c, d, e, f, g, h, i, j) \
++					_SDT_S(a) "," _SDT_S(b) "," \
++					_SDT_S(c) "," _SDT_S(d) "," \
++					_SDT_S(e) "," _SDT_S(f) "," \
++					_SDT_S(g) "," _SDT_S(h) "," \
++					_SDT_S(i) "," _SDT_S(j) "\n"
 +# define _SDT_ASM_ARGS(n)		_SDT_ASM_TEMPLATE_##n
 +# define _SDT_ASM_STRING_1(x)		_SDT_ASM_1(.asciz #x)
 +# define _SDT_ASM_SUBSTR_1(x)		_SDT_ASM_1(.ascii #x)
@@ -545,11 +586,16 @@ index 0000000..957abb5
 +#define _SDT_NOP	nop
 +#endif
 +
-+/* PipeASIO: x86_64 sites are a 5-byte nop so the optimized uprobe path applies.
++/* PipeASIO: x86_64 sites are the 10-byte nop, the only one the kernel's
++   optimized uprobe path takes (see the note at the top of this file).
 +   _SDT_ASM_1 cannot carry the comma-separated .byte list (its _SDT_S
-+   re-invocation would split on the commas), hence the 5-argument helper. */
++   re-invocation would split on the commas), hence the 10-argument helper.
++   The .balign comes first, so the 990 label, the address the note records,
++   stays on the first byte of the nop. */
 +#if defined(__x86_64__)
-+# define _SDT_DEF_NOP _SDT_ASM_5(990: .byte 0x0f, 0x1f, 0x44, 0x00, 0x00)
++# define _SDT_DEF_NOP _SDT_ASM_1(.balign 16) \
++		      _SDT_ASM_10(990: .byte 0x66, 0x2e, 0x0f, 0x1f, 0x84, \
++				  0x00, 0x00, 0x00, 0x00, 0x00)
 +#else
 +# define _SDT_DEF_NOP _SDT_ASM_1(990: _SDT_NOP)
 +#endif
@@ -1030,7 +1076,7 @@ index 9aafb96..fb3fcde 100644
      if (admitted)
          This->host_buffer_index = half ? 0 : 1;
 diff --git a/src/audio.c b/src/audio.c
-index d9c6637..ab54e8f 100644
+index d9c6637..3154aa8 100644
 --- a/src/audio.c
 +++ b/src/audio.c
 @@ -21,10 +21,12 @@
@@ -1046,7 +1092,18 @@ index d9c6637..ab54e8f 100644
  #include "pipeasio_pw_buffer.h"
  #include "pipeasio_rt_priority.h"
  #ifndef PIPEASIO_AUDIO_UNIXLIB
-@@ -106,9 +108,13 @@ static DWORD WINAPI
+@@ -60,6 +62,10 @@
+ #include <pmmintrin.h> /* _MM_SET_DENORMALS_ZERO_MODE */
+ #include <xmmintrin.h> /* _MM_SET_FLUSH_ZERO_MODE */
+ 
++/* Fingerprint of the "pipeasio" USDT sites for the build audit; V2 is the
++ * 10-byte nop of include/sdt.h (pipeasio-usdt-block-markers). */
++static const char pipeasio_usdt_marker[] __attribute__((used)) = "PIPEASIO_USDT_V2";
++
+ /* RT/data-loop thread id for diagnostics. */
+ static unsigned long
+ audio_current_thread_id(void)
+@@ -106,9 +112,13 @@ static DWORD WINAPI
  audio_rt_trampoline(LPVOID raw)
  {
      struct audio_rt_state *s = raw;
@@ -1060,7 +1117,7 @@ index d9c6637..ab54e8f 100644
  
      TRACE("rt thread entry: tid=%lx\n", (unsigned long)GetCurrentThreadId());
  
-@@ -362,6 +368,11 @@ struct audio_client
+@@ -362,6 +372,11 @@ struct audio_client
  
      /* Last spa_io_position.clock.nsec - feeds audio_get_time_nsec. */
      _Atomic uint64_t   last_clock_nsec;
@@ -1072,7 +1129,7 @@ index d9c6637..ab54e8f 100644
      bool               debug_enabled;
      bool               quantum_warned;
      _Atomic bool       quantum_muted;          /* mismatch mute active (issue #49) */
-@@ -384,6 +395,7 @@ struct audio_client
+@@ -384,6 +399,7 @@ struct audio_client
      _Atomic uint32_t   xrun_count;          /* cycles we missed, this activation */
      uint64_t           last_clock_position; /* previous cycle's clock.position */
      uint32_t           last_clock_id;       /* timeline the position belongs to */
@@ -1080,7 +1137,7 @@ index d9c6637..ab54e8f 100644
  
      /* Latency the connected device chain reports, per direction, in samples.
       * Written on the filter loop from a peer's SPA_PARAM_Latency, read by
-@@ -666,6 +678,9 @@ audio_open(const char *client_name, uint32_t options, uint32_t *status)
+@@ -666,6 +682,9 @@ audio_open(const char *client_name, uint32_t options, uint32_t *status)
      }
      atomic_init(&c->sample_rate, AUDIO_DEFAULT_SAMPLE_RATE);
      atomic_init(&c->last_clock_nsec, 0);
@@ -1090,7 +1147,7 @@ index d9c6637..ab54e8f 100644
      atomic_init(&c->observed_quantum, 0);
      atomic_init(&c->quantum_muted, false);
      atomic_init(&c->global_force_quantum, 0);
-@@ -1154,6 +1169,11 @@ audio_activate_locked(audio_client_t *c)
+@@ -1154,6 +1173,11 @@ audio_activate_locked(audio_client_t *c)
      atomic_store_explicit(&c->xrun_count, 0, memory_order_relaxed);
      c->last_clock_position = 0;
      c->last_clock_id       = 0;
@@ -1102,7 +1159,7 @@ index d9c6637..ab54e8f 100644
  
      atomic_store_explicit(&c->active, true, memory_order_release);
      pw_thread_loop_lock(c->loop);
-@@ -1366,6 +1386,27 @@ audio_get_time_nsec(audio_client_t *c)
+@@ -1366,6 +1390,27 @@ audio_get_time_nsec(audio_client_t *c)
      return c ? atomic_load_explicit(&c->last_clock_nsec, memory_order_acquire) : 0;
  }
  
@@ -1130,7 +1187,7 @@ index d9c6637..ab54e8f 100644
  /* Ports. */
  
  audio_port_t *
-@@ -2516,9 +2557,22 @@ static void
+@@ -2516,9 +2561,22 @@ static void
  audio_on_process(void *userdata, struct spa_io_position *position)
  {
      audio_client_t *c = userdata;
@@ -1153,7 +1210,7 @@ index d9c6637..ab54e8f 100644
      for (uint32_t i = 0; i < c->n_ports; ++i)
      {
          audio_port_t     *port = c->ports[i];
-@@ -2527,8 +2581,6 @@ audio_on_process(void *userdata, struct spa_io_position *position)
+@@ -2527,8 +2585,6 @@ audio_on_process(void *userdata, struct spa_io_position *position)
          atomic_store_explicit(&port->cycle_buffer, buffer, memory_order_release);
      }
  
@@ -1162,7 +1219,7 @@ index d9c6637..ab54e8f 100644
      /* Remember the raw graph quantum every cycle (read by
       * audio_observed_quantum):
       * follow-device mode settles its buffer size to it, the config watcher
-@@ -2584,6 +2636,25 @@ audio_on_process(void *userdata, struct spa_io_position *position)
+@@ -2584,6 +2640,25 @@ audio_on_process(void *userdata, struct spa_io_position *position)
              audio_signal_diagnostic(c, AUDIO_DIAGNOSTIC_TRACE, quantum, position);
      }
  
@@ -1188,7 +1245,7 @@ index d9c6637..ab54e8f 100644
      /* Deliver the host callback.  At matched sizes, once per cycle.  While
       * muted, the graph cycles at the foreign quantum but the host still
       * expects buffer_size frames per bufferSwitch: invoking it once per
-@@ -2621,35 +2692,19 @@ audio_on_process(void *userdata, struct spa_io_position *position)
+@@ -2621,35 +2696,19 @@ audio_on_process(void *userdata, struct spa_io_position *position)
           * duration returns. */
          c->mute_accum = 0;
  
@@ -1233,7 +1290,7 @@ index d9c6637..ab54e8f 100644
      }
      else
          c->last_clock_position = 0;
-@@ -2676,6 +2731,7 @@ audio_on_process(void *userdata, struct spa_io_position *position)
+@@ -2676,6 +2735,7 @@ audio_on_process(void *userdata, struct spa_io_position *position)
                  pw_filter_queue_buffer(port->pw_filter_port, buffer);
          }
      }

@@ -21,6 +21,7 @@ uninstall:                    ## remove installed Wine tree + launcher
 test:                         ## run installer and launcher lifecycle gates
 	./scripts/test-tsan-policy.sh
 	./scripts/test-release-policy.sh
+	./scripts/test-build-audit-usdt.sh
 	./scripts/test-config-boundary.sh
 	./scripts/test-project-file-installer.sh
 	./scripts/test-installer-ui.sh
@@ -64,6 +65,7 @@ test-profiler:                 ## run profiler workbench checks (control layer, 
 	python3 -I ./profiler/tracer/tests/test_validate.py
 	python3 -I ./profiler/tracer/tests/test_bt_template.py
 	python3 -I ./profiler/tracer/tests/test_jit_classifier.py
+	python3 -I ./profiler/tracer/tests/test_calibrate.py
 	python3 -I ./profiler/bin/tests/test-ledger-report.py
 	python3 -I ./profiler/bin/tests/test-history-add.py
 	./profiler/bin/tests/test-state-leftovers.sh

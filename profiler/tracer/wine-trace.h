@@ -37,16 +37,22 @@
 #ifndef WINE_TRACE_H
 #define WINE_TRACE_H
 
-#define WINE_TRACE_VERSION "0.3.1"
-#define WINE_TRACE_ABI     4          /* bump when any struct in this file changes */
+#define WINE_TRACE_VERSION "0.4.0"
+#define WINE_TRACE_ABI     5          /* bump when any struct in this file changes */
 
 /* ---- sizing ---------------------------------------------------------- */
-#define AGG_SLOTS          4          /* time ring: agg[(completion_ts / AGG_SLOT_NS) & 3] */
+#define AGG_SLOTS          4          /* time ring: agg[(completion_ts / AGG_SLOT_NS) & 3] (scheduler keys) */
 #define AGG_SLOT_NS        100000000ULL          /* 100 ms per slot; user space drains slot W-2 */
-#define AGG_ENTRIES        65536      /* per slot */
+#define AGG_ENTRIES        16384      /* per slot (only the scheduler programs write the hash maps) */
+#define ACC_BITS           4
+#define ACC_SLOTS          (1 << ACC_BITS)       /* per-thread crossing accumulator: ~2 blocks of an AudioCalc worker */
+#define ACC_MAX_AGE_NS     50000000ULL           /* an accumulator older than this is flushed at the next probe */
 #define INFLIGHT_DEPTH     8          /* nested entries per thread (power of two) */
 #define MAX_PIDS           64
-#define MAX_TIDS           8192
+#define MAX_TIDS_BITS      13
+#define MAX_TIDS           (1 << MAX_TIDS_BITS)  /* thread-state slots (array map) */
+#define TSTATE_PROBES      4          /* slots tried per tid (open addressing) */
+#define TSTATE_HASH        2654435761u           /* Fibonacci hashing of the tid onto MAX_TIDS slots */
 #define MAX_UNIXLIBS       256
 #define MAX_TRIGGER_IDS    64
 #define WINDOW_NS          100000000ULL          /* 100 ms non-block buckets */
@@ -127,6 +133,7 @@ struct wt_config {
 	__u32 callback_return_id; /* NtCallbackReturn's syscall id (from the id table; NO_SYSCALL_ID = unknown):
 				 * it never returns through its own frame (it resumes the frame of the user
 				 * callback's caller), so it is counted, not pushed */
+	__u32 sched_records;    /* 1 = drill-down also emits REC_WAKE / REC_OFFCPU records (--sched-records) */
 };
 #define NO_SYSCALL_ID 0xffffffffu
 
@@ -143,25 +150,35 @@ struct wt_config {
 /* ---- global data (.bss) ------------------------------------------------ */
 /* The block in progress: written by the PipeASIO callback thread's programs only
  * (single writer), read by every program.  Plain scalars: a reader may see a block
- * boundary half-updated, never a pointer. */
+ * boundary half-updated, never a pointer.  The first cache line holds what every probe reads
+ * (written twice per block); trig_used, the only field other threads write in a block, has a
+ * cache line of its own so that its atomic adds do not invalidate the read-mostly line. */
 struct global {
 	__u64 cur_seq;          /* block in progress (0 between blocks) */
+	__u64 blocks;           /* block_start count: the per-thread accumulators flush when it moves */
+	__u64 sample_after_ns;  /* deadline - slack margin: entries after it are slack-sampled */
+	__u32 callback_tid;
+	__u32 stopping;         /* set by the loader before it detaches: no new block starts (its END
+				 * would be lost to the link teardown, which detaches block_start first) */
 	__u64 last_seq;         /* last completed block */
 	__u64 block_start_ts;
 	__u64 deadline_ns;
 	__u64 period_ns;        /* nframes * 1e9 / rate */
-	__u64 sample_after_ns;  /* deadline - slack margin: entries after it are slack-sampled */
-	__u64 blocks;           /* block_start count */
-	__u32 callback_tid;
 	__u32 nframes;
 	__u32 rate;
-	__u32 unixlib_next;     /* handle index allocator (atomic) */
-	__u32 trig_used;        /* slack-triggered samples taken in the current block (atomic) */
-	__u32 stopping;         /* set by the loader before it detaches: no new block starts (its END
-				 * would be lost to the link teardown, which detaches block_start first) */
-};
+	__u32 unixlib_next;     /* handle index allocator (atomic; rare) */
+	__u32 start_flags;      /* block_start's flags operand */
+	__u64 slack_margin_ns;  /* period_ns * slack_thresh_pct / 100 (recomputed when nframes/rate change) */
+	__u64 clock_nsec;       /* block_start's clock_nsec operand */
+	__u64 before_ts;        /* block_before_live / block_after_live of the block in progress (0 = not yet): */
+	__u64 after_ts;         /* block_end ships them with the start fields in one REC_BLOCK (PHASE_BLOCK) */
+	__u32 trig_used __attribute__((aligned(64)));   /* slack-triggered samples in the current block
+							  * (atomic, read before it is bumped) */
+	__u32 pad1[15];
+} __attribute__((aligned(64)));
 
-/* counters (.bss, atomic adds; all of them are rare events except CT_STACKS) */
+/* counters (.bss, atomic adds on one shared array: only rare events and stack samples count here;
+ * the per-crossing counts live in the thread's own struct tstate) */
 enum wt_counter {
 	CT_UNMATCHED_EXIT = 0,     /* exit without a matching entry (NtContinue, callbacks, ...) */
 	CT_FIRST_EXIT,             /* first event of a thread is an exit: thread start / entered before tracing */
@@ -181,13 +198,15 @@ enum wt_counter {
 	CT_FILTERED,               /* --roles audio: entries of other threads */
 	CT_NTSYNC_UNMATCHED,       /* NTSync wait return without an in-flight wait */
 	CT_UNIXCALL_SLOW_EXIT,     /* syscall_exit of the unix-call slow path (no syscall entry to match) */
-	CT_NTSYNC_WAIT_HITS,       /* NTSync waits of traced processes (the fentry fires for everyone) */
-	CT_NTSYNC_WAKE_HITS,       /* NTSync wakes of traced processes */
+	CT_NTSYNC_WAIT_HITS,       /* NTSync waits of traced processes: not counted in BPF any more (user space
+				    * sums the per-thread tstate.nt_wait_hits; the slot keeps the names stable) */
+	CT_NTSYNC_WAKE_HITS,       /* NTSync wakes of traced processes (tstate.nt_wake_hits, as above) */
 	CT_OPEN_AT_EXIT,           /* entries still open when their thread exited (NtTerminateProcess, ...) */
 	CT_CALLBACK_RETURN,        /* NtCallbackReturn entries (counted as zero-duration crossings, never pushed) */
 	CT_NEVER_RETURNED,         /* entries popped by a new syscall / unix call at the same frame (and the
 				    * entries above them): they never passed their exit probe */
 	CT_ANOMALY_DROP,           /* ring buffer full: drill-down anomaly record lost (diagnostics only) */
+	CT_RB_DROP_AGG,            /* ring buffer full: crossings lost with a dropped REC_AGG record (their count) */
 	CT__COUNT
 };
 
@@ -228,6 +247,33 @@ struct agg_val {
 	__u32 pad;
 };
 
+/* The per-thread crossing accumulator (struct tstate ak[] / av[], ACC_SLOTS slots, open addressing
+ * by a hash of the key, acc_mask = slots in use): every completed crossing of the thread is folded
+ * into it instead of a hash-map update, and it travels to user space as one REC_AGG record per
+ * thread and block or two (see acc_commit in wine-trace.bpf.c).  Keys and values are split so
+ * that a lookup touches one key line and one value line.  User space turns each REC_AGG entry
+ * (struct acc_ent) back into an agg_key / agg_val. */
+struct acc_key {
+	__u64 seq;          /* agg_key.seq: block seq, or WINDOW_BIT | window_id */
+	__u64 idp;          /* agg_key.id | (__u64)agg_key.pid_ << 32 */
+	__u32 kfl;          /* agg_key.kind | pkind << 8 | flags << 16 */
+	__u32 pad;
+};
+struct acc_val {
+	__u64 count, total_ns, max_ns, oncpu_ns;
+	__u32 waker;        /* agg_val.last_waker */
+	__u32 pad;
+};
+struct acc_ent {            /* one REC_AGG entry */
+	__u64 seq;
+	__u64 idp;
+	__u32 kfl;
+	__u32 waker;
+	__u64 count, total_ns, max_ns, oncpu_ns;
+};
+#define ACC_IDP(id, pid_)          ((__u64)(__u32)(id) | ((__u64)(__u32)(pid_) << 32))
+#define ACC_KFL(kind, pkind, flags) ((__u32)(__u8)(kind) | ((__u32)(__u8)(pkind) << 8) | ((__u32)(__u16)(flags) << 16))
+
 /* one key + value under construction (map operations take pointers into this, never into
  * the BPF stack) */
 struct aggscratch {
@@ -258,16 +304,33 @@ struct unixlib_key {
 	__u64 handle;
 };
 
-/* Per-thread state (hash map keyed by tid).  Only the owning thread's programs write the
- * in-flight stack and `ag`/`arg`/`wa`/`ukey`; the scheduler programs (non-preemptible
- * tp_btf) write the sched fields and use `sg`.  A thread cannot run two of its own
- * programs at once, so none of these scratch areas is shared between concurrent runs. */
+/* Per-thread state: slot of an array map (MAX_TIDS entries), found by hashing the tid and
+ * claimed by the thread itself with a compare-and-swap of `tid` (TSTATE_PROBES slots tried; the
+ * scheduler programs only look slots up), released at thread exit.  An array lookup is inlined
+ * by the verifier: no hashing helper, no key compare call (B5c: the hash map's lookup was ~15% of
+ * every program).  Only the owning thread's programs write the in-flight stack, the accumulator
+ * and `arg`/`wa`/`ukey`; the scheduler programs (non-preemptible tp_btf) write the sched fields
+ * and use `sg`.  A thread cannot run two of its own programs at once, so none of these scratch
+ * areas is shared between concurrent runs.  What every crossing touches comes first. */
 struct tstate {
-	struct inflight_ent s[INFLIGHT_DEPTH];
+	__u32 tid;              /* slot owner (0 = free) */
 	__u32 depth;
 	__u32 seen;             /* 1 once a syscall entry or exit of the thread was seen */
-	/* per-thread counters (validate.py per_tid scope) */
+	__u32 sample_cd;        /* syscall / unix-call entries until the next random stack sample */
+	__u32 acc_mask;         /* accumulator slots in use (bit per slot) */
+	__u32 acc_n;            /* ... and their number */
+	__u64 acc_epoch;        /* gl.blocks when the first key went into the accumulator */
+	__u64 acc_t0;           /* time the first key went in (flushed after ACC_MAX_AGE_NS) */
+	__u32 role_gen;         /* role_gen when role_audio was read from `tids` (~0 = never) */
+	__u32 role_audio;       /* 1 = audio role (batches its accumulator across waits, acc_before_block) */
+	__u64 stack_top;        /* first unreadable address above a sampled rsp (stack windows stop there) */
+	struct inflight_ent s[INFLIGHT_DEPTH];   /* s[depth] is also the scratch key of a point event */
+	struct acc_key ak[ACC_SLOTS];
+	struct acc_val av[ACC_SLOTS];
+	__u64 arg[6];           /* USDT arguments land here (bpf_usdt_arg writes 8 bytes) */
+	/* per-thread counters (validate.py per_tid scope; nt_*: probe_hits.ntsync_wait / _wake) */
 	__u32 unmatched, first_exit, abandoned, overflow, open_at_exit, never_returned;
+	__u32 nt_wait_hits, nt_wake_hits;
 	/* scheduler state */
 	__u64 off_ts;           /* switch-out time, 0 while on CPU */
 	__u64 on_ts;            /* switch-in time, 0 while off CPU */
@@ -283,22 +346,22 @@ struct tstate {
 	__u64 cycle_ts;
 	__u64 now0;             /* probe time, taken before the arguments are fetched */
 	/* scratch */
-	struct aggscratch ag;   /* the thread's own programs */
-	struct aggscratch sg;   /* scheduler programs */
+	struct aggscratch sg;   /* scheduler programs (agg hash maps) */
 	struct unixlib_key ukey;
-	__u64 arg[6];           /* USDT arguments land here (bpf_usdt_arg writes 8 bytes) */
 	__u64 wa[5];            /* struct nt_wait_args copy */
 };
 
 /* ---- ring-buffer records ---------------------------------------------- */
 enum wt_rec {
 	REC_STACK = 1, REC_BLOCK = 2, REC_WAKE = 3, REC_OFFCPU = 4, REC_NAME = 5,
-	REC_EVENT = 6, REC_UNIXLIB = 7, REC_FORK = 8, REC_THREAD = 9, REC_EXIT = 10, REC_ANOMALY = 11
+	REC_EVENT = 6, REC_UNIXLIB = 7, REC_FORK = 8, REC_THREAD = 9, REC_EXIT = 10, REC_ANOMALY = 11,
+	REC_AGG = 12
 };
 
 enum wt_phase {
 	PHASE_CYCLE_START = 0, PHASE_BLOCK_START = 1, PHASE_BEFORE_LIVE = 2, PHASE_AFTER_LIVE = 3,
-	PHASE_BLOCK_END = 4, PHASE_CYCLE_END = 5
+	PHASE_BLOCK_END = 4, PHASE_CYCLE_END = 5,
+	PHASE_BLOCK = 6         /* since 0.4: a whole block in one record, written at its end */
 };
 
 struct rec_hdr { __u16 type; __u16 len; __u32 tid; __u64 ts; };                    /* 16 B */
@@ -316,19 +379,22 @@ struct rec_stack {
 	__u8  bytes[];        /* --stack-bytes (512..4096, default 1536) from user rsp */
 };
 
-/* Probe arguments land straight in a[] (8 bytes each: bpf_usdt_arg's result size).
- * Phases of a block whose block_start this tracer did not see (attached mid-block, or started
- * after the loader set gl.stopping) are not emitted.
- *   BLOCK_START: seq, a = {nframes, rate, clock_nsec, deadline_ns, flags}
- *   BEFORE_LIVE / AFTER_LIVE: seq
- *   BLOCK_END: seq, a = {flags, missed, block_start_ts, deadline_ns, nframes | rate << 32} (gl copies,
- *              0 unless gl holds this block: they rebuild a block whose BLOCK_START record was lost)
- *   CYCLE_START: seq = 0, a = {clock_nsec, next_nsec, duration, position, cycle_flags}
- *   CYCLE_END: seq = block that started inside the cycle (0 = none), a = {missed, delivered, cycle_start_ts} */
+/* Since 0.4 a block travels as ONE record, written by block_end (h.ts = the end): the start,
+ * before-Live and after-Live phases only stamp struct global (the callback thread is their only
+ * writer), so the callback thread pays one ring-buffer reservation per block instead of four.
+ * Blocks whose block_start this tracer did not see (attached mid-block, or started after the
+ * loader set gl.stopping) give no record.
+ *   BLOCK: seq, a = {nframes | rate << 32, clock_nsec, deadline_ns, start_flags, block_start_ts,
+ *          before_ts (0 = none), after_ts (0 = none), end flags, missed}
+ *   BLOCK_END: seq, a = {flags, missed, 0...}: an end whose start this tracer did not see
+ *   CYCLE_END: seq = block that started inside the cycle (0 = none), a = {missed, delivered,
+ *              cycle_start_ts}; there is no CYCLE_START record any more (its stamp rides here)
+ * BLOCK_START / BEFORE_LIVE / AFTER_LIVE / CYCLE_START are 0.3's phases (the loader still reads
+ * them). */
 struct rec_block {
 	struct rec_hdr h;
 	__u64 seq;
-	__u64 a[5];
+	__u64 a[9];
 	__u32 phase;
 	__u32 pad;
 };
@@ -354,6 +420,15 @@ struct rec_event {
 
 struct rec_unixlib { struct rec_hdr h; __u64 handle; __u32 pid, idx; };
 
+/* REC_AGG: a thread's accumulated crossings (h.tid = the thread, h.ts = flush time); entries
+ * e[0 .. n-1] are valid.  One record per thread and block (or 100 ms window, or full accumulator). */
+struct rec_agg {
+	struct rec_hdr h;
+	__u32 n;
+	__u32 pad;
+	struct acc_ent e[ACC_SLOTS];
+};
+
 /* REC_FORK (new process: pid = child tgid, h.tid = child tid), REC_THREAD (new thread of a
  * traced process), REC_EXIT (flags bit0 = group dead; the thread's own counters) */
 struct rec_task {
@@ -361,6 +436,7 @@ struct rec_task {
 	__u32 pid, parent_pid, parent_tid, flags;
 	char comm[16];
 	__u32 unmatched, first_exit, abandoned, overflow, open_at_exit, never_returned;
+	__u32 nt_wait_hits, nt_wake_hits;
 };
 
 /* drill-down only: one pairing anomaly with the thread's in-flight stack at that moment

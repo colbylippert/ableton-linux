@@ -11,24 +11,34 @@ the unix side of Wine, with the caller and the result, without a patch
 per syscall or unix call. ntdll.so now carries eight static user-space
 trace points (SystemTap SDT notes, provider "wine") on the two x86_64
 dispatchers and on the wineserver request and wait paths. An eBPF tracer
-attaches to them by file and pid. Unattached, a site is one 5-byte nop
-(nopl 0x0(%rax,%rax,1)) and its description lives in the non-allocated
-.note.stapsdt section: no branch, no load, no runtime state and no
-semaphore, so the cost is zero. Attached, the kernel replaces the nop
-with its uprobe; the 5-byte form lets a kernel with the optimized x86_64
-uprobe use a call to its trampoline instead of int3.
+attaches to them by file and pid. Unattached, a site is one 10-byte nop
+(nopw %cs:0x0(%rax,%rax,1)) and its description lives in the
+non-allocated .note.stapsdt section: no branch, no load, no runtime
+state and no semaphore, so the cost is zero. Attached, the kernel puts a
+uprobe on the nop. The 10-byte form is the only one Linux 7.2 optimizes:
+the first hit rewrites the site to "lea -0x80(%rsp),%rsp; call" into
+the process's uprobe trampoline, and every later hit enters the kernel
+through a syscall instead of an int3 trap, about 170 instead of 430 ns
+per hit on the profiling laptop. The form is also a requirement: a
+kernel that does not optimize this nop (Linux before 7.2) refuses a
+uprobe on it, because its %cs prefix makes uprobe_init_insn() return
+-ENOTSUPP (error 524), so tracing these sites needs Linux 7.2 or later.
+The earlier 5-byte nop could be traced on any kernel, through int3.
 
 Scope
 
 dlls/ntdll/unix/sdt.h is systemtap's <sys/sdt.h> (CC0) with the probe
-site changed to the 5-byte nop on x86_64 (_SDT_DEF_NOP) and one line of
-trailing whitespace blanked; its provenance block lists the changes.
-dlls/ntdll/unix/sdt-config.h replaces the autoconf-generated file and
-enables the "?" and "R" section flags (binutils 2.36 and later). Both
-headers are private to the ntdll unix side; dlls/ntdll/Makefile.in lists
-no headers and is unchanged. sync.c is untouched, so performance/0001
-keeps applying. A pre-C99 -std stops signal_x86_64.c with one #error,
-because its raw templates need the variadic STAP_PROBE_ASM of sdt.h.
+site changed on x86_64 (_SDT_DEF_NOP) to that 10-byte nop, emitted as
+.byte through a new ten-argument _SDT_ASM_10 and aligned to 16 bytes so
+that no site can cross a 4 KiB page (Linux 7.2.9 puts no uprobe at all
+on a 10-byte nop that does), and with one line of trailing whitespace
+blanked; its provenance block lists the changes. sdt-config.h
+replaces the autoconf-generated file and enables the "?" and "R" section
+flags (binutils 2.36 and later). Both headers are private to the ntdll
+unix side; dlls/ntdll/Makefile.in lists no headers and is unchanged.
+sync.c is untouched, so performance/0001 keeps applying. A pre-C99 -std
+stops signal_x86_64.c with one #error, because its raw templates need
+the variadic STAP_PROBE_ASM of sdt.h.
 
 Probes in the dispatchers (signal_x86_64.c), as asm templates with
 decimal displacements, no commas and a single % (basic asm):
@@ -58,8 +68,13 @@ decimal displacements, no commas and a single % (basic asm):
     -4@%eax 8@%rcx
     After the call's "movq %rsp,%rcx".
 
-Every dispatcher site runs on the kernel stack with free space below
-%rsp, so a trampoline call cannot clobber live data.
+An optimized hit stores 32 bytes just below the red zone, from %rsp -
+160 to %rsp - 129 (the return address and the trampoline's saved %rcx,
+%r11 and %rax), and gives back %rsp, the flags and every register.
+Every dispatcher site runs on the kernel stack with %rsp at or below the
+syscall frame and only unused stack beneath it, so those stores cannot
+clobber live data; at the C sites the ABI leaves the stack below the
+red zone free.
 
 Probes in C (server.c), through STAP_PROBE1 and STAP_PROBE2:
 
@@ -71,29 +86,41 @@ Probes in C (server.c), through STAP_PROBE1 and STAP_PROBE2:
     server_select, around wait_select_reply, where waits that do not
     use NTSync and alertable waits block.
 
-server.c also carries the literal WINE_USDT_V1 for the build audit.
+server.c also carries the literal WINE_USDT_V2 for the build audit; V1
+marked the earlier 5-byte nop sites, which the kernel does not optimize.
 
 Verification
 
-On a CachyOS VM (gcc 16.2, binutils 2.47) the patched dispatcher asm
-blocks, compiled verbatim with the unix-side flags, and a copy of the
-server.c statements assembled without warnings. readelf -n shows provider
-wine with syscall_entry, syscall_exit, unixcall_entry and unixcall_exit
-and their argument strings, and with server_req_start, server_req_end,
-server_wait_start and server_wait_end. objdump shows nopl
-0x0(%rax,%rax,1) at the four dispatcher sites, between the instructions
-named above. Linked into a shared object, the eight notes and the
-WINE_USDT_V1 literal survive strip --strip-unneeded; .note.stapsdt is
-not allocated and .stapsdt.base carries the AGR flags. Every argument
-string parses under the grammar of libbpf's x86_64 USDT argument parser.
-The patch applies to a fresh checkout of the series with git apply
---check and git am --3way.
+On the CachyOS profiling laptop (Linux 7.2.9, gcc 16.2, binutils 2.47)
+the series applies to the vendored base with git am --3way, followed by
+performance/0001. A test program built against the patched sdt.h, with
+a STAP_PROBE3 site, a STAP_PROBEV site and three STAP_PROBE_ASM sites in
+a global asm function that use the dispatchers' argument strings, has
+the 10-byte nop on a 16-byte boundary at every site; readelf -n shows
+the notes with those argument strings and bpftrace -l lists the probes.
+With bpftrace attached, every site read back from /proc/<pid>/mem as
+48 8d 64 24 80 e8 and a call into the [uprobes-trampoline] mapping, all
+arguments arrived intact, the %rsp-relative ones included, the
+registers, the carry flag and the red zone survived every hit, and a
+counting probe cost about 160 to 200 ns per hit against about 420 to
+460 ns for the 5-byte nop. A 10-byte nop placed across a page boundary
+got no breakpoint: with bpftrace attached first it never fired in 1000
+calls, and attaching to the running process failed with error 524
+(ENOTSUPP), while one ending on the last byte of a page was optimized
+and a 5-byte nop across a page still trapped. The two dispatchers of
+the patched signal_x86_64.c, assembled on their own with wine/asm.h and
+dwarf.h, have the 10-byte nop on a 16-byte boundary at all four sites.
+Linked with copies of the server.c probes into a shared object, all
+eight notes and the WINE_USDT_V2 literal survive strip --strip-unneeded
+and the build audit's --check-usdt-sites passes every site;
+.note.stapsdt is not allocated and .stapsdt.base carries the AGR flags
+in the object file.
 ---
  dlls/ntdll/unix/sdt-config.h    |  10 +
- dlls/ntdll/unix/sdt.h           | 547 ++++++++++++++++++++++++++++++++
+ dlls/ntdll/unix/sdt.h           | 577 ++++++++++++++++++++++++++++++++
  dlls/ntdll/unix/server.c        |  14 +-
  dlls/ntdll/unix/signal_x86_64.c |  12 +
- 4 files changed, 581 insertions(+), 2 deletions(-)
+ 4 files changed, 611 insertions(+), 2 deletions(-)
  create mode 100644 dlls/ntdll/unix/sdt-config.h
  create mode 100644 dlls/ntdll/unix/sdt.h
 
@@ -115,10 +142,10 @@ index 0000000..bbfa72e
 +#define _SDT_ASM_SECTION_RETAIN_SUPPORT 1
 diff --git a/dlls/ntdll/unix/sdt.h b/dlls/ntdll/unix/sdt.h
 new file mode 100644
-index 0000000..64c4949
+index 0000000..7d5d4b2
 --- /dev/null
 +++ b/dlls/ntdll/unix/sdt.h
-@@ -0,0 +1,547 @@
+@@ -0,0 +1,577 @@
 +/* Wine: vendored copy of systemtap's <sys/sdt.h>, private to the ntdll unix
 +   side.  signal_x86_64.c and server.c include it for the "wine" USDT
 +   provider: static user-space trace points, one nop per site plus a
@@ -133,14 +160,34 @@ index 0000000..64c4949
 +
 +   Local changes:
 +   1. _SDT_DEF_NOP, used by _SDT_ASM_BODY in place of
-+      _SDT_ASM_1(990: _SDT_NOP): on x86_64 a probe site is the 5-byte
-+      "nopl 0x0(%rax,%rax,1)" (0f 1f 44 00 00) instead of the 1-byte nop,
-+      so kernels with the optimized x86_64 uprobe can replace the site with
-+      a call to their trampoline.  Kernels without it single-step the site
-+      as before.  Every site must therefore have free stack below %rsp.
-+   2. "sdt-config.h" is the hand-written sibling file instead of the
++      _SDT_ASM_1(990: _SDT_NOP): on x86_64 a probe site is the 10-byte
++      "nopw %cs:0x0(%rax,%rax,1)" (66 2e 0f 1f 84 00 00 00 00 00) instead
++      of the 1-byte nop.  It is written as .byte, because the assembler
++      may encode a nop mnemonic differently, and aligned to 16 bytes, with
++      the 990 label on its first byte.  Linux 7.2 optimizes a uprobe on
++      exactly this instruction and on no other (arch/x86/kernel/uprobes.c,
++      can_optimize and is_optimizable_nop10): the first hit rewrites the
++      site to "lea -0x80(%rsp),%rsp; call" into the process's
++      [uprobes-trampoline] page (48 8d 64 24 80 e8 and a rel32), and later
++      hits enter the kernel through a syscall instead of an int3 trap.
++      The lea steps over the 128-byte red zone: an optimized hit writes
++      only the 32 bytes below it (the return address and the trampoline's
++      saved %rcx, %r11 and %rax), so every site needs that much free stack
++      below %rsp - 128.  A 10-byte nop that crosses a 4 KiB page gets no
++      uprobe at all on Linux 7.2.9: attaching to a running process fails
++      with ENOTSUPP, and a process started after the attach never gets
++      the breakpoint.  With the alignment the last start in a page is
++      offset 4080, so no site can cross.  These sites need Linux 7.2 or
++      later to be traced at all: a kernel that does not optimize this
++      exact nop (Linux before 7.2) refuses a uprobe on it, because the %cs
++      segment prefix makes uprobe_init_insn() return -ENOTSUPP (bpftrace:
++      "Unknown error 524").  Upstream's 1-byte nop traps through int3 on
++      any kernel.
++   2. _SDT_ASM_10, the ten-argument sibling of _SDT_ASM_5, carries the
++      byte list: _SDT_ASM_1 would split it at the commas.
++   3. "sdt-config.h" is the hand-written sibling file instead of the
 +      autoconf-generated one.
-+   3. One line of trailing whitespace (after the __sdt_type template) is
++   4. One line of trailing whitespace (after the __sdt_type template) is
 +      blank, so the patch applies without a whitespace warning.
 +   Nothing else changed.  _SDT_HAS_SEMAPHORES stays undefined.  */
 +
@@ -195,6 +242,7 @@ index 0000000..64c4949
 +# define _SDT_ASM_2(a, b)		a,b;
 +# define _SDT_ASM_3(a, b, c)		a,b,c;
 +# define _SDT_ASM_5(a, b, c, d, e)	a,b,c,d,e;
++# define _SDT_ASM_10(a, b, c, d, e, f, g, h, i, j)	a,b,c,d,e,f,g,h,i,j;
 +# define _SDT_ASM_STRING_1(x)		.asciz #x;
 +# define _SDT_ASM_SUBSTR_1(x)		.ascii #x;
 +# define _SDT_DEPAREN_0()				/* empty */
@@ -233,6 +281,12 @@ index 0000000..64c4949
 +# define _SDT_ASM_5(a, b, c, d, e)	_SDT_S(a) "," _SDT_S(b) "," \
 +					_SDT_S(c) "," _SDT_S(d) "," \
 +					_SDT_S(e) "\n"
++# define _SDT_ASM_10(a, b, c, d, e, f, g, h, i, j) \
++					_SDT_S(a) "," _SDT_S(b) "," \
++					_SDT_S(c) "," _SDT_S(d) "," \
++					_SDT_S(e) "," _SDT_S(f) "," \
++					_SDT_S(g) "," _SDT_S(h) "," \
++					_SDT_S(i) "," _SDT_S(j) "\n"
 +# define _SDT_ASM_ARGS(n)		_SDT_ASM_TEMPLATE_##n
 +# define _SDT_ASM_STRING_1(x)		_SDT_ASM_1(.asciz #x)
 +# define _SDT_ASM_SUBSTR_1(x)		_SDT_ASM_1(.ascii #x)
@@ -381,10 +435,13 @@ index 0000000..64c4949
 +#endif
 +
 +/* Wine: see the note at the top of this file.  _SDT_ASM_1 takes a single
-+   argument, so the comma-separated byte list goes through the five-argument
-+   helper.  */
++   argument, so the comma-separated byte list goes through the ten-argument
++   helper.  The .balign comes first, so the 990 label, the address the note
++   records, stays on the first byte of the nop.  */
 +#if defined(__x86_64__)
-+# define _SDT_DEF_NOP	_SDT_ASM_5(990: .byte 0x0f, 0x1f, 0x44, 0x00, 0x00)
++# define _SDT_DEF_NOP	_SDT_ASM_1(.balign 16)				\
++			_SDT_ASM_10(990: .byte 0x66, 0x2e, 0x0f, 0x1f, 0x84, \
++				    0x00, 0x00, 0x00, 0x00, 0x00)
 +#else
 +# define _SDT_DEF_NOP	_SDT_ASM_1(990: _SDT_NOP)
 +#endif
@@ -667,7 +724,7 @@ index 0000000..64c4949
 +
 +#endif /* sys/sdt.h */
 diff --git a/dlls/ntdll/unix/server.c b/dlls/ntdll/unix/server.c
-index 730a0cd..c53f349 100644
+index 730a0cd..e46e699 100644
 --- a/dlls/ntdll/unix/server.c
 +++ b/dlls/ntdll/unix/server.c
 @@ -79,6 +79,7 @@
@@ -682,8 +739,8 @@ index 730a0cd..c53f349 100644
  
  static const char *server_dir;
  
-+/* fingerprint of the "wine" USDT trace points for the build audit */
-+static const char wine_usdt_marker[] __attribute__((used)) = "WINE_USDT_V1";
++/* fingerprint of the "wine" USDT sites for the build audit; V2: 10-byte nops */
++static const char wine_usdt_marker[] __attribute__((used)) = "WINE_USDT_V2";
 +
  unsigned int supported_machines_count = 0;
  USHORT supported_machines[8] = { 0 };

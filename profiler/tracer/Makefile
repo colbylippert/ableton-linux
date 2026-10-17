@@ -9,12 +9,15 @@
 #   make            -> build/wine-trace (+ build/vmlinux.h, build/wine-trace.bpf.o, build/wine-trace.skel.h)
 #   make check      -> build + static sanity checks (program sections, maps, --version)
 #   make test       -> JIT prologue classifier unit test (no root, no BPF load)
+#   make test-python -> the Python tests (unittest discover -s profiler/tracer/tests -t . from the repo root)
+#   make trapcal    -> build/trapcal.exe, the trap calibration workload (mingw-w64; calibrate.py builds it too)
 #   make self-check -> build + `sudo -n build/wine-trace --self-check` (loads, never attaches)
 #   make test-gate  -> a deliberately broken build (one USDT program with a 128-byte frame) whose
 #                      self-check must refuse with exit 2 (loads, never attaches; needs sudo -n)
 #   make clean
 #
-# Overrides: CLANG=, BPFTOOL=, CC=, BUILD=, VMLINUX_BTF=, BPF_CPU=v3, BPF_EXTRA= (extra clang flags)
+# Overrides: CLANG=, BPFTOOL=, CC=, BUILD=, VMLINUX_BTF=, BPF_CPU=v3, BPF_EXTRA= (extra clang flags),
+# MINGW= (the PE compiler of trapcal.exe), PYTHON=
 
 CLANG      ?= clang
 BPFTOOL    ?= bpftool
@@ -25,6 +28,8 @@ BPF_CPU    ?= v3
 ARCH       ?= x86
 BPF_EXTRA  ?=
 SUDO       ?= sudo -n
+MINGW      ?= x86_64-w64-mingw32-gcc
+PYTHON     ?= python3
 
 # vmlinux.h is generated from the kernel's BTF and is not -Wextra clean (missing declarations):
 # it comes in through -isystem so that only warnings of our own code are printed.
@@ -41,8 +46,9 @@ SKEL  := $(BUILD)/wine-trace.skel.h
 VMLX  := $(BUILD)/vmlinux.h
 JITT  := $(BUILD)/test-jit-classifier
 GATE  := $(BUILD)/gate
+TRAPCAL := $(BUILD)/trapcal.exe
 
-.PHONY: all clean check vmlinux test self-check test-gate
+.PHONY: all clean check vmlinux test test-python trapcal self-check test-gate
 
 all: $(BIN)
 
@@ -80,6 +86,14 @@ $(JITT): tests/test_jit_classifier.c wine-trace.h | $(BUILD)
 
 test: $(JITT)
 	$(JITT)
+
+test-python:
+	cd ../.. && $(PYTHON) -I -m unittest discover -s profiler/tracer/tests -t .
+
+trapcal: $(TRAPCAL)
+
+$(TRAPCAL): trapcal.c | $(BUILD)
+	$(MINGW) -Wall -Wextra -O1 -nostartfiles -Wl,-e,mainCRTStartup -o $@ trapcal.c -lkernel32 -lntdll
 
 self-check: all
 	$(SUDO) $(BIN) --self-check > $(BUILD)/stack-check.json

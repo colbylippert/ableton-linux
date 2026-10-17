@@ -449,14 +449,26 @@ Apply them in sequence with the rest of the series.
   `server_req_start` and `server_req_end` around the wineserver request in
   `server_call_unlocked`, and `server_wait_start` and `server_wait_end`
   around `wait_select_reply` (`dlls/ntdll/unix/server.c`). Each site is one
-  5-byte nop plus a descriptor in the non-allocated `.note.stapsdt` section;
-  nothing runs until an eBPF tracer attaches to a chosen process, and there
-  is no switch to set. `dlls/ntdll/unix/sdt.h` is systemtap's `<sys/sdt.h>`
-  (CC0) with the x86_64 nop widened so the kernel's optimised uprobe applies;
-  `sdt-config.h` enables the `?` and `R` section flags. `sync.c` is
-  untouched, so `performance/0001` keeps applying. The fingerprint literal is
-  `WINE_USDT_V1`, and the audit also counts the eight probe names in
-  `ntdll.so`. See `profiler/tracer/README.md`.
+  10-byte nop (`66 2e 0f 1f 84 00 00 00 00 00`, 16-byte aligned) plus a
+  descriptor in the non-allocated `.note.stapsdt` section; nothing runs
+  until an eBPF tracer attaches to a chosen process, and there is no switch
+  to set. That nop is the only form Linux 7.2 optimises: the first hit
+  rewrites the site to `lea -0x80(%rsp),%rsp; call` into the process's
+  `[uprobes-trampoline]`, and every later hit costs a syscall instead of an
+  int3 trap (about 170 instead of 430 ns per hit on the profiling laptop).
+  The alignment keeps every site inside one 4 KiB page: Linux 7.2.9 puts
+  no uprobe at all on a 10-byte nop that crosses one (attaching fails with
+  `ENOTSUPP`, or the probe silently never fires). Tracing the sites needs
+  Linux 7.2 or later: an older kernel refuses a uprobe on that nop, because
+  its `%cs` prefix makes `uprobe_init_insn()` return `ENOTSUPP` (error
+  524), where the earlier 5-byte nop traced on any kernel.
+  `dlls/ntdll/unix/sdt.h` is systemtap's `<sys/sdt.h>` (CC0) with that
+  x86_64 site; `sdt-config.h` enables the `?` and `R` section flags.
+  `sync.c` is untouched, so `performance/0001` keeps applying. The
+  fingerprint literal is `WINE_USDT_V2` (`V1` marked the earlier 5-byte
+  nop); the audit also counts the eight probe names in `ntdll.so` and
+  checks that every site is that nop and stays inside one page. See
+  `profiler/tracer/README.md`.
 - `pipeasio/0017` adds six USDT probes (provider `pipeasio`) to the PipeASIO
   driver: `cycle_start` and `cycle_end` around the PipeWire cycle in
   `audio_on_process`, and `block_start`, `block_before_live`,
@@ -464,6 +476,10 @@ Apply them in sequence with the rest of the series.
   per-instance block sequence and carrying the cycle deadline (PipeWire's
   next wakeup). Telemetry samples gain the sequence and the slack against
   that deadline, the per-second `cycles=` line gains `block_range=A-B late=N`
-  (the fingerprint), and the data-loop and lifecycle threads are named
+  (one fingerprint), and the data-loop and lifecycle threads are named
   `pipeasio-rt` and `pipeasio-worker`. The WoW64 PE half never sees `sdt.h`.
-  The audit counts the six probe names in `pipeasio64.dll.so`.
+  The sites use the same 16-byte aligned 10-byte nop as `0108`
+  (`include/sdt.h`), so tracing them needs Linux 7.2 or later as well, and
+  `src/audio.c` carries the second fingerprint, `PIPEASIO_USDT_V2`. The
+  audit counts the six probe names in `pipeasio64.dll.so` and checks every
+  site as for `0108`.

@@ -24,8 +24,9 @@ backend; a forced libbpf start still fails when the loader's own pre-attach self
 | `gen_tables.py` | Generates `tables/wine-<ver>.json` (syscall ids, wineserver request numbers, unix-call codes) from a patched Wine tree. |
 | `tables/wine-11.13.json` | Generated from the 11.13 base + the 96-patch series (`series-aceb236`) + 0108 (table inputs unchanged by 0108), protocol 957. |
 | `validate.py` | Compares a traced `tools/traceprobe.exe` run (its `EXPECT` lines) and PipeASIO telemetry with the tracer's output (design B section 7). |
-| `tests/test_reduce.py`, `tests/test_bt_template.py`, `tests/test_gen_tables.py`, `tests/test_validate.py`, `tests/test_symbolize.py`, `tests/test_jit_classifier.py` (+ `.c`) | `python3 -I -m unittest discover -s profiler/tracer/tests -v` from the repo root; the C classifier test also runs as `make -C profiler/tracer test`. |
-| `../bin/wine-trace` | The CLI (`start`/`stop`/`run`/`status`) shared with the suite and the root helper. |
+| `calibrate.py`, `trapcal.c` | The trap calibration (`wine-trace calibrate`): times `trapcal.exe`'s NtYieldExecution loops in the prefix untraced and traced and writes the measured cost per probe hit (BUILD.md, "Trap calibration"). |
+| `tests/test_reduce.py`, `tests/test_bt_template.py`, `tests/test_gen_tables.py`, `tests/test_validate.py`, `tests/test_symbolize.py`, `tests/test_calibrate.py`, `tests/test_jit_classifier.py` (+ `.c`) | `python3 -I -m unittest discover -s profiler/tracer/tests -t .` (or `-v` instead of `-t .`) from the repo root, `make -C profiler/tracer test-python`; the C classifier test also runs as `make -C profiler/tracer test`. |
+| `../bin/wine-trace` | The CLI (`start`/`stop`/`run`/`status`/`calibrate`) shared with the suite and the root helper. |
 
 ## Callers (libbpf backend)
 
@@ -41,10 +42,10 @@ apportioned to the callers sampled for the same (tid, kind, id) in the same bloc
 (`caller_basis: block`), else in the whole run (`run`); server requests and NTSync waits/wakes use
 their enclosing call's samples (`parent-block`, `parent-run`); `unsampled` when that thread never
 sampled the id. `scripts/bench-report.py interface` ranks call sites by these callers (it prefers
-each crossing's recorded caller). The libbpf `summary.json` ranks the nested kinds apart
-(`nested_call_sites`) and shares each late block's lost slack among the top-level crossings of
-audio-role threads only (BUILD.md, "Lost slack"); the reducer's summary and `bench-report.py`
-still share it among all crossings.
+each crossing's recorded caller). The libbpf `summary.json`, the reducer's summary and
+`bench-report.py interface` rank the nested kinds apart (`nested_call_sites`, keyed by their
+`parent` too) and share each late block's lost slack among the top-level crossings of
+audio-role threads only (BUILD.md, "Lost slack"), so `report.md` never counts one wait twice.
 
 ## Running (passwordless `sudo -n`)
 
@@ -54,6 +55,7 @@ sudo -n profiler/bin/wine-trace start --out DIR --pid 4200 --pid 4100 --run-id T
 sudo -n profiler/bin/wine-trace status --out DIR                                      # exit 0 running, 3 not
 sudo -n profiler/bin/wine-trace stop  --out DIR                                       # SIGINT, reduce, chown
 sudo -n profiler/bin/wine-trace run   --out DIR --duration 30 --mode drilldown        # start+sleep+stop
+profiler/bin/wine-trace calibrate                     # as the prefix's user, Live stopped (BUILD.md)
 ```
 
 `start` options: `--pid P` (repeatable; without it the prefix pids come from
@@ -165,8 +167,14 @@ event, not the wrapper's stop time. `summary.json` `tracer.loss` and `tracer.jso
 evidence (`source`, `lower_bound`, `reported_by_bpftrace`, `recursion_misses`, `by_kind`,
 `emitted`, `received`, `received_after_counters`). `bench-report.py interface` turns a null
 `lost_events`, `clean_exit: false` or a `tracer_exit` other than `clean` into the
-`interface-tracer-unclean` confounder, a non-zero count into `interface-lost-events` and a
-non-empty `private_stack_risky` into `interface-tracer-private-stack`.
+`interface-tracer-unclean` confounder and a non-empty `private_stack_risky` into
+`interface-tracer-private-stack`.  `interface-lost-events` fires when events were lost and the
+ring buffer dropped records (libbpf `loss.ringbuf_drops`, or its `ringbuf_drops_*` kinds; for this
+prototype every lost line except the recursion misses), or the loss exceeds 0.1 % of the probe
+hits (`LOST_EVENTS_CONFOUNDER_FRACTION`), or the hits are unknown: the kernel's recursion misses
+on the NTSync fentry programs alone are ~1e-4 of the hits on every Live run.  The section keeps
+`lost_events`, `lost_events_fraction`, `ringbuf_drops`, `lost_events_threshold` and
+`lost_events_confounded` either way, and `report.md` prints the fraction.
 
 ## Stack budget (format 3)
 
@@ -210,15 +218,23 @@ Other lines starting with `@` and anything unknown are ignored (the unknown ones
 * A format-3 unix-call `E` line gets its frame and PE caller from the `R` line of the same tid
   within 1 ms (`unixcall_entries_without_r`, `unixcall_r_lines_unmatched`,
   `unixcall_r_lines_too_late` count the misses).
-* `S`, `W`/`w` and `K` nest inside the innermost open entry of their tid and inherit its caller.
+* `S`, `W`/`w` and `K` nest inside the innermost open entry of their tid and inherit its caller;
+  their crossings and events record that entry as `parent` (`{"kind": "syscall", "id":
+  "NtWaitForSingleObject"}`), and a parent makes a separate site (header `nesting: parent`,
+  reducer `reduce.py/3`). Without an open entry they are top-level (caller `none`).
 * Block association (design B section 3b): the `seq` printed at entry decides. `seq > 0` →
   that block's `crossings`; `seq == 0` → the 100 ms window bucket of the thread (`threads.jsonl`),
   flagged `between_blocks` for the callback thread. An exit never moves an event.
 * `late` = `slack_ns < 0`; `near_late` = `0 ≤ slack_ns < near_late_fraction × period` (the mode
   of `period_ns`; exclusive of `late`). `lost_slack.total_ns` = Σ over late and near-late blocks of
-  `near_late_slack_ns − slack_ns`; each block's lost slack is attributed to its crossings in
-  proportion to their `total_ns`, capped at the crossing time (`attributed_ns`), the rest is
-  `unattributed_ns`. `call_sites` are ranked by `total_ns_in_late_blocks`, then count.
+  `near_late_slack_ns − slack_ns`; each block's lost slack is attributed to its top-level
+  crossings of audio-role threads (`pipeasio_callback`, `audio_worker`, `pipeasio_rt`,
+  `pipeasio_worker`, `plugin:*`) in proportion to their `total_ns`, capped at that time
+  (`attributed_ns`), the rest is `unattributed_ns` (the libbpf tracer's rule, BUILD.md "Lost
+  slack"). `call_sites` (top-level crossings, with `share_of_lost_slack`) and `nested_call_sites`
+  (nested ones, keyed `kind|id|pkind:pid|caller`, no share: their time is part of the enclosing
+  call's) are ranked by `total_ns_in_late_blocks`, then count; a site counts once per block for
+  `late_blocks`/`per_late_block`, however many threads made it.
 * Caller placeholders until `symbolize.py` runs: syscalls `ntdll.dll!<Name>+0x14` /
   `win32u.dll!<Name>+0x14` (the stub return address is always +0x14), unix calls `pe!0x<rip>`,
   nested kinds inherit. Unix-call ids are `<module>.so:<code name>` when the handle falls inside
@@ -237,12 +253,13 @@ Outputs (first line of each `.jsonl` is a `{"type":"header"}` record with `monot
 tracer version, pids, mode, tables): `blocks.jsonl` (per block: `seq, t_start, t_before_live,
 t_after_live, t_end, clock_nsec, deadline_ns, period_ns, nframes, rate, callback_tid,
 wake_latency_ns, pre_ns, live_ns, post_ns, elapsed_ns, slack_ns, late, near_late, missed_cycles,
-flags, crossings[{tid, role, kind, id, caller, n, total_ns, max_ns, woken_by?}], offcpu[], stacks[],
-cycle?`), `threads.jsonl` (per 100 ms window × tid: `t, window_ms, pid, tid, comm, role, oncpu_ns,
+flags, crossings[{tid, role, kind, id, caller, parent?, n, total_ns, max_ns, woken_by?}], offcpu[],
+stacks[], cycle?`), `threads.jsonl` (per 100 ms window × tid: `t, window_ms, pid, tid, comm, role, oncpu_ns,
 offcpu_ns, wakeups, run_delay_ns, crossings{kind:{n,total_ns}}, top_ids[[id,n,total_ns]],
 between_blocks?`; sched fields are `null` without `--sched`), `summary.json` (`tracer, thresholds,
-blocks, lost_slack, call_sites, kinds, roles, hotspots_non_audio, counters, warnings`),
-`events.jsonl` (drilldown: `t, tid, role, kind, id, caller, dur_ns, status, seq, woken_by?`).
+blocks, lost_slack, call_sites, nested_call_sites, kinds, roles, hotspots_non_audio, counters,
+warnings`), `events.jsonl` (drilldown: `t, tid, role, kind, id, caller, parent?, dur_ns, status,
+seq, woken_by?`).
 `tracer.json` gains `stopped_monotonic_ns`, `lost_events`, `probe_hits`, `counters`, `blocks`,
 `overhead_estimate_ns_per_block` (probe hits per block × `--ns-per-hit`, an assumption, not a
 measurement).
@@ -270,8 +287,14 @@ picks `tables/wine-<runtime version>.json` and warns on a mismatch.
 ## Tests
 
 ```bash
-python3 -I -m unittest discover -s profiler/tracer/tests -v
+python3 -I -m unittest discover -s profiler/tracer/tests -t .     # dotted names (tests/ is a package)
+python3 -I -m unittest discover -s profiler/tracer/tests -v       # the same tests by file name
+make -C profiler/tracer test-python test                           # + the C classifier test
 ```
+
+`test_calibrate.py` checks the trap calibration's ELF reader of the dispatcher probe sites (5- and
+10-byte nops, page crossing), its result parsing, the CPU choice (`--cpu auto`: CPU 2 and, on a
+hybrid CPU, the first E-core) and the per-CPU figures; the timed runs need Wine and root.
 
 `test_reduce.py` builds a synthetic trace (three blocks: on time, late, near-late; nested and
 abandoned syscalls; an unmatched thread-start exit; wineserver request/wait nesting; an NTSync wait
@@ -293,8 +316,9 @@ checks the committed 11.13 table (`NtYieldExecution` 0x0046, `NtQueryPerformance
   tracer on bare metal, never from this prototype.
 * No stack windows: its callers stay placeholders (`ntdll.dll!<Name>+0x14`, `pe!0x<rip>` resolved
   to `module+offset`); real caller chains come from the libbpf backend (above).
-* USDT probes are attached by file (every process mapping that `ntdll.so` pays the nop → trap);
-  the pid filter only limits the output.
+* USDT probes are attached by file: every process mapping that `ntdll.so` pays a probe hit (with
+  the 10-byte sites on Linux 7.2+ the kernel's optimized uprobe call, not an int3 trap); the pid
+  filter only limits the output.
 * The stack budget depends on bpftrace's code generation and the kernel's private-stack rule:
   a new bpftrace or kernel can push a program over 64 bytes, which `wine-trace start` then
   refuses (re-measure, then trim the record).

@@ -1273,7 +1273,7 @@ cmd_format_patch() {
         info "1. $tail_var (scripts/build-audit.sh:$wt) → '$number-$name.patch'"
     fi
     info "2. add a FINGERPRINTS line (scripts/build-audit.sh:$fp; patch|ascii|wide|module|literal — a distinctive string the"
-    info "   change compiles into a shipped module, e.g. 0108|ascii|lib/wine/x86_64-unix/ntdll.so|WINE_USDT_V1), or a"
+    info "   change compiles into a shipped module, e.g. 0108|ascii|lib/wine/x86_64-unix/ntdll.so|WINE_USDT_V2), or a"
     info "   STAMP_ONLY line (scripts/build-audit.sh:$so; patch|reason) for logic-only changes — else the audit says UNLISTED"
     info "3. ./scripts/build-audit.sh --freeze   (rewrites patches/SERIES.sha256 — commit it with the patch)"
     info "4. the performance series stays exactly performance/0001 (scripts/test-release-policy.sh:436): new Wine work goes"

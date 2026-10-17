@@ -44,6 +44,7 @@
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
+#include <sys/utsname.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -60,13 +61,23 @@
 #define LOADER_NAME      "wine-trace.c"
 #define SUMMARY_SCHEMA   "ableton-linux-tracer-summary/v1"
 #define DEFAULT_NEAR_LATE 0.15
-/* assumed uprobe trap cost per hit: measured on the CachyOS laptop (7.2.9, B5b) as traceprobe
- * NtYieldExecution x5000 traced minus untraced (1795 - 662 ns per syscall) less the BPF run time
- * of the entry/exit pair (93 + 70 ns), i.e. ~485 ns per trap; not measured per run */
+/* Fallback uprobe trap cost per USDT hit when no matching calibration is given: B5b's one-off
+ * measurement on the CachyOS laptop (7.2.9, nop5 sites), traceprobe NtYieldExecution x5000
+ * traced minus untraced (1795 - 662 ns per syscall) less the BPF run time of the entry/exit
+ * pair (93 + 70 ns), i.e. ~485 ns per trap.  `wine-trace calibrate` measures it for the
+ * installed runtime and kernel (--trap-calibration); tracer.json says which one was used
+ * (overhead.trap_ns_source, trap_ns_assumed). */
 #define DEFAULT_TRAP_NS  500u
-#define BLOCK_FLUSH_NS   700000000ULL      /* write a block 0.7 s after its end */
+#define TRAP_CALIBRATION_SCHEMA "wine-trace-trap-calibration/1"
+/* A block is written 3 s after its end: a thread's accumulated crossings reach user space at its
+ * next wait or probe (wine-trace.bpf.c, acc_before_block), and keys arriving after their block was
+ * written only reach the thread's window (keys_for_flushed_block).  With 0.7 s, ~500 keys per
+ * 30 s of Live arrived too late for their block (B5c review; 2-30 now, none of audio-role threads).
+ * A window must outlive the blocks that started in it, whose crossings join it when they are
+ * written: 4 s. */
+#define BLOCK_FLUSH_NS   3000000000ULL     /* write a block 3 s after its end */
 #define BLOCK_GIVEUP_NS  5000000000ULL     /* a block without block_end after 5 s is incomplete */
-#define WINDOW_FLUSH_W   25                /* write a 100 ms window 2.5 s after it */
+#define WINDOW_FLUSH_W   40                /* write a 100 ms window 4 s after it */
 #define FOLLOW_TIMEOUT_NS 15000000000ULL   /* a forked child must map ntdll.so within 15 s */
 #define MAPS_REFRESH_NS  2000000000ULL     /* re-read a process's executable ranges at most every 2 s */
 /* code-pointing words in a stack fingerprint: with 6, ~3 % of the B5b samples merged with a
@@ -101,6 +112,7 @@ static const char *const counter_names[CT__COUNT] = {
 	[CT_NTSYNC_WAIT_HITS] = "ntsync_wait_hits", [CT_NTSYNC_WAKE_HITS] = "ntsync_wake_hits",
 	[CT_OPEN_AT_EXIT] = "open_at_thread_exit", [CT_CALLBACK_RETURN] = "callback_returns",
 	[CT_NEVER_RETURNED] = "never_returned", [CT_ANOMALY_DROP] = "anomaly_records_dropped",
+	[CT_RB_DROP_AGG] = "ringbuf_drops_agg_crossings",
 };
 
 /* USDT programs: probe-hit key (tracer.json probe_hits, the prototype's names) */
@@ -151,6 +163,9 @@ static struct {
 	double near_late;
 	int keep_stacks;          /* -1 = default */
 	__u32 trap_ns;
+	int trap_set;             /* --trap-ns given (source "option") */
+	const char *trap_calibration;  /* --trap-calibration FILE (written by `wine-trace calibrate`) */
+	int sched_records;        /* --sched-records: drill-down REC_WAKE / REC_OFFCPU records */
 	int perf_hz;
 	int verbose;
 	int quiet;
@@ -1305,23 +1320,35 @@ static const char *role_of(__u32 tid)
 	return t->role;
 }
 
-/* --roles audio: keep the kernel's tid filter in step with the classifier */
+/* Keep the kernel's `tids` map (the audio-role threads) in step with the classifier, in every
+ * mode: --roles audio filters by it, and a thread without an audio role ships its accumulated
+ * crossings before every wait (wine-trace.bpf.c, acc_before_block).  role_gen tells the threads
+ * to look their entry up again. */
 static void thr_sync_bpf_role(struct thr *t)
 {
 	__u8 r;
 	int fd;
 
-	if (!opt.roles_audio || !skel)
+	if (!skel)
+		return;
+	fd = bpf_map__fd(skel->maps.tids);
+	if (fd < 0)             /* not loaded yet */
 		return;
 	r = role_enum(role_of(t->tid));
 	if (r == t->bpf_role)
 		return;
-	fd = bpf_map__fd(skel->maps.tids);
+	if (ROLE_IS_AUDIO(r) == ROLE_IS_AUDIO(t->bpf_role)) {
+		if (ROLE_IS_AUDIO(r))
+			bpf_map_update_elem(fd, &t->tid, &r, BPF_ANY);
+		t->bpf_role = r;
+		return;
+	}
 	if (ROLE_IS_AUDIO(r))
 		bpf_map_update_elem(fd, &t->tid, &r, BPF_ANY);
 	else
 		bpf_map_delete_elem(fd, &t->tid);
 	t->bpf_role = r;
+	__atomic_add_fetch(&skel->bss->role_gen, 1, __ATOMIC_RELEASE);   /* after the map change */
 }
 
 static void thr_set_comm(__u32 tid, __u32 pid, const char *comm)
@@ -1588,7 +1615,7 @@ static void write_header(FILE *f, const char *file)
 	}
 	fprintf(f, "],\"mode\":\"%s\",\"sample\":{\"rate\":1,\"stack_sample_n\":%u,\"stack_bytes\":%u,"
 		   "\"slack_threshold_pct\":%u,\"keep_stacks\":\"%s\",\"roles\":\"%s\",\"no_exit\":%s},"
-		   "\"near_late_fraction\":%g,\"window_ms\":%llu,\"clock\":\"CLOCK_MONOTONIC\"}\n",
+		   "\"near_late_fraction\":%g,\"window_ms\":%llu,\"clock\":\"CLOCK_MONOTONIC\",\"nesting\":\"parent\"}\n",
 		mode_name(), opt.sample_n, opt.stack_bytes, opt.slack_pct, keep_name(),
 		opt.roles_audio ? "audio" : "all", opt.no_exit ? "true" : "false", opt.near_late,
 		(unsigned long long)(WINDOW_NS / 1000000ULL));
@@ -1652,12 +1679,19 @@ static struct {
 
 static struct {
 	__u64 rb_records[16];
-	__u64 keys_drained, drains, keys_for_flushed_block, keys_for_unknown_block;
+	/* keys_before_block_record: arrived while their block had no record yet (normal since 0.4: the
+	 * block's record is written at block_end); keys_for_unknown_block: their block never got one
+	 * (counted when it is written or given up); keys_for_flushed_block: arrived after their block
+	 * was written (moved to the thread's window), _audio: of audio-role threads */
+	__u64 keys_drained, drains, keys_for_flushed_block, keys_for_flushed_block_audio;
+	__u64 keys_before_block_record, keys_for_unknown_block;
 	__u64 stack_samples, stack_reps, stack_reps_full, stack_refs_in_blocks;
 	__u64 events_written, blocks_written, windows_written;
 	__u64 forks, follow_attached, follow_failed, offcpu_records, wake_records;
 	__u64 open_entries_at_end, invalid_blocks, rb_short;
 	__u64 blocks_rebuilt, follow_skipped_unverified_ntdll, anomalies;
+	__u64 acc_entries, acc_entries_at_stop;          /* REC_AGG entries / accumulator entries drained at stop */
+	__u64 nt_wait_exited, nt_wake_exited, nt_wait_live, nt_wake_live;   /* per-thread NTSync hit counts */
 } cnt;
 
 static struct site *site_get(int kind, const char *name, int pkind, const char *pname)
@@ -2222,6 +2256,8 @@ static void block_flush(struct block *b)
 			bstat.incomplete++;
 		else
 			cnt.invalid_blocks++;
+		if (!b->have_start && !b->have_end)     /* only keys ever arrived for it */
+			cnt.keys_for_unknown_block += b->nx;
 		/* its crossings still count for the thread windows */
 		for (i = 0; i < b->nx; i++)
 			twin_add((b->have_start ? b->t0 : b->t1) / WINDOW_NS, &b->x[i], false);
@@ -2537,16 +2573,37 @@ static void consume_key(const struct agg_key *k, const struct agg_val *v)
 
 			if (t) {
 				cnt.keys_for_flushed_block++;
+				if (role_is_audio(role_of(k->tid)))
+					cnt.keys_for_flushed_block_audio++;
 				twin_add(*t / WINDOW_NS, &x, false);
 				return;
 			}
-			/* a block whose block_start we have not seen yet (or never will) */
-			cnt.keys_for_unknown_block++;
+			/* a block whose record has not arrived yet (0.4: written at block_end) or never
+			 * will (keys_for_unknown_block, counted in block_flush) */
+			cnt.keys_before_block_record++;
 			b = block_get(k->seq, true);
 		}
 		grow((void **)&b->x, &b->capx, b->nx + 1, sizeof(*b->x));
 		b->x[b->nx++] = x;
 	}
+}
+
+/* one accumulator entry of a REC_AGG record (or of a tstate drained at stop) */
+static void consume_acc(__u32 tid, const struct acc_ent *e)
+{
+	struct agg_key k = {
+		.seq = e->seq, .tid = tid, .kind = (__u8)(e->kfl & 0xff), .pkind = (__u8)((e->kfl >> 8) & 0xff),
+		.flags = (__u16)(e->kfl >> 16), .id = (__u32)e->idp, .pid_ = (__u32)(e->idp >> 32),
+	};
+	struct agg_val v = {
+		.count = e->count, .total_ns = e->total_ns, .max_ns = e->max_ns, .oncpu_ns = e->oncpu_ns,
+		.last_waker = e->waker,
+	};
+
+	if (!e->count)
+		return;
+	cnt.acc_entries++;
+	consume_key(&k, &v);
 }
 
 static struct agg_key *drain_keys;
@@ -2646,6 +2703,39 @@ static void handle_block_rec(const struct rec_block *r)
 	struct block *b;
 
 	switch (r->phase) {
+	case PHASE_BLOCK: {
+		/* 0.4: the whole block in one record, written at its end (h.ts) */
+		struct thr *t = thr_get(r->h.tid, 0);
+
+		if (!t->callback) {
+			t->callback = true;
+			t->role_valid = false;
+			thr_sync_bpf_role(t);
+		}
+		callback_tid = r->h.tid;
+		b = block_get(r->seq, true);
+		b->have_start = true;
+		b->tid = r->h.tid;
+		b->nframes = (__u32)r->a[0];
+		b->rate = (__u32)(r->a[0] >> 32);
+		b->clock_nsec = r->a[1];
+		b->deadline = r->a[2];
+		b->start_flags = (__u32)r->a[3];
+		b->t0 = r->a[4];
+		if (r->a[5]) {
+			b->before = r->a[5];
+			b->have_before = true;
+		}
+		if (r->a[6]) {
+			b->after = r->a[6];
+			b->have_after = true;
+		}
+		b->t1 = r->h.ts;
+		b->end_flags = (__u32)r->a[7];
+		b->missed = (__u32)r->a[8];
+		b->have_end = true;
+		break;
+	}
 	case PHASE_BLOCK_START: {
 		struct thr *t = thr_get(r->h.tid, 0);
 
@@ -3014,6 +3104,15 @@ static int handle_rec(void *ctx, void *data, size_t size)
 		if (size >= sizeof(struct rec_block))
 			handle_block_rec(data);
 		break;
+	case REC_AGG:
+		if (size >= sizeof(struct rec_agg)) {
+			const struct rec_agg *r = data;
+			__u32 i, n = r->n < ACC_SLOTS ? r->n : ACC_SLOTS;
+
+			for (i = 0; i < n; i++)
+				consume_acc(h->tid, &r->e[i]);
+		}
+		break;
 	case REC_STACK:
 		if (size >= sizeof(struct rec_stack))
 			handle_stack_rec(data, size);
@@ -3076,6 +3175,8 @@ static int handle_rec(void *ctx, void *data, size_t size)
 			t->open_at_exit += r->open_at_exit;
 			t->never_returned += r->never_returned;
 			t->counters_final = true;
+			cnt.nt_wait_exited += r->nt_wait_hits;
+			cnt.nt_wake_exited += r->nt_wake_hits;
 			if (r->flags & 1) {
 				struct proc *p = proc_get(r->pid, false);
 
@@ -3428,6 +3529,7 @@ static void set_config(void)
 	c->count_hits = stats_fd < 0 ? 1 : 0;
 	c->fast_args = (__u32)fast_args;
 	c->callback_return_id = syscall_id_of("NtCallbackReturn");
+	c->sched_records = (__u32)opt.sched_records;
 }
 
 /* open + load with the NTSync fallback chain; returns 0 or exits */
@@ -3712,6 +3814,11 @@ static void print_stack_check(FILE *f)
 	}
 }
 
+/* The kernel's ENOTSUPP (include/linux/errno.h; not in the C library's errno.h): the uprobe
+ * code refused the instruction at the probe site. */
+#define WT_ENOTSUPP 524
+static unsigned usdt_enotsupp;      /* USDT attaches the kernel refused with ENOTSUPP */
+
 static int attach_usdt_one(struct bpf_program *prog, __u32 pid, const char *path, const char *provider,
 			   const char *name)
 {
@@ -3722,6 +3829,17 @@ static int attach_usdt_one(struct bpf_program *prog, __u32 pid, const char *path
 
 		if (opt.verbose)
 			logmsg("attach %s:%s to pid %u (%s) failed: %s", provider, name, pid, path, strerror(e));
+		if (e == WT_ENOTSUPP && !usdt_enotsupp++) {
+			struct utsname un;
+
+			/* patch 0108 / pipeasio 0017 sites are the 10-byte nop 66 2e 0f 1f 84 00 00 00 00 00:
+			 * only a kernel that optimizes it (Linux 7.2+) skips the instruction check, an older
+			 * one rejects its %cs prefix (is_prefix_bad), and 7.2 rejects a site crossing a page */
+			warn_add("the kernel refused a uprobe on %s:%s (%s) with ENOTSUPP (error 524): the 10-byte nop "
+				 "USDT sites of patch 0108 / pipeasio 0017 need Linux 7.2 or later (running %s), which "
+				 "also refuses a site that crosses a 4 KiB page (scripts/build-audit.sh "
+				 "--check-usdt-sites)", provider, name, path, uname(&un) == 0 ? un.release : "?");
+		}
 		return -e;
 	}
 	add_link(l);
@@ -3933,6 +4051,10 @@ static void read_counters(void)
 
 	for (k = 0; k < CT__COUNT; k++)
 		ctr[k] = ((volatile __u64 *)skel->bss->counters)[k];
+	/* NTSync hits are per-thread fields (no shared atomic in the hot path): exited threads report
+	 * them in REC_EXIT, the live ones are read from the tstate map at stop */
+	ctr[CT_NTSYNC_WAIT_HITS] += cnt.nt_wait_exited + cnt.nt_wait_live;
+	ctr[CT_NTSYNC_WAKE_HITS] += cnt.nt_wake_exited + cnt.nt_wake_live;
 	for (k = 0; k < N_USDT_PROGS; k++)
 		phits[k] = stats_fd < 0 ? ((volatile __u64 *)skel->bss->hits)[usdt_progs[k].hit] : 0;
 	sched_switch_runs = sched_waking_runs = perf_runs = 0;
@@ -4018,12 +4140,141 @@ static int cmp_hot(const void *a, const void *b)
 	return strcmp(x->key, y->key);
 }
 
+/* ---- uprobe trap cost per USDT hit: a matching calibration, --trap-ns, or the fallback ----
+ * `wine-trace calibrate` (profiler/tracer/calibrate.py) times a tight NtYieldExecution loop in the
+ * prefix untraced and traced and writes the cost of one probe hit outside the BPF program (the
+ * uprobe trap or optimised-uprobe entry and the run-time-statistics bookkeeping) for this kernel
+ * and this ntdll.so.  A file for another kernel or another ntdll.so build is rejected (the
+ * reason is kept); the fallback DEFAULT_TRAP_NS is flagged trap_ns_assumed. */
+static struct {
+	double base_ns;            /* per hit with one traced process (calibration or option) */
+	double base_max_ns;        /* the slowest calibrated CPU's (ns_per_trap_max; 0 = one CPU only) */
+	double extra_consumer_ns;  /* per additional traced process (one uprobe consumer each) */
+	__u32 ns;                  /* the value used: base + (usdt_processes - 1) x extra */
+	__u32 ns_max;              /* the same from base_max_ns (0 = none) */
+	const char *source;        /* "calibration" | "option" | "assumed-default" */
+	bool assumed;
+	char rejected[320];        /* why --trap-calibration was not used ("" = used or not given) */
+	char *json;                /* the calibration record (compact) when used */
+	int usdt_processes;
+} trap = { .base_ns = DEFAULT_TRAP_NS, .source = "assumed-default", .assumed = true };
+
+static const char *traced_ntdll(void)
+{
+	size_t i;
+
+	if (opt.ntdll && opt.ntdll[0])
+		return opt.ntdll;
+	for (i = 0; i < procs.cap; i++) {
+		struct proc *p;
+
+		if (!procs.used[i])
+			continue;
+		p = (struct proc *)(uintptr_t)procs.vals[i];
+		if (p->initial && p->ntdll[0])
+			return p->ntdll;
+	}
+	return NULL;
+}
+
+static double jv_num(const struct jv *v, double dflt)
+{
+	return v && v->t == J_NUM && v->s ? strtod(v->s, NULL) : dflt;
+}
+
+static void load_trap_calibration(void)
+{
+	struct jv *root = NULL, *nt, *v;
+	const char *err = NULL, *ntdll = traced_ntdll();
+	char *text, real[PATH_MAX];
+	struct utsname un;
+	struct stat st;
+	double ns;
+
+	if (opt.trap_set) {
+		trap.base_ns = opt.trap_ns;
+		trap.source = "option";
+		trap.assumed = false;
+	}
+	if (!opt.trap_calibration || !opt.trap_calibration[0])
+		return;
+	text = read_file(opt.trap_calibration, NULL);
+	if (!text) {
+		snprintf(trap.rejected, sizeof(trap.rejected), "cannot read %s: %s", opt.trap_calibration, strerror(errno));
+		goto out;
+	}
+	root = json_parse(text, &err);
+	free(text);
+	if (!root || root->t != J_OBJ) {
+		snprintf(trap.rejected, sizeof(trap.rejected), "%s is not a JSON object (%s)", opt.trap_calibration,
+			 err ? err : "?");
+		goto out;
+	}
+	v = jv_get(root, "schema");
+	if (!v || v->t != J_STR || strcmp(v->s, TRAP_CALIBRATION_SCHEMA) != 0) {
+		snprintf(trap.rejected, sizeof(trap.rejected), "schema is not %s", TRAP_CALIBRATION_SCHEMA);
+		goto out;
+	}
+	v = jv_get(root, "kernel");
+	if (uname(&un) != 0 || !v || v->t != J_STR || strcmp(v->s, un.release) != 0) {
+		snprintf(trap.rejected, sizeof(trap.rejected), "calibrated on kernel %s, running %s",
+			 v && v->t == J_STR ? v->s : "?", un.release);
+		goto out;
+	}
+	nt = jv_get(root, "ntdll");
+	if (!ntdll || !realpath(ntdll, real) || stat(real, &st) != 0) {
+		snprintf(trap.rejected, sizeof(trap.rejected), "the traced ntdll.so is unknown or unreadable");
+		goto out;
+	}
+	v = nt ? jv_get(nt, "path") : NULL;
+	if (!v || v->t != J_STR || strcmp(v->s, real) != 0 || (long long)jv_num(jv_get(nt, "size"), -1) != (long long)st.st_size ||
+	    (long long)jv_num(jv_get(nt, "mtime_ns"), -1) !=
+		    (long long)st.st_mtim.tv_sec * 1000000000LL + (long long)st.st_mtim.tv_nsec) {
+		snprintf(trap.rejected, sizeof(trap.rejected), "calibrated with another ntdll.so build (%.120s); tracing %.120s",
+			 v && v->t == J_STR ? v->s : "?", real);
+		goto out;
+	}
+	ns = jv_num(jv_get(root, "ns_per_trap"), -1.0);
+	if (!(ns > 0.0 && ns < 100000.0)) {
+		snprintf(trap.rejected, sizeof(trap.rejected), "ns_per_trap missing or implausible");
+		goto out;
+	}
+	if (!opt.trap_set) {            /* an explicit --trap-ns wins; the record is still kept */
+		double max_ns = jv_num(jv_get(root, "ns_per_trap_max"), 0.0);
+
+		trap.base_ns = ns;
+		/* calibrate.py/2: several CPUs (a P-core first, then an E-core); the first CPU's figure is
+		 * the estimate, the slowest one the *_max fields */
+		trap.base_max_ns = max_ns > ns && max_ns < 100000.0 ? max_ns : 0.0;
+		trap.extra_consumer_ns = jv_num(jv_get(root, "ns_per_extra_consumer"), 0.0);
+		if (!(trap.extra_consumer_ns >= 0.0 && trap.extra_consumer_ns < 10000.0))
+			trap.extra_consumer_ns = 0.0;
+		trap.source = "calibration";
+		trap.assumed = false;
+	}
+	{
+		size_t len = 0;
+		FILE *m = open_memstream(&trap.json, &len);
+
+		if (m) {
+			json_write(m, root, 0);
+			fclose(m);
+		}
+	}
+out:
+	if (trap.rejected[0])
+		warn_add("trap calibration not used: %s; the overhead estimate uses %s %.0f ns per probe hit", trap.rejected,
+			 trap.assumed ? "the assumed" : "--trap-ns", trap.base_ns);
+	jv_free(root);
+}
+
 struct overhead {
 	__u64 bpf_run_ns, bpf_run_cnt, usdt_run_ns, usdt_hits, kernel_run_ns, hits;
-	double bpf_ns_per_hit, hits_per_block, hits_per_s;
-	__u64 estimate_ns_per_block;
+	double bpf_ns_per_hit, hits_per_block, usdt_hits_per_block, hits_per_s;
+	double bpf_ns_per_block, trap_ns_per_block, trap_ns_per_block_max;
+	__u64 estimate_ns_per_block, estimate_ns_per_block_max;
 	double loader_user_s, loader_sys_s, loader_cpu_pct, wall_s;
-	double bpf_cpu_pct, trap_cpu_pct, total_cpu_pct;
+	double bpf_cpu_pct, trap_cpu_pct, trap_cpu_pct_max, total_cpu_pct;
 	long maxrss_kb;
 	bool stats_ok;
 };
@@ -4034,6 +4285,7 @@ static void collect_overhead(void)
 {
 	struct bpf_program *prog;
 	struct rusage ru;
+	size_t i;
 
 	memset(&ov, 0, sizeof(ov));
 	ov.stats_ok = stats_fd >= 0;
@@ -4049,11 +4301,29 @@ static void collect_overhead(void)
 		else
 			ov.kernel_run_ns += info.run_time_ns;
 	}
+	/* processes with USDT probes attached: each one is a consumer of the shared uprobes, so a hit
+	 * runs every attached process's handler (all but one return at once) */
+	trap.usdt_processes = 0;
+	for (i = 0; i < procs.cap; i++)
+		if (procs.used[i] && ((struct proc *)(uintptr_t)procs.vals[i])->attached)
+			trap.usdt_processes++;
+	trap.ns = (__u32)llround(trap.base_ns +
+				 (trap.usdt_processes > 1 ? (double)(trap.usdt_processes - 1) * trap.extra_consumer_ns : 0.0));
+	trap.ns_max = trap.base_max_ns > 0.0 ?
+		(__u32)llround(trap.base_max_ns +
+			       (trap.usdt_processes > 1 ? (double)(trap.usdt_processes - 1) * trap.extra_consumer_ns : 0.0)) : 0;
 	ov.usdt_hits = usdt_hits_total();
 	ov.hits = ov.usdt_hits + ctr[CT_NTSYNC_WAIT_HITS] + ctr[CT_NTSYNC_WAKE_HITS];
 	ov.bpf_ns_per_hit = ov.usdt_hits ? (double)ov.usdt_run_ns / (double)ov.usdt_hits : 0.0;
 	ov.hits_per_block = bstat.count ? (double)ov.hits / (double)bstat.count : 0.0;
-	ov.estimate_ns_per_block = (__u64)llround(ov.hits_per_block * (ov.bpf_ns_per_hit + (double)opt.trap_ns));
+	ov.usdt_hits_per_block = bstat.count ? (double)ov.usdt_hits / (double)bstat.count : 0.0;
+	/* every program's measured run time (USDT and kernel-side) plus the trap cost of the USDT hits
+	 * (the NTSync fentry programs have no trap); B5b multiplied all hits by the USDT mean + trap */
+	ov.bpf_ns_per_block = bstat.count ? (double)ov.bpf_run_ns / (double)bstat.count : 0.0;
+	ov.trap_ns_per_block = ov.usdt_hits_per_block * (double)trap.ns;
+	ov.estimate_ns_per_block = (__u64)llround(ov.bpf_ns_per_block + ov.trap_ns_per_block);
+	ov.trap_ns_per_block_max = ov.usdt_hits_per_block * (double)trap.ns_max;
+	ov.estimate_ns_per_block_max = (__u64)llround(ov.bpf_ns_per_block + ov.trap_ns_per_block_max);
 	getrusage(RUSAGE_SELF, &ru);
 	ov.loader_user_s = (double)ru.ru_utime.tv_sec + (double)ru.ru_utime.tv_usec / 1e6;
 	ov.loader_sys_s = (double)ru.ru_stime.tv_sec + (double)ru.ru_stime.tv_usec / 1e6;
@@ -4061,7 +4331,8 @@ static void collect_overhead(void)
 	ov.loader_cpu_pct = ov.wall_s > 0 ? 100.0 * (ov.loader_user_s + ov.loader_sys_s) / ov.wall_s : 0.0;
 	ov.hits_per_s = ov.wall_s > 0 ? (double)ov.hits / ov.wall_s : 0.0;
 	ov.bpf_cpu_pct = ov.wall_s > 0 ? 100.0 * (double)ov.bpf_run_ns / (ov.wall_s * 1e9) : 0.0;
-	ov.trap_cpu_pct = ov.wall_s > 0 ? 100.0 * (double)ov.usdt_hits * (double)opt.trap_ns / (ov.wall_s * 1e9) : 0.0;
+	ov.trap_cpu_pct = ov.wall_s > 0 ? 100.0 * (double)ov.usdt_hits * (double)trap.ns / (ov.wall_s * 1e9) : 0.0;
+	ov.trap_cpu_pct_max = ov.wall_s > 0 ? 100.0 * (double)ov.usdt_hits * (double)trap.ns_max / (ov.wall_s * 1e9) : 0.0;
 	ov.total_cpu_pct = ov.bpf_cpu_pct + ov.trap_cpu_pct + ov.loader_cpu_pct;
 	ov.maxrss_kb = ru.ru_maxrss;
 }
@@ -4072,12 +4343,19 @@ static void collect_overhead(void)
 static __u64 lost_events(void)
 {
 	return ctr[CT_RB_DROP_BLOCK] + ctr[CT_RB_DROP_EVENT] + ctr[CT_RB_DROP_OTHER] + ctr[CT_AGG_FULL] +
-	       ctr[CT_INFLIGHT_OVERFLOW] + ctr[CT_TSTATE_FULL] + rmisses_total;
+	       ctr[CT_RB_DROP_AGG] + ctr[CT_INFLIGHT_OVERFLOW] + ctr[CT_TSTATE_FULL] + rmisses_total;
+}
+
+/* lost records of the ring buffer itself (block phases, events, names/tasks, aggregates):
+ * bench-report's interface-lost-events confounder fires on any of these */
+static __u64 ringbuf_drops(void)
+{
+	return ctr[CT_RB_DROP_BLOCK] + ctr[CT_RB_DROP_EVENT] + ctr[CT_RB_DROP_OTHER] + ctr[CT_RB_DROP_AGG];
 }
 
 static void write_loss(FILE *f)
 {
-	static const int kinds[] = { CT_RB_DROP_BLOCK, CT_RB_DROP_EVENT, CT_RB_DROP_OTHER, CT_AGG_FULL,
+	static const int kinds[] = { CT_RB_DROP_BLOCK, CT_RB_DROP_EVENT, CT_RB_DROP_OTHER, CT_RB_DROP_AGG, CT_AGG_FULL,
 				     CT_INFLIGHT_OVERFLOW, CT_TSTATE_FULL };
 	size_t i;
 	bool first = true;
@@ -4092,9 +4370,9 @@ static void write_loss(FILE *f)
 	}
 	if (rmisses_total)
 		fprintf(f, "%s\"recursion_misses\":%llu", first ? "" : ",", (unsigned long long)rmisses_total);
-	fprintf(f, "},\"recursion_misses\":%llu,\"probe_hits\":%llu,\"fraction_of_hits\":%.6f,"
+	fprintf(f, "},\"recursion_misses\":%llu,\"ringbuf_drops\":%llu,\"probe_hits\":%llu,\"fraction_of_hits\":%.6f,"
 		   "\"stack_samples_dropped\":%llu,\"stack_samples_unstored\":%llu}",
-		(unsigned long long)rmisses_total, (unsigned long long)ov.hits,
+		(unsigned long long)rmisses_total, (unsigned long long)ringbuf_drops(), (unsigned long long)ov.hits,
 		ov.hits ? (double)lost_events() / (double)ov.hits : 0.0, (unsigned long long)ctr[CT_STACK_DROP],
 		(unsigned long long)cnt.stack_reps_full);
 }
@@ -4164,15 +4442,17 @@ static void write_counters_all(FILE *f)
 	for (k = 0; k < CT__COUNT; k++)
 		fprintf(f, "%s\"%s\":%llu", k ? "," : "", counter_names[k], (unsigned long long)ctr[k]);
 	fprintf(f, ",\"keys_drained\":%llu,\"drains\":%llu,\"keys_for_flushed_block\":%llu,"
+		   "\"keys_for_flushed_block_audio\":%llu,\"keys_before_block_record\":%llu,"
 		   "\"keys_for_unknown_block\":%llu,\"stack_samples\":%llu,\"stack_representatives\":%llu,"
 		   "\"stack_samples_unstored\":%llu,\"stack_refs_in_blocks\":%llu,\"events\":%llu,"
 		   "\"blocks_written\":%llu,\"windows_written\":%llu,\"incomplete_blocks\":%llu,\"invalid_blocks\":%llu,"
 		   "\"forks\":%llu,\"follow_attached\":%llu,\"follow_failed\":%llu,\"offcpu_records\":%llu,"
 		   "\"wake_records\":%llu,\"open_entries_at_end\":%llu,\"short_records\":%llu,\"ringbuf_drops\":%llu,"
 		   "\"recursion_misses\":%llu,\"blocks_rebuilt\":%llu,\"follow_skipped_unverified_ntdll\":%llu,"
-		   "\"anomaly_records\":%llu,\"ringbuf_records\":{",
+		   "\"anomaly_records\":%llu,\"acc_entries\":%llu,\"acc_entries_at_stop\":%llu,\"ringbuf_records\":{",
 		(unsigned long long)cnt.keys_drained, (unsigned long long)cnt.drains,
-		(unsigned long long)cnt.keys_for_flushed_block, (unsigned long long)cnt.keys_for_unknown_block,
+		(unsigned long long)cnt.keys_for_flushed_block, (unsigned long long)cnt.keys_for_flushed_block_audio,
+		(unsigned long long)cnt.keys_before_block_record, (unsigned long long)cnt.keys_for_unknown_block,
 		(unsigned long long)cnt.stack_samples, (unsigned long long)cnt.stack_reps,
 		(unsigned long long)cnt.stack_reps_full, (unsigned long long)cnt.stack_refs_in_blocks,
 		(unsigned long long)cnt.events_written, (unsigned long long)cnt.blocks_written,
@@ -4181,12 +4461,13 @@ static void write_counters_all(FILE *f)
 		(unsigned long long)cnt.follow_attached, (unsigned long long)cnt.follow_failed,
 		(unsigned long long)cnt.offcpu_records, (unsigned long long)cnt.wake_records,
 		(unsigned long long)cnt.open_entries_at_end, (unsigned long long)cnt.rb_short,
-		(unsigned long long)(ctr[CT_RB_DROP_BLOCK] + ctr[CT_RB_DROP_EVENT] + ctr[CT_RB_DROP_OTHER]),
+		(unsigned long long)ringbuf_drops(),
 		(unsigned long long)rmisses_total, (unsigned long long)cnt.blocks_rebuilt,
-		(unsigned long long)cnt.follow_skipped_unverified_ntdll, (unsigned long long)cnt.anomalies);
+		(unsigned long long)cnt.follow_skipped_unverified_ntdll, (unsigned long long)cnt.anomalies,
+		(unsigned long long)cnt.acc_entries, (unsigned long long)cnt.acc_entries_at_stop);
 	{
 		static const char *const rn[] = { "", "stack", "block", "wake", "offcpu", "name", "event", "unixlib",
-						  "fork", "thread", "exit", "anomaly" };
+						  "fork", "thread", "exit", "anomaly", "agg" };
 		bool first = true;
 
 		for (i = 1; i < sizeof(rn) / sizeof(rn[0]); i++) {
@@ -4254,19 +4535,43 @@ static void write_overhead(FILE *f)
 	fprintf(f, "{\"usdt_hits\":%llu,\"probe_hits\":%llu,\"probe_hits_per_s\":%.1f,\"bpf_stats_enabled\":%s,"
 		   "\"bpf_run_cnt\":%llu,\"bpf_run_time_ns\":%llu,\"usdt_bpf_run_time_ns\":%llu,"
 		   "\"kernel_bpf_run_time_ns\":%llu,\"bpf_ns_per_run\":%.1f,\"hits_per_block\":%.2f,"
-		   "\"assumed_trap_ns_per_hit\":%u,\"estimate_ns_per_block\":%llu,\"loader_user_s\":%.3f,"
+		   "\"usdt_hits_per_block\":%.2f,\"usdt_processes\":%d,\"trap_ns_per_hit\":%u,\"trap_ns_source\":\"%s\","
+		   "\"trap_ns_assumed\":%s,\"trap_calibration\":%s,",
+		(unsigned long long)ov.usdt_hits, (unsigned long long)ov.hits, ov.hits_per_s, ov.stats_ok ? "true" : "false",
+		(unsigned long long)ov.bpf_run_cnt, (unsigned long long)ov.bpf_run_ns, (unsigned long long)ov.usdt_run_ns,
+		(unsigned long long)ov.kernel_run_ns, ov.bpf_ns_per_hit, ov.hits_per_block, ov.usdt_hits_per_block,
+		trap.usdt_processes, trap.ns, trap.source, trap.assumed ? "true" : "false", trap.json ? trap.json : "null");
+	if (trap.rejected[0]) {
+		fputs("\"trap_calibration_rejected\":", f);
+		jstr(f, trap.rejected);
+		fputc(',', f);
+	}
+	if (trap.ns_max)
+		fprintf(f, "\"trap_ns_per_hit_max\":%u,\"trap_ns_per_block_max\":%.0f,\"estimate_ns_per_block_max\":%llu,"
+			   "\"trap_cpu_pct_estimate_max\":%.3f,",
+			trap.ns_max, ov.trap_ns_per_block_max, (unsigned long long)ov.estimate_ns_per_block_max,
+			ov.trap_cpu_pct_max);
+	fprintf(f, "\"assumed_trap_ns_per_hit\":%u,\"bpf_ns_per_block\":%.0f,\"trap_ns_per_block\":%.0f,"
+		   "\"estimate_ns_per_block\":%llu,\"loader_user_s\":%.3f,"
 		   "\"loader_sys_s\":%.3f,\"loader_wall_s\":%.3f,\"loader_cpu_pct\":%.3f,\"bpf_cpu_pct\":%.3f,"
 		   "\"trap_cpu_pct_estimate\":%.3f,\"total_cpu_pct_estimate\":%.3f,\"loader_maxrss_kb\":%ld,"
 		   "\"note\":\"cpu_pct values are percent of one CPU over the traced wall time. bpf_* are measured "
 		   "(kernel.bpf_stats_enabled via BPF_ENABLE_STATS while tracing; bpf_ns_per_run is the USDT programs' "
-		   "mean); the uprobe trap itself is not measured: trap_cpu_pct_estimate = usdt_hits x "
-		   "assumed_trap_ns_per_hit, estimate_ns_per_block = hits_per_block x (bpf_ns_per_run + "
-		   "assumed_trap_ns_per_hit)\"}",
-		(unsigned long long)ov.usdt_hits, (unsigned long long)ov.hits, ov.hits_per_s, ov.stats_ok ? "true" : "false",
-		(unsigned long long)ov.bpf_run_cnt, (unsigned long long)ov.bpf_run_ns, (unsigned long long)ov.usdt_run_ns,
-		(unsigned long long)ov.kernel_run_ns, ov.bpf_ns_per_hit, ov.hits_per_block, opt.trap_ns,
-		(unsigned long long)ov.estimate_ns_per_block, ov.loader_user_s, ov.loader_sys_s, ov.wall_s,
-		ov.loader_cpu_pct, ov.bpf_cpu_pct, ov.trap_cpu_pct, ov.total_cpu_pct, ov.maxrss_kb);
+		   "mean, bpf_ns_per_block every program's run time per block). The uprobe trap is not measured per "
+		   "run: trap_ns_per_hit comes from `wine-trace calibrate` for this kernel and ntdll.so "
+		   "(trap_ns_source calibration, trap_calibration has the record; it includes the run-time-statistics "
+		   "bookkeeping, and with ns_per_extra_consumer one handler per further traced process), from "
+		   "--trap-ns (option), or is the B5b fallback (assumed-default, trap_ns_assumed true). The calibration "
+		   "times a tight loop with hot caches on its first CPU (CPU 2, a P-core, by default), so "
+		   "trap_ns_per_hit and everything derived from it are a lower bound: Live's audio threads also run on "
+		   "E-cores, where a trap cost about a third more on the laptop, and miss caches. When the calibration "
+		   "covered several CPUs, the *_max fields use its slowest (ns_per_trap_max). "
+		   "assumed_trap_ns_per_hit repeats trap_ns_per_hit for older readers. trap_cpu_pct_estimate = "
+		   "usdt_hits x trap_ns_per_hit; estimate_ns_per_block = bpf_ns_per_block + usdt_hits_per_block x "
+		   "trap_ns_per_hit (the NTSync fentry programs have no trap)\"}",
+		trap.ns, ov.bpf_ns_per_block, ov.trap_ns_per_block, (unsigned long long)ov.estimate_ns_per_block,
+		ov.loader_user_s, ov.loader_sys_s, ov.wall_s, ov.loader_cpu_pct, ov.bpf_cpu_pct, ov.trap_cpu_pct,
+		ov.total_cpu_pct, ov.maxrss_kb);
 }
 
 static void write_summary(void)
@@ -4491,7 +4796,7 @@ static void write_summary(void)
 		   "\"lost_events\": %llu, \"probe_hits\": ",
 		(unsigned long long)ctr[CT_UNMATCHED_EXIT], (unsigned long long)ctr[CT_FIRST_EXIT],
 		(unsigned long long)ctr[CT_ABANDONED],
-		(unsigned long long)(ctr[CT_RB_DROP_BLOCK] + ctr[CT_RB_DROP_EVENT] + ctr[CT_RB_DROP_OTHER]),
+		(unsigned long long)ringbuf_drops(),
 		(unsigned long long)ctr[CT_STACK_DROP], (unsigned long long)lost_events());
 	write_probe_hits(f);
 	fprintf(f, ", \"events\": %llu, \"all\": ", (unsigned long long)cnt.events_written);
@@ -4613,12 +4918,13 @@ static void write_tracer_json(void)
 	}
 	fprintf(m, ",\"ntsync\":\"%s\",\"sched\":%s,\"follow\":%s,\"sched_waking_irq\":%s,"
 		   "\"sample\":{\"stack_sample_n\":%u,\"stack_bytes\":%u,\"slack_threshold_pct\":%u,\"keep_stacks\":\"%s\","
-		   "\"roles\":\"%s\",\"no_exit\":%s,\"ringbuf_mb\":%u,\"trigger_ids\":%d},"
+		   "\"roles\":\"%s\",\"no_exit\":%s,\"ringbuf_mb\":%u,\"trigger_ids\":%d,\"sched_records\":%s,"
+		   "\"acc_slots\":%d},"
 		   "\"reduce\":{\"version\":\"" LOADER_NAME "/" WINE_TRACE_VERSION "\",\"tables\":",
 		ntsync_used, sched_enabled ? "true" : "false", opt.follow ? "true" : "false",
 		waking_irq ? "true" : "false", opt.sample_n, opt.stack_bytes, opt.slack_pct, keep_name(),
 		opt.roles_audio ? "audio" : "all", opt.no_exit ? "true" : "false", roundup_pow2(opt.ringbuf_mb),
-		opt.ntrigger);
+		opt.ntrigger, opt.sched_records ? "true" : "false", ACC_SLOTS);
 	if (tables_basename())
 		jstr(m, tables_basename());
 	else
@@ -4858,7 +5164,12 @@ static void usage(int code)
 		"  --tables FILE            id table (default ../tables/wine-<ver>.json next to the binary)\n"
 		"  --ntdll PATH, --pipeasio PATH   library paths (default: from /proc/PID/maps)\n"
 		"  --no-follow              do not attach to children forked by traced processes\n"
-		"  --trap-ns N              assumed uprobe trap cost for the overhead estimate (default %u)\n"
+		"  --trap-calibration FILE  measured uprobe trap cost (written by `wine-trace calibrate`); used when\n"
+		"                           its kernel and ntdll.so match this run\n"
+		"  --trap-ns N              uprobe trap cost per probe hit for the overhead estimate (overrides the\n"
+		"                           calibration; without either: the assumed %u ns, flagged trap_ns_assumed)\n"
+		"  --sched-records          drill-down: also emit per-wakeup / per-off-CPU-interval records (counted\n"
+		"                           only; off by default: they cost a ring-buffer record per context switch)\n"
 		"  --perf-hz N              --mode sample frequency (default 999)\n"
 		"  --self-check             load the programs, print the stack classification as JSON, exit 0 when\n"
 		"                           every uprobe program is on the kernel stack, 2 otherwise (no attach)\n"
@@ -4893,7 +5204,7 @@ static void parse_args(int argc, char **argv)
 {
 	enum { OPT_MODE = 256, OPT_NTSYNC, OPT_SCHED, OPT_RUNID, OPT_SAMPLE, OPT_STACKB, OPT_ROLES, OPT_NOEXIT, OPT_SLACK, OPT_RBMB,
 	       OPT_DUR, OPT_TRIG, OPT_TABLES, OPT_NTDLL, OPT_PIPE, OPT_NOFOLLOW, OPT_NEAR, OPT_KEEP, OPT_TRAP, OPT_PERFHZ, OPT_VERSION, OPT_PRIVSTACK,
-	       OPT_SELFCHECK, OPT_SLACKN, OPT_DUMPJIT, OPT_GENERIC };
+	       OPT_SELFCHECK, OPT_SLACKN, OPT_DUMPJIT, OPT_GENERIC, OPT_TRAPCAL, OPT_SCHEDREC };
 	static const struct option lo[] = {
 		{ "out", required_argument, NULL, 'o' }, { "pid", required_argument, NULL, 'p' },
 		{ "mode", required_argument, NULL, OPT_MODE }, { "ntsync", required_argument, NULL, OPT_NTSYNC },
@@ -4910,6 +5221,8 @@ static void parse_args(int argc, char **argv)
 		{ "unsafe-private-stack", no_argument, NULL, OPT_PRIVSTACK }, { "self-check", no_argument, NULL, OPT_SELFCHECK },
 		{ "slack-samples", required_argument, NULL, OPT_SLACKN }, { "dump-jit", required_argument, NULL, OPT_DUMPJIT },
 		{ "generic-args", no_argument, NULL, OPT_GENERIC },
+		{ "trap-calibration", required_argument, NULL, OPT_TRAPCAL },
+		{ "sched-records", no_argument, NULL, OPT_SCHEDREC },
 		{ "version", no_argument, NULL, OPT_VERSION }, { "help", no_argument, NULL, 'h' }, { NULL, 0, NULL, 0 },
 	};
 	int c;
@@ -5014,7 +5327,9 @@ static void parse_args(int argc, char **argv)
 			else if (strcmp(optarg, "all") == 0) opt.keep_stacks = KEEP_ALL;
 			else { fprintf(stderr, "wine-trace: --keep-stacks none|late|all\n"); exit(2); }
 			break;
-		case OPT_TRAP: opt.trap_ns = (__u32)parse_ulong(optarg, "--trap-ns", 1000000); break;
+		case OPT_TRAP: opt.trap_ns = (__u32)parse_ulong(optarg, "--trap-ns", 1000000); opt.trap_set = 1; break;
+		case OPT_TRAPCAL: opt.trap_calibration = optarg; break;
+		case OPT_SCHEDREC: opt.sched_records = 1; break;
 		case OPT_PERFHZ: opt.perf_hz = (int)parse_ulong(optarg, "--perf-hz", 100000); if (!opt.perf_hz) opt.perf_hz = 1; break;
 		case OPT_PRIVSTACK: opt.allow_priv_stack = 1; break;
 		case OPT_SELFCHECK: opt.self_check = 1; break;
@@ -5115,34 +5430,53 @@ static void load_and_check(void)
 		logmsg("stack self-check passed: %d programs, every uprobe program on the kernel stack", nchecks);
 }
 
-/* open entries and per-thread counters of the threads still alive */
+/* open entries, accumulated crossings not flushed yet and per-thread counters of the threads still
+ * alive (after the links are gone: nothing writes the map any more) */
 static void read_tstates(void)
 {
 	int fd = bpf_map__fd(skel->maps.tstate);
-	__u32 key, next, *prev = NULL;
+	__u32 idx, i;
 	struct tstate *ts = xmalloc(sizeof(*ts));
 
-	while (bpf_map_get_next_key(fd, prev, &next) == 0) {
-		if (bpf_map_lookup_elem(fd, &next, ts) == 0) {
-			struct thr *t;
+	/* the array slots in use (tid != 0): released slots belong to exited threads, whose counters
+	 * and last crossings arrived in their REC_EXIT / REC_AGG records */
+	for (idx = 0; idx < MAX_TIDS; idx++) {
+		struct thr *t;
 
-			if (ts->depth <= INFLIGHT_DEPTH)
-				cnt.open_entries_at_end += ts->depth;
-			if (ts->unmatched || ts->first_exit || ts->abandoned || ts->overflow || ts->open_at_exit ||
-			    ts->never_returned) {
-				t = thr_get(next, 0);
-				if (!t->counters_final) {
-					t->unmatched = ts->unmatched;
-					t->first_exit = ts->first_exit;
-					t->abandoned = ts->abandoned;
-					t->overflow = ts->overflow;
-					t->open_at_exit = ts->open_at_exit;
-					t->never_returned = ts->never_returned;
-				}
+		if (bpf_map_lookup_elem(fd, &idx, ts) != 0 || !ts->tid)
+			continue;
+		if (ts->depth <= INFLIGHT_DEPTH)
+			cnt.open_entries_at_end += ts->depth;
+		for (i = 0; i < ACC_SLOTS; i++) {
+			struct acc_ent e;
+
+			if (!(ts->acc_mask & (1u << i)))
+				continue;
+			e.seq = ts->ak[i].seq;
+			e.idp = ts->ak[i].idp;
+			e.kfl = ts->ak[i].kfl;
+			e.waker = ts->av[i].waker;
+			e.count = ts->av[i].count;
+			e.total_ns = ts->av[i].total_ns;
+			e.max_ns = ts->av[i].max_ns;
+			e.oncpu_ns = ts->av[i].oncpu_ns;
+			consume_acc(ts->tid, &e);
+			cnt.acc_entries_at_stop++;
+		}
+		cnt.nt_wait_live += ts->nt_wait_hits;
+		cnt.nt_wake_live += ts->nt_wake_hits;
+		if (ts->unmatched || ts->first_exit || ts->abandoned || ts->overflow || ts->open_at_exit ||
+		    ts->never_returned) {
+			t = thr_get(ts->tid, 0);
+			if (!t->counters_final) {
+				t->unmatched = ts->unmatched;
+				t->first_exit = ts->first_exit;
+				t->abandoned = ts->abandoned;
+				t->overflow = ts->overflow;
+				t->open_at_exit = ts->open_at_exit;
+				t->never_returned = ts->never_returned;
 			}
 		}
-		key = next;
-		prev = &key;
 	}
 	free(ts);
 }
@@ -5190,6 +5524,7 @@ int main(int argc, char **argv)
 	}
 	detect_wine_version();
 	load_tables();
+	load_trap_calibration();
 
 	/* BPF: load, verify the stack class of every program BEFORE anything is attached */
 	load_and_check();
@@ -5235,7 +5570,9 @@ int main(int argc, char **argv)
 			       p->pipeasio[0] ? " (with pipeasio)" : "");
 	}
 	if (!total && opt.mode != MODE_SAMPLE)
-		die("no USDT probe could be attached (runtime without patch 0108, or no Wine process among the pids)");
+		die("no USDT probe could be attached (%s)",
+		    usdt_enotsupp ? "the kernel refused the 10-byte nop sites with ENOTSUPP: they need Linux 7.2 or later"
+				  : "runtime without patch 0108, or no Wine process among the pids");
 	base_ns = mono_ns();
 	if (opt.mode != MODE_SAMPLE) {
 		f_blocks = open_out("blocks.jsonl", p_blocks);
@@ -5270,8 +5607,8 @@ int main(int argc, char **argv)
 	last_progress = base_ns;
 
 	while (!stop_flag) {
-		/* records are submitted without wakeup (unless the ring is a quarter full): the poll
-		 * mostly times out, and the consume collects what arrived in the meantime */
+		/* records are submitted without wakeup (BPF_RB_NO_WAKEUP): the poll mostly times out,
+		 * and the consume collects what arrived in the meantime */
 		err = ring_buffer__poll(rb, POLL_MS);
 		if (err >= 0)
 			err = ring_buffer__consume(rb);
@@ -5318,6 +5655,11 @@ int main(int argc, char **argv)
 	read_counters();
 	flush_blocks(UINT64_MAX, true);
 	flush_windows(UINT64_MAX);
+	if (cnt.keys_for_flushed_block_audio)
+		warn_add("%llu accumulated keys of audio-role threads arrived more than %.0f s after their block "
+			 "ended: their crossings are in threads.jsonl, not in blocks.jsonl or the lost slack "
+			 "(counters.keys_for_flushed_block_audio)",
+			 (unsigned long long)cnt.keys_for_flushed_block_audio, (double)BLOCK_FLUSH_NS / 1e9);
 	collect_overhead();
 	write_stacks();
 	close_out(&f_blocks, p_blocks);
@@ -5332,11 +5674,12 @@ int main(int argc, char **argv)
 	chown_outputs();
 	logmsg("stopped: %llu blocks (%llu late, %llu near-late), lost=%llu of %llu hits, unmatched=%llu, abandoned=%llu, "
 	       "%llu stack samples in %llu distinct stacks, bpf %.0f ns/run (USDT), cpu: bpf %.2f%% + loader %.2f%% "
-	       "(+ ~%.2f%% assumed trap cost)",
+	       "(+ ~%.2f%% trap cost at %u ns/hit, %s)",
 	       (unsigned long long)bstat.count, (unsigned long long)bstat.late, (unsigned long long)bstat.near_late,
 	       (unsigned long long)lost_events(), (unsigned long long)ov.hits, (unsigned long long)ctr[CT_UNMATCHED_EXIT],
 	       (unsigned long long)ctr[CT_ABANDONED], (unsigned long long)cnt.stack_samples,
-	       (unsigned long long)cnt.stack_reps, ov.bpf_ns_per_hit, ov.bpf_cpu_pct, ov.loader_cpu_pct, ov.trap_cpu_pct);
+	       (unsigned long long)cnt.stack_reps, ov.bpf_ns_per_hit, ov.bpf_cpu_pct, ov.loader_cpu_pct, ov.trap_cpu_pct,
+	       trap.ns, trap.source);
 	printf("stopped monotonic_stop_ns=%llu blocks=%llu lost=%llu\n", (unsigned long long)stop_ns,
 	       (unsigned long long)bstat.count, (unsigned long long)lost_events());
 	fflush(stdout);

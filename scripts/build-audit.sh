@@ -43,6 +43,96 @@ if [ "${1:-}" = --check-series-policy ]; then
     exit 0
 fi
 
+# USDT probe sites the kernel can optimize. Linux 7.2 (arch/x86/kernel/
+# uprobes.c: can_optimize -> is_optimizable_nop10) optimizes a uprobe only on
+# exactly this 10-byte nop: the first hit rewrites the site to
+# "lea -0x80(%rsp),%rsp; call" into the process's [uprobes-trampoline] page
+# (48 8d 64 24 80 e8 + rel32). Any other site traps through int3 on every
+# hit, about 430 instead of 170 ns per hit on the profiling laptop, and the
+# interface tracer takes about a thousand hits per audio block. Worse, 7.2.9
+# puts no uprobe at all on a 10-byte nop whose bytes cross a 4 KiB page:
+# attaching to a running process fails with ENOTSUPP (524), and a process
+# started after the attach never gets the breakpoint, so that probe silently
+# reports nothing. The vendored sdt.h of 0108 and pipeasio/0017 emits the nop
+# as .byte, 16-byte aligned so that no site can cross a page.
+readonly USDT_NOP10='66 2e 0f 1f 84 00 00 00 00 00'
+usdt_nop10_report() {   # <ELF file> <provider>
+    # One line per <provider> probe site: "ok|bad <provider:name> vaddr=<hex>
+    # offset=<hex> <detail>". The note's location is a link-time address;
+    # like libbpf, correct it by the distance between the .stapsdt.base
+    # section and the base the note recorded (non-zero only after
+    # prelinking), then map it to a file offset through the PT_LOAD program
+    # header that holds all 10 bytes. The page rule uses the virtual
+    # address: a shared object loads at a page-aligned bias, so its page
+    # offset is the one the kernel sees. Every readelf ends in "|| true": a
+    # file it cannot parse yields no sites, which the callers report as a
+    # failure, instead of pipefail ending the audit inside an assignment.
+    local file="$1" provider="$2" stapsdt_base loads
+    stapsdt_base="$(readelf -SW "$file" 2>/dev/null | sed -n 's/^ *\[ *[0-9]*\] *//p' \
+        | awk '$1 == ".stapsdt.base" { print "0x" $3; exit }' || true)"
+    loads="$(readelf -lW "$file" 2>/dev/null | awk '$1 == "LOAD" {
+            flags = ""; for (i = 7; i < NF; i++) flags = flags $i
+            print $2, $3, $5, flags }' || true)"
+    { readelf -n "$file" 2>/dev/null || true; } | awk -v want="$provider" '
+        /^ *Provider: / { provider = $2; next }
+        /^ *Name: /     { name = $2; next }
+        /^ *Location: / {
+            if (provider == want) {
+                loc = $2; base = $4; sub(/,$/, "", loc); sub(/,$/, "", base)
+                print name, loc, base
+            }
+            provider = "" }' |
+    while read -r name loc base; do
+        local vaddr off="" seg_off seg_vaddr seg_filesz seg_flags exec=0 bytes
+        vaddr=$(( loc ))
+        if [ -n "$stapsdt_base" ] && (( base != 0 )); then
+            vaddr=$(( loc + stapsdt_base - base ))
+        fi
+        while read -r seg_off seg_vaddr seg_filesz seg_flags; do
+            [ -n "$seg_off" ] || continue
+            if (( vaddr >= seg_vaddr && vaddr + 10 <= seg_vaddr + seg_filesz )); then
+                off=$(( seg_off + vaddr - seg_vaddr ))
+                case "$seg_flags" in *E*) exec=1 ;; esac
+                break
+            fi
+        done <<< "$loads"
+        if [ -z "$off" ]; then
+            printf 'bad %s:%s vaddr=%#x offset=none: not inside a PT_LOAD segment\n' \
+                "$provider" "$name" "$vaddr"
+            continue
+        fi
+        bytes="$(od -An -v -tx1 -j "$off" -N 10 "$file" 2>/dev/null | tr -s ' \n' ' ' \
+            | sed 's/^ //; s/ $//' || true)"
+        if [ "$exec" != 1 ]; then
+            printf 'bad %s:%s vaddr=%#x offset=%#x: not in an executable segment\n' \
+                "$provider" "$name" "$vaddr" "$off"
+        elif [ "$bytes" != "$USDT_NOP10" ]; then
+            printf 'bad %s:%s vaddr=%#x offset=%#x: bytes %s, not the 10-byte nop %s\n' \
+                "$provider" "$name" "$vaddr" "$off" "${bytes:-unreadable}" "$USDT_NOP10"
+        elif (( (vaddr & 0xfff) + 10 > 0x1000 )); then
+            printf 'bad %s:%s vaddr=%#x offset=%#x: its 10 bytes cross a 4 KiB page boundary\n' \
+                "$provider" "$name" "$vaddr" "$off"
+        else
+            printf 'ok %s:%s vaddr=%#x offset=%#x\n' "$provider" "$name" "$vaddr" "$off"
+        fi
+    done
+}
+
+if [ "${1:-}" = --check-usdt-sites ]; then
+    [ "$#" -eq 3 ] || fail "usage: $0 --check-usdt-sites ELF PROVIDER"
+    [ -f "$2" ] || fail "no such file: $2"
+    command -v readelf >/dev/null || fail "readelf (binutils) is required"
+    report="$(usdt_nop10_report "$2" "$3")"
+    n_sites="$(printf '%s\n' "$report" | grep -cE '^(ok|bad) ' || true)"
+    n_bad="$(printf '%s\n' "$report" | grep -c '^bad ' || true)"
+    [ -z "$report" ] || printf '%s\n' "$report" | sed 's/^/   /'
+    [ "$n_sites" -gt 0 ] || fail "no $3: probe sites in $2"
+    [ "$n_bad" -eq 0 ] ||
+        fail "$n_bad of $n_sites $3: probe sites in $2 are not the 10-byte nop the kernel optimizes, or cross a 4 KiB page"
+    say "OK: all $n_sites $3: probe sites in $2 are the 10-byte nop and none crosses a 4 KiB page."
+    exit 0
+fi
+
 expected_source_tree=""
 if [ "${1:-}" = --source-tree-sha ]; then
     [ "$#" -ge 2 ] || fail "usage: $0 --source-tree-sha SHA256 [TARBALL_OR_TREE]"
@@ -395,7 +485,7 @@ FINGERPRINTS='
 0105|ascii|lib/wine/x86_64-windows/winmm.dll|Out of memory refreshing %s mappings
 0106|ascii|lib/wine/x86_64-windows/libusb-1.0.dll|Operation not supported or unimplemented on this platform
 0107|ascii|lib/wine/x86_64-unix/win32u.so|restoring %s after whole-client expose of %p
-0108|ascii|lib/wine/x86_64-unix/ntdll.so|WINE_USDT_V1
+0108|ascii|lib/wine/x86_64-unix/ntdll.so|WINE_USDT_V2
 performance/0001|ascii|lib/wine/x86_64-unix/ntdll.so|WINE_APC_FASTPATH
 pipeasio/0001|ascii|lib/wine/x86_64-unix/pipeasio.dll.so|pipeasio-clamp-sample-rate
 pipeasio/0002|ascii|lib/wine/x86_64-unix/pipeasio.dll.so|pipeasio-midi-timebase
@@ -412,6 +502,7 @@ pipeasio/0014|ascii|lib/wine/x86_64-unix/pipeasio.dll.so|enabled for 64-bit host
 pipeasio/0015|ascii|lib/wine/x86_64-unix/pipeasio.dll.so|PIPEASIO_TELEMETRY could not open a nonblocking report descriptor
 pipeasio/0016|ascii|lib/wine/x86_64-unix/pipeasio.dll.so|pipeasio-node-arbitration
 pipeasio/0017|ascii|lib/wine/x86_64-unix/pipeasio.dll.so|block_range=
+pipeasio/0017|ascii|lib/wine/x86_64-unix/pipeasio.dll.so|PIPEASIO_USDT_V2
 '
 # 0010's source marker (pipeasio-any-buffer-size-panel) is a comment and does
 # not reach the panel binary; its fingerprint is the tooltip literal above,
@@ -561,13 +652,14 @@ done
 say "== [4/4] structural invariants =="
 must() { [ -s "$tree/$1" ] && ok "$1" "present" || bad "$1" "missing/empty"; }
 # USDT trace points (0108 in ntdll.so, pipeasio/0017 in pipeasio64.dll.so):
-# every probe site is one 5-byte nop plus a SystemTap SDT descriptor in the
+# every probe site is one 10-byte nop plus a SystemTap SDT descriptor in the
 # non-allocated .note.stapsdt section, and the interface tracer attaches by
 # provider and probe name. Finding the descriptors proves they survived the
 # container's strip --strip-unneeded. Distinct names are counted, not note
 # entries: gcc may inline a probe's enclosing function into several callers
 # and emit one descriptor per copy (a tracer attaches to every copy). The
-# nops are no measure either, gcc pads alignment with the same nopl form.
+# nops are no measure either, the assembler pads alignment with the same
+# forms; must_usdt_nop10 reads the bytes at each descriptor's address instead.
 usdt_probe_names() {   # <file> <provider> -> distinct probe names, one per line
     # || true: readelf exits non-zero on a file it cannot parse, and under
     # pipefail that would end the audit inside the caller's assignment.
@@ -586,6 +678,26 @@ must_usdt() {   # <tree-relative .so> <provider> <expected distinct probe count>
         ok "$label" "$3 $2: probes ($names)"
     else
         bad "$label" "expected $3 $2: probes, found $count${names:+ ($names)}"
+    fi
+}
+# Every probe site, inlined copies included, must be the 10-byte nop the
+# kernel optimizes and must not cross a 4 KiB page (usdt_nop10_report above).
+# A 5-byte-nop build (WINE_USDT_V1, PipeASIO without PIPEASIO_USDT_V2) fails
+# here: it works, but every probe hit traps through int3. A crossing site
+# would lose its probe altogether.
+must_usdt_nop10() {   # <tree-relative .so> <provider>
+    local label="$1 nop10" file="$tree/$1" report sites problems
+    [ -f "$file" ] || { bad "$label" "missing: $file"; return 0; }
+    report="$(usdt_nop10_report "$file" "$2")"
+    sites="$(printf '%s\n' "$report" | grep -cE '^(ok|bad) ' || true)"
+    problems="$(printf '%s\n' "$report" | sed -n 's/^bad //p')"
+    if [ "$sites" -eq 0 ]; then
+        bad "$label" "no $2: probe sites found"
+    elif [ -n "$problems" ]; then
+        bad "$label" "$(printf '%s\n' "$problems" | grep -c .) of $sites $2: sites not optimizable by the kernel:"
+        printf '%s\n' "$problems" | sed 's/^/        /'
+    else
+        ok "$label" "$sites $2: sites are the 10-byte nop, none crosses a 4 KiB page"
     fi
 }
 must bin/wine
@@ -760,7 +872,9 @@ if command -v readelf >/dev/null; then
     # block_before_live, block_after_live, block_end (the two block_*_live
     # probes sit in both branches of pipeasio_host_call_process: 8 sites).
     must_usdt lib/wine/x86_64-unix/ntdll.so wine 8
+    must_usdt_nop10 lib/wine/x86_64-unix/ntdll.so wine
     must_usdt lib/wine/x86_64-unix/pipeasio64.dll.so pipeasio 6
+    must_usdt_nop10 lib/wine/x86_64-unix/pipeasio64.dll.so pipeasio
 else
     bad "readelf" "binutils missing — cannot verify bridge DT_NEEDED (install binutils)"
 fi

@@ -8,6 +8,15 @@
 #   wine-trace stop   --out DIR [--stop-timeout S]
 #   wine-trace run    --duration S  <start options>
 #   wine-trace status --out DIR
+#   wine-trace calibrate [--out DIR] [--cpu auto|C[,C...]] [--iterations N] [--repeats R] [--extra-consumers K]
+#                     [--no-save] ...   (run as the prefix's user, Live stopped: profiler/tracer/calibrate.py)
+#
+# calibrate: measures the uprobe trap cost per probe hit (traced minus untraced NtYieldExecution
+#   loops of profiler/tracer/trapcal.exe in the prefix, less the measured BPF run time) and saves
+#   it as ~/.local/state/profiler/trap-calibration.json.  start hands that file to the libbpf
+#   loader (--trap-calibration; WINE_TRACE_TRAP_CALIBRATION=FILE|none overrides), which uses it
+#   for tracer.json's overhead estimate while the kernel and the traced ntdll.so match it, and
+#   falls back to the assumed 500 ns (overhead.trap_ns_assumed) otherwise.
 #
 # Backend: the libbpf tracer profiler/tracer/build/wine-trace when it is built (make -C
 # profiler/tracer) AND its stack self-check passes (`wine-trace --self-check` with the same
@@ -584,6 +593,22 @@ daemonise()
     die "daemon did not write $pidfile"
 }
 
+# The trap calibration for the libbpf loader (`wine-trace calibrate` writes it): the invoking
+# user's ~/.local/state/profiler/trap-calibration.json, or WINE_TRACE_TRAP_CALIBRATION (a file,
+# or "none").  Prints nothing when there is none; the loader checks that it matches the run.
+trap_calibration_file()
+{
+    local file
+    if [ -n "${WINE_TRACE_TRAP_CALIBRATION+x}" ]; then
+        file="$WINE_TRACE_TRAP_CALIBRATION"
+    else
+        file="$(invoking_home)/.local/state/profiler/trap-calibration.json"
+    fi
+    if [ -n "$file" ] && [ "$file" != none ] && [ -f "$file" ]; then
+        printf '%s\n' "$file"
+    fi
+}
+
 # Options that change which BPF programs the libbpf loader loads (and so their stack frames):
 # the self-check runs with exactly these, then the loader checks again before it attaches.
 libbpf_load_args()
@@ -658,6 +683,9 @@ cmd_start()
         for pid in "${pids[@]}"; do args+=(--pid "$pid"); done
         [ -n "$run_id" ] && args+=(--run-id "$run_id")
         [ -z "$tables" ] || args+=(--tables "$tables")
+        local trap_cal
+        trap_cal="$(trap_calibration_file)"
+        [ -z "$trap_cal" ] || args+=(--trap-calibration "$trap_cal")
         log "backend: libbpf $libbpf_bin ${args[*]} ($backend_reason)"
         clock_before_ns="$(monotonic_ns)"
         daemonise "$out/wine-trace.pid" "$out/wine-trace.stdout" "$out/wine-trace.stderr" "$libbpf_bin" "${args[@]}"
@@ -1064,6 +1092,10 @@ cmd_run()
 
 main()
 {
+    if [ "${1:-}" = calibrate ]; then
+        shift
+        exec python3 -I "$tracer_dir/calibrate.py" "$@"
+    fi
     parse_args "$@"
     case "$verb" in
         start) cmd_start ;;
