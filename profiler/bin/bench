@@ -21,6 +21,14 @@
 #   * a laptop (a Battery power supply) refuses to start on battery: the CPU
 #     clocks and EPP follow the battery policy and the numbers are not
 #     comparable (exit 2). --allow-battery overrides.
+#   * the power profile ABLETON_POWER names (default performance; exported for
+#     the launcher too) is held for the whole run. The launcher's own
+#     `powerprofilesctl launch` hold is refused by polkit from an SSH session
+#     (hold-profile is allow_active only), which left B4's runs on "balanced".
+#     This hold runs in a `systemd-run --user --scope`, which polkit credits to
+#     the user's graphical session; it ends with the run (and within 5 s when
+#     the wrapper dies). A hold that does not take effect stops the run
+#     (exit 2); ABLETON_POWER=off or --no-power-hold skips it.
 #   * every other argument is forwarded unchanged — see scripts/bench-suite.sh
 #     --help (--tag, --duration, --trace off|interface|drilldown, --scenario,
 #     --sets, --dry-run, …); under the suite's --dry-run nothing is muted
@@ -48,9 +56,11 @@ and prints the run directory at the end. ABLETON_WINE_ROOT selects the runtime.
 
 Before every run it mutes the audio node PipeASIO drives (audio_node= in
 $setup_conf), refuses when PipeASIO's output_device names another node and,
-on a laptop, refuses to run on battery.
+on a laptop, refuses to run on battery. It holds the ABLETON_POWER power
+profile (default performance) for the whole run.
   --allow-battery     measure on battery anyway (numbers are not comparable)
   --no-audio-check    do not check or mute the audio node
+  --no-power-hold     do not hold the power profile (ABLETON_POWER=off does the same)
 Everything else is passed through; the suite's own help follows.
 
 EOF
@@ -80,6 +90,7 @@ tag=manual
 output=""
 allow_battery=0
 audio_check=1
+power_hold=1
 suite_dry=0
 args=()
 while [ $# -gt 0 ]; do
@@ -91,6 +102,7 @@ while [ $# -gt 0 ]; do
         --output=*) output="${1#*=}"; args+=(--output "$output") ;;
         --allow-battery) allow_battery=1 ;;
         --no-audio-check) audio_check=0 ;;
+        --no-power-hold) power_hold=0 ;;
         --dry-run) suite_dry=1; args+=("$1") ;;
         *) args+=("$1") ;;
     esac
@@ -120,7 +132,53 @@ if host_has_battery; then
         fi
     fi
 fi
-say "cpufreq  governor $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo '?'), EPP $(cat /sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference 2>/dev/null || echo '?'), profile $(timeout 5 powerprofilesctl get 2>/dev/null || echo '?')"
+
+# The power hold and the trial-dialog watcher end with the wrapper.
+watcher=""
+power_unit=""
+power_pid=""
+cleanup() {
+    [ -z "$watcher" ] || kill "$watcher" 2>/dev/null || true
+    [ -z "$power_pid" ] || kill "$power_pid" 2>/dev/null || true
+    [ -z "$power_unit" ] || timeout 10 systemctl --user stop "$power_unit.scope" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+current_profile() { timeout 5 powerprofilesctl get 2>/dev/null || echo '?'; }
+power_profile="${ABLETON_POWER:-performance}"
+case "$power_profile" in on|auto) power_profile=performance ;; esac
+export ABLETON_POWER="$power_profile"
+if [ "$power_hold" -eq 0 ] || [ "$power_profile" = off ]; then
+    say "power    no profile hold (--no-power-hold or ABLETON_POWER=off); profile $(current_profile)"
+elif ! command -v powerprofilesctl >/dev/null 2>&1; then
+    say "WARNING: powerprofilesctl is not installed: no power profile hold (the governor and EPP below apply)"
+elif [ "$power_profile" != performance ] && [ "$power_profile" != power-saver ]; then
+    # power-profiles-daemon holds only performance and power-saver
+    say "power    ABLETON_POWER=$power_profile: nothing to hold; profile $(current_profile)"
+elif [ "$suite_dry" -eq 1 ]; then
+    say "power    dry run: would hold '$power_profile' for the run (profile now $(current_profile))"
+else
+    hold=(powerprofilesctl launch -p "$power_profile" -r "profiler bench $safe_tag" -i profiler-bench --
+          sh -c 'while kill -0 "$1" 2>/dev/null; do sleep 5; done' profiler-bench-hold "$$")
+    if command -v systemd-run >/dev/null 2>&1 && timeout 5 systemctl --user show-environment >/dev/null 2>&1; then
+        power_unit="profiler-bench-power-$$"
+        systemd-run --user --scope --quiet --collect --unit="$power_unit" -- "${hold[@]}" >/dev/null 2>&1 &
+    else
+        "${hold[@]}" >/dev/null 2>&1 &
+    fi
+    power_pid=$!
+    for _ in $(seq 1 20); do
+        [ "$(current_profile)" != "$power_profile" ] || break
+        kill -0 "$power_pid" 2>/dev/null || break
+        sleep 0.5
+    done
+    [ "$(current_profile)" = "$power_profile" ] \
+        || die "could not hold the '$power_profile' power profile (profile $(current_profile); powerprofilesctl launch failed or polkit refused it): the run would measure another CPU policy — check 'powerprofilesctl list', or pass --no-power-hold (ABLETON_POWER=off) for a run without the hold"
+    say "power    holding '$power_profile' for the run${power_unit:+ (systemd user scope $power_unit)}"
+fi
+say "cpufreq  governor $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo '?'), EPP $(cat /sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference 2>/dev/null || echo '?'), profile $(current_profile)"
 
 # ------------------------------------------------------------- audio ----
 audio_device="$(cfg audio_device)"
@@ -159,12 +217,10 @@ say "output   $output"
 
 # An unauthorised Trial shows a demo-mode dialog at every launch that blocks control
 # surfaces until answered: answer it ("Save/Export Disabled") for the whole suite.
-watcher=""
 if [ "${PROFILER_NO_TRIAL_WATCH:-0}" != 1 ] && [ -x "$here/live-trial-dialog" ] && \
    ! printf '%s\n' ${args[@]+"${args[@]}"} | grep -qx -- '--dry-run'; then
     "$here/with-session-env" "$here/live-trial-dialog" watch --for 86400 >/dev/null 2>&1 &
     watcher=$!
-    trap '[ -z "$watcher" ] || kill "$watcher" 2>/dev/null || true' EXIT
     say "trial    demo-mode dialog watcher running (pid $watcher)"
 fi
 

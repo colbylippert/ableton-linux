@@ -76,6 +76,14 @@ INTERFACE_CONFOUNDERS = {
     "interface-tracer-output-missing": (
         "The measurement requested tracing but the tracer output is missing."
     ),
+    "interface-tracer-unclean": (
+        "The interface tracer did not exit cleanly (crashed, killed or no end record), so its lost "
+        "events are unknown and its output may stop before the measurement ends."
+    ),
+    "interface-tracer-private-stack": (
+        "The interface tracer ran multi-thread probes on a per-CPU private stack, so events of two "
+        "threads can mix and some crossings may carry wrong fields."
+    ),
 }
 INTERFACE_METRIC_SPECS = (
     ("late_blocks", "Late audio blocks", "blocks", ("blocks", "late")),
@@ -647,9 +655,40 @@ def parse_metadata(text: str) -> dict[str, Any]:
     }
 
 
+PW_TOP_FOLLOWER_RE = re.compile(r"(?:^|\s)\+\s")
+# FORMAT is an upper-case sample format with a digit (S16LE, F32LE, S24_32LE),
+# optionally followed by channels and rate.
+PW_TOP_FORMAT_RE = re.compile(r"^(?=[A-Z0-9_]*[0-9])[A-Z][A-Z0-9_]*(?:\s+\d+\s+\d+)?\s+")
+
+
+def pw_top_row_tail(line: str) -> tuple[bool, str]:
+    """(is a follower, node name) from the columns after ERR of one pw-top row.
+
+    pw-top lists every driver followed by the nodes it drives; a follower's
+    name carries a "+ " prefix (after the FORMAT column, which can be empty).
+    """
+    parts = line.split(None, 9)
+    tail = parts[9] if len(parts) > 9 else ""
+    follower = PW_TOP_FOLLOWER_RE.search(tail)
+    if follower:
+        return True, tail[follower.end():].strip()
+    return False, PW_TOP_FORMAT_RE.sub("", tail).strip()
+
+
 def parse_pw_top(text: str, node_pattern: str = DEFAULT_NODE_RE) -> dict[str, Any]:
+    """Parse `pw-top -b` frames for the nodes that match node_pattern.
+
+    Besides the error counters and the node's own QUANT, every matched sample
+    records the QUANT of the driver the node follows in that frame (the node
+    itself when it drives): that is the buffer size the graph actually ran at,
+    which can differ from the settings metadata's clock.quantum (the graph
+    default when no client asks for another one; PipeASIO asks for its own).
+    """
     wanted = re.compile(node_pattern)
     nodes: list[dict[str, Any]] = []
+    driver: dict[str, Any] | None = None
+    effective_samples: list[tuple[int, int]] = []
+    driver_names: set[str] = set()
     current: dict[int, dict[str, Any]] = {}
     generations: dict[int, int] = {}
     transitions: list[dict[str, Any]] = []
@@ -666,14 +705,31 @@ def parse_pw_top(text: str, node_pattern: str = DEFAULT_NODE_RE) -> dict[str, An
         line = raw_line.split("\t", 1)[-1].strip()
         if re.match(r"^S\s+ID\s+QUANT\s+RATE\b", line):
             frame += 1
+            driver = None
             continue
         fields = line.split(None, 10)
         if len(fields) < 10 or not fields[1].isdigit():
             continue
         node_id, quantum, rate, error = fields[1], fields[2], fields[3], fields[8]
         name = fields[10] if len(fields) > 10 else ""
+        follower, row_name = pw_top_row_tail(line)
+        if not follower:
+            driver = {
+                "id": int(node_id), "name": row_name,
+                "quantum": int(quantum) if quantum.isdigit() else 0,
+                "rate": int(rate) if rate.isdigit() else 0,
+            }
         if not (rate.isdigit() and int(rate) > 0 and error.isdigit() and wanted.search(name)):
             continue
+        row_driver = driver if follower and driver is not None else {
+            "id": int(node_id), "name": row_name, "quantum": int(quantum) if quantum.isdigit() else 0,
+            "rate": int(rate),
+        }
+        if row_driver["quantum"] > 0 and row_driver["rate"] > 0:
+            effective_samples.append((row_driver["rate"], row_driver["quantum"]))
+            driver_names.add(row_driver["name"])
+        elif quantum.isdigit() and int(quantum) > 0:
+            effective_samples.append((int(rate), int(quantum)))
         if frame < 0:
             frame = 0
         sample_rows += 1
@@ -728,10 +784,22 @@ def parse_pw_top(text: str, node_pattern: str = DEFAULT_NODE_RE) -> dict[str, An
                 state["quantums"].append(current_quantum)
     node_values = sorted(nodes, key=lambda item: (item["id"], item["generation"]))
     instrumented = any(item["samples"] >= 2 for item in node_values)
+    effective_quantums: list[int] = []
+    for _, value in effective_samples:
+        if not effective_quantums or effective_quantums[-1] != value:
+            effective_quantums.append(value)
+    counts = collections.Counter(effective_samples)
+    latest = {key: index for index, key in enumerate(effective_samples)}
+    # The most frequent (rate, quantum) of the driving node; ties go to the latest.
+    effective = max(counts, key=lambda key: (counts[key], latest[key])) if counts else None
     return {
         "node_pattern": node_pattern,
         "sample_rows": sample_rows,
         "instrumented": instrumented,
+        "effective_rate": effective[0] if effective else None,
+        "effective_quantum": effective[1] if effective else None,
+        "effective_quantums": effective_quantums,
+        "driver_names": sorted(driver_names),
         "err_delta": sum(max(0, item["err_delta"]) for item in node_values),
         "nodes": node_values,
         "quantum_transitions": transitions,
@@ -764,11 +832,30 @@ def parse_osc(text: str) -> dict[str, Any]:
             averages.append(average)
         if peak >= 0:
             peaks.append(peak)
+    # Both values are percent of the audio buffer period (CPU_SCALE 1.0 in the
+    # bench handler; B5 checked it against AbletonOSC's unscaled
+    # /live/application/get/average_process_usage on the laptop: identical).
+    # average_process_usage is Live's smoothed load; peak_process_usage is
+    # Live's recent worst buffer, typically 1.7-2x the average, and a buffer
+    # that overran its deadline reads above 100%: B4's 571-797% peaks fell in
+    # the seconds where PipeWire's ERR counter rose. It is not a sum over cores
+    # and not reset by reading: its median stayed at 121-133% whether the
+    # handler reported every 0.3 s or every 6 s. peak_percent stays the window
+    # maximum (one overrun owns it); the median is the typical worst buffer.
+    ordered = sorted(peaks)
+    middle = len(ordered) // 2
+    median = (
+        None if not ordered
+        else ordered[middle] if len(ordered) % 2 else (ordered[middle - 1] + ordered[middle]) / 2
+    )
     return {
         "instrumented": bool(averages),
         "sample_count": len(averages),
         "average_percent": round(sum(averages) / len(averages), 3) if averages else None,
         "peak_percent": max(peaks) if peaks else None,
+        "peak_median_percent": round(median, 3) if median is not None else None,
+        "peak_over_100_count": sum(value > 100.0 for value in peaks) if peaks else None,
+        "peak_scope": "percent of the audio buffer period; Live's recent worst buffer (over 100% = a missed deadline)",
         "addresses": addresses,
         "undecodable": undecodable,
     }
@@ -2797,12 +2884,26 @@ def interface_tracer(
         value = summary.get(key, tracer.get(key))
         if is_number(value):
             overhead[key] = value
+    loss = tracer.get("loss") if isinstance(tracer.get("loss"), dict) else {}
+    risky = tracer.get("private_stack_risky")
+    # Unclean: the tracer said so (wine-trace stop's tracer_exit, reduce.py's clean_exit) or the
+    # lost-event count is unknown, which reduce.py reports only for a trace without its END output.
+    tracer_exit = tracer.get("tracer_exit")
+    clean = not (
+        not is_number(lost)
+        or tracer.get("clean_exit") is False
+        or (tracer_exit is not None and tracer_exit != "clean")
+    )
     return {
         "version": tracer.get("version"),
         "mode": tracer.get("mode"),
         "sample_rate": tracer.get("sample_rate"),
         "attach": tracer.get("attach") if isinstance(tracer.get("attach"), list) else [],
         "lost_events": int(lost) if is_number(lost) else None,
+        "lost_events_lower_bound": bool(loss.get("lower_bound")),
+        "clean_exit": clean,
+        "tracer_exit": tracer_exit,
+        "private_stack_risky": [str(item) for item in risky] if isinstance(risky, list) else [],
         "overhead": overhead,
         "started_offset_seconds": started_offset,
         "stopped_offset_seconds": stopped_offset,
@@ -2867,6 +2968,10 @@ def interface_section(
         confounders.append("interface-tracer-coverage-incomplete")
     if tracer_value["lost_events"]:
         confounders.append("interface-lost-events")
+    if not tracer_value["clean_exit"]:
+        confounders.append("interface-tracer-unclean")
+    if tracer_value["private_stack_risky"]:
+        confounders.append("interface-tracer-private-stack")
     return {
         "schema": INTERFACE_SCHEMA,
         "mode": mode,
@@ -3240,13 +3345,24 @@ def markdown_report(report: dict[str, Any]) -> str:
             f"{percent(host)} | {percent(live)} | "
             f"{percent(wine)} | {number(counters.get('interrupts', {}).get('total_rate_per_second'))} | "
             f"{number(counters.get('softirqs', {}).get('total_rate_per_second'))} | {power_label} | "
-            f"{audio_before.get('clock.rate', 'pending')}/{audio_before.get('clock.quantum', 'pending')} → "
-            f"{audio_after.get('clock.rate', 'pending')}/{audio_after.get('clock.quantum', 'pending')} | "
+            f"{sample_rate_buffer_label(pw, audio_before, audio_after)} | "
             f"{audio_changed} | "
             f"{cpu_policy_changed} | {change_label} | "
-            f"{pw.get('err_delta', 'pending')} | {number(dsp.get('average_percent'))} / "
-            f"{number(dsp.get('peak_percent'))} | {transition_label} | {item.get('crackle', {}).get('status', 'unknown')} |"
+            f"{pw.get('err_delta', 'pending')} | {dsp_label(dsp)} | "
+            f"{transition_label} | {item.get('crackle', {}).get('status', 'unknown')} |"
         )
+    lines.extend([
+        "",
+        "Sample rate and buffer size: the rate and buffer size (QUANT) of the PipeWire driver that "
+        "Live's node followed in `pw-top`, then the settings metadata's `clock.rate`/`clock.quantum` "
+        "(the graph default; PipeASIO asks for its own buffer size). DSP average and peak: Live's "
+        "`Application.average_process_usage` and `peak_process_usage`, both in percent of the audio "
+        "buffer period (no scaling: AbletonOSC's own `/live/application/get/average_process_usage` "
+        "returns the same numbers). The peak is Live's recent worst buffer, about twice the average; "
+        "above 100% a buffer overran its deadline, and peaks of several hundred percent coincide with "
+        "PipeWire errors. The cell shows the window's average, the median of the reported peaks, then "
+        "the largest peak and how many reports went over 100%.",
+    ])
     lines.extend(interface_markdown(report))
     runtime = profile_value.get("runtime", {})
     prefix = profile_value.get("prefix", {})
@@ -3600,6 +3716,39 @@ def collector_observed(measurement: dict[str, Any], name: str) -> bool:
         isinstance(duration, (int, float)) and not isinstance(duration, bool)
         and collector_command_usable(command, duration, name)
     )
+
+
+def sample_rate_buffer_label(
+    pw_top: dict[str, Any], before: dict[str, Any], after: dict[str, Any],
+) -> str:
+    """"48000/64 (graph default 256)": the driver's rate/QUANT from pw-top, then the metadata."""
+    before_rate, before_quantum = before.get("clock.rate", "pending"), before.get("clock.quantum", "pending")
+    after_rate, after_quantum = after.get("clock.rate", "pending"), after.get("clock.quantum", "pending")
+    rate, quantum = pw_top.get("effective_rate"), pw_top.get("effective_quantum")
+    if (before_rate, before_quantum) != (after_rate, after_quantum):
+        graph = f"{before_rate}/{before_quantum} → {after_rate}/{after_quantum}"
+    elif rate is not None and str(before_rate) == str(rate):
+        graph = str(before_quantum)
+    else:
+        graph = f"{before_rate}/{before_quantum}"
+    if rate is None or quantum is None:
+        return f"pending (graph default {graph})"
+    quantums = [value for value in pw_top.get("effective_quantums") or [] if isinstance(value, int)]
+    shown = "→".join(str(value) for value in quantums) if len(quantums) > 1 else str(quantum)
+    return f"{rate}/{shown} (graph default {graph})"
+
+
+def dsp_label(dsp: dict[str, Any]) -> str:
+    """"47.13 / 54.80 (max 715.12, 12 over 100%)": average, median peak, largest peak."""
+    def number(value: Any) -> str:
+        return "pending" if value is None else f"{value:.2f}"
+    average, peak = dsp.get("average_percent"), dsp.get("peak_percent")
+    median = dsp.get("peak_median_percent")
+    if median is None:
+        # a measurement rendered before the peak median existed
+        return f"{number(average)} / {number(peak)}"
+    over = dsp.get("peak_over_100_count")
+    return f"{number(average)} / {number(median)} (max {number(peak)}, {over if over is not None else 'pending'} over 100%)"
 
 
 def quantum_transition_count(measurement: dict[str, Any]) -> int | None:
@@ -4166,7 +4315,9 @@ def csv_set_values(measurement: dict[str, Any]) -> dict[str, Any]:
         "dsp_average_percent": dsp.get("average_percent"),
         "dsp_peak_percent": dsp.get("peak_percent"),
         "sample_rate_hz": live.get("sample_rate") or audio_settings.get("clock.rate"),
-        "buffer_frames": live.get("output_buffer_frames") or audio_settings.get("clock.quantum"),
+        "buffer_frames": (
+            live.get("output_buffer_frames") or pw_top.get("effective_quantum") or audio_settings.get("clock.quantum")
+        ),
         "crackle_status": nested(measurement, "crackle", "status"),
     }
 

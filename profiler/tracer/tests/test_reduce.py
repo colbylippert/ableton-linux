@@ -10,6 +10,7 @@ import importlib.util
 import json
 import os
 import random
+import re
 import sys
 import tempfile
 import unittest
@@ -554,6 +555,354 @@ class ReduceTest(unittest.TestCase):
         self.assertEqual(len(out["blocks"]), 3)
 
 
+def without_sort_counters(counters):
+    counters = dict(counters)
+    counters["all"] = {key: value for key, value in counters["all"].items() if key != "sort_runs"}
+    return counters
+
+
+class StreamingReduceTest(unittest.TestCase):
+    """B5: external sort, streaming aggregation and the @emitted loss accounting."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.base_dir = os.path.join(cls.tmp.name, "base")
+        os.makedirs(cls.base_dir)
+        write_run(cls.base_dir, build_fixture(), mode="drilldown")
+        cls.base = run_reduce(cls.base_dir, mode="drilldown")
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def fresh_dir(self, name):
+        path = os.path.join(self.tmp.name, name)
+        os.makedirs(path)
+        return path
+
+    def test_external_sort_matches_in_memory_sort(self):
+        lines = build_fixture()
+        body = lines[1:]
+        random.Random(99).shuffle(body)
+        for chunk in ("1", "3", "7"):
+            run_dir = self.fresh_dir("chunk%s" % chunk)
+            write_run(run_dir, [lines[0]] + body, mode="drilldown")
+            out = run_reduce(run_dir, mode="drilldown", extra=["--sort-chunk-lines", chunk])
+            self.assertEqual(out["blocks"], self.base["blocks"])
+            self.assertEqual(out["threads"], self.base["threads"])
+            self.assertEqual(out["events"], self.base["events"])
+            self.assertEqual(out["summary"]["call_sites"], self.base["summary"]["call_sites"])
+            self.assertEqual(out["summary"]["hotspots_non_audio"], self.base["summary"]["hotspots_non_audio"])
+            self.assertEqual(without_sort_counters(out["summary"]["counters"]),
+                             without_sort_counters(self.base["summary"]["counters"]))
+            self.assertGreater(out["summary"]["counters"]["all"]["sort_runs"], 1)
+            leftovers = [name for name in os.listdir(run_dir) if name.startswith(".reduce-sort-")]
+            self.assertEqual(leftovers, [], "sorted runs must be removed")
+
+    def test_summary_mode_keeps_no_event_list(self):
+        run_dir = self.fresh_dir("summary-stream")
+        write_run(run_dir, build_fixture(), mode="summary")
+        captured = {}
+        original = reduce_mod.run
+
+        def capture(options):
+            captured["result"] = original(options)
+            return captured["result"]
+
+        reduce_mod.run = capture
+        try:
+            rc = reduce_mod.main(["--in", run_dir, "--mode", "summary", "--quiet", "--sort-chunk-lines", "4"])
+        finally:
+            reduce_mod.run = original
+        self.assertEqual(rc, 0)
+        reducer, summary = captured["result"]
+        self.assertEqual(reducer.events, [], "summary mode must not keep the event list")
+        self.assertEqual(summary["counters"]["events"], 12)
+        self.assertEqual(summary["blocks"]["count"], 3)
+
+    def test_block_crossings_of_unfinished_block_go_to_windows(self):
+        f = Fixture()
+        f.hdr()
+        f.thread(S0 + 100, TID_AUDIO, PID_LIVE, "AudioCalc")
+        f.block(1, S0 + 1_000_000, S0 + 960_000, S0 + 960_000 + PERIOD, S0 + 1_010_000, S0 + 1_400_000,
+                S0 + 1_410_000, 0x1, 0)
+        f.block(2, S0 + 2_333_333, S0 + 2_293_333, S0 + 2_293_333 + PERIOD, None, None, None, 0, 0)
+        f.sc_entry(S0 + 1_100_000, TID_AUDIO, 0x000A, 0xA1, 1)
+        f.sc_exit(S0 + 1_101_000, TID_AUDIO, 0x000A, 0xA1)
+        # entered during block 2, which never ends: window bucket + events_for_unknown_block
+        f.sc_entry(S0 + 2_400_000, TID_AUDIO, 0x000A, 0xA2, 2)
+        f.sc_exit(S0 + 2_402_000, TID_AUDIO, 0x000A, 0xA2)
+        # exits after block 1 ended but was entered during it: still block 1
+        f.sc_entry(S0 + 1_300_000, TID_AUDIO, 0x0046, 0xA3, 1)
+        f.sc_exit(S0 + 1_500_000, TID_AUDIO, 0x0046, 0xA3)
+        f.end(S0 + 3_000_000)
+        run_dir = self.fresh_dir("unfinished")
+        write_run(run_dir, f.lines)
+        out = run_reduce(run_dir)
+        self.assertEqual([block["seq"] for block in out["blocks"]], [1])
+        ids = sorted((item["id"], item["n"]) for item in out["blocks"][0]["crossings"])
+        self.assertEqual(ids, [("NtReleaseSemaphore", 1), ("NtYieldExecution", 1)])
+        counters = out["summary"]["counters"]["all"]
+        self.assertEqual(counters["events_for_unknown_block"], 1)
+        self.assertEqual(counters["incomplete_blocks"], 1)
+        windows = [record for record in out["threads"] if record["tid"] == TID_AUDIO]
+        self.assertEqual(windows[0]["crossings"], {"syscall": {"n": 1, "total_ns": 2_000}})
+
+    def format2_lines(self, emitted, with_end=True):
+        lines = build_fixture()
+        lines[0] = "hdr mono_start_ns=%d format=2 clock=monotonic" % S0
+        lines = [line for line in lines if not line.startswith("Lost ") and not line.startswith("end ")]
+        if with_end:
+            lines.append("end mono_end_ns=%d" % (S0 + 200_000_000))
+            for kind, count in emitted.items():
+                lines.append("@emitted[%d]: %d" % (ord(kind), count))
+        return lines
+
+    def test_lost_events_from_emitted_counters(self):
+        # The fixture holds 9 E, 9 X, 13 B, 2 S lines: claim 2 E and 1 B more were emitted.
+        run_dir = self.fresh_dir("emitted")
+        write_run(run_dir, self.format2_lines({"E": 11, "X": 9, "B": 14, "S": 2, "T": 5}))
+        out = run_reduce(run_dir)
+        loss = out["summary"]["tracer"]["loss"]
+        self.assertEqual(out["summary"]["tracer"]["lost_events"], 3)
+        self.assertEqual(out["summary"]["counters"]["lost_events"], 3)
+        self.assertEqual(loss["source"], "emitted_counters")
+        self.assertEqual(loss["by_kind"], {"B": 1, "E": 2})
+        self.assertEqual(loss["emitted"]["E"], 11)
+        self.assertEqual(loss["received"]["E"], 9)
+        self.assertEqual(out["tracer"]["lost_events"], 3)
+        self.assertEqual(out["tracer"]["loss"]["by_kind"], {"B": 1, "E": 2})
+        self.assertTrue(out["tracer"]["clean_exit"])
+        self.assertEqual(out["tracer"]["clock"], "monotonic")
+        self.assertEqual(out["summary"]["tracer"]["clock"], "monotonic")
+        self.assertTrue(any("3 events lost" in warning for warning in out["summary"]["warnings"]))
+        # @emitted lines are bookkeeping, not ignored junk
+        self.assertEqual(out["summary"]["counters"]["all"]["ignored_lines"], 1)
+
+    def test_lost_events_zero_when_every_emitted_line_arrived(self):
+        run_dir = self.fresh_dir("emitted-zero")
+        write_run(run_dir, self.format2_lines({"E": 9, "X": 9, "B": 13, "S": 2}))
+        out = run_reduce(run_dir)
+        self.assertEqual(out["tracer"]["lost_events"], 0)
+        self.assertEqual(out["tracer"]["loss"]["by_kind"], {})
+        self.assertEqual(out["tracer"]["loss"]["source"], "emitted_counters")
+
+    def test_lost_events_unknown_without_emitted_counters(self):
+        run_dir = self.fresh_dir("crashed")
+        write_run(run_dir, self.format2_lines({}, with_end=False))
+        out = run_reduce(run_dir)
+        self.assertIsNone(out["tracer"]["lost_events"])
+        self.assertIsNone(out["summary"]["counters"]["lost_events"])
+        self.assertEqual(out["tracer"]["loss"]["source"], "unknown")
+        self.assertFalse(out["tracer"]["clean_exit"])
+        self.assertTrue(any("lost events unknown" in warning for warning in out["summary"]["warnings"]))
+        self.assertEqual(len(out["blocks"]), 3)
+
+    def test_format1_trace_keeps_bpftrace_reports(self):
+        self.assertEqual(self.base["tracer"]["lost_events"], 3)
+        self.assertEqual(self.base["tracer"]["loss"]["source"], "bpftrace_reports")
+
+    def test_format1_trace_without_end_is_unknown(self):
+        # the B4 crash: format 1, bpftrace aborted, no "end" line -> unknown, not 0
+        run_dir = self.fresh_dir("format1-crash")
+        write_run(run_dir, [line for line in build_fixture() if not line.startswith(("end ", "Lost "))])
+        out = run_reduce(run_dir)
+        self.assertIsNone(out["tracer"]["lost_events"])
+        self.assertFalse(out["tracer"]["clean_exit"])
+
+
+WRAPPER = TRACER_DIR.parent / "bin" / "wine-trace"
+TID_UNNAMED = 4320
+
+
+def format3_lines(emitted=None, with_end=True):
+    """A format-3 events.txt: no T lines for threads alive at start, X prints st before fr, the
+    unix-call entry is an E line (c=, h=) plus an R line, server waits carry a 64-bit dur."""
+    b1 = S0 + 10_000_000
+    lines = [
+        "hdr mono_start_ns=%d format=3 clock=monotonic" % S0,
+        "B %d %d start seq=1 n=64 rate=48000 clk=%d dl=%d" % (b1, TID_CALLBACK, b1 - 40_000, b1 - 40_000 + PERIOD),
+        "B %d %d before seq=1" % (b1 + 10_000, TID_CALLBACK),
+        "E %d %d syscall a fr=a1 seq=1" % (b1 + 100_000, TID_AUDIO),
+        "X %d %d syscall st=0 fr=a1" % (b1 + 100_700, TID_AUDIO),
+        "B %d %d after seq=1" % (b1 + 500_000, TID_CALLBACK),
+        "B %d %d end seq=1 fl=1 missed=0" % (b1 + 510_000, TID_CALLBACK),
+        # AudioCalc between blocks: its window record in threads.jsonl
+        "E %d %d syscall 46 fr=a2 seq=0" % (S0 + 20_000_000, TID_AUDIO),
+        "X %d %d syscall st=0 fr=a2" % (S0 + 20_002_000, TID_AUDIO),
+        # MIDI thread: a unix call (E + R from the second program) and a 5 s alertable server wait
+        "E %d %d unixcall c=0 h=7f0000001000 seq=0" % (S0 + 40_000_000, TID_MIDI),
+        "R %d %d fr=b2 rip=140001234" % (S0 + 40_000_300, TID_MIDI),
+        "X %d %d unixcall st=0 fr=b2" % (S0 + 40_120_000, TID_MIDI),
+        "E %d %d syscall 34 fr=b3 seq=0" % (S0 + 999_000_000, TID_MIDI),
+        "S %d %d wait 3 dur=5000000000 st=102 seq=0" % (S0 + 6_000_000_000, TID_MIDI),
+        "X %d %d syscall st=102 fr=b3" % (S0 + 6_000_001_000, TID_MIDI),
+        # a thread created while tracing gets its T line from task_newtask
+        "T %d %d %d comm=AudioCalc" % (S0 + 6_100_000_000, TID_UNNAMED, PID_LIVE),
+        "E %d %d syscall 46 fr=c1 seq=0" % (S0 + 6_200_000_000, TID_UNNAMED),
+        "X %d %d syscall st=0 fr=c1" % (S0 + 6_200_001_000, TID_UNNAMED),
+    ]
+    if with_end:
+        lines.append("end mono_end_ns=%d" % (S0 + 7_000_000_000))
+        counts = emitted if emitted is not None else {69: 4, 101: 1, 88: 5, 66: 4, 83: 1, 84: 1}
+        lines.extend("@emitted[%d]: %d" % item for item in sorted(counts.items()))
+    return lines
+
+
+TASKS_START = (
+    "T %d %d %d comm=Ableton Live 12 Trial.exe\n" % (S0 - 5_000_000, TID_MAIN, PID_LIVE)
+    + "T %d %d %d comm=pw-data-loop\n" % (S0 - 5_000_000, TID_CALLBACK, PID_LIVE)
+    + "T %d %d %d comm=AudioCalc\n" % (S0 - 5_000_000, TID_AUDIO, PID_LIVE)
+    + "T %d %d %d comm=MIDI\n" % (S0 - 5_000_000, TID_MIDI, PID_LIVE)
+    + "T %d %d %d comm=wineserver\n" % (S0 - 5_000_000, TID_WINESERVER, PID_WINESERVER)
+)
+
+
+class Format3Test(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def run_dir(self, name, lines, tasks_start=TASKS_START, tasks_stop=None):
+        run_dir = os.path.join(self.tmp.name, name)
+        os.makedirs(run_dir)
+        write_run(run_dir, lines)
+        if tasks_start is not None:
+            with open(os.path.join(run_dir, "tasks-start.txt"), "w", encoding="utf-8", newline="\n") as handle:
+                handle.write(tasks_start)
+        if tasks_stop is not None:
+            with open(os.path.join(run_dir, "tasks-stop.txt"), "w", encoding="utf-8", newline="\n") as handle:
+                handle.write(tasks_stop)
+        return run_dir
+
+    def test_tasks_start_names_threads_for_roles(self):
+        out = run_reduce(self.run_dir("roles", format3_lines()))
+        crossings = out["blocks"][0]["crossings"]
+        self.assertEqual([(item["tid"], item["role"]) for item in crossings], [(TID_AUDIO, "audio_worker")])
+        roles = {record["tid"]: record["role"] for record in out["threads"]}
+        self.assertEqual(roles[TID_AUDIO], "audio_worker")
+        self.assertEqual(roles[TID_UNNAMED], "audio_worker", "task_newtask T line")
+        self.assertEqual(roles[TID_MIDI], "live:MIDI")
+        comms = {record["tid"]: record["comm"] for record in out["threads"]}
+        self.assertEqual(comms[TID_AUDIO], "AudioCalc")
+        # the wrapper-written T lines are not tracer output: no effect on the loss accounting
+        self.assertEqual(out["tracer"]["loss"]["received"].get("T"), 1)
+        self.assertEqual(out["tracer"]["lost_events"], 0)
+
+    def test_without_tasks_files_threads_stay_unnamed(self):
+        out = run_reduce(self.run_dir("no-tasks", format3_lines(), tasks_start=None))
+        self.assertNotEqual(out["blocks"][0]["crossings"][0]["role"], "audio_worker")
+
+    def test_tasks_stop_names_threads_seen_only_at_stop(self):
+        tasks_stop = "T %d %d %d comm=AudioCalc\n" % (S0 + 7_500_000_000, TID_MIDI + 1, PID_LIVE)
+        lines = format3_lines()
+        lines.insert(-7, "E %d %d syscall 46 fr=d1 seq=0" % (S0 + 6_300_000_000, TID_MIDI + 1))
+        lines.insert(-7, "X %d %d syscall st=0 fr=d1" % (S0 + 6_300_001_000, TID_MIDI + 1))
+        out = run_reduce(self.run_dir("stop-tasks", lines, tasks_stop=tasks_stop))
+        roles = {record["tid"]: record["role"] for record in out["threads"]}
+        self.assertEqual(roles[TID_MIDI + 1], "audio_worker")
+        # stopped_monotonic_ns comes from the end line, never from the wrapper's stop stamp
+        self.assertEqual(out["tracer"]["stopped_monotonic_ns"], S0 + 7_000_000_000)
+
+    def test_format3_lines_pair_and_join(self):
+        out = run_reduce(self.run_dir("format3", format3_lines()), mode="drilldown")
+        counters = out["summary"]["counters"]["all"]
+        self.assertEqual(out["summary"]["counters"]["unmatched_exits"], 0)
+        self.assertEqual(counters.get("unixcall_entries_without_r", 0), 0)
+        self.assertNotIn("unmatched_exits_with_restore_flags", counters)
+        unix = [event for event in out["events"] if event["kind"] == "unixcall"]
+        self.assertEqual(len(unix), 1)
+        self.assertEqual(unix[0]["caller"], "pe!0x140001234")
+        self.assertEqual(unix[0]["dur_ns"], 120_000)
+        self.assertTrue(unix[0]["id"].startswith("winscard.so"), unix[0]["id"])
+        wait = [event for event in out["events"] if event["kind"] == "server_wait"]
+        # 64-bit dur: a 5 s wait (> 2^32 ns) keeps its start
+        self.assertEqual(wait[0]["dur_ns"], 5_000_000_000)
+        self.assertEqual(wait[0]["status"], "0x102")
+        self.assertEqual(out["summary"]["kinds"]["server_wait"], {"n": 1, "total_ns": 5_000_000_000})
+        loss = out["tracer"]["loss"]
+        self.assertEqual(loss["emitted"]["R"], 1)
+        self.assertEqual(loss["emitted"]["E"], 5)
+        self.assertNotIn("e", loss["emitted"])
+        self.assertEqual(loss["by_kind"], {})
+
+    def test_lost_r_line_counts_against_the_unixcall_entry_counter(self):
+        lines = [line for line in format3_lines() if not line.startswith("R ")]
+        out = run_reduce(self.run_dir("lost-r", lines))
+        self.assertEqual(out["tracer"]["loss"]["by_kind"], {"R": 1})
+        self.assertEqual(out["tracer"]["lost_events"], 1)
+
+    def test_loss_total_takes_the_larger_report_and_adds_recursion_misses(self):
+        # shortfall 3 (E) vs bpftrace's own "Lost 5": the same drops, so max(5, 3) = 5; + 7 misses
+        lines = format3_lines({69: 7, 101: 1, 88: 5, 66: 4, 83: 1, 84: 1})
+        lines.insert(1, "Lost 5 events")
+        out = run_reduce(self.run_dir("max", lines), extra=["--recursion-misses", "7"])
+        loss = out["tracer"]["loss"]
+        self.assertEqual(loss["by_kind"], {"E": 3})
+        self.assertEqual(loss["reported_by_bpftrace"], 5)
+        self.assertEqual(loss["recursion_misses"], 7)
+        self.assertEqual(out["tracer"]["lost_events"], 12)
+        self.assertEqual(out["summary"]["tracer"]["lost_events"], 12)
+        self.assertFalse(loss["lower_bound"])
+        # shortfall larger than the report
+        lines = format3_lines({69: 14, 101: 1, 88: 5, 66: 4, 83: 1, 84: 1})
+        lines.insert(1, "Lost 5 events")
+        out = run_reduce(self.run_dir("max2", lines))
+        self.assertEqual(out["tracer"]["lost_events"], 10)
+
+    def test_recursion_misses_alone_are_lost_events(self):
+        out = run_reduce(self.run_dir("misses", format3_lines()), extra=["--recursion-misses", "2612"])
+        self.assertEqual(out["tracer"]["lost_events"], 2612)
+        self.assertTrue(any("2612 fentry/fexit recursion misses" in item for item in out["summary"]["warnings"]))
+
+    def test_lines_after_the_counters_make_a_lower_bound(self):
+        # X received 5, emitted 4: one line arrived after @emitted was read
+        out = run_reduce(self.run_dir("lag", format3_lines({69: 4, 101: 1, 88: 4, 66: 4, 83: 1, 84: 1})))
+        loss = out["tracer"]["loss"]
+        self.assertEqual(loss["received_after_counters"], 1)
+        self.assertTrue(loss["lower_bound"])
+        self.assertEqual(out["tracer"]["lost_events"], 0)
+        self.assertTrue(any("lower bound" in item for item in out["summary"]["warnings"]))
+
+    def test_crashed_tracer_stops_at_its_last_event(self):
+        # no end line (bpftrace aborted): the wrapper's later stop time must not claim coverage
+        lines = format3_lines(with_end=False)
+        tasks_stop = "T %d %d %d comm=AudioCalc\n" % (S0 + 60_000_000_000, TID_AUDIO, PID_LIVE)
+        run_dir = self.run_dir("crashed", lines, tasks_stop=tasks_stop)
+        argv = ["--in", run_dir, "--quiet", "--stopped-monotonic-ns", str(S0 + 90_000_000_000)]
+        self.assertEqual(reduce_mod.main(argv), 0)
+        out = read_outputs(run_dir)
+        self.assertEqual(out["tracer"]["stopped_monotonic_ns"], S0 + 6_200_001_000)
+        self.assertEqual(out["summary"]["tracer"]["stopped_monotonic_ns"], S0 + 6_200_001_000)
+        self.assertFalse(out["tracer"]["clean_exit"])
+        self.assertIsNone(out["tracer"]["lost_events"])
+
+    def test_wrapper_reduce_arguments_are_accepted(self):
+        text = WRAPPER.read_text(encoding="utf-8")
+        start = text.index("local reduce_args=(")
+        block = text[start:text.index(")\n", start)]
+        pairs = re.findall(r'(--[a-z-]+)\s+"([^"]*)"', block)
+        self.assertIn("--recursion-misses", [option for option, _ in pairs])
+        run_dir = self.run_dir("wrapper", format3_lines())
+        values = {
+            "$out": run_dir,
+            "$out/tracer.json": os.path.join(run_dir, "tracer.json"),
+            "$mode": "summary",
+            "$stopped_ns": str(S0 + 8_000_000_000),
+            "$lost_extra": "0",
+            "${rmisses:-0}": "4",
+        }
+        argv = []
+        for option, expression in pairs:
+            self.assertIn(expression, values, "unknown wrapper expression %s %s" % (option, expression))
+            argv += [option, values[expression]]
+        self.assertEqual(reduce_mod.main(argv + ["--quiet"]), 0)
+        out = read_outputs(run_dir)
+        self.assertEqual(out["tracer"]["loss"]["recursion_misses"], 4)
+        self.assertEqual(out["tracer"]["lost_events"], 4)
+
+
 class ParserTest(unittest.TestCase):
     def test_parse_line_shapes(self):
         parse = reduce_mod.parse_line
@@ -572,6 +921,7 @@ class ParserTest(unittest.TestCase):
         self.assertEqual(parse("K 1 2 3 cmd=80044e88 seq=4", 0), ("K", 1, 2, 3, 0x80044E88, 4))
         self.assertEqual(parse("O 50 2 off=10 wake=40 st=1", 0), ("O", 50, 2, 10, 40, 1))
         self.assertIsNone(parse("Attaching 3 probes...", 0))
+        self.assertIsNone(parse("WARNING: something", 0))
         with self.assertRaises((ValueError, KeyError, IndexError)):
             parse("E 10 5 syscall", 0)
 

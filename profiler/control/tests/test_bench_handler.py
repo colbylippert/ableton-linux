@@ -115,6 +115,18 @@ class HandlerCase(unittest.TestCase):
         self.assertTrue(all(type(value) is float for value in values))
         self.assertIsNone(remote)
 
+    def test_cpu_values_pass_live_percent_through_unscaled(self):
+        # Live 12.4.6 reports both attributes in percent of the buffer period
+        # (checked against AbletonOSC's unscaled average_process_usage on the
+        # laptop); a peak above 100 is a missed deadline, not a unit error.
+        self.assertEqual(bench.CPU_SCALE, 1.0)
+        self.make_handler()
+        self.application.average_process_usage = 47.134
+        self.application.peak_process_usage = 715.125
+        self.server.dispatch("/abl/bench/poll")
+        (values, _), = self.reports("/abl/bench/cpu")
+        self.assertEqual(values, (47.134, 715.125))
+
     def test_cpu_period_rearms_at_tick_resolution(self):
         handler = self.make_handler()
         self.manager.advance(4)

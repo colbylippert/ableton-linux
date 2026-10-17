@@ -62,6 +62,7 @@ test-profiler:                 ## run profiler workbench checks (control layer, 
 	python3 -I ./profiler/tracer/tests/test_symbolize.py
 	python3 -I ./profiler/tracer/tests/test_reduce.py
 	python3 -I ./profiler/tracer/tests/test_validate.py
+	python3 -I ./profiler/tracer/tests/test_bt_template.py
 	python3 -I ./profiler/bin/tests/test-ledger-report.py
 	python3 -I ./profiler/bin/tests/test-history-add.py
 

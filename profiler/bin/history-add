@@ -173,11 +173,44 @@ def runtime_record(profile: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+# Launcher settings the suite records next to the switches (bench-report.py
+# BENCHMARK_ABLETON_ENV_KEYS) that are not switches: Link anchor paths come
+# from the installer configuration (~/.config/ableton-wine/config), and a value
+# equal to scripts/ableton-live's default is the stock configuration. B4's
+# plain baseline carried ABLETON_LINKD=<path> and ABLETON_LINK_MODE=off this
+# way and was flagged as switched (and hidden from the dashboard's "No
+# switches" filter and ledger-report's hotspot fallback).
+NOT_SWITCHES = frozenset({"ABLETON_LINKD", "ABLETON_LINKD_LINGER"})
+LAUNCHER_DEFAULTS = {
+    "ABLETON_DCOMP": {"on"},
+    "ABLETON_DPI_MODE": {"auto"},
+    "ABLETON_LINK_MODE": {"off"},
+    "ABLETON_MAX_AUDIO_THREADS": {"auto"},
+    "ABLETON_POWER": {"performance", "on", "auto"},
+    "ABLETON_RT": {"auto", "on"},
+    "ABLETON_TEXT_SMOOTHING": {"subpixel"},
+    "ABLETON_THEME_MODE": {"auto"},
+    "ABLETON_TOPBAR_MODE": {"live"},
+    "ABLETON_UI_FONT": {"auto"},
+}
+
+
+def is_switch(key: str, value: str) -> bool:
+    """A recorded gate is a switch when it is set and differs from the stock configuration."""
+    value = value.strip()
+    if not value or key in NOT_SWITCHES:
+        return False
+    return value.lower() not in LAUNCHER_DEFAULTS.get(key, ())
+
+
 def switch_record(profile: dict[str, Any]) -> dict[str, str]:
     gates = nested(profile, "configuration", "benchmark_gates")
     if not isinstance(gates, dict):
         return {}
-    return {str(key): str(value) for key, value in sorted(gates.items())}
+    return {
+        str(key): str(value) for key, value in sorted(gates.items())
+        if value is not None and is_switch(str(key), str(value))
+    }
 
 
 def voluntary_switch_rate(measurement: dict[str, Any]) -> Any:

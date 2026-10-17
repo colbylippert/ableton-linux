@@ -1,25 +1,35 @@
 #!/usr/bin/env bash
 # wine-trace -- driver for the Wine interface tracer (design B, section 3b CLI contract).
 #
-#   wine-trace start  --out DIR [--pid P]... [--run-id TOKEN] [--mode summary|drilldown] [--proto]
+#   wine-trace start  --out DIR [--pid P]... [--run-id TOKEN] [--mode summary|drilldown]
+#                     [--proto|--libbpf] [--allow-private-stack]
 #                     [--no-ntsync] [--sched|--no-sched] [--no-follow] [--no-pid-filter]
 #                     [--wine-root DIR] [--prefix DIR] [--tables FILE] [--attach-timeout S]
 #   wine-trace stop   --out DIR [--stop-timeout S]
 #   wine-trace run    --duration S  <start options>
 #   wine-trace status --out DIR
 #
-# Backend: profiler/tracer/build/wine-trace (libbpf, production) when it exists, else --proto:
-# the bpftrace prototype profiler/tracer/wine-trace.bt whose event lines profiler/tracer/reduce.py
-# joins offline into blocks.jsonl, threads.jsonl, summary.json (and events.jsonl in drilldown).
+# Backend: the bpftrace prototype profiler/tracer/wine-trace.bt (default, --proto) whose event
+# lines profiler/tracer/reduce.py joins offline into blocks.jsonl, threads.jsonl, summary.json
+# (and events.jsonl in drilldown).  The libbpf tracer profiler/tracer/build/wine-trace is opt-in
+# (--libbpf or WINE_TRACE_BACKEND=libbpf) until its USDT programs fit the 64-byte stack budget:
+# the loader refuses to attach without --unsafe-private-stack (profiler/tracer/BUILD.md).
+# --allow-private-stack: trace even when a multi-thread USDT program of the bpftrace script runs on
+# a per-CPU private stack (events can mix; recorded in tracer.json, a bench-report confounder).
 #
 # start: discovers the prefix pids (scripts/lib/lifecycle.sh: ableton_prefix_pids, narrowed by
 #   --run-id through ABLETON_BENCH_RUN_ID=TOKEN) unless --pid is given, resolves ntdll.so and
 #   pipeasio64.dll.so from the pids' /proc/PID/maps (fallback: the runtime root), snapshots the
 #   maps, generates DIR/wine-trace.bt, checks it with bpftrace --dry-run (retrying without the
 #   kernel-side NTSync probes), daemonises bpftrace with setsid (pidfile DIR/wine-trace.pid),
-#   waits for the "hdr" line (= every probe attached) and writes DIR/tracer.json.
-# stop: SIGINT (then TERM, KILL), waits, runs reduce.py (+ symbolize.py --blocks when present),
-#   updates tracer.json with stopped_monotonic_ns / lost_events / probe hits.
+#   waits for the "hdr" line (= every probe attached), checks that its timestamp is
+#   CLOCK_MONOTONIC (between python's time.monotonic_ns() before the launch and now), records
+#   which loaded programs run on a per-CPU private stack (JIT prologue, via bpftool) and writes
+#   DIR/tracer.json.  The threads alive at start are written as T lines to tasks-start.txt.
+# stop: SIGINT (then TERM, KILL), waits, records how bpftrace ended (tracer_exit: clean when the
+#   END output is there, else crashed/killed/no-end) and the fentry programs' recursion misses,
+#   runs reduce.py (+ symbolize.py --blocks when present), updates tracer.json with
+#   stopped_monotonic_ns / lost_events / probe hits.
 # Output files are chowned to SUDO_UID:SUDO_GID so the invoking user can read them.
 #
 # Needs root (sudo -n): bpftrace attaches uprobes and fentry programs.  Never touches anything
@@ -43,7 +53,9 @@ out=""
 pids=()
 run_id=""
 mode="summary"
-proto=0
+use_libbpf=0
+[ "${WINE_TRACE_BACKEND:-}" != libbpf ] || use_libbpf=1
+allow_private_stack=0
 ntsync=1
 sched=""
 follow=1
@@ -57,7 +69,7 @@ stop_timeout=30
 
 usage()
 {
-    sed -n '2,25p' "$self" | sed 's/^# \{0,1\}//' >&2
+    sed -n '2,/^$/p' "$self" | sed 's/^# \{0,1\}//' >&2
     exit 2
 }
 
@@ -87,7 +99,9 @@ parse_args()
             --pid) [ "$#" -ge 2 ] || usage; pids+=("$2"); shift 2 ;;
             --run-id) [ "$#" -ge 2 ] || usage; run_id="$2"; shift 2 ;;
             --mode) [ "$#" -ge 2 ] || usage; mode="$2"; shift 2 ;;
-            --proto) proto=1; shift ;;
+            --proto) use_libbpf=0; shift ;;
+            --libbpf) use_libbpf=1; shift ;;
+            --allow-private-stack) allow_private_stack=1; shift ;;
             --no-ntsync) ntsync=0; shift ;;
             --sched) sched=1; shift ;;
             --no-sched) sched=0; shift ;;
@@ -154,6 +168,11 @@ tracer_alive()
 monotonic_ns()
 {
     python3 -I -c 'import time; print(time.monotonic_ns())'
+}
+
+boottime_ns()
+{
+    python3 -I -c 'import time; print(time.clock_gettime_ns(time.CLOCK_BOOTTIME))' 2>/dev/null || echo 0
 }
 
 # Prefix pids through the repo's lifecycle library, evaluated as the invoking user's HOME.
@@ -248,6 +267,25 @@ snapshot_maps()
     done
 }
 
+# T lines ("T <monotonic ns> <tid> <pid> comm=<comm>", the events.txt format) for every thread of
+# the traced pids, to $out/tasks-$1.txt; reduce.py reads tasks-start.txt and tasks-stop.txt next to
+# events.txt.  The USDT programs print no first-sight T lines (one printf per program, see
+# wine-trace.bt), threads created while tracing come from task:task_newtask.
+snapshot_tasks()
+{
+    local which="$1" pid task tid comm now
+    now="$(monotonic_ns)"
+    : > "$out/tasks-$which.txt"
+    for pid in "${pids[@]}"; do
+        for task in /proc/"$pid"/task/[0-9]*; do
+            [ -d "$task" ] || continue
+            tid="${task##*/}"
+            comm="$(cat "$task/comm" 2>/dev/null || true)"
+            printf 'T %s %s %s comm=%s\n' "$now" "$tid" "$pid" "$comm" >> "$out/tasks-$which.txt"
+        done
+    done
+}
+
 write_pids_tsv()
 {
     local pid comm image exe
@@ -277,7 +315,7 @@ list_probes()
     # and nothing when the function or tracepoint is unknown.
     local probe
     for probe in fentry:ntsync:ntsync_char_ioctl fexit:ntsync:ntsync_char_ioctl fentry:ntsync:ntsync_obj_ioctl \
-                 tracepoint:sched:sched_process_exec tracepoint:task:task_rename \
+                 tracepoint:sched:sched_process_exec tracepoint:task:task_rename tracepoint:task:task_newtask \
                  tracepoint:sched:sched_waking tracepoint:sched:sched_switch; do
         if [ -n "$(bpftrace -l "$probe" 2>/dev/null | grep -F -- "${probe##*:}" || true)" ]; then
             printf '%s\n' "$probe" >> "$out/probes.txt"
@@ -297,11 +335,14 @@ generate_script()
     local strip="$1" filter="1"
     [ "$pid_filter" -eq 1 ] && filter='@pids[pid]'
     python3 -I - "$template" "$out/wine-trace.bt" "$ntdll" "${pipeasio:-/nonexistent/pipeasio64.dll.so}" \
-        "$filter" "$(IFS=,; printf '%s' "${pids[*]}")" "$strip" "$out/probes.txt" "$out/attach.txt" <<'PY'
+        "$filter" "$(IFS=,; printf '%s' "${pids[*]}")" "$strip" "$out/probes.txt" "$out/attach.txt" \
+        "$out/tasks-start.txt" <<'PY'
+import os
 import re
 import sys
 
 (template, dest, ntdll, pipeasio, filt, pid_list, strip, probes_file, attach_file) = sys.argv[1:10]
+tasks_file = sys.argv[10] if len(sys.argv) > 10 else ""
 strip = set(part for part in strip.split(",") if part)
 with open(probes_file, encoding="utf-8") as handle:
     available = set(line.strip() for line in handle if line.strip())
@@ -349,6 +390,12 @@ while index < len(kept):
 # 3. placeholders
 pids = [pid for pid in pid_list.split(",") if pid]
 init = " ".join("@pids[(uint32)%s] = 1;" % pid for pid in pids) or "@pids[(uint32)0] = 0;"
+# the threads alive at start seed @tids (the --sched probes filter on it)
+tids = []
+if tasks_file and os.path.isfile(tasks_file):
+    with open(tasks_file, encoding="utf-8", errors="replace") as handle:
+        tids = [line.split()[2] for line in handle if line.startswith("T ") and len(line.split()) > 3]
+init += "".join(" @tids[(uint32)%s] = 1;" % tid for tid in tids if tid.isdigit())
 text = "\n".join(output)
 text = text.replace("@NTDLL@", ntdll).replace("@PIPEASIO@", pipeasio).replace("@FILTER@", filt)
 text = text.replace("@PIDS_INIT@", init)
@@ -357,7 +404,8 @@ if re.search(r"^// @@SECTION", text, re.M) or "@NTDLL@" in text or "@PIPEASIO@" 
 with open(dest, "w", encoding="utf-8", newline="\n") as handle:
     handle.write(re.sub(r"\n{3,}", "\n\n", text).rstrip("\n") + "\n")
 with open(attach_file, "w", encoding="utf-8", newline="\n") as handle:
-    for probe in attached:
+    # one line per probe (unixcall_entry carries two programs)
+    for probe in dict.fromkeys(attached):
         handle.write(probe + "\n")
 PY
 }
@@ -401,12 +449,27 @@ if os.path.isfile(attach_txt):
     with open(attach_txt, encoding="utf-8") as handle:
         attach = [line.strip() for line in handle if line.strip()]
 started = int(fields.get("started_monotonic_ns") or time.monotonic_ns())
+clock_check = None
+if fields.get("clock_before_ns") and fields.get("clock_after_ns"):
+    clock_check = {
+        "python_monotonic_before_ns": int(fields["clock_before_ns"]),
+        "hdr_ns": started,
+        "python_monotonic_after_ns": int(fields["clock_after_ns"]),
+        "boottime_ns": int(fields.get("clock_boottime_ns") or 0) or None,
+        "ok": fields.get("clock_ok") == "1",
+    }
 data = {
     "version": fields.get("version", "wine-trace/1"),
     "backend": fields.get("backend", "bpftrace"),
     "mode": fields.get("mode", "summary"),
     "sample_rate": 1,
     "attach": attach,
+    "clock": fields.get("clock") or "monotonic",
+    "clock_check": clock_check,
+    "private_stack_programs": [name for name in (fields.get("private_stack_programs") or "").split(",") if name],
+    # multi-thread USDT programs among them (events can mix); non-empty only with --allow-private-stack
+    "private_stack_risky": [name for name in (fields.get("private_stack_risky") or "").split(",") if name],
+    "private_stack_allowed": fields.get("private_stack_allowed") == "1",
     "started_monotonic_ns": started,
     "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     "pids": pids,
@@ -508,8 +571,10 @@ cmd_start()
     resolve_libraries
     write_pids_tsv
     snapshot_maps ""
+    snapshot_tasks start
     local backend="bpftrace" started_ns tool_version script_name="" events_name=""
-    if [ "$proto" -eq 0 ] && [ -x "$libbpf_bin" ]; then
+    if [ "$use_libbpf" -eq 1 ]; then
+        [ -x "$libbpf_bin" ] || die "--libbpf: $libbpf_bin is not built (make -C profiler/tracer)"
         backend="libbpf"
         tool_version="$("$libbpf_bin" --version 2>/dev/null | head -n 1 || true)"
         local args=(--out "$out" --mode "$mode")
@@ -522,7 +587,11 @@ cmd_start()
         started_ns="$(monotonic_ns)"
         daemonise "$out/wine-trace.pid" "$out/wine-trace.stdout" "$out/wine-trace.stderr" "$libbpf_bin" "${args[@]}"
         sleep 1
-        tracer_alive || { tail -n 20 "$out/wine-trace.stderr" >&2 2>/dev/null || true; die "libbpf tracer exited early"; }
+        if ! tracer_alive; then
+            tail -n 20 "$out/wine-trace.stderr" >&2 2>/dev/null || true
+            rm -f -- "$out/wine-trace.pid"
+            die "libbpf tracer exited early ($out/wine-trace.stderr)"
+        fi
         : > "$out/attach.txt"
     else
         command -v bpftrace >/dev/null 2>&1 || die "bpftrace is not installed (pacman -S bpftrace) and $libbpf_bin does not exist"
@@ -549,10 +618,42 @@ cmd_start()
         script_name="wine-trace.bt"
         events_name="events.txt"
         log "backend: bpftrace ($tool_version), $(wc -l < "$out/attach.txt") probes, ntsync=$([ "$ntsync" -eq 1 ] && echo fentry || echo off) sched=$sched follow=$follow"
-        export BPFTRACE_PERF_RB_PAGES="${BPFTRACE_PERF_RB_PAGES:-1024}"
-        daemonise "$out/wine-trace.pid" "$out/events.txt" "$out/bpftrace.stderr" bpftrace -q -B full "$out/wine-trace.bt"
-        wait_for_header "$(pidfile_pid)" || { rm -f -- "$out/wine-trace.pid"; chown_out; exit 1; }
+        if grep -v 'found external warnings' "$out/dry-run.log" 2>/dev/null | grep -q 'WARNING:'; then
+            log "warning: bpftrace compiled the script with warnings ($out/dry-run.log)"
+        fi
+        clock_before_ns="$(monotonic_ns)"
+        # --no-warnings is part of the stack budget: without it bpftrace 0.27 generates bigger
+        # frames (presumably its runtime helper-error checks) and the hot USDT programs cross 64
+        # bytes, onto the per-CPU private stack (wine-trace.bt header; measured with bpftool on
+        # the generated script).  It also hides bpftrace's "Lost N events" report
+        # and the compile warnings (which 0.27 echoes on stdout = events.txt); ring-buffer drops are
+        # counted through @emitted instead, and the dry run above keeps the warnings.
+        daemonise "$out/wine-trace.pid" "$out/events.txt" "$out/bpftrace.stderr" bpftrace -q -B full --no-warnings "$out/wine-trace.bt"
+        if ! wait_for_header "$(pidfile_pid)"; then
+            stop_daemon "$(pidfile_pid)" || true   # a timeout leaves bpftrace running
+            rm -f -- "$out/wine-trace.pid"
+            die "bpftrace did not attach ($out/bpftrace.stderr)"
+        fi
+        clock_after_ns="$(monotonic_ns)"
+        clock_boottime_ns="$(boottime_ns)"
         started_ns="$(sed -n 's/^hdr mono_start_ns=\([0-9]*\).*$/\1/p' "$out/events.txt" | head -n 1)"
+        # The hdr line is printed by BEGIN (after every probe attached) with nsecs(monotonic): it
+        # must fall between the two python time.monotonic_ns() readings.  A CLOCK_BOOTTIME stamp
+        # (plain "nsecs") is larger than both by the suspended time and fails this check.
+        if [ -n "$started_ns" ] && [ "$started_ns" -ge "$clock_before_ns" ] && [ "$started_ns" -le "$clock_after_ns" ]; then
+            clock_ok=1
+        else
+            clock_ok=0
+            stop_daemon "$(pidfile_pid)" || true
+            rm -f -- "$out/wine-trace.pid"
+            die "hdr mono_start_ns=${started_ns:-?} is not CLOCK_MONOTONIC (python monotonic $clock_before_ns..$clock_after_ns, boottime $clock_boottime_ns): mixed clocks would corrupt every offset"
+        fi
+        check_frames "$(pidfile_pid)"
+        if [ -n "$private_stack_risky" ] && [ "$allow_private_stack" -ne 1 ]; then
+            stop_daemon "$(pidfile_pid)" || true
+            rm -f -- "$out/wine-trace.pid"
+            die "multi-thread USDT programs run on a per-CPU private stack, so events of two threads can mix: $private_stack_risky (bpftrace/kernel changed the frame sizes? see the wine-trace.bt header; --allow-private-stack traces anyway)"
+        fi
     fi
     local table_name=""
     if [ -n "$tables" ]; then
@@ -564,14 +665,82 @@ cmd_start()
         "run_id=$run_id" "pid_filter=$pid_filter" "wine_root=$wine_root" "wine_version=$wine_version" \
         "ntdll=$ntdll" "pipeasio=$pipeasio" "ntsync=$([ "$ntsync" -eq 1 ] && echo fentry || echo off)" \
         "sched=$sched" "follow=$follow" "tables=$table_name" "tool_version=$tool_version" \
-        "script=$script_name" "events=$events_name"
+        "script=$script_name" "events=$events_name" "clock=monotonic" \
+        "clock_before_ns=${clock_before_ns:-}" "clock_after_ns=${clock_after_ns:-}" \
+        "clock_boottime_ns=${clock_boottime_ns:-}" "clock_ok=${clock_ok:-}" \
+        "private_stack_programs=${private_stack:-}" "private_stack_risky=${private_stack_risky:-}" \
+        "private_stack_allowed=$allow_private_stack"
     chown_out
     log "started: pid $(pidfile_pid), started_monotonic_ns=$started_ns, out=$out"
 }
 
+# bpftool prog show --json, reduced to "id<TAB>type<TAB>name<TAB>recursion_misses" for the programs
+# that bpftrace process $1 holds.
+bpftrace_progs()
+{
+    command -v bpftool >/dev/null 2>&1 || return 0
+    bpftool prog show --json 2>/dev/null | python3 -I -c '
+import json, sys
+want = int(sys.argv[1])
+try:
+    progs = json.load(sys.stdin)
+except ValueError:
+    progs = []
+for prog in progs:
+    if any(entry.get("pid") == want for entry in prog.get("pids", []) or []):
+        print("%s\t%s\t%s\t%s" % (prog.get("id"), prog.get("type"), prog.get("name", ""), prog.get("recursion_misses", 0)))
+' "$1" || true
+}
+
+# Which loaded programs run on the kernel's per-CPU private stack (verifier, kernel >= 6.14: frame
+# >= 64 bytes; the x86 JIT prologue then sets up %r9 from %gs instead of "sub $N,%rsp")?  A
+# preemptible USDT program on a private stack can mix two events in one record when a second
+# thread enters it on the same CPU (wine-trace.bt header).  Sets $private_stack (every such
+# program, tracer.json private_stack_programs) and $private_stack_risky (the multi-thread USDT
+# ones, comma list; cmd_start refuses to trace with them unless --allow-private-stack).
+check_frames()
+{
+    local bpid="$1" id type name misses prologue risky=""
+    private_stack=""
+    private_stack_risky=""
+    if ! command -v bpftool >/dev/null 2>&1; then
+        private_stack="unknown(no bpftool)"
+        log "warning: bpftool is missing: cannot check the programs for a per-CPU private stack"
+        return 0
+    fi
+    while IFS="$(printf '\t')" read -r id type name misses; do
+        [ -n "$id" ] || continue
+        prologue="$(bpftool prog dump jited id "$id" 2>/dev/null | sed -n '4,16p' || true)"
+        if printf '%s\n' "$prologue" | grep -q '%gs:.*%r9'; then
+            private_stack="${private_stack:+$private_stack,}$name"
+            case "$type:$name" in
+                kprobe:*pipeasio*) ;;  # single PipeASIO callback thread: cannot re-enter
+                kprobe:*) risky="${risky:+$risky,}$name" ;;
+            esac
+        fi
+    done < <(bpftrace_progs "$bpid")
+    private_stack_risky="$risky"
+    if [ -n "$risky" ]; then
+        log "warning: preemptible USDT programs on a per-CPU private stack (events can mix): $risky"
+    fi
+}
+
+# Sum of recursion_misses (fentry/fexit re-entries skipped by the kernel) over bpftrace's programs.
+recursion_misses_of()
+{
+    local total=0 id type name misses
+    while IFS="$(printf '\t')" read -r id type name misses; do
+        case "$misses" in ''|*[!0-9]*) misses=0 ;; esac
+        total=$((total + misses))
+    done < <(bpftrace_progs "$1")
+    printf '%s\n' "$total"
+}
+
 stop_daemon()
 {
+    # Sets stop_signal to the last signal that was needed (INT normally).
     local pid="$1" deadline
+    stop_signal=INT
     kill -INT "$pid" 2>/dev/null || return 0
     deadline=$((SECONDS + stop_timeout))
     while kill -0 "$pid" 2>/dev/null; do
@@ -580,6 +749,7 @@ stop_daemon()
     done
     if kill -0 "$pid" 2>/dev/null; then
         log "warning: tracer ignored SIGINT for ${stop_timeout}s; sending SIGTERM"
+        stop_signal=TERM
         kill -TERM "$pid" 2>/dev/null || true
         deadline=$((SECONDS + 10))
         while kill -0 "$pid" 2>/dev/null; do
@@ -589,6 +759,7 @@ stop_daemon()
     fi
     if kill -0 "$pid" 2>/dev/null; then
         log "warning: tracer ignored SIGTERM; sending SIGKILL (buffered output is lost)"
+        stop_signal=KILL
         kill -KILL "$pid" 2>/dev/null || true
         sleep 0.5
     fi
@@ -598,7 +769,8 @@ cmd_stop()
 {
     require_root
     [ -d "$out" ] || die "$out does not exist"
-    local pid="" stopped_ns backend="bpftrace" lost_extra=0 rc=0
+    local pid="" stopped_ns backend="bpftrace" lost_extra=0 rc=0 was_running=0 tracer_exit="" rmisses=0
+    stop_signal=""
     if [ -f "$out/tracer.json" ]; then
         backend="$(sed -n 's/^[[:space:]]*"backend":[[:space:]]*"\([a-z]*\)".*$/\1/p' "$out/tracer.json" | head -n 1)"
         backend="${backend:-bpftrace}"
@@ -612,8 +784,10 @@ cmd_stop()
             local tsv_pids=()
             [ -f "$out/pids.tsv" ] && mapfile -t tsv_pids < <(cut -f1 "$out/pids.tsv")
             pids=(${tsv_pids[@]+"${tsv_pids[@]}"})
-            [ "${#pids[@]}" -eq 0 ] || snapshot_maps "-stop"
+            [ "${#pids[@]}" -eq 0 ] || { snapshot_maps "-stop"; snapshot_tasks stop; }
+            rmisses="$(recursion_misses_of "$pid")"
         fi
+        was_running=1
         stop_daemon "$pid"
     else
         log "warning: no running tracer for $out (pidfile ${pid:-absent}); reducing what is there"
@@ -621,21 +795,42 @@ cmd_stop()
     rm -f -- "$out/wine-trace.pid"
     if [ "$backend" = bpftrace ]; then
         [ -s "$out/events.txt" ] || die "$out/events.txt is empty: nothing to reduce"
+        # How did bpftrace end?  END prints "end mono_end_ns=" and the @emitted counters; without
+        # them the lost-event count is unknown (reduce.py reports null, not 0).
+        if grep -qE 'terminate called|std::bad_alloc|Segmentation fault|Aborted|core dumped' "$out/bpftrace.stderr" 2>/dev/null; then
+            tracer_exit="crashed"
+        elif grep -q '^end mono_end_ns=' "$out/events.txt"; then
+            tracer_exit="clean"
+        elif [ "$stop_signal" = KILL ]; then
+            tracer_exit="killed"
+        else
+            tracer_exit="no-end"
+        fi
+        if [ "$was_running" -eq 0 ] && [ "$tracer_exit" = clean ]; then
+            tracer_exit="exited-before-stop"
+        fi
+        if [ "$tracer_exit" != clean ]; then
+            log "warning: bpftrace did not exit cleanly ($tracer_exit); see $out/bpftrace.stderr"
+        fi
         if [ -f "$out/bpftrace.stderr" ]; then
             # grep exits 1 when nothing was lost (the normal case): under pipefail that
             # status must not abort the stop before reduce.py runs
             lost_extra="$( { grep -oE 'Lost [0-9]+ events?' "$out/bpftrace.stderr" || true; } | awk '{s+=$2} END {print s+0}')"
-            if grep -qiE 'error|WARNING' "$out/bpftrace.stderr"; then
+            # "N warnings generated." is clang's summary for the BTF-derived vmlinux.h (harmless)
+            # (no grep -q here: an early exit would SIGPIPE the left side and fail under pipefail)
+            if grep -iE 'error|WARNING|terminate|abort' "$out/bpftrace.stderr" | grep -v 'warnings\{0,1\} generated\.$' > /dev/null; then
                 log "bpftrace stderr has diagnostics ($out/bpftrace.stderr):"
                 tail -n 10 "$out/bpftrace.stderr" >&2 || true
             fi
         fi
         local reduce_args=(--in "$out" --tracer-json "$out/tracer.json" --mode "$mode" \
-                           --stopped-monotonic-ns "$stopped_ns" --lost-events-extra "$lost_extra")
+                           --stopped-monotonic-ns "$stopped_ns" --lost-events-extra "$lost_extra" \
+                           --recursion-misses "${rmisses:-0}")
         [ -z "$tables" ] || reduce_args+=(--tables "$tables")
         log "reducing: python3 -I $reduce_py ${reduce_args[*]}"
         python3 -I "$reduce_py" "${reduce_args[@]}" || rc=$?
-        [ "$rc" -eq 0 ] || { chown_out; die "reduce.py failed with $rc"; }
+        [ "$rc" -eq 0 ] || { update_tracer_json "tracer_exit=$tracer_exit"; chown_out; die "reduce.py failed with $rc"; }
+        update_tracer_json "tracer_exit=$tracer_exit"
     else
         update_tracer_json "stopped_monotonic_ns=$stopped_ns"
         [ -f "$out/blocks.jsonl" ] || log "warning: the libbpf backend left no blocks.jsonl in $out"
@@ -653,7 +848,7 @@ cmd_stop()
             || log "warning: symbolize.py failed (see $out/wine-trace.log); blocks keep placeholder callers"
     fi
     chown_out
-    log "stopped: out=$out stopped_monotonic_ns=$stopped_ns lost_extra=$lost_extra"
+    log "stopped: out=$out stopped_monotonic_ns=$stopped_ns lost_extra=$lost_extra recursion_misses=${rmisses:-0} tracer_exit=${tracer_exit:-n/a}"
 }
 
 # maps.json for symbolize.py: {"type":"maps","snapshots":[{"t":..,"pid":..,"text":..}]} from the

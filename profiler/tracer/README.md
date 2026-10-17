@@ -7,8 +7,9 @@ follows `../../plans/design-C-control-suite-agent-loop.md` section B.
 
 This directory currently holds the **bpftrace prototype** (`wine-trace.bt` + `reduce.py`), the
 id tables and their generator, and the tests. The libbpf production tracer
-(`wine-trace.bpf.c`/`wine-trace.c`, built into `build/wine-trace`) is a later deliverable; the
-wrapper already prefers it when the binary exists.
+(`wine-trace.bpf.c`/`wine-trace.c`, built into `build/wine-trace`) is opt-in (`--libbpf` or
+`WINE_TRACE_BACKEND=libbpf`) while its loader refuses to attach (private-stack blocker,
+`BUILD.md`); `make` alone never changes the backend.
 
 | File | Role |
 |---|---|
@@ -16,10 +17,11 @@ wrapper already prefers it when the binary exists.
 | `reduce.py` | Offline join of the event lines into `blocks.jsonl`, `threads.jsonl`, `summary.json` (+ `events.jsonl` in drilldown); updates `tracer.json`. |
 | `gen_tables.py` | Generates `tables/wine-<ver>.json` (syscall ids, wineserver request numbers, unix-call codes) from a patched Wine tree. |
 | `tables/wine-11.13.json` | Generated from the 11.13 base + the 96-patch series (`series-aceb236`) + 0108 (table inputs unchanged by 0108), protocol 957. |
-| `tests/test_reduce.py`, `tests/test_gen_tables.py` | `python3 -I -m unittest discover -s profiler/tracer/tests -v` from the repo root. |
+| `validate.py` | Compares a traced `tools/traceprobe.exe` run (its `EXPECT` lines) and PipeASIO telemetry with the tracer's output (design B section 7). |
+| `tests/test_reduce.py`, `tests/test_bt_template.py`, `tests/test_gen_tables.py`, `tests/test_validate.py`, `tests/test_symbolize.py` | `python3 -I -m unittest discover -s profiler/tracer/tests -v` from the repo root. |
 | `../bin/wine-trace` | The CLI (`start`/`stop`/`run`/`status`) shared with the suite and the root helper. |
 
-## Running (VM: passwordless `sudo -n`)
+## Running (passwordless `sudo -n`)
 
 ```bash
 sudo -n profiler/bin/wine-trace start --out "$RUN/raw/interface" --mode summary      # pids discovered
@@ -33,7 +35,9 @@ sudo -n profiler/bin/wine-trace run   --out DIR --duration 30 --mode drilldown  
 `scripts/lib/lifecycle.sh` `ableton_prefix_pids`, evaluated with the invoking user's `HOME`, and
 `--run-id TOKEN` keeps only processes carrying `ABLETON_BENCH_RUN_ID=TOKEN`), `--mode
 summary|drilldown` (drilldown also writes `events.jsonl` and enables the scheduler probes),
-`--proto` (force bpftrace even when `build/wine-trace` exists), `--no-ntsync` (strip the
+`--proto` (the bpftrace backend, the default), `--libbpf` (the production loader, opt-in),
+`--allow-private-stack` (trace although a multi-thread USDT program landed on a per-CPU private
+stack, see "Stack budget" below), `--no-ntsync` (strip the
 kernel-side NTSync probes), `--sched`/`--no-sched`, `--no-follow` (no exec/rename tracking),
 `--no-pid-filter` (trace every process mapping ntdll.so), `--wine-root DIR`, `--prefix DIR`,
 `--tables FILE`, `--attach-timeout S`.
@@ -42,11 +46,23 @@ What `start` does: resolves `ntdll.so` and `pipeasio64.dll.so` from the pids' `/
 (fallback `$ABLETON_WINE_ROOT/lib/wine/x86_64-unix/`), snapshots the maps to `maps-<pid>.txt`,
 lists the available probes with `bpftrace -l`, writes `DIR/wine-trace.bt` (sections and absent
 probes stripped, placeholders substituted), checks it with `bpftrace --dry-run` (if the NTSync
-probes are the reason it fails, they are dropped and the script is retried), daemonises
-`bpftrace -q -B full` with `setsid` (pidfile `DIR/wine-trace.pid`, stdout `events.txt`, stderr
-`bpftrace.stderr`), waits for the `hdr` line (printed by `BEGIN`, i.e. after every probe attached)
-and writes `tracer.json`. `stop` snapshots the maps again (`maps-<pid>-stop.txt`), sends SIGINT
-(TERM after `--stop-timeout`, then KILL), runs `reduce.py`, builds `maps.json`
+probes are the reason it fails, they are dropped and the script is retried; the dry run's warnings
+stay in `dry-run.log`), writes the threads alive at start as `T` lines to `tasks-start.txt` (and
+seeds `@tids` with them), daemonises `bpftrace -q -B full --no-warnings` with `setsid` (pidfile
+`DIR/wine-trace.pid`, stdout `events.txt`, stderr `bpftrace.stderr`; `--no-warnings` is part of
+the stack budget below and also keeps 0.27's warnings, echoed with the script source on stdout,
+out of `events.txt`), waits for the `hdr` line (printed by `BEGIN`, i.e. after every probe
+attached), checks the clock domain (the `hdr` timestamp must lie between python's
+`time.monotonic_ns()` read before the launch and after the `hdr` appeared; a CLOCK_BOOTTIME stamp
+fails and `start` exits 1), checks the JIT prologue of every loaded program with `bpftool` (a
+multi-thread USDT program on a per-CPU private stack stops the tracer and `start` exits 1 unless
+`--allow-private-stack`) and writes `tracer.json` (`clock: "monotonic"`, `clock_check` with both
+readings and CLOCK_BOOTTIME for reference, `private_stack_programs`, `private_stack_risky`,
+`private_stack_allowed`). `stop` snapshots the maps and threads again (`maps-<pid>-stop.txt`,
+`tasks-stop.txt`), reads the programs' `recursion_misses` (bpftool), sends SIGINT (TERM after
+`--stop-timeout`, then KILL), records `tracer_exit` in `tracer.json` (`clean` when the `end` line is
+in `events.txt`; `crashed` when `bpftrace.stderr` shows an abort; `killed`, `no-end`,
+`exited-before-stop`), runs `reduce.py --recursion-misses N`, builds `maps.json`
 (`{"type":"maps","snapshots":[{"t","pid","text"}]}`) and, when `symbolize.py` exists, runs
 `symbolize.py --blocks blocks.jsonl --maps maps.json --out blocks.symbolized.jsonl --symcache
 symcache.json --imports-out imports.json` (non-fatal; the prototype records no stack windows, so
@@ -58,21 +74,26 @@ Exit codes: 0 ok, 1 error, 2 usage, 3 not running (`status`). Fails fast when `n
 
 ## Event line format (`events.txt`, contract between `wine-trace.bt` and `reduce.py`)
 
-All timestamps are `nsecs` (CLOCK_MONOTONIC, the suite's `time.monotonic_ns()` base); hex fields
-have no `0x` prefix; `seq` is the block in progress at the probe (0 = none).
+All timestamps are `nsecs(monotonic)` (CLOCK_MONOTONIC, the suite's `time.monotonic_ns()` and
+PipeWire's `clock.nsec` base; plain `nsecs` is CLOCK_BOOTTIME in bpftrace 0.27 and differs by the
+suspended time on a laptop that has slept); hex fields
+have no `0x` prefix; `seq` is the block in progress at the probe (0 = none). Format 3 (B5) is
+shaped by the stack budget (below): a 32-bit field printed right after the tid shares its 8-byte
+slot, so several lines moved fields; `reduce.py` still reads formats 1 and 2.
 
 | Line | Meaning |
 |---|---|
-| `hdr mono_start_ns=N format=1` | `BEGIN`: base for every `offset_seconds` |
-| `T ts tid pid comm=NAME` | first sight of a thread (comm may contain spaces) |
+| `hdr mono_start_ns=N format=3 clock=monotonic` | `BEGIN`: base for every `offset_seconds` (format 1 = the pre-B5 script: no `@emitted`, boot-clock `nsecs`; format 2 = the first B5 script) |
+| `T ts tid pid comm=NAME` | a thread: `task:task_newtask` for threads created while tracing (`pid` = the new task's process); `tasks-start.txt` / `tasks-stop.txt` (written by the wrapper, `ts` = its own monotonic stamp) for every thread alive at start/stop. Comm may contain spaces. Format 1/2 printed first-sight `T` lines from the USDT probes. |
 | `N ts tid comm=NAME` | `task_rename` (Wine writes `SetThreadDescription` names to comm) |
 | `P ts pid parent=PPID comm=NAME` | exec of a child of a traced process (now traced too) |
-| `E ts tid syscall ID fr=FRAME seq=S rsp=X rip=X` | `wine:syscall_entry`; `rsp`/`rip` are the user stack pointer / `NtXxx+0x14` |
-| `X ts tid syscall ID fr=FRAME st=STATUS rf=RESTORE_FLAGS` | `wine:syscall_exit` |
-| `E ts tid unixcall HANDLE:CODE fr=FRAME seq=S rip=X` | `wine:unixcall_entry` (`rip` = PE caller) |
-| `X ts tid unixcall fr=FRAME st=STATUS` | `wine:unixcall_exit` |
-| `S ts tid req TYPE dur=NS st=STATUS seq=S` | one wineserver request (`server_req_end`; start = ts − dur) |
-| `S ts tid wait FLAGS dur=NS st=STATUS seq=S` | one `wait_select_reply` (`server_wait_end`) |
+| `E ts tid syscall ID fr=FRAME seq=S` | `wine:syscall_entry` (format 1/2 added `rsp=`/`rip=`, the user stack pointer / `NtXxx+0x14`) |
+| `X ts tid syscall st=STATUS fr=FRAME` | `wine:syscall_exit`; paired by frame (format 1/2: `X ts tid syscall ID fr= st= rf=RESTORE_FLAGS`) |
+| `E ts tid unixcall c=CODE h=HANDLE seq=S` | `wine:unixcall_entry`, first program (format 1/2: `E ts tid unixcall HANDLE:CODE fr= seq= rip=`) |
+| `R ts tid fr=FRAME rip=X` | `wine:unixcall_entry`, second program: frame and PE caller of the unix call that the same thread entered just before (joined within 1 ms) |
+| `X ts tid unixcall st=STATUS fr=FRAME` | `wine:unixcall_exit` |
+| `S ts tid req TYPE dur=NS seq=S` | one wineserver request (`server_req_end`; start = ts − dur; 64-bit dur, 32-bit seq, no status) |
+| `S ts tid wait FLAGS dur=NS st=STATUS seq=S` | one `wait_select_reply` (`server_wait_end`; 64-bit dur: INFINITE waits of idle threads last any time) |
 | `B ts tid start seq=S n=FRAMES rate=HZ clk=NS dl=NS` | `pipeasio:block_start` (clock_nsec, deadline_ns absolute) |
 | `B ts tid before seq=S` / `after seq=S` | `block_before_live` / `block_after_live` |
 | `B ts tid end seq=S fl=FLAGS missed=N` | `block_end`; flags bit0 admitted, bit1 time_info, bit2 muted |
@@ -83,18 +104,77 @@ have no `0x` prefix; `seq` is the block in progress at the probe (0 = none).
 | `U ts waker_tid waker_pid wakee=TID` | `sched_waking` of a traced thread (`--sched`) |
 | `O ts_on tid off=TS_OFF wake=TS_WAKE st=PREV_STATE` | one off-CPU interval of a traced thread (`--sched`) |
 | `end mono_end_ns=N` | `END` |
-| `Lost N events` | bpftrace perf-buffer drops (counted as `lost_events`) |
+| `@emitted[CODE]: N` | after `end`: printfs issued per line kind (`CODE` = ASCII code of the line letter, 69 = `E`; 101 = `e`: format 3's unix-call `E` line, which also stands for its uncounted `R` line) |
+| `Lost N events` | bpftrace's own drop report (counted; hidden by `--no-warnings`, and 0.27 prints none for ring-buffer drops anyway) |
 
-Lines starting with `@` (bpftrace's map dump at exit) and anything unknown are ignored and counted.
+Lost events: bpftrace 0.27 drops ring-buffer records silently (verified: an overload test lost
+~28k of 3.7M records without any message), so every printf also bumps `@emitted[CODE]`. `END`
+clears `@pids` first (no new event passes the pid filter), then prints `end` and `@emitted`.
+
+    lost_events = max(reported, shortfall) + recursion_misses
+
+* `reported` = `Lost N events` lines + `--lost-events-extra` (the wrapper's count from
+  `bpftrace.stderr`); they count the same dropped records as the shortfall, so the two are never
+  added;
+* `shortfall` = Σ per kind max(0, emitted − received lines) (`T` lines from `tasks-*.txt` are not
+  received lines);
+* `recursion_misses` = `--recursion-misses`: the fentry/fexit runs the kernel skipped because the
+  program was already active on that CPU (bpftool `recursion_misses`, read by `wine-trace stop`
+  before SIGINT); their `W`/`w`/`K` lines were never emitted (B5 review run: 2612 in 20 s).
+
+Lines received beyond `@emitted` (printed while the counters were read) are
+`received_after_counters`; they can hide a shortfall of the same size, so `loss.lower_bound` is
+then true. A format ≥ 2 trace without `@emitted` (bpftrace crashed or was killed: no `END`) gets
+`lost_events: null` and a warning, never a silent 0, and its `stopped_monotonic_ns` is its last
+event, not the wrapper's stop time. `summary.json` `tracer.loss` and `tracer.json` `loss` carry the
+evidence (`source`, `lower_bound`, `reported_by_bpftrace`, `recursion_misses`, `by_kind`,
+`emitted`, `received`, `received_after_counters`). `bench-report.py interface` turns a null
+`lost_events`, `clean_exit: false` or a `tracer_exit` other than `clean` into the
+`interface-tracer-unclean` confounder, a non-zero count into `interface-lost-events` and a
+non-empty `private_stack_risky` into `interface-tracer-private-stack`.
+
+## Stack budget (format 3)
+
+USDT programs run preemptible with no recursion guard. Since 6.14 the verifier gives a
+`BPF_PROG_TYPE_KPROBE` program with a frame of 64 bytes or more a per-CPU private stack, so two
+threads entering the same program on one CPU share its frame and their events mix (B4/B5: the
+`std::bad_alloc` aborts with two printfs per program, the libbpf loader's kernel oops). The
+multi-thread ntdll programs therefore stay below 64 bytes. Measured with `bpftool prog dump jited`
+on the generated script (kernel 7.2.9, bpftrace 0.27):
+
+| Change | Effect |
+|---|---|
+| `--no-warnings` | smaller frames (presumably no runtime helper-error checks are compiled in); without it 6 of the 10 ntdll programs (and most pipeasio, fentry and tracepoint programs) land on the private stack |
+| printf record ≤ 40 bytes (8-byte id + 4 slots) | 40–48 byte frames with the `@emitted` count and the pid filter; a 40-byte record with warnings on, or a 48-byte record, crosses 64 |
+| a u32 printed right after the tid | shares the tid's slot (`X` prints `st` before `fr`: 32 bytes instead of 40) |
+| unix-call entry split into `E` + `R` | `R` (40-byte record) has no `count()`; `E` counts under 101 for both |
+
+`wine-trace start` checks every program's JIT prologue (`movabs …,%r9; add %gs:…,%r9` = private
+stack) and refuses to trace when a multi-thread USDT program is among them; the pipeasio programs
+(one callback thread) and fentry/fexit/tracepoint programs (recursion-guarded or non-preemptible)
+may use it. `tests/test_bt_template.py` pins the record sizes statically.
+
+Other lines starting with `@` and anything unknown are ignored (the unknown ones counted).
 
 ## Reduction rules (`reduce.py`)
 
-* Lines are sorted by timestamp (bpftrace drains per-CPU buffers; the file is not ordered).
+* Lines are sorted by (timestamp, file order) (bpftrace drains per-CPU buffers; the file is not
+  ordered). Inputs above `--sort-chunk-lines` (default 2,000,000) are sorted in runs under a
+  temporary `.reduce-sort-*` directory in the output directory (`--sort-dir`) and merged; the
+  directory is removed afterwards. Crossings are aggregated as they complete (per block, per
+  100 ms window, per call site), so memory follows blocks × call sites, not events; only
+  `--mode drilldown` keeps the event list (for `events.jsonl`). A block's crossings are buffered
+  until its `end` line decides whether it gets a record; crossings of blocks that never end go
+  to the window buckets (`events_for_unknown_block`).
 * `E`/`X` are paired per tid in LIFO order by frame pointer. An `X` matching an entry below the top
   pops the entries above it as `abandoned_entries` (user-mode callbacks leave through
-  `NtCallbackReturn`). An `X` matching nothing is an `unmatched_exit`; the sub-counters
-  `unmatched_exits_first_on_tid` (thread start / entered before tracing) and
-  `unmatched_exits_with_restore_flags` (NtContinue, unix-call slow path) classify them.
+  `NtCallbackReturn`). An `X` matching nothing is an `unmatched_exit` (NtContinue, the unix-call
+  slow path); the sub-counter `unmatched_exits_first_on_tid` counts thread starts and calls entered
+  before tracing (format 3 prints no restore_flags, so the former
+  `unmatched_exits_with_restore_flags` split is gone).
+* A format-3 unix-call `E` line gets its frame and PE caller from the `R` line of the same tid
+  within 1 ms (`unixcall_entries_without_r`, `unixcall_r_lines_unmatched`,
+  `unixcall_r_lines_too_late` count the misses).
 * `S`, `W`/`w` and `K` nest inside the innermost open entry of their tid and inherit its caller.
 * Block association (design B section 3b): the `seq` printed at entry decides. `seq > 0` →
   that block's `crossings`; `seq == 0` → the 100 ms window bucket of the thread (`threads.jsonl`),
@@ -110,7 +190,8 @@ Lines starting with `@` (bpftrace's map dump at exit) and anything unknown are i
   a `.so` mapping of the snapshots and the table knows the code, else `<module>.so#<code>`.
 * Roles (design B section 5): `pipeasio_callback` is the tid firing `block_start`; every other
   thread goes through the shared classifier `symbolize.load_roles()` + `roles.toml` (comm, exe
-  and process comm from the `T`/`N`/`P` lines and the pid images in `tracer.json`): `audio_worker`
+  and process comm from the `T`/`N`/`P` lines -- `tasks-start.txt` and `tasks-stop.txt` included --
+  and the pid images in `tracer.json`): `audio_worker`
   (`AudioCalc`), `pipeasio_rt`/`pipeasio_worker`, `wineserver`, `webview`/`max`/`push2` (exe),
   `main` (tid == pid of a `.exe`), `live:<comm>` (named Live threads), `unknown:<comm>`.
   `--roles FILE` picks another table, `--no-roles` (or a missing/broken `symbolize.py`) uses the
@@ -168,12 +249,14 @@ checks the committed 11.13 table (`NtYieldExecution` 0x0046, `NtQueryPerformance
 
 ## Known limits of the prototype
 
-* Every crossing is a `printf` through the perf buffer: expect µs-level overhead per hit and
-  `Lost N events` under load (`BPFTRACE_PERF_RB_PAGES`, default 1024 pages per CPU). Timing
-  claims come from the production tracer on bare metal, never from this prototype.
+* Every crossing is a `printf` through the ring buffer: expect µs-level overhead per hit and
+  silent drops under load (counted through `@emitted`). Timing claims come from the production
+  tracer on bare metal, never from this prototype.
 * No stack windows: callers are placeholders until the libbpf tracer and `symbolize.py` exist.
 * USDT probes are attached by file (every process mapping that `ntdll.so` pays the nop → trap);
   the pid filter only limits the output.
-* The bpftrace script was written against the 0.27 syntax (`delete(@map, key)`, `uptr()`,
-  `fentry:module:function`, `--dry-run`) but could not be compiled yet: bpftrace is not installed
-  on the VM at the time of writing (see the VERIFY list in the stage report).
+* The stack budget depends on bpftrace's code generation and the kernel's private-stack rule:
+  a new bpftrace or kernel can push a program over 64 bytes, which `wine-trace start` then
+  refuses (re-measure, then trim the record).
+* The server-request line carries no status, and the 32-bit `seq` of the `S` lines wraps after
+  2^32 blocks (about 66 days at 64 frames / 48 kHz).

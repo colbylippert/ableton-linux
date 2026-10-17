@@ -389,6 +389,71 @@ class ParserTests(unittest.TestCase):
         self.assertTrue(parsed["identity_confounded"])
         self.assertEqual(parsed["err_delta"], 1)
 
+    def test_pw_top_effective_quantum_follows_the_driver(self):
+        # B4 on the laptop: the settings metadata said 256, the graph ran at 64.
+        # Live is a follower ("+ " prefix, empty FORMAT) of the driving source.
+        fixture = """\
+0.004987\tS   ID  QUANT   RATE    WAIT    BUSY   W/Q   B/Q  ERR FORMAT           NAME
+0.005108\tC   97      0      0    ---     ---   ---   ---     0                  Ableton Live 12 Trial
+0.247468\tS   ID  QUANT   RATE    WAIT    BUSY   W/Q   B/Q  ERR FORMAT           NAME
+0.247560\tI   29      0      0   0.0us   0.0us  ???   ???     0                  Dummy-Driver
+0.247759\tR   66     64  48000   4.1ms  41.1us  3.10  0.03  23522    S32LE 2 48000 alsa_input.pci-0000_00_1f.3-platform-skl_hda_dsp_generic.HiFi__Mic1__source
+0.247780\tR   64      0      0    +++   36.6us  +++   0.03  720299    S32LE 2 48000  + alsa_output.pci-0000_00_1f.3-platform-skl_hda_dsp_generic.HiFi__Speaker__sink
+0.247800\tR   97     64  48000  36.2us 538.1us  0.03  0.40   19                   + Ableton Live 12 Trial
+0.247814\tS   67      0      0    ---     ---   ---   ---     0                  bluez_midi.server
+1.004847\tS   ID  QUANT   RATE    WAIT    BUSY   W/Q   B/Q  ERR FORMAT           NAME
+1.005759\tR   66     64  48000   4.1ms  41.1us  3.10  0.03  23530    S32LE 2 48000 alsa_input.pci-0000_00_1f.3-platform-skl_hda_dsp_generic.HiFi__Mic1__source
+1.005800\tR   97     64  48000  36.2us 538.1us  0.03  0.40   21                   + Ableton Live 12 Trial
+"""
+        parsed = report.parse_pw_top(fixture)
+        self.assertEqual((parsed["effective_rate"], parsed["effective_quantum"]), (48000, 64))
+        self.assertEqual(parsed["effective_quantums"], [64])
+        self.assertEqual(parsed["driver_names"], ["alsa_input.pci-0000_00_1f.3-platform-skl_hda_dsp_generic.HiFi__Mic1__source"])
+        self.assertEqual(parsed["err_delta"], 2)
+        self.assertEqual([node["name"] for node in parsed["nodes"]], ["Ableton Live 12 Trial"])
+        self.assertEqual(report.pw_top_row_tail("R 97 64 48000 1us 2us 0.0 0.0 19 + Ableton Live 12 Trial"),
+                         (True, "Ableton Live 12 Trial"))
+        self.assertEqual(report.pw_top_row_tail("R 66 64 48000 1us 2us 0.0 0.0 1 S32LE 2 48000 alsa_input.x"),
+                         (False, "alsa_input.x"))
+        settings = {"clock.rate": "48000", "clock.quantum": "256"}
+        self.assertEqual(report.sample_rate_buffer_label(parsed, settings, settings), "48000/64 (graph default 256)")
+        self.assertEqual(
+            report.sample_rate_buffer_label(parsed, settings, {"clock.rate": "48000", "clock.quantum": "128"}),
+            "48000/64 (graph default 48000/256 → 48000/128)",
+        )
+        self.assertEqual(report.sample_rate_buffer_label({}, settings, settings), "pending (graph default 48000/256)")
+        # A driver that changes its quantum inside the window shows every value.
+        changed = dict(parsed, effective_quantums=[64, 128, 64])
+        self.assertEqual(report.sample_rate_buffer_label(changed, settings, settings), "48000/64→128→64 (graph default 256)")
+
+    def test_pw_top_driver_is_the_node_itself_when_it_drives(self):
+        fixture = """\
+0.0\tS ID QUANT RATE WAIT BUSY W/Q B/Q ERR FORMAT NAME
+0.1\tR 42 128 48000 0.1 0.2 0.0 0.0 2 S16LE Ableton Live
+0.2\tR 43 0 0 0.1 0.2 0.0 0.0 0 + Ableton Live helper
+"""
+        parsed = report.parse_pw_top(fixture)
+        self.assertEqual((parsed["effective_rate"], parsed["effective_quantum"]), (48000, 128))
+        self.assertEqual(parsed["driver_names"], ["Ableton Live"])
+
+    def test_osc_peak_is_the_worst_buffer_per_report(self):
+        # B4 Inbuilts: average 30-88%, peaks around 50% and up to 715% where the
+        # PipeWire ERR counter rose; the median keeps one overrun from owning the cell.
+        fixture = "".join(
+            f"{index * 0.5:.1f}\t1700000000.000 /abl/bench/cpu {average} {peak}\n"
+            for index, (average, peak) in enumerate([(30, 47.475), (32, 53.7), (31, 132.15), (80, 715.125), (75, 50.0)])
+        )
+        parsed = report.parse_osc(fixture)
+        self.assertEqual(parsed["peak_percent"], 715.125)
+        self.assertEqual(parsed["peak_median_percent"], 53.7)
+        self.assertEqual(parsed["peak_over_100_count"], 2)
+        self.assertEqual(report.dsp_label(parsed), "49.60 / 53.70 (max 715.12, 2 over 100%)")
+        self.assertEqual(report.dsp_label({"average_percent": 12.0, "peak_percent": 18.0}), "12.00 / 18.00")
+        self.assertEqual(report.dsp_label({}), "pending / pending")
+        even = report.parse_osc("0.1\t1.0 /abl/bench/cpu 10 20\n0.2\t1.5 /abl/bench/cpu 10 30\n")
+        self.assertEqual(even["peak_median_percent"], 25.0)
+        self.assertEqual(even["peak_over_100_count"], 0)
+
     def test_osc_average_and_peak_are_distinct(self):
         fixture = """\
 0.1\t1700000000.000 /abl/bench/cpu 10 14
@@ -1393,6 +1458,35 @@ class ProfilerTests(unittest.TestCase):
         lossy = fixture_interface_section(tracer=interface_tracer(lost_events=3))
         self.assertEqual(lossy["confounders"], ["interface-lost-events"])
         self.assertEqual(lossy["tracer"]["lost_events"], 3)
+        self.assertTrue(lossy["tracer"]["clean_exit"])
+
+    def test_interface_unclean_tracer_confounders(self):
+        # b5-tproto-t60: bpftrace aborted 32.9 s in; reduce.py stops the trace at its last event
+        # and reports lost_events null, so the coverage and the exit are both flagged
+        crashed = dict(interface_tracer(stopped_ns=FIXTURE_TRACER_START_NS + 5_000_000_000, lost_events=None),
+                       clean_exit=False, tracer_exit="crashed")
+        section = fixture_interface_section(tracer=crashed)
+        self.assertIsNone(section["tracer"]["lost_events"])
+        self.assertFalse(section["tracer"]["clean_exit"])
+        self.assertEqual(section["tracer"]["tracer_exit"], "crashed")
+        self.assertEqual(section["confounders"], ["interface-tracer-coverage-incomplete", "interface-tracer-unclean"])
+        # each signal alone is enough
+        for tracer in (interface_tracer(lost_events=None), dict(interface_tracer(), clean_exit=False),
+                       dict(interface_tracer(), tracer_exit="killed")):
+            self.assertIn("interface-tracer-unclean", fixture_interface_section(tracer=tracer)["confounders"])
+        self.assertNotIn("interface-tracer-unclean",
+                         fixture_interface_section(tracer=dict(interface_tracer(), tracer_exit="clean",
+                                                               clean_exit=True))["confounders"])
+
+    def test_interface_private_stack_and_lower_bound(self):
+        tracer = dict(interface_tracer(lost_events=2), private_stack_risky=["usdt_wine_syscall_entry_2"],
+                      private_stack_allowed=True, loss={"lower_bound": True})
+        section = fixture_interface_section(tracer=tracer)
+        self.assertEqual(section["confounders"], ["interface-lost-events", "interface-tracer-private-stack"])
+        self.assertEqual(section["tracer"]["private_stack_risky"], ["usdt_wine_syscall_entry_2"])
+        self.assertTrue(section["tracer"]["lost_events_lower_bound"])
+        for kind in section["confounders"]:
+            self.assertIn(kind, report.INTERFACE_CONFOUNDERS)
 
     def test_interface_subcommand_rewrites_measurement(self):
         with tempfile.TemporaryDirectory() as temporary:

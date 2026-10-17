@@ -20,9 +20,14 @@ import Live
 from .handler import AbletonOSCHandler
 
 # Multiplier for Application.average_process_usage and peak_process_usage so
-# the wire carries percent. VERIFY with profiler/control/smoke-test.sh against
-# Live's CPU meter: keep 1.0 when the attribute already is a percent, set
-# 100.0 when it is a 0..1 fraction.
+# the wire carries percent. Both attributes already are percent of the audio
+# buffer period (Live 12.4.6, B5 on the laptop: AbletonOSC's unscaled
+# /live/application/get/average_process_usage returned exactly the value this
+# handler reported, 22.159615 and 48.926708; Live's CPU meter showed 26% on
+# Benchmark_Empty, whose B4 average was 27%). peak_process_usage is Live's recent worst buffer,
+# 1.7-2x the average and not reset by reading; it exceeds 100% when a buffer
+# misses its deadline (B4's 571-797% peaks match PipeWire xruns), so a large
+# peak is not a unit error. Keep 1.0.
 CPU_SCALE = 1.0
 # Live runs schedule_message() callbacks on 100 ms ticks (Manager.tick).
 TICK_MS = 100

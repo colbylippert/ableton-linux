@@ -235,6 +235,24 @@ class RecordTests(unittest.TestCase):
                 "benchmark/-": "20261016T150000Z-baseline", "benchmark/-@interface": "20261016T151000Z-baseline-traced",
             })
 
+    def test_plain_baseline_with_launcher_configuration_does_not_warn(self):
+        # B4's baseline: the suite recorded the installer's Link settings and the
+        # wrapper's ABLETON_POWER; none of them is a switch.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "20261017T034259Z-b4-baseline-untraced"
+            history = Path(temporary) / "history"
+            profile = bench_tests.benchmark_profile(gates={
+                "ABLETON_LINKD": "/home/user/.local/share/ableton-wine/ableton-linkd",
+                "ABLETON_LINK_MODE": "off", "ABLETON_POWER": "performance", "ABLETON_RT": "auto",
+                "WINE_APC_FASTPATH": "", "PIPEASIO_TELEMETRY": " ",
+            })
+            bench_tests.write_benchmark_run(root, profile=profile)
+            completed = run_cli(str(root), "--history-dir", str(history), "--baseline")
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertNotIn("warning", completed.stderr)
+            record = json.loads((history / "runs/20261017T034259Z-b4-baseline-untraced.json").read_text())
+            self.assertEqual(record["switches"], {})
+
     def test_rejects_bad_arguments_and_incomplete_baselines(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "running"
@@ -291,6 +309,21 @@ class HelperTests(unittest.TestCase):
         self.assertEqual(history_add.run_structure({"set_order": ["Benchmark_Zero"]}, None), "diagnostic")
         self.assertEqual(history_add.run_structure({"structure": "benchmark", "set_order": ["x"]}, None), "benchmark")
         self.assertIsNone(history_add.run_structure({}, None))
+
+    def test_switch_classification(self):
+        profile = {"configuration": {"benchmark_gates": {
+            "ABLETON_LINKD": "/opt/linkd", "ABLETON_LINKD_LINGER": "0", "ABLETON_LINK_MODE": "session",
+            "ABLETON_MAX_AUDIO_THREADS": "4", "ABLETON_POWER": "balanced", "ABLETON_RT": "off",
+            "ABLETON_DCOMP": "on", "ABLETON_THEME_MODE": "auto",
+            "PIPEASIO_PREFERRED_BUFFERSIZE": "64", "WINE_APC_FASTPATH": "0", "WINE_MSG_FASTPATH": "",
+        }}}
+        self.assertEqual(history_add.switch_record(profile), {
+            "ABLETON_LINK_MODE": "session", "ABLETON_MAX_AUDIO_THREADS": "4", "ABLETON_POWER": "balanced",
+            "ABLETON_RT": "off", "PIPEASIO_PREFERRED_BUFFERSIZE": "64", "WINE_APC_FASTPATH": "0",
+        })
+        self.assertEqual(history_add.switch_record({"configuration": {"benchmark_gates": None}}), {})
+        self.assertFalse(history_add.is_switch("ABLETON_POWER", "Performance"))
+        self.assertTrue(history_add.is_switch("WINE_APC_FASTPATH", "1"))
 
     def test_numbers_reject_booleans_and_strings(self):
         self.assertIsNone(history_add.number(True))

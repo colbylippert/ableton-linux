@@ -3,10 +3,11 @@
 #
 # Built on the Linux host that runs the tracer (CachyOS: clang, bpf (bpftool), libbpf,
 # elfutils, zlib).  Everything generated lands in $(BUILD) (profiler/.gitignore:
-# tracer/build/), so `build.sh`'s source snapshot never sees the artifacts.
+# tracer/build/), so `build.sh`'s source snapshot never sees the artifacts.  BUILD.md has the
+# prerequisites and the regeneration rules.
 #
 #   make            -> build/wine-trace (+ build/vmlinux.h, build/wine-trace.bpf.o, build/wine-trace.skel.h)
-#   make check      -> build + static sanity checks (program sections, --version)
+#   make check      -> build + static sanity checks (program sections, maps, --version)
 #   make clean
 #
 # Overrides: CLANG=, BPFTOOL=, CC=, BUILD=, VMLINUX_BTF=, BPF_CPU=v3
@@ -19,11 +20,13 @@ VMLINUX_BTF ?= /sys/kernel/btf/vmlinux
 BPF_CPU    ?= v3
 ARCH       ?= x86
 
-BPF_CFLAGS := -O2 -g -target bpf -mcpu=$(BPF_CPU) -D__TARGET_ARCH_$(ARCH) -I. -I$(BUILD) \
+# vmlinux.h is generated from the kernel's BTF and is not -Wextra clean (missing declarations):
+# it comes in through -isystem so that only warnings of our own code are printed.
+BPF_CFLAGS := -O2 -g -target bpf -mcpu=$(BPF_CPU) -D__TARGET_ARCH_$(ARCH) -I. -isystem $(BUILD) \
               -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -Wno-missing-field-initializers
 CFLAGS     ?= -O2 -g
 CFLAGS     += -Wall -Wextra -std=gnu11 -I. -I$(BUILD) -D_GNU_SOURCE
-LDLIBS     := -lbpf -lelf -lz -pthread
+LDLIBS     := -lbpf -lelf -lz -lm -pthread
 
 BIN   := $(BUILD)/wine-trace
 BPFO  := $(BUILD)/wine-trace.bpf.o
@@ -46,8 +49,9 @@ $(VMLX): | $(BUILD)
 $(BPFO): wine-trace.bpf.c wine-trace.h $(VMLX) | $(BUILD)
 	$(CLANG) $(BPF_CFLAGS) -c wine-trace.bpf.c -o $@
 
+# `name wine_trace` pins the skeleton's identifiers (struct wine_trace, wine_trace__open, ...)
 $(SKEL): $(BPFO)
-	$(BPFTOOL) gen skeleton $(BPFO) > $@.tmp && mv $@.tmp $@
+	$(BPFTOOL) gen skeleton $(BPFO) name wine_trace > $@.tmp && mv $@.tmp $@
 
 $(BIN): wine-trace.c wine-trace.h $(SKEL)
 	$(CC) $(CFLAGS) wine-trace.c -o $@ $(LDLIBS)
@@ -57,7 +61,7 @@ check: all
 	@readelf -S -W $(BPFO) | grep -oE ' (usdt|fentry/[a-z_]+|fexit/[a-z_]+|kprobe/[a-z_]+|kretprobe/[a-z_]+|tp_btf/[a-z_]+|tracepoint/[a-z_/]+|perf_event) ' | sort | uniq -c
 	@test "$$(readelf -S -W $(BPFO) | grep -c ' usdt ')" -ge 1
 	@echo "== maps"
-	@$(BPFTOOL) btf dump file $(BPFO) format raw 2>/dev/null | grep -E "VAR '(agg|agg0|inflight|sched|pids|tids|cfg|gl|rb|stats|unixlibs|trigger_ids)'" | sed 's/.*VAR/VAR/'
+	@$(BPFTOOL) btf dump file $(BPFO) format raw 2>/dev/null | grep -E "VAR '(agg|agg0|agg1|agg2|agg3|inflight|sched|pids|tids|cfg|gl|rb|stats|unixlibs|trigger_ids)'" | sed 's/.*VAR/VAR/'
 	@echo "== loader"
 	@$(BIN) --version
 	@ls -l $(BIN) $(BPFO)

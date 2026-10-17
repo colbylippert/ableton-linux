@@ -24,6 +24,9 @@ tracer="${ABLETON_BENCH_TRACER:-$root/profiler/bin/wine-trace}"
 root_helper="${ABLETON_BENCH_ROOT_HELPER:-profiler-root-helper}"
 sudo="${ABLETON_BENCH_SUDO:-sudo}"
 scenario_tool="${ABLETON_BENCH_SCENARIO_TOOL:-$root/profiler/control/scenario-run.py}"
+quit_tool="${ABLETON_BENCH_QUIT_TOOL:-$root/profiler/bin/live-trial-dialog}"
+session_env_tool="${ABLETON_BENCH_SESSION_ENV:-$root/profiler/bin/with-session-env}"
+state_tool="${ABLETON_BENCH_STATE_TOOL:-$root/profiler/bin/state}"
 privilege=none
 dry_run=0
 skip_vst_check=0
@@ -54,12 +57,19 @@ The suite runs Zero, Empty, Inbuilts, Max4Live, and VSTs in that order. Zero
 measures Live while it is idle. The other sets use their control device for
 playback. The suite writes source data, report.json, and report.md. The command
 also writes one <machine-id>-<YYYYMMDDTHHMMSSffffffZ>_cpu-benchmark.csv file
-with system resource readings. The command closes each started Live process by
-its exact process ID. Other Wine sessions continue.
+with system resource readings. The command quits each started Live through its
+UI (profiler/bin/live-trial-dialog quit-live) and falls back to TERM and KILL by
+its exact process ID, followed by profiler/bin/state clean-crash (also run
+when Live crashed before the stop). Other Wine
+sessions continue. ABLETON_BENCH_QUIT_TOOL, ABLETON_BENCH_SESSION_ENV, and
+ABLETON_BENCH_STATE_TOOL replace those helpers.
 
 A run with --sets or --scenario has the diagnostic structure: compare accepts
 it only with --structure diagnostic. Tracing runs the tracer as root through
-profiler-root-helper on PATH or passwordless sudo. ABLETON_BENCH_TRACE,
+profiler-root-helper on PATH (through sudo -n; it runs its own installed or
+allowlisted wine-trace, not ABLETON_BENCH_TRACER, and the suite waits up to
+ABLETON_BENCH_TRACE_START_TIMEOUT seconds, default 180, for it to attach) or
+passwordless sudo. ABLETON_BENCH_TRACE,
 ABLETON_BENCH_SCENARIO, ABLETON_BENCH_TRACER, ABLETON_BENCH_ROOT_HELPER,
 ABLETON_BENCH_SUDO, and ABLETON_BENCH_SCENARIO_TOOL set the defaults.
 
@@ -379,10 +389,38 @@ wait_log_quiet()
     return 1
 }
 
+# Live quits through its own UI first: live-trial-dialog quit-live (Ctrl+Q, the quit-time trial
+# dialog, WM_CLOSE) leaves no crash-recovery state behind. It acts on the one Live of the machine,
+# so it runs only while every Live process is runner-owned. TERM and then KILL by exact pid remain
+# the fallback; after a signal, `state clean-crash` removes the crash-recovery files the next
+# launch would otherwise offer to restore.
+quit_owned_live()
+{
+    local pids="$1" foreign
+    [ -n "$pids" ] || return 0
+    [ -x "$quit_tool" ] || return 1
+    foreign="$(global_live_pids | grep -vxF -f <(printf '%s\n' "$pids") || true)"
+    if [ -n "$foreign" ]; then
+        printf 'bench-suite: another Live session is running (pid(s): %s); not quitting through the UI\n' \
+            "$(printf '%s' "$foreign" | tr '\n' ' ')" >&2
+        return 1
+    fi
+    "$session_env_tool" "$quit_tool" quit-live --timeout 60 >&2 || return 1
+    [ -z "$(owned_live_pids)" ]
+}
+
 stop_owned_session()
 {
-    local pids pid deadline remaining="" rc=0
+    local pids pid deadline remaining="" rc=0 quit=0
     [ -n "$active_token" ] || return 0
+    pids="$(owned_live_pids)"
+    if [ -n "$pids" ]; then
+        if quit_owned_live "$pids"; then
+            quit=1
+        else
+            printf 'bench-suite: Live did not quit through its UI; sending TERM to the owned pid(s)\n' >&2
+        fi
+    fi
     pids="$(owned_live_pids)"
     while IFS= read -r pid; do
         [ -n "$pid" ] || continue
@@ -421,22 +459,59 @@ stop_owned_session()
         fi
         wait "$launcher_pid" 2>/dev/null || true
     fi
+    # Signalled, or already gone (crashed) before the stop: either way Live left
+    # its crash-recovery files behind.
+    if [ "$quit" -ne 1 ] && [ -x "$state_tool" ]; then
+        "$state_tool" clean-crash >&2 \
+            || printf 'bench-suite: state clean-crash failed after Live ended without a UI quit\n' >&2
+    fi
     active_token=""
     launcher_pid=""
     return "$rc"
 }
 
-# The tracer runs as root. The helper finds its own copy of the tool and takes
-# the tool arguments after --; sudo runs the configured tracer directly.
+# The tracer runs as root. The helper (root-only, reached through its sudoers
+# rule with sudo -n) finds its own copy of the tool and takes the tool
+# arguments after --; sudo runs the configured tracer directly.
 trace_run()
 {
     local verb="$1"
     shift
     case "$privilege" in
-        root-helper) "$root_helper" trace "$verb" --tool wine-trace --run-dir "$output" -- "$@" ;;
+        root-helper)
+            if [ "$verb" = start ]; then
+                helper_trace_start "$@"
+            else
+                "$sudo" -n -- "$root_helper" trace "$verb" --tool wine-trace --run-dir "$output" -- "$@"
+            fi
+            ;;
         sudo) "$sudo" -n -- "$tracer" "$verb" "$@" ;;
         *) return 1 ;;
     esac
+}
+
+# The helper's `trace start` returns once the tool runs in the background, but
+# wine-trace start needs seconds to attach. Wait for its own verdict, the
+# "wine-trace: started:" or "wine-trace: error:" line it appends to the
+# helper's trace/wine-trace.err, so the measurement window opens only on an
+# attached tracer and a failed start fails the run.
+helper_trace_start()
+{
+    local err="$output/trace/wine-trace.err" seen=0 deadline line
+    [ ! -f "$err" ] || seen="$(wc -l < "$err")"
+    "$sudo" -n -- "$root_helper" trace start --tool wine-trace --run-dir "$output" -- "$@" || return 1
+    deadline=$((SECONDS + ${ABLETON_BENCH_TRACE_START_TIMEOUT:-180}))
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        line="$(tail -n +"$((seen + 1))" "$err" 2>/dev/null | grep -E '^wine-trace: (started|error):' | head -n 1 || true)"
+        case "$line" in
+            "wine-trace: started:"*) return 0 ;;
+            "wine-trace: error:"*) printf 'bench-suite: %s\n' "$line" >&2; return 1 ;;
+        esac
+        sleep 0.5
+    done
+    printf 'bench-suite: the tracer reported no start within %ss (%s)\n' \
+        "${ABLETON_BENCH_TRACE_START_TIMEOUT:-180}" "$err" >&2
+    return 1
 }
 
 # The output directory is created as the user so the files stay readable

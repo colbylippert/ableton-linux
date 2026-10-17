@@ -10,11 +10,17 @@ Two checks, selected by the inputs given (both may run in one invocation):
    kind  syscall | unixcall | server_req | server_wait | ntsync_wait | ntsync_wake | offcpu
    id    the tracer's id string (NtYieldExecution, create_event, WAIT_ANY,
          winscard.so:scard_establish_context ...); fnmatch globs allowed
-         (``winscard.so:*``); a hex/decimal number is matched against the event's
-         ``id_num`` or translated with ``--tables``
-   op    == != >= <= > < ~        (~ : within max(1, 5 %) of n)
+         (``winscard.so:*``); a bare unix library (``winscard.so``) matches every
+         unix-call id of that library (``winscard.so:<name>`` or ``winscard.so#<code>``); for
+         the nested kinds (server_req, server_wait, ntsync_wait, ntsync_wake) an id that is a
+         syscall name (``NtDelayExecution``) matches the enclosing syscall, i.e. the event's
+         ``caller`` placeholder ``ntdll.dll!<Name>+0x14``; a hex/decimal number is matched
+         against the event's ``id_num`` or translated with ``--tables``
+   op    == != >= <= > < ~        (~ : within max(1, 5 %) of n); the word forms
+         eq ne ge le gt lt (what traceprobe.exe prints) are accepted too
    key=value filters (need per-event data, i.e. ``events.jsonl``):
          thread=<comm>        count on another thread of the probe process
+                              (thread=helper: the probe's helper thread, from the TID line)
          status=<v>|<v>...    NTSTATUS / errno values or names (STATUS_TIMEOUT, ETIMEDOUT)
          dur_ms=10+-1         duration window; also dur_us=, dur_ns=, and lo..hi ranges
          within=<id glob>     enclosed (by time, same tid) in a syscall/unixcall with that id
@@ -27,8 +33,10 @@ Two checks, selected by the inputs given (both may run in one invocation):
    crossings exclude between-block events, ``top_ids`` are top-N), so they yield
    PASS when satisfied and SKIP otherwise; only ``*`` ids against the per-kind
    totals of threads.jsonl are exact.  The probe's tid is
-   given with ``--tid`` or found by ``--comm`` (default ``traceprobe.exe``) in the
-   thread tables of ``threads.jsonl`` / ``events.jsonl`` / ``tracer.json``.
+   given with ``--tid``, else taken from the probe's final ``TID ... linux_tid=N`` line
+   (``linux_helper_tid=`` / ``helper_comm=`` resolve ``thread=helper``), else found by
+   ``--comm`` (default ``traceprobe.exe``, or the TID line's ``comm=``) in the thread tables
+   of ``threads.jsonl`` / ``events.jsonl`` / ``tracer.json``.
    Pairing checks (orphan server/ntsync events, ``unmatched_exits``,
    ``abandoned_entries`` from ``tracer.json``) run when the data allows.
 
@@ -58,6 +66,9 @@ KINDS = ("syscall", "unixcall", "server_req", "server_wait", "ntsync_wait", "nts
 ENCLOSING_KINDS = ("syscall", "unixcall")
 NESTED_KINDS = ("server_req", "server_wait", "ntsync_wait")
 OPS = ("==", "!=", ">=", "<=", ">", "<", "~")
+OP_WORDS = {"eq": "==", "ne": "!=", "ge": ">=", "le": "<=", "gt": ">", "lt": "<"}
+CALLER_NAME_RE = re.compile(r"^(?:ntdll|win32u)\.dll!(\w+)\+0x[0-9a-fA-F]+$")
+PROBE_TID_RE = re.compile(r"^\s*TID\s+\d+\s+(.*?)\s*$")
 ENCLOSE_TOLERANCE_NS = 1000
 
 STATUS_NAMES = {
@@ -71,7 +82,7 @@ STATUS_NAMES = {
     "ETIMEDOUT": -110, "EOWNERDEAD": -130, "ENOTTY": -25,
 }
 
-EXPECT_RE = re.compile(r"^\s*EXPECT\s+(\S+)\s+(\S+)\s+(==|!=|>=|<=|>|<|~)\s+(\d+)\s*(.*?)\s*$")
+EXPECT_RE = re.compile(r"^\s*EXPECT\s+(\S+)\s+(\S+)\s+(==|!=|>=|<=|>|<|~|eq|ne|ge|le|gt|lt)\s+(\d+)\s*(.*?)\s*$")
 TELEMETRY_RE = re.compile(r"\[pipeasio telemetry\]\s*(.*?)\s*$")
 
 
@@ -249,6 +260,7 @@ def parse_expect_lines(lines: Iterable[str]) -> List[Expectation]:
         if not m:
             continue
         kind, id_pattern, op, n, rest = m.groups()
+        op = OP_WORDS.get(op, op)
         filters: Dict[str, str] = {}
         for token in rest.split():
             key, sep, value = token.partition("=")
@@ -256,6 +268,40 @@ def parse_expect_lines(lines: Iterable[str]) -> List[Expectation]:
                 filters[key.strip().lower()] = value.strip()
         result.append(Expectation(kind.lower(), id_pattern, op, int(n), filters, raw.strip()))
     return result
+
+
+def parse_probe_ids(lines: Iterable[str]) -> Dict[str, str]:
+    """key=value fields of the probe's last ``TID <wintid> ...`` line (empty when absent)."""
+    ids: Dict[str, str] = {}
+    for raw in lines:
+        m = PROBE_TID_RE.match(raw)
+        if not m:
+            continue
+        ids = {}
+        for token in m.group(1).split():
+            key, sep, value = token.partition("=")
+            if sep:
+                ids[key] = value
+    return ids
+
+
+def probe_number(ids: Dict[str, str], key: str) -> Optional[int]:
+    value = ids.get(key, "")
+    return int(value) if value.isdigit() and int(value) > 0 else None
+
+
+def expect_id_matches(exp: "Expectation", ev: "Event", name: Any) -> bool:
+    """id_matches plus the probe's conventions (bare unix library, enclosing syscall)."""
+    if id_matches(exp.id, name, ev.id_num):
+        return True
+    pattern = exp.id
+    if exp.kind == "unixcall" and pattern.endswith(".so") and not any(ch in pattern for ch in "*?["):
+        text = "" if name is None else str(name)
+        return text.startswith(pattern + ":") or text.startswith(pattern + "#")
+    if exp.kind in NESTED_KINDS + ("ntsync_wake",) and re.match(r"^(Nt|Zw)\w+$", pattern):
+        m = CALLER_NAME_RE.match(str(ev.fields.get("caller") or ""))
+        return bool(m) and m.group(1) == pattern
+    return False
 
 
 def parse_range(text: str, scale: int = 1) -> Optional[Tuple[int, int]]:
@@ -572,13 +618,21 @@ def enclosed_by(ev: Event, obs: Observations, pattern: str, tables: Dict[int, st
 
 
 def evaluate_expectation(exp: Expectation, obs: Observations, tid: int, tables: Dict[int, str],
-                         report: Report) -> None:
+                         report: Report, probe_ids: Optional[Dict[str, str]] = None) -> None:
     label = exp.label()
     target = tid
-    if "thread" in exp.filters:
-        hits = obs.tids_with_comm(exp.filters["thread"], obs.pids.get(tid))
+    probe_ids = probe_ids or {}
+    thread = exp.filters.get("thread")
+    if thread == "helper" and probe_number(probe_ids, "linux_helper_tid"):
+        target = probe_number(probe_ids, "linux_helper_tid") or tid
+    elif thread is not None:
+        if thread == "helper":
+            thread = probe_ids.get("helper_comm") or thread
+        hits = obs.tids_with_comm(thread, obs.pids.get(tid))
+        if not hits and thread != exp.filters["thread"]:
+            hits = obs.tids_with_comm(thread)
         if not hits:
-            report.add("SKIP", label, "no thread with comm %r" % exp.filters["thread"])
+            report.add("SKIP", label, "no thread with comm %r" % thread)
             return
         target = hits[0] if len(hits) == 1 else max(hits, key=obs.activity)
     if exp.kind not in KINDS:
@@ -591,9 +645,9 @@ def evaluate_expectation(exp: Expectation, obs: Observations, tid: int, tables: 
             if ev.tid != target or ev.kind != exp.kind:
                 continue
             name = ev.id
-            if ev.id_num is not None and ev.id_num in tables and not id_matches(exp.id, ev.id, ev.id_num):
+            if ev.id_num is not None and ev.id_num in tables and not expect_id_matches(exp, ev, ev.id):
                 name = tables[ev.id_num]
-            if not id_matches(exp.id, name, ev.id_num):
+            if not expect_id_matches(exp, ev, name):
                 continue
             ok, problem = event_passes_filters(ev, exp, obs, tid, tables)
             if problem:
@@ -637,6 +691,7 @@ def pairing_checks(obs: Observations, tid: int, report: Report) -> None:
     if obs.has_events:
         orphans = 0
         nested = 0
+        open_enclosed = 0
         timed = True
         for ev in obs.events:
             if ev.tid != tid or ev.kind not in NESTED_KINDS:
@@ -646,7 +701,18 @@ def pairing_checks(obs: Observations, tid: int, report: Report) -> None:
                 timed = False
                 break
             if not enclosed_by(ev, obs, "*", {}):
-                orphans += 1
+                # An entry that never exits (the process's final NtTerminateProcess) is not in
+                # events.jsonl, but reduce.py attributed the nested event to it while it was on
+                # the tid's stack: its caller names it.  Only caller "none" is a real orphan.
+                caller = ev.fields.get("caller")
+                if caller and caller != "none":
+                    open_enclosed += 1
+                else:
+                    orphans += 1
+        if open_enclosed:
+            report.add("INFO", "pairing-open-enclosure",
+                       "%d server/ntsync events inside an entry that never exited (caller kept) on tid %d"
+                       % (open_enclosed, tid))
         if not timed:
             report.add("SKIP", "pairing-enclosure", "events carry no timestamps")
         elif nested:
@@ -706,14 +772,21 @@ def run_expect(args: argparse.Namespace, report: Report) -> None:
     if args.tracer:
         obs.load_tracer(args.tracer)
     tables = load_tables(args.tables) if args.tables else {}
-    expectations = parse_expect_lines(read_lines(args.expect))
+    expect_lines = read_lines(args.expect)
+    expectations = parse_expect_lines(expect_lines)
     if not expectations:
         report.add("FAIL", "expect-input", "no EXPECT lines in %s" % args.expect)
         return
+    probe_ids = parse_probe_ids(expect_lines)
     if args.tid is not None:
         tid, note = args.tid, "--tid"
+    elif probe_number(probe_ids, "linux_tid"):
+        tid, note = probe_number(probe_ids, "linux_tid"), "the probe's TID line (linux_tid)"
     else:
-        tid, note = obs.resolve_tid(args.comm, args.pid)
+        comm = args.comm
+        if comm == "traceprobe.exe" and probe_ids.get("comm"):
+            comm = probe_ids["comm"]
+        tid, note = obs.resolve_tid(comm, args.pid)
     if tid is None:
         report.add("FAIL", "expect-thread", note)
         for exp in expectations:
@@ -721,7 +794,7 @@ def run_expect(args: argparse.Namespace, report: Report) -> None:
         return
     report.add("INFO", "expect-thread", "tid %d (%s); observations from %s" % (tid, note, "+".join(obs.sources)))
     for exp in expectations:
-        evaluate_expectation(exp, obs, tid, tables, report)
+        evaluate_expectation(exp, obs, tid, tables, report, probe_ids)
     pairing_checks(obs, tid, report)
 
 

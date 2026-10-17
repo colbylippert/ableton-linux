@@ -26,12 +26,13 @@
 #ifndef WINE_TRACE_H
 #define WINE_TRACE_H
 
-#define WINE_TRACE_VERSION "0.1.0"
-#define WINE_TRACE_ABI     1          /* bump when any struct in this file changes */
+#define WINE_TRACE_VERSION "0.2.0"
+#define WINE_TRACE_ABI     2          /* bump when any struct in this file changes */
 
 /* ---- sizing ---------------------------------------------------------- */
-#define AGG_SLOTS          4          /* epoch ring: agg[(seq >> 6) & 3] */
-#define AGG_EPOCH_SHIFT    6          /* 64 blocks per epoch */
+#define AGG_SLOTS          4          /* time ring: agg[(completion_ts / AGG_SLOT_NS) & 3] */
+#define AGG_SLOT_NS        100000000ULL          /* 100 ms per slot; user space drains slot W-2 */
+#define AGG_EPOCH_SHIFT    6          /* global.epoch = seq >> 6 (informational) */
 #define AGG_ENTRIES        65536      /* per slot */
 #define INFLIGHT_DEPTH     4
 #define MAX_PIDS           64
@@ -188,6 +189,7 @@ enum wt_stat {
 	ST_UNMATCHED_EXIT, ST_THREAD_START_EXIT, ST_ABANDONED_ENTRY, ST_INFLIGHT_OVERFLOW,
 	ST_AGG_FULL, ST_RINGBUF_DROP, ST_STACK_READ_FAIL, ST_STACKS, ST_FILTERED, ST_NTSYNC_UNMATCHED,
 	ST_SAMPLE_CTR,
+	ST_UNIXCALL_SLOW_EXIT,  /* syscall_exit of the unix-call slow path (no syscall entry to match) */
 	ST__COUNT
 };
 

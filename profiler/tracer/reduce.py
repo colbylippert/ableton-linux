@@ -3,11 +3,14 @@
 
     reduce.py --in DIR [--out DIR] [--tracer-json FILE] [--tables FILE] [--mode summary|drilldown]
               [--near-late-fraction 0.15] [--window-ms 100] [--stopped-monotonic-ns N]
-              [--lost-events-extra N] [--ns-per-hit 2000]
+              [--lost-events-extra N] [--recursion-misses N] [--ns-per-hit 2000]
 
 Input: ``DIR/events.txt`` written by ``wine-trace.bt`` (format: profiler/tracer/README.md), the
-optional ``DIR/tracer.json`` written by ``profiler/bin/wine-trace start`` (pids, images, mode) and
-the optional ``DIR/maps-<pid>*.txt`` snapshots of ``/proc/<pid>/maps`` (unix-call handle -> .so).
+``T`` lines of ``DIR/tasks-start.txt`` / ``DIR/tasks-stop.txt`` (every thread of the traced pids
+at start/stop, written by ``profiler/bin/wine-trace``; format 3 prints ``T`` lines only for threads
+created while tracing), the optional ``DIR/tracer.json`` written by ``profiler/bin/wine-trace
+start`` (pids, images, mode) and the optional ``DIR/maps-<pid>*.txt`` snapshots of
+``/proc/<pid>/maps`` (unix-call handle -> .so).
 
 Output (all times are ``offset_seconds`` from the header's ``monotonic_start_ns``, first line of
 every .jsonl file is a ``{"type":"header"}`` record):
@@ -19,9 +22,28 @@ every .jsonl file is a ``{"type":"header"}`` record):
 * ``tracer.json``   -- updated in place with ``stopped_monotonic_ns``, ``lost_events``,
   ``probe_hits`` and the reducer counters when ``--tracer-json`` is given.
 
-Pairing rules: lines are sorted by timestamp first (bpftrace drains per-CPU buffers, so the file
-is not globally ordered).  ``E``/``X`` records are paired per tid in LIFO order by the frame
-pointer: an ``X`` whose frame matches an open entry below the top pops the entries above it as
+Ordering and memory: lines are sorted by (timestamp, file order) first (bpftrace drains per-CPU
+buffers, so the file is not globally ordered).  Inputs larger than ``--sort-chunk-lines`` are
+sorted externally (sorted runs in a temporary directory next to the outputs, merged with
+``heapq.merge``) and every completed crossing is aggregated as soon as it is paired, so memory
+grows with the number of blocks and distinct call sites, not with the number of events
+(``--mode drilldown`` still keeps the event list for ``events.jsonl``).
+
+Lost events: bpftrace 0.27 drops ring-buffer records silently, so ``wine-trace.bt`` (format >= 2)
+counts every printf in the ``@emitted`` map (key = ASCII code of the line letter; format 3 counts
+the unix-call ``E`` line under 101 = ``e``, which stands for one ``E`` and one ``R`` line) and
+prints it after the ``end`` line.  ``lost_events`` = max(reported, shortfall) + recursion misses,
+where reported = bpftrace's own ``Lost N events`` lines + the wrapper's ``--lost-events-extra``
+(both count the same dropped records as the shortfall), shortfall = the per-kind sum of
+max(0, emitted - received lines) and recursion misses = ``--recursion-misses`` (fentry/fexit runs
+the kernel skipped: their W/w/K lines were never emitted).  Lines received beyond ``@emitted``
+(printed while the counters were read) are ``received_after_counters``: they can hide a shortfall
+of the same size, so ``lower_bound`` is then true.  A format >= 2 trace without ``@emitted`` or any
+trace without its ``end`` line (the tracer did not exit cleanly) reports ``lost_events`` as null
+(unknown), never as a silent zero, and ``stopped_monotonic_ns`` = its last event.
+
+Pairing rules: ``E``/``X`` records are paired per tid in LIFO order by the frame pointer: an
+``X`` whose frame matches an open entry below the top pops the entries above it as
 ``abandoned`` (user-mode callbacks return through ``NtCallbackReturn`` without an exit); an ``X``
 matching nothing is an ``unmatched`` exit (the first one on a tid is normally the thread start,
 which jumps to the dispatcher return label).  ``S`` (server requests/waits), ``W``/``w``
@@ -39,18 +61,37 @@ import argparse
 import bisect
 import collections
 import glob
+import heapq
 import importlib.util
 import json
 import math
 import os
 import re
+import shutil
 import sys
+import tempfile
 
-REDUCER_VERSION = "reduce.py/1"
+REDUCER_VERSION = "reduce.py/2"
 SUMMARY_SCHEMA = "ableton-linux-tracer-summary/v1"
 HEADER_RE = re.compile(r"^hdr\s+mono_start_ns=(\d+)")
+HEADER_FORMAT_RE = re.compile(r"\bformat=(\d+)")
+HEADER_CLOCK_RE = re.compile(r"\bclock=(\w+)")
 END_RE = re.compile(r"^end\s+mono_end_ns=(\d+)")
 LOST_RE = re.compile(r"^Lost\s+(\d+)\s+events?")
+EMITTED_RE = re.compile(r"^@emitted\[(\d+)\]:\s*(\d+)\s*$")
+EVENT_KINDS = frozenset(("E", "X", "R", "S", "B", "C", "W", "w", "K", "U", "O", "T", "N", "P"))
+# Files next to events.txt with extra event lines (T lines of the threads alive at start/stop,
+# written by profiler/bin/wine-trace).
+TASK_FILES = ("tasks-start.txt", "tasks-stop.txt")
+DEFAULT_SORT_CHUNK_LINES = 2_000_000
+# Block states while streaming: OPEN (start seen, crossings buffered), DONE (valid start/end:
+# crossings go straight to the block), DROPPED (ended without a usable start).
+BLOCK_OPEN = "open"
+BLOCK_DONE = "done"
+BLOCK_DROPPED = "dropped"
+# An R line (unix-call frame + PE caller, second program on the probe) joins the frameless unix-call
+# entry of its thread when the two timestamps are this close.
+R_JOIN_WINDOW_NS = 1_000_000
 
 AUDIO_ROLES = ("pipeasio_callback", "audio_worker", "pipeasio_rt", "pipeasio_worker")
 NTSYNC_WAIT_CMDS = {0xC0284E82: "WAIT_ANY", 0xC0284E83: "WAIT_ALL"}
@@ -92,20 +133,31 @@ def parse_line(line, index):
             return ("E", ts, tid, "syscall", int(tokens[4], 16), 0, int(fields["fr"], 16),
                     int(fields["seq"]), int(fields.get("rsp", "0"), 16), int(fields.get("rip", "0"), 16))
         if what == "unixcall":
+            if "=" in tokens[4]:
+                # format 3: "c=CODE h=HANDLE seq=S"; fr/rip follow in an R line from a second program
+                fields = kv_fields(tokens[4:])
+                return ("E", ts, tid, "unixcall", int(fields["h"], 16), int(fields["c"]), None,
+                        int(fields["seq"]), 0, 0)
             handle, _, code = tokens[4].partition(":")
-            return ("E", ts, tid, "unixcall", int(handle, 16), int(code), int(fields["fr"], 16),
+            frame = int(fields["fr"], 16) if "fr" in fields else None
+            return ("E", ts, tid, "unixcall", int(handle, 16), int(code), frame,
                     int(fields["seq"]), 0, int(fields.get("rip", "0"), 16))
         raise ValueError("unknown entry kind %r" % what)
     if kind == "X":
         ts, tid, what = int(tokens[1]), int(tokens[2]), tokens[3]
         if what == "syscall":
-            fields = kv_fields(tokens[5:])
-            return ("X", ts, tid, "syscall", int(tokens[4], 16), int(fields["fr"], 16),
+            # format 3 drops the id (pairing is by frame) and restore_flags and prints st before fr
+            has_id = "=" not in tokens[4]
+            fields = kv_fields(tokens[5:] if has_id else tokens[4:])
+            return ("X", ts, tid, "syscall", int(tokens[4], 16) if has_id else 0, int(fields["fr"], 16),
                     int(fields.get("st", "0"), 16), int(fields.get("rf", "0"), 16))
         if what == "unixcall":
             fields = kv_fields(tokens[4:])
             return ("X", ts, tid, "unixcall", 0, int(fields["fr"], 16), int(fields.get("st", "0"), 16), 0)
         raise ValueError("unknown exit kind %r" % what)
+    if kind == "R":
+        fields = kv_fields(tokens[3:])
+        return ("R", int(tokens[1]), int(tokens[2]), int(fields["fr"], 16), int(fields.get("rip", "0"), 16))
     if kind == "S":
         ts, tid, what = int(tokens[1]), int(tokens[2]), tokens[3]
         fields = kv_fields(tokens[5:])
@@ -293,6 +345,7 @@ class Reducer:
         self.probe_hits = collections.Counter()
         self.mono_start_ns = None
         self.mono_end_ns = None
+        self.last_event_ns = None
         self.lost_events = 0
         self.records = []
         self.names = {}
@@ -313,6 +366,26 @@ class Reducer:
         self.tables = Tables()
         self.roles = None
         self.role_cache = {}
+        # streaming state (format 2 reducer): sorted runs, per-kind line counts, @emitted
+        self.trace_format = None
+        self.trace_clock = None
+        self.emitted = collections.Counter()
+        self.received = collections.Counter()
+        self.sort_chunk = []
+        self.sort_runs = []
+        self.sort_dir = None
+        self.n_events = 0
+        self.keep_events = bool(options is not None and getattr(options, "mode", "summary") == "drilldown")
+        self.block_state = {}
+        self.block_pending = {}
+        self.block_agg = collections.defaultdict(dict)
+        self.windows = collections.defaultdict(lambda: {"kinds": {}, "ids": {}, "wakeups": 0})
+        self.kinds_total = collections.defaultdict(lambda: [0, 0])
+        self.site_all = collections.defaultdict(lambda: [0, 0, 0])
+        self.site_woken = collections.defaultdict(collections.Counter)
+        self.hot_by_tid = collections.defaultdict(lambda: [0, 0])
+        self.syscall_cache = {}
+        self.unixcall_cache = {}
 
     # -- loading ------------------------------------------------------------------------------
 
@@ -339,53 +412,148 @@ class Reducer:
             except OSError as exc:
                 self.warnings.append("cannot read %s: %s" % (path, exc))
 
-    def load_events(self, path):
+    def load_events(self, path, sort_dir=None, chunk_lines=DEFAULT_SORT_CHUNK_LINES, extra_paths=()):
+        """Pass 1: header/end/lost/@emitted lines, per-kind counts and sorted runs of event lines.
+
+        Event lines are kept raw as (ts, file index, line); every ``chunk_lines`` lines the chunk is
+        sorted and spilled to a run file under ``sort_dir`` (default: a temporary directory), so
+        the memory of this pass is bounded by one chunk.  ``sorted_records`` merges the runs.
+        """
         if not os.path.isfile(path):
             raise ReduceError("%s: events file missing" % path)
-        records = self.records
-        with open(path, "r", encoding="utf-8", errors="replace") as handle:
-            for index, line in enumerate(handle):
+        chunk_lines = max(1, int(chunk_lines or DEFAULT_SORT_CHUNK_LINES))
+        chunk = self.sort_chunk
+        received = self.received
+        min_ts = None
+        kept = 0
+        index = -1
+        for source in [path] + [extra for extra in extra_paths if os.path.isfile(extra)]:
+            with open(source, "r", encoding="utf-8", errors="replace") as handle:
+                for line in handle:
+                    index += 1
+                    line = line.rstrip("\n")
+                    if not line:
+                        continue
+                    first = line[0]
+                    if first == "@":
+                        match = EMITTED_RE.match(line)
+                        if match:
+                            code = int(match.group(1))
+                            if 0 < code < 128:
+                                self.emitted[chr(code)] += int(match.group(2))
+                        continue
+                    if first == "#":
+                        continue
+                    if first == "h":
+                        match = HEADER_RE.match(line)
+                        if match:
+                            if self.mono_start_ns is None:
+                                self.mono_start_ns = int(match.group(1))
+                                fmt = HEADER_FORMAT_RE.search(line)
+                                self.trace_format = int(fmt.group(1)) if fmt else 1
+                                clock = HEADER_CLOCK_RE.search(line)
+                                self.trace_clock = clock.group(1) if clock else None
+                            else:
+                                self.counters["duplicate_headers"] += 1
+                            continue
+                    if first == "e":
+                        match = END_RE.match(line)
+                        if match:
+                            self.mono_end_ns = int(match.group(1))
+                            continue
+                    if first == "L":
+                        match = LOST_RE.match(line)
+                        if match:
+                            self.lost_events += int(match.group(1))
+                            self.counters["lost_event_lines"] += 1
+                            continue
+                    parts = line.split(" ", 2)
+                    kind = parts[0]
+                    if kind not in EVENT_KINDS:
+                        self.counters["ignored_lines"] += 1
+                        continue
+                    try:
+                        ts = int(parts[1])
+                    except (IndexError, ValueError):
+                        self.counters["malformed_lines"] += 1
+                        continue
+                    if source == path:
+                        received[kind] += 1
+                        # the tracer's own last event (tasks-stop.txt is stamped by the wrapper)
+                        if self.last_event_ns is None or ts > self.last_event_ns:
+                            self.last_event_ns = ts
+                    if min_ts is None or ts < min_ts:
+                        min_ts = ts
+                    chunk.append((ts, index, line))
+                    kept += 1
+                    if len(chunk) >= chunk_lines:
+                        self.spill_chunk(sort_dir)
+                        chunk = self.sort_chunk
+        if self.mono_start_ns is None:
+            if not kept:
+                self.cleanup()
+                raise ReduceError("%s: no header line and no events" % path)
+            self.mono_start_ns = min_ts
+            self.warnings.append("no 'hdr mono_start_ns=' line; using the first event timestamp")
+        self.sort_chunk.sort()
+        if self.sort_runs:
+            self.counters["sort_runs"] = len(self.sort_runs) + (1 if self.sort_chunk else 0)
+
+    def spill_chunk(self, sort_dir):
+        if self.sort_dir is None:
+            if sort_dir:
+                os.makedirs(sort_dir, exist_ok=True)
+            self.sort_dir = tempfile.mkdtemp(prefix=".reduce-sort-", dir=sort_dir or None)
+        chunk = self.sort_chunk
+        chunk.sort()
+        path = os.path.join(self.sort_dir, "run-%05d.txt" % len(self.sort_runs))
+        with open(path, "w", encoding="utf-8", newline="\n") as handle:
+            handle.writelines(item[2] + "\n" for item in chunk)
+        self.sort_runs.append(path)
+        self.sort_chunk = []
+
+    @staticmethod
+    def iter_run(path):
+        with open(path, "r", encoding="utf-8") as handle:
+            for line in handle:
                 line = line.rstrip("\n")
-                if not line:
-                    continue
-                first = line[0]
-                if first == "@" or first == "#":
-                    continue
-                if first == "h":
-                    match = HEADER_RE.match(line)
-                    if match:
-                        if self.mono_start_ns is None:
-                            self.mono_start_ns = int(match.group(1))
-                        else:
-                            self.counters["duplicate_headers"] += 1
-                        continue
-                if first == "e":
-                    match = END_RE.match(line)
-                    if match:
-                        self.mono_end_ns = int(match.group(1))
-                        continue
-                if first == "L":
-                    match = LOST_RE.match(line)
-                    if match:
-                        self.lost_events += int(match.group(1))
-                        self.counters["lost_event_lines"] += 1
-                        continue
+                yield (int(line.split(" ", 2)[1]), line)
+
+    def sorted_records(self):
+        """Pass 2: parsed records in (timestamp, file order) order.
+
+        Runs hold contiguous, ascending file-index ranges and heapq.merge is stable for equal
+        keys, so ties keep their file order exactly as an in-memory sort by (ts, index) would.
+        """
+        tail = ((ts, line) for ts, _index, line in self.sort_chunk)
+        if self.sort_runs:
+            sources = [self.iter_run(path) for path in self.sort_runs] + [tail]
+            merged = heapq.merge(*sources, key=lambda item: item[0])
+        else:
+            merged = tail
+        probe_hits = self.probe_hits
+        counters = self.counters
+        try:
+            for _ts, line in merged:
                 try:
-                    record = parse_line(line, index)
+                    record = parse_line(line, 0)
                 except (ValueError, KeyError, IndexError):
-                    self.counters["malformed_lines"] += 1
+                    counters["malformed_lines"] += 1
                     continue
                 if record is None:
-                    self.counters["ignored_lines"] += 1
+                    counters["ignored_lines"] += 1
                     continue
-                self.probe_hits[record[0]] += 1
-                records.append((record[1], index, record))
-        if self.mono_start_ns is None:
-            if not records:
-                raise ReduceError("%s: no header line and no events" % path)
-            self.mono_start_ns = min(ts for ts, _, _ in records)
-            self.warnings.append("no 'hdr mono_start_ns=' line; using the first event timestamp")
-        records.sort(key=lambda item: (item[0], item[1]))
+                probe_hits[record[0]] += 1
+                yield record
+        finally:
+            self.sort_chunk = []
+            self.cleanup()
+
+    def cleanup(self):
+        if self.sort_dir is not None:
+            shutil.rmtree(self.sort_dir, ignore_errors=True)
+            self.sort_dir = None
+            self.sort_runs = []
 
     # -- naming -------------------------------------------------------------------------------
 
@@ -439,15 +607,23 @@ class Reducer:
         return role
 
     def syscall_caller(self, sid):
-        name = self.tables.syscall_name(sid)
-        module = "win32u.dll" if sid >= 0x1000 else "ntdll.dll"
-        return name, "%s!%s+0x14" % (module, name)
+        cached = self.syscall_cache.get(sid)
+        if cached is None:
+            name = self.tables.syscall_name(sid)
+            module = "win32u.dll" if sid >= 0x1000 else "ntdll.dll"
+            cached = self.syscall_cache[sid] = (name, "%s!%s+0x14" % (module, name))
+        return cached
 
     def unixcall_id(self, handle, code):
-        module = self.modules.lookup(handle)
+        key = (handle, code)
+        cached = self.unixcall_cache.get(key)
+        if cached is None:
+            module = self.modules.lookup(handle)
+            cached = self.unixcall_cache[key] = (module, self.tables.unixcall_name(module, code))
+        module, name = cached
         if module is None and self.modules.ranges:
             self.counters["unixcall_handle_unmapped"] += 1
-        return self.tables.unixcall_name(module, code)
+        return name
 
     # -- processing ---------------------------------------------------------------------------
 
@@ -455,10 +631,12 @@ class Reducer:
         stacks = collections.defaultdict(list)
         seen_entry = set()
         pending_wait = {}
-        events = self.events
+        pending_r = {}
+        emit = self.emit
         counters = self.counters
-        for ts, _, rec in self.records:
+        for rec in self.sorted_records():
             kind = rec[0]
+            ts = rec[1]
             if kind == "E":
                 _, _, tid, what, ident, code, frame, seq, _rsp, rip = rec
                 if what == "syscall":
@@ -466,13 +644,31 @@ class Reducer:
                 else:
                     name = self.unixcall_id(ident, code)
                     caller = "pe!0x%x" % rip
-                stacks[tid].append((what, name, caller, frame, ts, seq))
+                entry = [what, name, caller, frame, ts, seq]
+                if frame is None:
+                    # format 3 unix call: frame and PE caller arrive in the R line of the second
+                    # program on the same probe (normally just after this line, same thread)
+                    pending = pending_r.pop(tid, None)
+                    if pending is not None and abs(ts - pending[2]) <= R_JOIN_WINDOW_NS:
+                        entry[3], entry[2] = pending[0], "pe!0x%x" % pending[1]
+                stacks[tid].append(entry)
                 seen_entry.add(tid)
                 if len(stacks[tid]) > 64:
                     stacks[tid].pop(0)
                     counters["stack_overflow_drops"] += 1
+            elif kind == "R":
+                _, _, tid, frame, rip = rec
+                for entry in reversed(stacks[tid]):
+                    if entry[0] == "unixcall" and entry[3] is None:
+                        if abs(ts - entry[4]) <= R_JOIN_WINDOW_NS:
+                            entry[3], entry[2] = frame, "pe!0x%x" % rip
+                        else:
+                            counters["unixcall_r_lines_too_late"] += 1
+                        break
+                else:
+                    pending_r[tid] = (frame, rip, ts)
             elif kind == "X":
-                _, _, tid, what, _ident, frame, status, rflags = rec
+                _, _, tid, what, _ident, frame, status, _rflags = rec
                 stack = stacks[tid]
                 depth = None
                 for index in range(len(stack) - 1, -1, -1):
@@ -481,13 +677,12 @@ class Reducer:
                         break
                 if depth is None:
                     # Thread start (init_syscall_frame's tail), NtContinue/exception returns and
-                    # the unix-call slow path (restore_flags set after unixcall_exit) all reach
-                    # the dispatcher return label without a matching entry.
+                    # the unix-call slow path all reach the dispatcher return label without a
+                    # matching entry.  (Format 3 prints no restore_flags, so the former
+                    # unmatched_exits_with_restore_flags split is gone.)
                     counters["unmatched_exits"] += 1
                     if tid not in seen_entry and not stack:
                         counters["unmatched_exits_first_on_tid"] += 1
-                    elif what == "syscall" and rflags:
-                        counters["unmatched_exits_with_restore_flags"] += 1
                     continue
                 abandoned = len(stack) - depth - 1
                 if abandoned:
@@ -498,7 +693,7 @@ class Reducer:
                 if dur < 0 or dur > MAX_DURATION_NS:
                     counters["invalid_durations"] += 1
                     continue
-                events.append((entry[0], entry[1], entry[2], tid, entry[4], ts, entry[5], status, None))
+                emit((entry[0], entry[1], entry[2], tid, entry[4], ts, entry[5], status, None))
             elif kind == "S":
                 _, _, tid, what, value, dur, status, seq = rec
                 if dur < 0 or dur > MAX_DURATION_NS:
@@ -517,7 +712,7 @@ class Reducer:
                     caller = "none"
                 else:
                     caller = enclosing[2]
-                events.append((ekind, name, caller, tid, ts - dur, ts, seq, status, None))
+                emit((ekind, name, caller, tid, ts - dur, ts, seq, status, None))
             elif kind == "W":
                 _, _, tid, cmd, count, alert, owner, seq = rec
                 if tid in pending_wait:
@@ -539,14 +734,14 @@ class Reducer:
                 woken = self.find_waker(tid, t0, ts)
                 if woken is not None:
                     extra["woken_by"] = woken
-                events.append(("ntsync_wait", name, caller, tid, t0, ts, seq, ret, extra))
+                emit(("ntsync_wait", name, caller, tid, t0, ts, seq, ret, extra))
             elif kind == "K":
                 _, _, tid, pid, cmd, seq = rec
                 self.tid_pid.setdefault(tid, pid)
                 name = NTSYNC_WAKE_CMDS.get(cmd, "cmd_0x%x" % cmd)
                 enclosing = stacks[tid][-1] if stacks[tid] else None
                 caller = enclosing[2] if enclosing else "none"
-                events.append(("ntsync_wake", name, caller, tid, ts, ts, seq, 0, None))
+                emit(("ntsync_wake", name, caller, tid, ts, ts, seq, 0, None))
             elif kind == "B":
                 _, _, tid, phase, seq, fields = rec
                 block = self.blocks.setdefault(seq, {})
@@ -559,12 +754,17 @@ class Reducer:
                     cycles = self.cycles_by_tid.get(tid)
                     if cycles and cycles[-1][1] is None:
                         cycles[-1][2] = seq
+                    if self.block_state.get(seq) is None:
+                        self.block_state[seq] = BLOCK_OPEN
+                    else:
+                        counters["duplicate_block_starts"] += 1
                 elif phase == "before":
                     block["before"] = ts
                 elif phase == "after":
                     block["after"] = ts
                 elif phase == "end":
                     block["end"] = (ts, int(fields.get("fl", "0"), 16), int(fields.get("missed", "0")))
+                    self.close_block(seq)
                 else:
                     counters["unknown_block_phase"] += 1
             elif kind == "C":
@@ -609,10 +809,109 @@ class Reducer:
         for tid, stack in stacks.items():
             if stack:
                 counters["open_entries_at_end"] += len(stack)
+                counters["unixcall_entries_without_r"] += sum(1 for entry in stack if entry[3] is None)
+        counters["unixcall_r_lines_unmatched"] += len(pending_r)
         counters["ntsync_wait_without_exit"] += len(pending_wait)
+        # Blocks that never ended (trace stopped mid-block, lost end line): their events go to
+        # the window buckets, like events of any block without a record.
+        for seq in sorted(self.block_pending):
+            for event in self.block_pending[seq]:
+                self.to_window(event, unknown_block=True)
+        self.block_pending = {}
         for wakes in self.wakes_by_tid.values():
             wakes.sort()
-        self.events.sort(key=lambda event: event[4])
+        if self.keep_events:
+            self.events.sort(key=lambda event: event[4])
+
+    # -- streaming aggregation ----------------------------------------------------------------
+
+    def emit(self, event):
+        """Account one completed crossing: global totals at once, then its block or window."""
+        kind, name, caller, tid, t0, t1, seq, _status, extra = event
+        self.n_events += 1
+        if self.keep_events:
+            self.events.append(event)
+        dur = t1 - t0
+        total = self.kinds_total[kind]
+        total[0] += 1
+        total[1] += dur
+        site_key = (kind, name, caller)
+        site = self.site_all[site_key]
+        site[0] += 1
+        site[1] += dur
+        if dur > site[2]:
+            site[2] = dur
+        woken = extra.get("woken_by") if extra else None
+        if woken is not None:
+            self.site_woken[site_key][woken] += 1
+        hot = self.hot_by_tid[(tid, kind, name, caller)]
+        hot[0] += 1
+        hot[1] += dur
+        if not seq:
+            self.to_window(event)
+            return
+        state = self.block_state.get(seq)
+        if state is BLOCK_OPEN:
+            self.block_pending.setdefault(seq, []).append(event)
+        elif state is BLOCK_DONE:
+            self.to_block(seq, event)
+        else:
+            self.to_window(event, unknown_block=True)
+
+    def close_block(self, seq):
+        """A block_end line: decide once whether the block gets a record (see build_blocks)."""
+        block = self.blocks.get(seq, {})
+        if self.block_state.get(seq) is BLOCK_DONE:
+            self.counters["duplicate_block_ends"] += 1
+            return
+        pending = self.block_pending.pop(seq, ())
+        if (seq != 0 and self.block_state.get(seq) is BLOCK_OPEN and "start" in block
+                and block["end"][0] >= block["start"][0]):
+            self.block_state[seq] = BLOCK_DONE
+            for event in pending:
+                self.to_block(seq, event)
+        else:
+            if self.block_state.get(seq) is not None:
+                self.block_state[seq] = BLOCK_DROPPED
+            for event in pending:
+                self.to_window(event, unknown_block=True)
+
+    def to_block(self, seq, event):
+        kind, name, caller, tid, t0, t1, _seq, _status, extra = event
+        block = self.blocks[seq]
+        window_ns = self.opt.window_ms * 10**6
+        if not block["start"][0] - window_ns <= t0 <= block["end"][0] + window_ns:
+            self.counters["events_outside_their_block"] += 1
+        dur = t1 - t0
+        agg = self.block_agg[seq].get((tid, kind, name, caller))
+        if agg is None:
+            agg = self.block_agg[seq][(tid, kind, name, caller)] = [0, 0, 0, None]
+        agg[0] += 1
+        agg[1] += dur
+        if dur > agg[2]:
+            agg[2] = dur
+        woken = extra.get("woken_by") if extra else None
+        if woken is not None:
+            if agg[3] is None:
+                agg[3] = collections.Counter()
+            agg[3][woken] += 1
+
+    def to_window(self, event, unknown_block=False):
+        kind, name, _caller, tid, t0, t1, _seq, _status, _extra = event
+        if unknown_block:
+            self.counters["events_for_unknown_block"] += 1
+        dur = t1 - t0
+        bucket = self.windows[((t0 - self.mono_start_ns) // (self.opt.window_ms * 10**6), tid)]
+        kind_agg = bucket["kinds"].get(kind)
+        if kind_agg is None:
+            kind_agg = bucket["kinds"][kind] = [0, 0]
+        kind_agg[0] += 1
+        kind_agg[1] += dur
+        id_agg = bucket["ids"].get((kind, name))
+        if id_agg is None:
+            id_agg = bucket["ids"][(kind, name)] = [0, 0]
+        id_agg[0] += 1
+        id_agg[1] += dur
 
     def find_waker(self, tid, t0, t1):
         wakes = self.wakes_by_tid.get(tid)
@@ -640,6 +939,11 @@ class Reducer:
             t_end, flags, missed = block["end"]
             if t_end < t_start:
                 self.counters["invalid_blocks"] += 1
+                continue
+            if self.block_state.get(seq) is not BLOCK_DONE:
+                # start line sorted after the end line (lost or skewed): its crossings already
+                # went to the window buckets, so it gets no record either
+                self.counters["incomplete_blocks"] += 1
                 continue
             period_ns = (nframes * 10**9 + rate // 2) // rate if rate else 0
             periods.append(period_ns)
@@ -672,7 +976,7 @@ class Reducer:
                 "stacks": [],
                 "_t0": t_start,
                 "_t1": t_end,
-                "_agg": {},
+                "_agg": self.block_agg.pop(seq, {}),
             }
             records[seq] = record
         if periods:
@@ -707,57 +1011,12 @@ class Reducer:
                 record["cycle"] = cycle
 
     def aggregate(self):
-        """Assign every completed event to its block or window bucket."""
+        """Finish the streaming aggregation: wakeups per window, then the block rollups."""
         window_ns = self.opt.window_ms * 10**6
-        windows = collections.defaultdict(lambda: {"kinds": {}, "ids": {}, "between": [0, 0], "wakeups": 0})
-        self.windows = windows
-        kinds_total = collections.defaultdict(lambda: [0, 0])
-        self.kinds_total = kinds_total
-        site_all = collections.defaultdict(lambda: [0, 0, 0])
-        self.site_all = site_all
-        self.site_woken = collections.defaultdict(collections.Counter)
-        counters = self.counters
-        for event in self.events:
-            kind, name, caller, tid, t0, t1, seq, _status, extra = event
-            dur = t1 - t0
-            kinds_total[kind][0] += 1
-            kinds_total[kind][1] += dur
-            site = site_all[(kind, name, caller)]
-            site[0] += 1
-            site[1] += dur
-            if dur > site[2]:
-                site[2] = dur
-            woken = extra.get("woken_by") if extra else None
-            if woken is not None:
-                self.site_woken[(kind, name, caller)][woken] += 1
-            record = self.block_records.get(seq) if seq else None
-            if seq and record is None:
-                counters["events_for_unknown_block"] += 1
-            if record is not None:
-                if not record["_t0"] - window_ns <= t0 <= record["_t1"] + window_ns:
-                    counters["events_outside_their_block"] += 1
-                agg = record["_agg"].setdefault((tid, kind, name, caller), [0, 0, 0, collections.Counter()])
-                agg[0] += 1
-                agg[1] += dur
-                if dur > agg[2]:
-                    agg[2] = dur
-                if woken is not None:
-                    agg[3][woken] += 1
-            else:
-                bucket = windows[((t0 - self.mono_start_ns) // window_ns, tid)]
-                kind_agg = bucket["kinds"].setdefault(kind, [0, 0])
-                kind_agg[0] += 1
-                kind_agg[1] += dur
-                id_agg = bucket["ids"].setdefault((kind, name), [0, 0])
-                id_agg[0] += 1
-                id_agg[1] += dur
-                if tid in self.callback_tids:
-                    bucket["between"][0] += 1
-                    bucket["between"][1] += dur
-                    counters["between_blocks_events"] += 1
         for tid, wakes in self.wakes_by_tid.items():
             for ts, _ in wakes:
-                windows[((ts - self.mono_start_ns) // window_ns, tid)]["wakeups"] += 1
+                self.windows[((ts - self.mono_start_ns) // window_ns, tid)]["wakeups"] += 1
+        self.block_agg.clear()
         self.finish_blocks()
 
     def finish_blocks(self):
@@ -865,12 +1124,13 @@ class Reducer:
     def window_records(self):
         """Return [(window_index, record)] for threads.jsonl."""
         window_ms = self.opt.window_ms
+        between_events = 0
         tids = set(tid for _, tid in self.windows) | set(self.offcpu_by_tid)
         sched = self.sched_window_stats(tids) if (self.offcpu_by_tid or self.oncpu_by_tid) else {}
         keys = set(self.windows) | set(sched)
         records = []
         for index, tid in sorted(keys):
-            bucket = self.windows.get((index, tid)) or {"kinds": {}, "ids": {}, "between": [0, 0], "wakeups": 0}
+            bucket = self.windows.get((index, tid)) or {"kinds": {}, "ids": {}, "wakeups": 0}
             oncpu, offcpu, delay = sched.get((index, tid), (None, None, None))
             top = sorted(bucket["ids"].items(), key=lambda item: (-item[1][1], item[0]))[:5]
             record = {
@@ -887,9 +1147,14 @@ class Reducer:
                 "crossings": {kind: {"n": n, "total_ns": total} for kind, (n, total) in sorted(bucket["kinds"].items())},
                 "top_ids": [[name, n, total] for (_kind, name), (n, total) in top],
             }
-            if bucket["between"][0]:
-                record["between_blocks"] = {"n": bucket["between"][0], "total_ns": bucket["between"][1]}
+            if tid in self.callback_tids and bucket["kinds"]:
+                # every window-bucket crossing of the callback thread happened between blocks
+                n = sum(value[0] for value in bucket["kinds"].values())
+                record["between_blocks"] = {"n": n, "total_ns": sum(value[1] for value in bucket["kinds"].values())}
+                between_events += n
             records.append((index, record))
+        if between_events:
+            self.counters["between_blocks_events"] = between_events
         return records
 
     # -- summary ------------------------------------------------------------------------------
@@ -913,6 +1178,79 @@ class Reducer:
             "near_late_fraction": self.opt.near_late_fraction,
             "window_ms": self.opt.window_ms,
         }
+
+    def loss_accounting(self):
+        """lost_events and its evidence (see the module docstring); computed once."""
+        cached = getattr(self, "_loss", None)
+        if cached is not None:
+            return cached
+        reported = self.lost_events + (self.opt.lost_events_extra if self.opt is not None else 0)
+        rmisses = int(getattr(self.opt, "recursion_misses", 0) or 0) if self.opt is not None else 0
+        by_kind = {}
+        lag = 0
+        emitted = self.expected_lines()
+        lower_bound = False
+        if emitted:
+            for kind, count in sorted(emitted.items()):
+                got = self.received.get(kind, 0)
+                if count > got:
+                    by_kind[kind] = count - got
+                elif got > count:
+                    lag += got - count
+            shortfall = sum(by_kind.values())
+            # bpftrace's "Lost N" and the shortfall count the same dropped records: never add them
+            total = max(reported, shortfall) + rmisses
+            source = "emitted_counters"
+            lower_bound = lag > 0
+            if total:
+                self.warnings.append("%d events lost (%s%s); per kind %s" % (
+                    total, "bpftrace reports %d, shortfall %d" % (reported, shortfall) if reported else "ring buffer drops %d" % shortfall,
+                    ", %d fentry/fexit recursion misses" % rmisses if rmisses else "",
+                    ", ".join("%s=%d" % item for item in sorted(by_kind.items())) or "-"))
+            if lag:
+                self.warnings.append("%d lines arrived after the @emitted counters were read: lost_events is a "
+                                     "lower bound (a shortfall of up to that size can hide behind them)" % lag)
+        elif (self.trace_format or 1) >= 2 or self.mono_end_ns is None:
+            total = None
+            source = "unknown"
+            self.warnings.append("lost events unknown: the trace has no @emitted counters (the tracer did not "
+                                 "exit cleanly: no END output)%s" % (" and bpftrace reported %d" % reported if reported else ""))
+        else:
+            total = reported + rmisses
+            source = "bpftrace_reports"
+        self._loss = {
+            "total": total,
+            "source": source,
+            "lower_bound": lower_bound,
+            "reported_by_bpftrace": reported,
+            "recursion_misses": rmisses,
+            "by_kind": by_kind,
+            "emitted": dict(sorted(emitted.items())),
+            "received": dict(sorted(self.received.items())),
+            "received_after_counters": lag,
+        }
+        return self._loss
+
+    def stopped_ns(self):
+        """End of the traced interval: the END line, else (crashed/killed tracer) its last event --
+        never the wrapper's stop time, which would claim coverage the trace does not have."""
+        if self.mono_end_ns is not None:
+            return self.mono_end_ns
+        if self.last_event_ns is not None:
+            return self.last_event_ns
+        return self.mono_start_ns
+
+    def expected_lines(self):
+        """Lines per kind the tracer printed, from @emitted.  Format 3 counts the unix-call entry
+        under 'e' (101): one E and one R line each (the R program has no count of its own)."""
+        emitted = collections.Counter()
+        for kind, count in self.emitted.items():
+            if kind == "e":
+                emitted["E"] += count
+                emitted["R"] += count
+            else:
+                emitted[kind] += count
+        return emitted
 
     def summary(self, blocks, windows):
         slacks = sorted(record["slack_ns"] for record in blocks if record["slack_ns"] is not None)
@@ -958,15 +1296,19 @@ class Reducer:
         blocks_per_minute = len(blocks) / minutes if minutes else 0.0
         hits_per_block = (sum(self.probe_hits[kind] for kind in ("E", "X", "S", "W", "w", "K")) / len(blocks)) if blocks else 0.0
         tracer = dict(self.tracer)
+        loss = self.loss_accounting()
         tracer_section = {
             "version": tracer.get("version", "proto-bpftrace"),
             "backend": tracer.get("backend", "bpftrace"),
             "mode": self.opt.mode,
             "sample_rate": tracer.get("sample_rate", 1),
             "attach": tracer.get("attach", []),
-            "lost_events": self.lost_events + self.opt.lost_events_extra,
+            "lost_events": loss["total"],
+            "loss": loss,
+            "clean_exit": self.mono_end_ns is not None,
+            "clock": self.trace_clock,
             "started_monotonic_ns": self.mono_start_ns,
-            "stopped_monotonic_ns": self.mono_end_ns or self.opt.stopped_monotonic_ns,
+            "stopped_monotonic_ns": self.stopped_ns(),
             "overhead_estimate_ns_per_block": int(round(hits_per_block * self.opt.ns_per_hit)),
             "overhead_estimate": {
                 "assumed_ns_per_hit": self.opt.ns_per_hit,
@@ -1006,9 +1348,9 @@ class Reducer:
                 "unmatched_exits_first_on_tid": counters.get("unmatched_exits_first_on_tid", 0),
                 "abandoned_entries": counters.get("abandoned_entries", 0),
                 "ringbuf_drops": 0,
-                "lost_events": self.lost_events + self.opt.lost_events_extra,
+                "lost_events": loss["total"],
                 "probe_hits": dict(sorted(self.probe_hits.items())),
-                "events": len(self.events),
+                "events": self.n_events,
                 "all": counters,
             },
             "warnings": list(self.warnings),
@@ -1035,13 +1377,13 @@ class Reducer:
     def hotspots(self):
         """Top (role, kind, id, caller) sites of the non-audio threads over the whole trace."""
         agg = collections.defaultdict(lambda: [0, 0])
-        for kind, name, caller, tid, t0, t1, _seq, _status, _extra in self.events:
+        for (tid, kind, name, caller), (n, total) in self.hot_by_tid.items():
             role = self.role_of(tid)
             if role in AUDIO_ROLES:
                 continue
             entry = agg[(role, kind, name, caller)]
-            entry[0] += 1
-            entry[1] += t1 - t0
+            entry[0] += n
+            entry[1] += total
         items = [
             {"role": role, "kind": kind, "name": name, "caller": caller, "n": n, "total_ns": total}
             for (role, kind, name, caller), (n, total) in agg.items()
@@ -1093,8 +1435,13 @@ class Reducer:
         if not path:
             return
         data = dict(self.tracer) if self.tracer else {}
-        data["stopped_monotonic_ns"] = self.mono_end_ns or self.opt.stopped_monotonic_ns
-        data["lost_events"] = self.lost_events + self.opt.lost_events_extra
+        data["stopped_monotonic_ns"] = self.stopped_ns()
+        loss = self.loss_accounting()
+        data["lost_events"] = loss["total"]
+        data["loss"] = loss
+        data["clean_exit"] = self.mono_end_ns is not None
+        if self.trace_clock:
+            data["clock"] = self.trace_clock
         data["probe_hits"] = dict(sorted(self.probe_hits.items()))
         # The Counter holds only keys that were incremented; validate.py needs the pairing counters
         # even when they are zero (design B section 7: abandoned_entries == 0).
@@ -1124,11 +1471,18 @@ def run(options):
         reducer.roles = load_role_table(options.roles, reducer.warnings)
     reducer.tables = Tables.locate(options.tables, reducer.tracer.get("wine_version"), reducer.warnings)
     reducer.load_maps(options.in_dir)
-    reducer.load_events(events_path)
-    reducer.process()
+    out_dir = options.out or options.in_dir
+    try:
+        # the T lines of every thread alive at start/stop (format 3 prints none for them)
+        task_paths = [os.path.join(options.in_dir, name) for name in TASK_FILES]
+        reducer.load_events(events_path, sort_dir=options.sort_dir or out_dir, chunk_lines=options.sort_chunk_lines,
+                            extra_paths=task_paths)
+        reducer.process()
+    finally:
+        reducer.cleanup()
     reducer.build_blocks()
     reducer.aggregate()
-    summary = reducer.write_outputs(options.out or options.in_dir)
+    summary = reducer.write_outputs(out_dir)
     reducer.update_tracer_json(tracer_json, summary)
     return reducer, summary
 
@@ -1147,12 +1501,19 @@ def main(argv=None):
     parser.add_argument("--window-ms", type=int, default=100)
     parser.add_argument("--stopped-monotonic-ns", type=int, default=None)
     parser.add_argument("--lost-events-extra", type=int, default=0, help="lost events reported outside events.txt")
+    parser.add_argument("--recursion-misses", type=int, default=0,
+                        help="fentry/fexit runs the kernel skipped (bpftool recursion_misses), added to lost_events")
     parser.add_argument("--ns-per-hit", type=int, default=2000, help="assumed probe cost for the overhead estimate")
     parser.add_argument("--top", type=int, default=20, help="hotspots_non_audio entries")
+    parser.add_argument("--sort-chunk-lines", type=int, default=DEFAULT_SORT_CHUNK_LINES,
+                        help="event lines sorted in memory at a time; larger inputs are merged from sorted runs")
+    parser.add_argument("--sort-dir", help="where the temporary sorted runs go (default: the output directory)")
     parser.add_argument("--quiet", action="store_true")
     options = parser.parse_args(argv)
     if options.window_ms <= 0:
         parser.error("--window-ms must be positive")
+    if options.sort_chunk_lines <= 0:
+        parser.error("--sort-chunk-lines must be positive")
     try:
         reducer, summary = run(options)
     except ReduceError as exc:
@@ -1161,13 +1522,13 @@ def main(argv=None):
     if not options.quiet:
         blocks = summary["blocks"]
         print(
-            "reduce: %d events, %d blocks (%d late, %d near-late), lost=%d unmatched=%d abandoned=%d"
+            "reduce: %d events, %d blocks (%d late, %d near-late), lost=%s unmatched=%d abandoned=%d"
             % (
                 summary["counters"]["events"],
                 blocks["count"],
                 blocks["late"],
                 blocks["near_late"],
-                summary["counters"]["lost_events"],
+                "unknown" if summary["counters"]["lost_events"] is None else summary["counters"]["lost_events"],
                 summary["counters"]["unmatched_exits"],
                 summary["counters"]["abandoned_entries"],
             ),

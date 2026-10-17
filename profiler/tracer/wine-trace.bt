@@ -1,10 +1,12 @@
 // wine-trace.bt -- prototype USDT tracer for the Wine interface profiler (design B, section 3a).
-// Target: bpftrace 0.27 on the CachyOS VM (kernel 7.2.x, BTF, module BTF for ntsync).
+// Target: bpftrace 0.27 on CachyOS (kernel 7.2.x, BTF, module BTF for ntsync).
 //
 // This file is a TEMPLATE.  profiler/bin/wine-trace copies it to <out>/wine-trace.bt and
 //   * replaces @NTDLL@ and @PIPEASIO@ with the absolute paths of ntdll.so / pipeasio64.dll.so,
 //   * replaces @FILTER@ with "@pids[pid]" (traced pids only) or "1" (--no-pid-filter),
-//   * replaces @PIDS_INIT@ with one "@pids[(uint32)N] = 1;" statement per traced pid,
+//   * replaces @PIDS_INIT@ with one "@pids[(uint32)N] = 1;" statement per traced pid and one
+//     "@tids[(uint32)T] = 1;" per thread of them at start (the threads' T lines are written by the
+//     wrapper to tasks-start.txt; threads created later get theirs from task:task_newtask),
 //   * strips the optional sections between "// @@SECTION <name> BEGIN/END" markers
 //     (ntsync: --no-ntsync or no fentry support; sched: unless --sched; follow: --no-follow),
 //   * strips every probe block (a line starting with usdt:/fentry:/fexit:/tracepoint: up to the
@@ -13,96 +15,150 @@
 // Never run the template itself.
 //
 // Output: one text line per event on stdout; the format is documented in
-// profiler/tracer/README.md and consumed by profiler/tracer/reduce.py.  Timestamps are nsecs
-// (bpf_ktime_get_ns = CLOCK_MONOTONIC, the same base as the suite's time.monotonic_ns() and
-// PipeWire's clock.nsec).  Entry/exit lines are NOT paired here: nesting (user-mode callbacks
-// inside win32u syscalls, NtContinue, the unix-call slow path) makes a depth-1 map lose events,
-// so every line carries the frame pointer and reduce.py pairs per tid in LIFO order.
-// -4@ arguments arrive sign-extended: always cast them to (uint32)/(int32).
+// profiler/tracer/README.md and consumed by profiler/tracer/reduce.py.  Entry/exit lines are NOT
+// paired here: nesting (user-mode callbacks inside win32u syscalls, NtContinue, the unix-call slow
+// path) makes a depth-1 map lose events, so every line carries the frame pointer and reduce.py
+// pairs per tid in LIFO order.  -4@ arguments arrive sign-extended: always cast them to
+// (uint32)/(int32).
+//
+// Clock: every timestamp is nsecs(monotonic) = CLOCK_MONOTONIC, the base of the suite's
+// time.monotonic_ns() and of PipeWire's clock.nsec.  Plain "nsecs" is CLOCK_BOOTTIME in bpftrace
+// 0.27 (it counts suspended time: on a laptop that has suspended the two differ by hours).
+//
+// Robustness (B5, verified on the 7.2.9 PREEMPT kernel, bpftrace 0.27):
+//   USDT programs (BPF_PROG_TYPE_KPROBE on uprobe_multi links) run PREEMPTIBLE (migrate_disable
+//   only, no recursion guard), so a second thread hitting the same probe on the same CPU can run
+//   the same program while the first one is preempted halfway.  Any per-CPU memory the program
+//   writes before its ringbuf output is then shared between the two runs:
+//   * bpftrace's scratch buffer: printf arguments larger than on_stack_limit (default 32 bytes)
+//     are built in a per-CPU array.  on_stack_limit = 256 moves them to the BPF stack.
+//   * the kernel's private stack: since 6.14 the verifier gives KPROBE-type programs whose stack
+//     is >= 64 bytes a per-CPU private stack (JIT prologue "movabs ..,%r9; add %gs:..,%r9"
+//     instead of "sub $N,%rsp"), assuming they cannot re-enter on one CPU.  For uprobes they can.
+//   A record then mixes two events; when the program has two printfs (the old first-sight T line
+//   + the event line) a short record goes out under the longer printf's id and bpftrace's event
+//   printer throws std::bad_alloc (OpaqueValue::check) and aborts; with one printf the fields of
+//   two events mix silently.  Hence:
+//   * every USDT program has exactly ONE printf (no T lines there: tasks-start.txt and
+//     task:task_newtask, which runs non-preemptible, provide them);
+//   * the multi-thread ntdll probes keep their frame below 64 bytes so they stay on the task's own
+//     kernel stack and cannot mix at all.  Measured on the GENERATED script (40-48 byte frames,
+//     profiler/tracer/README.md): the daemon runs with --no-warnings (without it bpftrace 0.27
+//     generates bigger frames, presumably runtime helper-error checks, and most programs cross 64),
+//     a printf record stays <= 40 bytes (printf id + 4 slots of 8; a u32 printed right after the
+//     32-bit tid shares its slot: E syscall prints the id there, X the status, E unixcall the
+//     code, S the request type / wait flags) and the unix-call entry is split into an E line and
+//     an R line from a second program on the same probe.  profiler/bin/wine-trace checks the JIT
+//     prologue of every loaded program after the start, records the private-stack ones in
+//     tracer.json (private_stack_programs, private_stack_risky) and refuses to trace when a
+//     multi-thread USDT program is among them (--allow-private-stack overrides; bench-report then
+//     adds the interface-tracer-private-stack confounder);
+//   * the pipeasio probes fire on the single PipeASIO callback thread only, so they cannot
+//     re-enter and may use a private stack; fentry/fexit programs have a recursion guard (a
+//     re-entry is skipped and counted in the program's recursion_misses, which the wrapper passes
+//     to reduce.py) and tracepoint programs run non-preemptible.
+//   * @emitted[<ASCII code of the line letter>] counts every printf, except the R program's: a
+//     count() does not fit its frame.  Every unixcall_entry runs both programs, so the E unixcall
+//     printf is counted under 101 ('e') and reduce.py expects that many E unixcall and R lines.
+//     Ring-buffer drops are silent (--no-warnings also hides bpftrace's "Lost N events"); END
+//     clears @pids first (no new event passes the pid filter), prints the "end" line, then
+//     @emitted, and reduce.py reports max(bpftrace's drops, emitted - received) + recursion misses
+//     as lost_events (a lower bound when lines arrived after the counters were read).
+//   * Per-tid state is zeroed, not deleted (delete() warns "Return value discarded" in 0.27); the
+//     maps are bounded by the thread count.
 //
 // Block association (design B, section 3b): @seq is the block in progress (set by
 // pipeasio:block_start, cleared by block_end).  Every entry line prints @seq as it was at entry
 // time; 0 means "no block in progress" (window bucket / between_blocks for the callback thread).
 
-// @@SECTION ntsync BEGIN
-// vendor/ntsync-uapi/linux/ntsync.h (ioctl numbers: _IOC(dir,'N',nr,size), 'N' = 0x4e)
-//   NTSYNC_IOC_WAIT_ANY     _IOWR('N', 0x82, struct ntsync_wait_args[40])  = 0xc0284e82
-//   NTSYNC_IOC_WAIT_ALL     _IOWR('N', 0x83, struct ntsync_wait_args[40])  = 0xc0284e83
-//   NTSYNC_IOC_SEM_RELEASE  _IOWR('N', 0x81, __u32)                        = 0xc0044e81
-//   NTSYNC_IOC_MUTEX_UNLOCK _IOWR('N', 0x85, struct ntsync_mutex_args[8])  = 0xc0084e85
-//   NTSYNC_IOC_EVENT_SET    _IOR ('N', 0x88, __u32)                        = 0x80044e88
-//   NTSYNC_IOC_EVENT_PULSE  _IOR ('N', 0x8a, __u32)                        = 0x80044e8a
-struct ntsync_wait_args {
-	unsigned long long timeout;
-	unsigned long long objs;
-	unsigned int count;
-	unsigned int index;
-	unsigned int flags;
-	unsigned int owner;
-	unsigned int alert;
-	unsigned int pad;
-};
-// @@SECTION ntsync END
+config = {
+	on_stack_limit = 256;
+	max_map_keys = 65536;
+	print_maps_on_exit = false;
+}
 
 BEGIN
 {
 	@PIDS_INIT@
 	@seq = (uint64)0;
 	@cb = (uint32)0;
-	printf("hdr mono_start_ns=%llu format=1\n", nsecs);
+	printf("hdr mono_start_ns=%llu format=3 clock=monotonic\n", nsecs(monotonic));
+	// 16 KB of "#" lines (ignored by reduce.py) push the hdr line through the -B full stdout
+	// buffer (st_blksize, 4 KB on the laptop) at once.  Without them hdr waits for the first
+	// 4 KB of events and "wine-trace start" waits as long as the traced process is idle.
+	printf("#----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------\n");
+	printf("#----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------\n");
+	printf("#----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------\n");
+	printf("#----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------\n");
+	printf("#----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------\n");
+	printf("#----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------\n");
+	printf("#----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------\n");
+	printf("#----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------\n");
+	printf("#----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------\n");
+	printf("#----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------\n");
+	printf("#----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------\n");
+	printf("#----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------\n");
+	printf("#----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------\n");
+	printf("#----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------\n");
+	printf("#----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------\n");
+	printf("#----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------\n");
 }
 
 // ---- ntdll.so: dispatcher probes (patch 0108) ---------------------------------------------
 
 // syscall_entry(id, frame, user_rsp, user_rip): -4@176(%rcx) 8@%rcx 8@136(%rcx) 8@112(%rcx)
+// Only id and frame are read (record: the id in the tid's slot, frame, seq; rsp is unused, the
+// syscall caller is the stub ntdll.dll!<Name>+0x14 by construction).
 usdt:@NTDLL@:wine:syscall_entry
 /@FILTER@/
 {
-	if (@tids[tid] == 0) {
-		@tids[tid] = 1;
-		printf("T %llu %d %d comm=%s\n", nsecs, tid, pid, comm);
-	}
-	printf("E %llu %d syscall %x fr=%llx seq=%llu rsp=%llx rip=%llx\n",
-	       nsecs, tid, (uint32)arg0, arg1, @seq, arg2, arg3);
+	@emitted[69] = count();
+	printf("E %llu %d syscall %x fr=%llx seq=%llu\n", nsecs(monotonic), tid, (uint32)arg0, arg1, @seq);
 }
 
 // syscall_exit(status, frame, id, restore_flags): -4@%eax 8@%rcx -4@176(%rcx) -4@180(%rcx)
+// Only status and frame are read (pairing is by frame; the id repeats the entry's).  The status
+// shares the tid's slot, so it is printed before the frame.
 usdt:@NTDLL@:wine:syscall_exit
 /@FILTER@/
 {
-	printf("X %llu %d syscall %x fr=%llx st=%x rf=%x\n",
-	       nsecs, tid, (uint32)arg2, arg1, (uint32)arg0, (uint32)arg3);
+	@emitted[88] = count();
+	printf("X %llu %d syscall st=%x fr=%llx\n", nsecs(monotonic), tid, (uint32)arg0, arg1);
 }
 
 // unixcall_entry(handle, code, frame, caller_rip): 8@%r10 -4@%edx 8@%rsp 8@112(%rsp)
+// Two programs on the same probe keep both frames below 64 bytes: E (code in the tid's slot,
+// handle, seq) and R (frame, PE caller).  They run back to back on the same thread; reduce.py
+// joins them per tid.  The E printf is counted under 101 ('e'), which stands for both lines: the
+// R program has no room for a count() of its own.
 usdt:@NTDLL@:wine:unixcall_entry
 /@FILTER@/
 {
-	if (@tids[tid] == 0) {
-		@tids[tid] = 1;
-		printf("T %llu %d %d comm=%s\n", nsecs, tid, pid, comm);
-	}
-	printf("E %llu %d unixcall %llx:%u fr=%llx seq=%llu rip=%llx\n",
-	       nsecs, tid, arg0, (uint32)arg1, arg2, @seq, arg3);
+	@emitted[101] = count();
+	printf("E %llu %d unixcall c=%u h=%llx seq=%llu\n", nsecs(monotonic), tid, (uint32)arg1, arg0, @seq);
+}
+
+usdt:@NTDLL@:wine:unixcall_entry
+/@FILTER@/
+{
+	printf("R %llu %d fr=%llx rip=%llx\n", nsecs(monotonic), tid, arg2, arg3);
 }
 
 // unixcall_exit(status, frame): -4@%eax 8@%rcx
 usdt:@NTDLL@:wine:unixcall_exit
 /@FILTER@/
 {
-	printf("X %llu %d unixcall fr=%llx st=%x\n", nsecs, tid, arg1, (uint32)arg0);
+	@emitted[88] = count();
+	printf("X %llu %d unixcall st=%x fr=%llx\n", nsecs(monotonic), tid, (uint32)arg0, arg1);
 }
 
 // server_req_start(req_type) / server_req_end(req_type, status): one request at a time per
-// thread, so the start timestamp and the entry-time @seq live in per-tid maps.
+// thread, so the start timestamp and the entry-time @seq live in per-tid maps.  The end line
+// carries no status (record: the type in the tid's slot, 64-bit dur, 32-bit seq).
 usdt:@NTDLL@:wine:server_req_start
 /@FILTER@/
 {
-	if (@tids[tid] == 0) {
-		@tids[tid] = 1;
-		printf("T %llu %d %d comm=%s\n", nsecs, tid, pid, comm);
-	}
-	@sr[tid] = nsecs;
+	@sr[tid] = nsecs(monotonic);
 	@srq[tid] = @seq;
 }
 
@@ -110,18 +166,20 @@ usdt:@NTDLL@:wine:server_req_end
 /@FILTER@/
 {
 	if (@sr[tid]) {
-		printf("S %llu %d req %d dur=%llu st=%x seq=%llu\n",
-		       nsecs, tid, (int32)arg0, nsecs - @sr[tid], (uint32)arg1, @srq[tid]);
-		delete(@sr, tid);
-		delete(@srq, tid);
+		$t = nsecs(monotonic);
+		@emitted[83] = count();
+		printf("S %llu %d req %d dur=%llu seq=%u\n",
+		       $t, tid, (int32)arg0, $t - @sr[tid], (uint32)@srq[tid]);
+		@sr[tid] = 0;
 	}
 }
 
 // server_wait_start(flags) / server_wait_end(ret): where non-NTSync and APC-alertable waits block.
+// dur is 64-bit: a wait through the server can last any time (INFINITE waits of idle threads).
 usdt:@NTDLL@:wine:server_wait_start
 /@FILTER@/
 {
-	@sw[tid] = nsecs;
+	@sw[tid] = nsecs(monotonic);
 	@swf[tid] = (uint32)arg0;
 	@swq[tid] = @seq;
 }
@@ -130,11 +188,11 @@ usdt:@NTDLL@:wine:server_wait_end
 /@FILTER@/
 {
 	if (@sw[tid]) {
-		printf("S %llu %d wait %x dur=%llu st=%x seq=%llu\n",
-		       nsecs, tid, @swf[tid], nsecs - @sw[tid], (uint32)arg0, @swq[tid]);
-		delete(@sw, tid);
-		delete(@swf, tid);
-		delete(@swq, tid);
+		$t = nsecs(monotonic);
+		@emitted[83] = count();
+		printf("S %llu %d wait %x dur=%llu st=%x seq=%u\n",
+		       $t, tid, @swf[tid], $t - @sw[tid], (uint32)arg0, (uint32)@swq[tid]);
+		@sw[tid] = 0;
 	}
 }
 
@@ -145,34 +203,35 @@ usdt:@NTDLL@:wine:server_wait_end
 usdt:@PIPEASIO@:pipeasio:block_start
 /@FILTER@/
 {
-	if (@tids[tid] == 0) {
-		@tids[tid] = 1;
-		printf("T %llu %d %d comm=%s\n", nsecs, tid, pid, comm);
-	}
+	$t = nsecs(monotonic);
 	@seq = (uint64)arg0;
 	@cb = tid;
+	@emitted[66] = count();
 	printf("B %llu %d start seq=%llu n=%u rate=%u clk=%llu dl=%llu\n",
-	       nsecs, tid, arg0, (uint32)arg1, (uint32)arg2, arg3, arg4);
+	       $t, tid, arg0, (uint32)arg1, (uint32)arg2, arg3, arg4);
 }
 
 usdt:@PIPEASIO@:pipeasio:block_before_live
 /@FILTER@/
 {
-	printf("B %llu %d before seq=%llu\n", nsecs, tid, arg0);
+	@emitted[66] = count();
+	printf("B %llu %d before seq=%llu\n", nsecs(monotonic), tid, arg0);
 }
 
 usdt:@PIPEASIO@:pipeasio:block_after_live
 /@FILTER@/
 {
-	printf("B %llu %d after seq=%llu\n", nsecs, tid, arg0);
+	@emitted[66] = count();
+	printf("B %llu %d after seq=%llu\n", nsecs(monotonic), tid, arg0);
 }
 
 // block_end(seq, flags, missed)
 usdt:@PIPEASIO@:pipeasio:block_end
 /@FILTER@/
 {
+	@emitted[66] = count();
 	printf("B %llu %d end seq=%llu fl=%x missed=%u\n",
-	       nsecs, tid, arg0, (uint32)arg1, (uint32)arg2);
+	       nsecs(monotonic), tid, arg0, (uint32)arg1, (uint32)arg2);
 	@seq = (uint64)0;
 }
 
@@ -181,37 +240,41 @@ usdt:@PIPEASIO@:pipeasio:block_end
 usdt:@PIPEASIO@:pipeasio:cycle_start
 /@FILTER@/
 {
+	@emitted[67] = count();
 	printf("C %llu %d start clk=%llu next=%llu dur=%u pos=%llu fl=%x\n",
-	       nsecs, tid, arg0, arg1, (uint32)arg2, arg3, (uint32)arg4);
+	       nsecs(monotonic), tid, arg0, arg1, (uint32)arg2, arg3, (uint32)arg4);
 }
 
 usdt:@PIPEASIO@:pipeasio:cycle_end
 /@FILTER@/
 {
-	printf("C %llu %d end missed=%u delivered=%u\n", nsecs, tid, (uint32)arg0, (uint32)arg1);
+	@emitted[67] = count();
+	printf("C %llu %d end missed=%u delivered=%u\n", nsecs(monotonic), tid, (uint32)arg0, (uint32)arg1);
 }
 
 // @@SECTION ntsync BEGIN
 // ---- kernel side: NTSync waits and wakes (no Wine patch; needs /sys/kernel/btf/ntsync) ------
 // ntsync_char_ioctl(file, cmd, parm) serves WAIT_ANY/WAIT_ALL on the device fd; the user
-// struct ntsync_wait_args at parm gives count/alert/owner on entry and index on exit.
+// struct ntsync_wait_args at parm (type from the ntsync module BTF) gives count/alert/owner on
+// entry and index on exit.  Ioctl numbers (vendor/ntsync-uapi/linux/ntsync.h, 'N' = 0x4e):
+//   WAIT_ANY 0xc0284e82, WAIT_ALL 0xc0284e83, SEM_RELEASE 0xc0044e81, MUTEX_UNLOCK 0xc0084e85,
+//   EVENT_SET 0x80044e88, EVENT_PULSE 0x80044e8a.
 fentry:ntsync:ntsync_char_ioctl
 /@FILTER@ && (args.cmd == 0xc0284e82 || args.cmd == 0xc0284e83)/
 {
+	$t = nsecs(monotonic);
 	$w = uptr((struct ntsync_wait_args *)args.parm);
-	if (@tids[tid] == 0) {
-		@tids[tid] = 1;
-		printf("T %llu %d %d comm=%s\n", nsecs, tid, pid, comm);
-	}
+	@emitted[87] = count();
 	printf("W %llu %d cmd=%x count=%u alert=%u owner=%u seq=%llu\n",
-	       nsecs, tid, args.cmd, $w->count, $w->alert, $w->owner, @seq);
+	       $t, tid, args.cmd, $w->count, $w->alert, $w->owner, @seq);
 }
 
 fexit:ntsync:ntsync_char_ioctl
 /@FILTER@ && (args.cmd == 0xc0284e82 || args.cmd == 0xc0284e83)/
 {
 	$w = uptr((struct ntsync_wait_args *)args.parm);
-	printf("w %llu %d ret=%d idx=%u\n", nsecs, tid, (int32)retval, $w->index);
+	@emitted[119] = count();
+	printf("w %llu %d ret=%d idx=%u\n", nsecs(monotonic), tid, (int32)retval, $w->index);
 }
 
 // ntsync_obj_ioctl(file, cmd, parm) on an object fd: EVENT_SET / EVENT_PULSE / SEM_RELEASE /
@@ -219,13 +282,22 @@ fexit:ntsync:ntsync_char_ioctl
 fentry:ntsync:ntsync_obj_ioctl
 /@FILTER@ && (args.cmd == 0x80044e88 || args.cmd == 0x80044e8a || args.cmd == 0xc0044e81 || args.cmd == 0xc0084e85)/
 {
-	if (@tids[tid] == 0) {
-		@tids[tid] = 1;
-		printf("T %llu %d %d comm=%s\n", nsecs, tid, pid, comm);
-	}
-	printf("K %llu %d %d cmd=%x seq=%llu\n", nsecs, tid, pid, args.cmd, @seq);
+	@emitted[75] = count();
+	printf("K %llu %d %d cmd=%x seq=%llu\n", nsecs(monotonic), tid, pid, args.cmd, @seq);
 }
 // @@SECTION ntsync END
+
+// ---- threads created while tracing (the wrapper writes the ones alive at start to tasks-start.txt) --
+// task_newtask runs in the creating task (non-preemptible tracepoint): args.pid is the new task,
+// which belongs to this process for a thread (CLONE_THREAD 0x10000) or is a new process.
+tracepoint:task:task_newtask
+/@FILTER@/
+{
+	$p = (args.clone_flags & 0x10000) ? pid : (uint32)args.pid;
+	@tids[(uint32)args.pid] = 1;
+	@emitted[84] = count();
+	printf("T %llu %d %d comm=%s\n", nsecs(monotonic), (uint32)args.pid, $p, args.comm);
+}
 
 // @@SECTION follow BEGIN
 // ---- children (Max.exe, msedgewebview2.exe, plugin hosts): add exec'd children of traced pids --
@@ -233,7 +305,8 @@ tracepoint:sched:sched_process_exec
 /@pids[(uint32)curtask->real_parent->tgid] || @pids[pid]/
 {
 	@pids[pid] = 1;
-	printf("P %llu %d parent=%d comm=%s\n", nsecs, pid, (uint32)curtask->real_parent->tgid, comm);
+	@emitted[80] = count();
+	printf("P %llu %d parent=%d comm=%s\n", nsecs(monotonic), pid, (uint32)curtask->real_parent->tgid, comm);
 }
 
 // Wine 11.13 writes SetThreadDescription names to /proc/PID/task/TID/comm: args.pid is the
@@ -241,7 +314,8 @@ tracepoint:sched:sched_process_exec
 tracepoint:task:task_rename
 /@FILTER@/
 {
-	printf("N %llu %d comm=%s\n", nsecs, (uint32)args.pid, args.newcomm);
+	@emitted[78] = count();
+	printf("N %llu %d comm=%s\n", nsecs(monotonic), (uint32)args.pid, args.newcomm);
 }
 // @@SECTION follow END
 
@@ -250,28 +324,35 @@ tracepoint:task:task_rename
 tracepoint:sched:sched_waking
 /@tids[(uint32)args.pid]/
 {
-	@wk[(uint32)args.pid] = nsecs;
-	printf("U %llu %d %d wakee=%d\n", nsecs, tid, pid, (uint32)args.pid);
+	$t = nsecs(monotonic);
+	@wk[(uint32)args.pid] = $t;
+	@emitted[85] = count();
+	printf("U %llu %d %d wakee=%d\n", $t, tid, pid, (uint32)args.pid);
 }
 
 tracepoint:sched:sched_switch
 /@tids[(uint32)args.prev_pid] || @tids[(uint32)args.next_pid]/
 {
+	$t = nsecs(monotonic);
 	if (@tids[(uint32)args.prev_pid]) {
-		@off[(uint32)args.prev_pid] = nsecs;
-		@ofs[(uint32)args.prev_pid] = (int64)args.prev_state;
+		@off[(uint32)args.prev_pid] = $t;
+		@ofs[(uint32)args.prev_pid] = args.prev_state;
 	}
 	if (@tids[(uint32)args.next_pid] && @off[(uint32)args.next_pid]) {
-		printf("O %llu %d off=%llu wake=%llu st=%d\n", nsecs, (uint32)args.next_pid,
+		@emitted[79] = count();
+		printf("O %llu %d off=%llu wake=%llu st=%d\n", $t, (uint32)args.next_pid,
 		       @off[(uint32)args.next_pid], @wk[(uint32)args.next_pid], @ofs[(uint32)args.next_pid]);
-		delete(@off, (uint32)args.next_pid);
-		delete(@wk, (uint32)args.next_pid);
-		delete(@ofs, (uint32)args.next_pid);
+		@off[(uint32)args.next_pid] = 0;
+		@wk[(uint32)args.next_pid] = 0;
+		@ofs[(uint32)args.next_pid] = 0;
 	}
 }
 // @@SECTION sched END
 
 END
 {
-	printf("end mono_end_ns=%llu\n", nsecs);
+	// From here on no traced event passes the pid filter: @emitted stops moving before it is read.
+	clear(@pids);
+	printf("end mono_end_ns=%llu\n", nsecs(monotonic));
+	print(@emitted);
 }

@@ -364,6 +364,128 @@ class TelemetryTests(unittest.TestCase):
         self.assertFalse(blk.muted)
 
 
+class ProbeConventionTests(unittest.TestCase):
+    """B5: what tools/traceprobe.exe really prints, against what reduce.py really writes."""
+
+    PROBE_OUTPUT = [
+        "traceprobe: wine interface tracer validation probe [fastpath=off]",
+        "info ids 32 pid=31 helper=0 linux_pid=100 linux_tid=100 linux_helper_tid=? comm=traceprobe-main helper_comm=traceprobe-help",
+        "EXPECT syscall NtDelayExecution eq 10",
+        "EXPECT server_wait NtDelayExecution ge 10",
+        "EXPECT server_req create_event eq 2",
+        "EXPECT unixcall winscard.so eq 3",
+        "EXPECT ntsync_wake EVENT_SET eq 2 thread=helper",
+        "EXPECT syscall NtYieldExecution ge 1",
+        "SUMMARY pass=10 fail=0 skip=0",
+        "TID 32 pid=31 helper=36 linux_pid=100 linux_tid=100 linux_helper_tid=? comm=traceprobe-main helper_comm=traceprobe-help",
+    ]
+
+    @staticmethod
+    def reducer_events():
+        """events.jsonl records shaped like reduce.py's public_events (callers, flag-named waits)."""
+        recs = [{"type": "header", "file": "events"}]
+        t = 1.0
+        for _ in range(10):
+            recs.append({"t": t, "tid": MAIN, "role": "main", "kind": "syscall", "id": "NtDelayExecution",
+                         "caller": "ntdll.dll!NtDelayExecution+0x14", "dur_ns": 1_100_000, "status": "0x0", "seq": 0})
+            recs.append({"t": t + 2e-6, "tid": MAIN, "role": "main", "kind": "server_wait",
+                         "id": "interruptible|alertable", "caller": "ntdll.dll!NtDelayExecution+0x14",
+                         "dur_ns": 1_000_000, "status": "0x102", "seq": 0})
+            t += 0.002
+        for _ in range(2):
+            recs.append({"t": t, "tid": MAIN, "kind": "syscall", "id": "NtCreateEvent",
+                         "caller": "ntdll.dll!NtCreateEvent+0x14", "dur_ns": 30_000, "status": "0x0"})
+            recs.append({"t": t + 2e-6, "tid": MAIN, "kind": "server_req", "id": "create_event",
+                         "caller": "ntdll.dll!NtCreateEvent+0x14", "dur_ns": 10_000, "status": "0x0"})
+            t += 0.001
+        for code in ("scard_establish_context", "scard_release_context", "scard_establish_context"):
+            recs.append({"t": t, "tid": MAIN, "kind": "unixcall", "id": "winscard.so:" + code,
+                         "caller": "pe!0x140001234", "dur_ns": 5000, "status": "0x0"})
+            t += 0.001
+        recs.append({"t": t, "tid": MAIN, "kind": "unixcall", "id": "winscardx.so#1", "caller": "pe!0x1",
+                     "dur_ns": 5000, "status": "0x0"})
+        for _ in range(2):
+            recs.append({"t": t, "tid": HELPER, "kind": "syscall", "id": "NtSetEvent",
+                         "caller": "ntdll.dll!NtSetEvent+0x14", "dur_ns": 3000, "status": "0x0"})
+            recs.append({"t": t + 1e-6, "tid": HELPER, "kind": "ntsync_wake", "id": "EVENT_SET",
+                         "caller": "ntdll.dll!NtSetEvent+0x14", "dur_ns": 0, "status": 0})
+            t += 0.001
+        recs.append({"t": t, "tid": MAIN, "kind": "syscall", "id": "NtYieldExecution",
+                     "caller": "ntdll.dll!NtYieldExecution+0x14", "dur_ns": 900, "status": "0x0"})
+        return recs
+
+    def run_main(self, extra=()):
+        import io
+        from contextlib import redirect_stdout
+        with tempfile.TemporaryDirectory() as tmp:
+            events = os.path.join(tmp, "events.jsonl")
+            with open(events, "w", encoding="utf-8") as fh:
+                for rec in self.reducer_events():
+                    fh.write(json.dumps(rec) + "\n")
+            threads = os.path.join(tmp, "threads.jsonl")
+            with open(threads, "w", encoding="utf-8") as fh:
+                fh.write(json.dumps({"type": "header", "file": "threads"}) + "\n")
+                fh.write(json.dumps({"t": 0.0, "pid": PID, "tid": HELPER, "comm": "traceprobe-help",
+                                     "crossings": {}, "top_ids": []}) + "\n")
+                fh.write(json.dumps({"t": 0.0, "pid": PID, "tid": MAIN, "comm": "traceprobe-main",
+                                     "crossings": {}, "top_ids": []}) + "\n")
+            expect = os.path.join(tmp, "traceprobe.txt")
+            with open(expect, "w", encoding="utf-8") as fh:
+                fh.write("\n".join(self.PROBE_OUTPUT) + "\n")
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                rc = V.main(["--expect", expect, "--events", events, "--threads", threads] + list(extra))
+        return rc, buf.getvalue().splitlines()
+
+    def test_word_ops_parse(self):
+        exps = V.parse_expect_lines(self.PROBE_OUTPUT)
+        self.assertEqual([e.op for e in exps], ["==", ">=", "==", "==", "==", ">="])
+
+    def test_probe_ids_line(self):
+        ids = V.parse_probe_ids(self.PROBE_OUTPUT)
+        self.assertEqual(ids["helper"], "36")
+        self.assertEqual(V.probe_number(ids, "linux_tid"), MAIN)
+        self.assertIsNone(V.probe_number(ids, "linux_helper_tid"))
+
+    def test_probe_output_passes_against_reducer_events(self):
+        rc, out = self.run_main()
+        self.assertEqual(rc, 0, "\n".join(out))
+        self.assertIn("INFO expect-thread: tid 100 (the probe's TID line (linux_tid)); observations from events+threads", out)
+        self.assertIn("PASS EXPECT server_wait NtDelayExecution >= 10: observed 10 on tid 100", out)
+        self.assertIn("PASS EXPECT unixcall winscard.so == 3: observed 3 on tid 100", out)
+        self.assertIn("PASS EXPECT ntsync_wake EVENT_SET == 2 thread=helper: observed 2 on tid 101", out)
+        self.assertIn("PASS EXPECT server_req create_event == 2: observed 2 on tid 100", out)
+
+    def test_event_inside_never_exiting_entry_is_not_an_orphan(self):
+        # The probe's last syscall, NtTerminateProcess(-1), never exits: its terminate_process
+        # request has no completed enclosing event but keeps the caller the reducer gave it.
+        obs = V.Observations()
+        obs.events = [V.Event({"t": 1.0, "tid": MAIN, "kind": "server_req", "id": "terminate_process",
+                               "caller": "ntdll.dll!NtTerminateProcess+0x14", "dur_ns": 13000}),
+                      V.Event({"t": 2.0, "tid": MAIN, "kind": "server_req", "id": "init_thread",
+                               "caller": "none", "dur_ns": 1000})]
+        report = V.Report()
+        V.pairing_checks(obs, MAIN, report)
+        lines = [r.line() for r in report.results]
+        self.assertIn("INFO pairing-open-enclosure: 1 server/ntsync events inside an entry that never exited "
+                      "(caller kept) on tid 100", lines)
+        self.assertIn("FAIL pairing-enclosure: 1 of 2 server/ntsync events without an enclosing syscall/unixcall "
+                      "on tid 100", lines)
+
+    def test_bare_module_does_not_match_other_libraries(self):
+        exp = V.parse_expect_lines(["EXPECT unixcall winscard.so eq 1"])[0]
+        event = V.Event({"tid": 1, "kind": "unixcall", "id": "winscardx.so#1"})
+        self.assertFalse(V.expect_id_matches(exp, event, event.id))
+        event = V.Event({"tid": 1, "kind": "unixcall", "id": "winscard.so#7"})
+        self.assertTrue(V.expect_id_matches(exp, event, event.id))
+
+    def test_enclosing_syscall_id_only_for_nested_kinds(self):
+        exp = V.parse_expect_lines(["EXPECT syscall NtDelayExecution eq 1"])[0]
+        event = V.Event({"tid": 1, "kind": "syscall", "id": "NtYieldExecution",
+                         "caller": "ntdll.dll!NtDelayExecution+0x14"})
+        self.assertFalse(V.expect_id_matches(exp, event, event.id))
+
+
 class CLITests(unittest.TestCase):
     def test_main_exit_code_and_json(self):
         with tempfile.TemporaryDirectory() as tmp:
