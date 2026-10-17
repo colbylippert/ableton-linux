@@ -86,7 +86,7 @@ phase_plugins_apply() {
     if ! _plugins_parse; then
         fail "cannot parse $(_plugins_lock) (expected: name url=… sha256=… member=… per line)" || return 1
     fi
-    [ -d "$(_lp_prefix)/drive_c" ] || { fail "prefix $(_lp_prefix) has no drive_c (phase install)"; return 1; }
+    [ -d "$(_lp_prefix)/drive_c" ] || prereq_fail "prefix $(_lp_prefix) has no drive_c (phase install)" || return 1
     dir="$(_plugins_vst3_dir)"
     _PLUGINS_ATTEMPTED=1
     run -- mkdir -p -- "$dir" || return 1

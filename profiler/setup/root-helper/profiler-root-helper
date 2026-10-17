@@ -21,6 +21,10 @@
 #       governor                  a cpufreq governor name, applied to every CPU
 #       epp                       an energy_performance_preference, applied to every CPU
 #       ananicy                   on | off  (ananicy-cpp.service enable+start / disable+stop)
+#       wifi-powersave.<iface>    on | off  (iw dev <iface> set power_save; wireless
+#                                 interfaces only — a laptop's Wi-Fi power save adds
+#                                 ~100 ms latency spikes; NetworkManager's
+#                                 wifi.powersave drop-in is the persistent form)
 #       sysctl.<key>              key ∈ kernel.perf_event_paranoid kernel.kptr_restrict
 #                                 kernel.sched_rt_runtime_us kernel.sched_autogroup_enabled
 #                                 kernel.timer_migration vm.swappiness vm.max_map_count
@@ -116,6 +120,7 @@ readonly RE_WORD='^[a-z][a-z0-9_-]{0,31}$'                      # governor / epp
 readonly RE_SECS='^[0-9]{1,6}$'
 readonly RE_USER='^[a-z_][a-z0-9_-]{0,31}$'
 readonly RE_KEY='^[a-z][a-z0-9_.-]{0,80}$'
+readonly RE_IFACE='^[a-z0-9][a-z0-9_.-]{0,14}$'                  # network interface names
 
 INVOKER="${SUDO_USER:-}"
 INVOKER_UID="${SUDO_UID:-}"
@@ -131,8 +136,8 @@ usage: sudo -n profiler-root-helper VERB …
   reset
   knob get KEY
   knob set KEY VALUE
-      KEY: thp | governor | epp | ananicy | sysctl.<allowlisted key> |
-           irq-affinity.<N> | irq-prio.<N> | rt-prio.<pid>
+      KEY: thp | governor | epp | ananicy | wifi-powersave.<iface> |
+           sysctl.<allowlisted key> | irq-affinity.<N> | irq-prio.<N> | rt-prio.<pid>
   trace start --tool NAME --run-dir DIR [--id ID] [--tool-dir DIR] [--pid N]…
               [--duration S] [-- ARGS…]
   trace stop  ID [--signal SIG] [--timeout S]
@@ -283,6 +288,30 @@ ananicy_set() {
     esac
 }
 
+wifi_ifaces() {      # wireless interfaces, one per line
+    local d
+    for d in /sys/class/net/*; do
+        [ -d "$d/wireless" ] || [ -e "$d/phy80211" ] || continue
+        printf '%s\n' "${d##*/}"
+    done
+    return 0
+}
+wifi_iface_check() { # wifi_iface_check IFACE → refuses anything that is not a wireless interface
+    [[ "$1" =~ $RE_IFACE ]] || refuse "bad interface name '$1'"
+    [ -d "/sys/class/net/$1/wireless" ] || [ -e "/sys/class/net/$1/phy80211" ] || refuse "'$1' is not a wireless interface"
+}
+wifi_ps_get() {
+    local v
+    command -v iw >/dev/null 2>&1 || { printf 'unavailable\n'; return 0; }
+    v="$(iw dev "$1" get power_save 2>/dev/null | sed -n 's/^Power save: *//p' | head -n1 || true)"
+    case "$v" in on|off) printf '%s\n' "$v" ;; *) printf 'unavailable\n' ;; esac
+}
+wifi_ps_set() {
+    [[ "$2" =~ ^(on|off)$ ]] || refuse "wifi-powersave must be on or off (got '$2')"
+    command -v iw >/dev/null 2>&1 || unavailable "iw is not installed"
+    iw dev "$1" set power_save "$2" || die "iw dev $1 set power_save $2 failed"
+}
+
 sysctl_allowed() { local k; for k in "${SYSCTL_ALLOW[@]}"; do [ "$1" = "$k" ] && return 0; done; return 1; }
 sysctl_get() { sysctl -n -- "$1" 2>/dev/null || printf 'unavailable\n'; }
 sysctl_set() {
@@ -382,6 +411,12 @@ do_knob() {
             cur="$(ananicy_get)"
             if [ "$op" = get ]; then msg "$cur"; [ "$cur" != absent ] || return 3; return 0; fi
             ananicy_set "$value"; msg "ananicy: $cur -> $value (enabled=$(ananicy_enabled) active=$(ananicy_active))" ;;
+        wifi-powersave.*)
+            sub="${key#wifi-powersave.}"
+            wifi_iface_check "$sub"
+            cur="$(wifi_ps_get "$sub")"
+            if [ "$op" = get ]; then msg "$cur"; [ "$cur" != unavailable ] || return 3; return 0; fi
+            wifi_ps_set "$sub" "$value"; msg "wifi-powersave.$sub: $cur -> $(wifi_ps_get "$sub")" ;;
         sysctl.*)
             sub="${key#sysctl.}"
             sysctl_allowed "$sub" || refuse "sysctl key '$sub' is not in the allowlist (${SYSCTL_ALLOW[*]})"
@@ -407,7 +442,7 @@ do_knob() {
             if [ "$op" = get ]; then msg "$cur"; return 0; fi
             rt_prio_set "$sub" "$value"; msg "rt-prio.$sub: $cur -> $(rt_prio_get "$sub")" ;;
         *)
-            refuse "unknown knob '$key' (thp governor epp ananicy sysctl.<key> irq-affinity.<N> irq-prio.<N> rt-prio.<pid>)" ;;
+            refuse "unknown knob '$key' (thp governor epp ananicy wifi-powersave.<iface> sysctl.<key> irq-affinity.<N> irq-prio.<N> rt-prio.<pid>)" ;;
     esac
     _log "result=ok knob $op $key${value:+ $value}"
 }
@@ -452,6 +487,11 @@ do_snapshot() {
         else
             printf 'ananicy_enabled=absent\nananicy_active=absent\n'
         fi
+        while IFS= read -r d; do
+            [ -n "$d" ] || continue
+            [[ "$d" =~ $RE_IFACE ]] || continue
+            printf 'wifi_powersave.%s=%s\n' "$d" "$(wifi_ps_get "$d")"
+        done < <(wifi_ifaces)
         for d in /proc/irq/[0-9]*; do
             [ -d "$d" ] || continue
             v="$(cat "$d/smp_affinity" 2>/dev/null)" || continue
@@ -503,6 +543,16 @@ do_reset() {
                 else err "$key: cannot restore '$val'"; failed=$((failed + 1)); fi ;;
             ananicy_enabled) base_en="$val" ;;
             ananicy_active)  base_act="$val" ;;
+            wifi_powersave.*)
+                sub="${key#wifi_powersave.}"
+                [[ "$sub" =~ $RE_IFACE ]] && [[ "$val" =~ ^(on|off)$ ]] || continue
+                [ -d "/sys/class/net/$sub/wireless" ] || [ -e "/sys/class/net/$sub/phy80211" ] || continue
+                command -v iw >/dev/null 2>&1 || continue
+                cur="$(wifi_ps_get "$sub")"
+                [ "$cur" = "$val" ] && continue
+                if iw dev "$sub" set power_save "$val" 2>/dev/null; then
+                    msg "wifi-powersave.$sub: $cur -> $val"; changed=$((changed + 1))
+                else err "wifi-powersave.$sub: cannot restore '$val'"; failed=$((failed + 1)); fi ;;
             irq_affinity.*)
                 sub="${key#irq_affinity.}"
                 [[ "$sub" =~ $RE_IRQ ]] && [[ "$val" =~ $RE_HEXMASK ]] || continue

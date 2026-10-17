@@ -11,11 +11,14 @@
 #                              Exports C_RESET C_BOLD C_DIM C_RED C_GREEN C_YELLOW
 #                              C_BLUE C_CYAN and G_STEP G_OK G_WARN G_FAIL G_SKIP
 #                              G_INFO G_BAR G_RULE.
-#   log_init [LOGFILE]         `exec 3>&1` keeps the terminal on fd 3, creates
+#   log_init [LOGFILE|--no-file]
+#                              `exec 3>&1` keeps the terminal on fd 3, creates
 #                              ~/.local/state/profiler, opens LOGFILE (default
 #                              setup-<UTC ts>.log there) and refreshes the
 #                              setup-latest.log symlink. Every message goes
 #                              coloured to fd 3 and ANSI-free to the file.
+#                              --no-file: terminal only, nothing is created
+#                              (setup-machine.sh --dry-run, verify.sh --no-log).
 #   section N TOTAL NAME       bold cyan rule: "══ [03/18] packages ═══…"
 #   step MSG                   "→ MSG"
 #   ok MSG                     green "✓ MSG"
@@ -44,7 +47,7 @@
 #                              Use it in a condition: `if run --allow-fail -- …; then`.
 #   summary_add NAME STATUS SECONDS NOTE
 #                              record one row (status ∈ ok|skipped|warn|failed|
-#                              not-run|dry-run)
+#                              not-run|dry-run|deferred)
 #   summary_table              print the table, WARNINGS, FAILURES, ACTIONS REQUIRED
 #                              and the log path (guarded: prints at most once)
 #   strip_ansi STRING          pure-bash ANSI stripper (prints the result)
@@ -112,6 +115,11 @@ log_init() {
     exec 3>&1
     LOG_FD=3
     log_colors_init
+    if [ "${1:-}" = --no-file ]; then
+        LOGFILE=""
+        export LOGFILE LOG_FD
+        return 0
+    fi
     dir="${PROFILER_STATE_DIR:-$HOME/.local/state/profiler}"
     if [ -n "${1:-}" ]; then
         LOGFILE="$1"; dir="$(dirname -- "$LOGFILE")"
@@ -298,7 +306,7 @@ _fmt_secs() {
 _status_color() {
     case "$1" in
         ok) printf '%s' "$C_GREEN" ;;
-        warn) printf '%s' "$C_YELLOW" ;;
+        warn|deferred) printf '%s' "$C_YELLOW" ;;
         failed) printf '%s' "$C_RED" ;;
         dry-run) printf '%s' "$C_CYAN" ;;
         *) printf '%s' "$C_DIM" ;;

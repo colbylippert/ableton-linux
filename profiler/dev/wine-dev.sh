@@ -63,11 +63,13 @@
 #                                    export HEAD as patches/NNNN-SLUG.patch (or
 #                                    patches/pipeasio/NNNN-SLUG.patch) with the host
 #                                    ~/.gitconfig masked (container-identical diff
-#                                    settings), rehearse the OFFICIAL order (numbered
-#                                    series + this patch + performance/*, which the dev
-#                                    tree applied before your change) in a throwaway
-#                                    index — refused on conflict unless --force — and
-#                                    print the build-audit checklist
+#                                    settings), rehearse the OFFICIAL order (base +
+#                                    every numbered patch with this one at its place +
+#                                    performance/*, which the dev tree applied BEFORE
+#                                    your change; pipeasio: tarball + patch -p1 of the
+#                                    series) in a throwaway worktree — refused on a
+#                                    conflict unless --force — and print the
+#                                    build-audit checklist
 #   shell [CMD…]                     interactive bash in the container, or run CMD there
 #   status [--deep]                  container, tree, build, runtime, locks, processes
 #   logs [-n N] [--follow] [--list]  the latest wine-dev log
@@ -671,7 +673,7 @@ cmd_apply() {
     [ -d "$WINE_SRC/.git" ] || die "no dev tree at $WINE_SRC — run  wine-dev.sh init" 2
     if [ "$abort" -eq 1 ]; then
         step "git am --abort"
-        run -- git -C "$WINE_SRC" am --abort || return 1
+        run -- "${GIT_CLEAN[@]}" -C "$WINE_SRC" am --abort || return 1
         summary_add abort "$(_st)" 0
         ok "HEAD: $(_wine_head)"
         return 0
@@ -691,7 +693,8 @@ cmd_apply() {
             { printf 'From: dist <build@localhost>\nDate: Thu, 01 Jan 2026 00:00:00 +0000\n'; cat -- "$real"; } > "$tmp"
             info "no From:/Date: header — synthetic 'From: dist <build@localhost>' prepended (as the build does)"
         fi
-        if run -- git -C "$WINE_SRC" -c user.email=build@localhost -c user.name=dist am --3way "$tmp"; then
+        # host ~/.gitconfig masked (GIT_CLEAN): the commit must be what the container's clean git makes
+        if run -- "${GIT_CLEAN[@]}" -C "$WINE_SRC" -c user.email=build@localhost -c user.name=dist am --3way "$tmp"; then
             summary_add "$(basename -- "$p")" "$(_st)" $(( $(_now) - t0 ))
         else
             summary_add "$(basename -- "$p")" failed $(( $(_now) - t0 ))
@@ -848,21 +851,43 @@ cmd_pipeasio_build() {
 }
 
 # ================================================================= sync ====
-_artifacts_to_stage() {   # _artifacts_to_stage DIR… — copy built modules from /work/build/DIR into the stage
-    local d arch f dst n=0
+# the stage's unix-library directory (lib/wine/x86_64-unix on this host): the one
+# make install created, else <uname -m>-unix
+_stage_unix_dir() {
+    local d
+    for d in "$STAGE_ROOT"/lib/wine/*-unix; do
+        [ -d "$d" ] && { printf '%s\n' "${d##*/}"; return 0; }
+    done
+    printf '%s-unix\n' "$(uname -m)"
+}
+
+# _artifacts_to_stage DIR… — copy the modules built in /work/build/DIR into the
+# stage, the way `make install` would place them:
+#   PE half    DIR/<arch>-windows/*.{dll,exe,sys,drv,…} → lib/wine/<arch>-windows/ (0644)
+#   unix half  DIR/<module>.so → lib/wine/x86_64-unix/<module>.so (0755). Wine's
+#              makedep builds the unix library in DIR itself (tools/makedep.c:
+#              arch_dirs[0] = "", the unixlib rule targets DIR/<module>.so);
+#              <host>-unix is only the INSTALL directory (install_program, 0755)
+#   server     server/wineserver → bin/wineserver; loader: loader/wine{,-preloader} → bin/
+# Every DIR must yield at least one file: a DIR that built nothing is an error,
+# not a silent partial sync (a stale ntdll.so would make every A/B wrong).
+_artifacts_to_stage() {
+    local d arch f dst n=0 m unixdir
+    unixdir="$(_stage_unix_dir)"
     shopt -s nullglob
     for d in "$@"; do
         d="${d%/}"
+        m=0
         case "$d" in
             server)
                 for f in "$BUILD_DIR/server/wineserver"; do
                     run --quiet -- install -m 0755 -- "$f" "$STAGE_ROOT/bin/wineserver" || { shopt -u nullglob; return 1; }
-                    n=$(( n + 1 )); kv "bin/wineserver" "← server/wineserver"
+                    m=$(( m + 1 )); kv "bin/wineserver" "← server/wineserver"
                 done ;;
             loader)
                 for f in "$BUILD_DIR"/loader/wine "$BUILD_DIR"/loader/wine-preloader; do
                     run --quiet -- install -m 0755 -- "$f" "$STAGE_ROOT/bin/$(basename -- "$f")" || { shopt -u nullglob; return 1; }
-                    n=$(( n + 1 )); kv "bin/$(basename -- "$f")" "← loader/$(basename -- "$f")"
+                    m=$(( m + 1 )); kv "bin/$(basename -- "$f")" "← loader/$(basename -- "$f")"
                 done ;;
             *)
                 for arch in "$BUILD_DIR/$d"/*-windows "$BUILD_DIR/$d"/*-unix; do
@@ -871,16 +896,24 @@ _artifacts_to_stage() {   # _artifacts_to_stage DIR… — copy built modules fr
                         [ -f "$f" ] || continue
                         dst="$STAGE_ROOT/lib/wine/$(basename -- "$arch")/$(basename -- "$f")"
                         run --quiet -- install -m 0644 -- "$f" "$dst" || { shopt -u nullglob; return 1; }
-                        n=$(( n + 1 )); kv "lib/wine/$(basename -- "$arch")/$(basename -- "$f")" "← $d/$(basename -- "$arch")"
+                        m=$(( m + 1 )); kv "lib/wine/$(basename -- "$arch")/$(basename -- "$f")" "← $d/$(basename -- "$arch")"
                     done
+                done
+                for f in "$BUILD_DIR/$d"/*.so; do
+                    [ -f "$f" ] || continue
+                    dst="$STAGE_ROOT/lib/wine/$unixdir/$(basename -- "$f")"
+                    run --quiet -- install -m 0755 -- "$f" "$dst" || { shopt -u nullglob; return 1; }
+                    m=$(( m + 1 )); kv "lib/wine/$unixdir/$(basename -- "$f")" "← $d (unix half)"
                 done ;;
         esac
+        if [ "$m" -eq 0 ] && ! _is_dry; then
+            shopt -u nullglob
+            fail "nothing built in $BUILD_DIR/$d (expected $d/<arch>-windows/*.dll and/or the unix half $d/<module>.so): run  wine-dev.sh build --dir $d  first"
+            return 1
+        fi
+        n=$(( n + m ))
     done
     shopt -u nullglob
-    if [ "$n" -eq 0 ] && ! _is_dry; then
-        fail "no built modules found under $BUILD_DIR for: $* (expected DIR/<arch>-windows/*.dll, DIR/<arch>-unix/*.so)"
-        return 1
-    fi
     ok "$n module(s) copied into the stage"
 }
 
@@ -895,11 +928,13 @@ for f in \"\$P\"/bin/*; do strip --strip-unneeded \"\$f\" 2>/dev/null || true; d
 
 _write_dev_info() {   # _write_dev_info STRIPPED MODE
     local tmp head dirty since pa official_version
+    # every substitution here must survive a missing input (no wine-src git tree
+    # yet, no official runtime yet): `|| true` / `|| echo`, never a bare pipeline
     head="$(git -C "$WINE_SRC" log -1 --format='%H %s' 2>/dev/null || echo unknown)"
-    dirty="$(_wine_dirty)"
+    dirty="$(_wine_dirty || true)"
     since="$(git -C "$WINE_SRC" log --format='  %h %s' "$SERIES_TAG..HEAD" 2>/dev/null || true)"
     pa="$(git -C "$PIPEASIO_SRC" log -1 --format='%H %s' 2>/dev/null || echo none)"
-    official_version="$(sed -n 's/^dist-version: *//p' "$OFFICIAL_ROOT/ABLETON-WINE-BUILD-INFO.txt" 2>/dev/null | head -n1)"
+    official_version="$(sed -n 's/^dist-version: *//p' "$OFFICIAL_ROOT/ABLETON-WINE-BUILD-INFO.txt" 2>/dev/null | head -n1 || true)"
     tmp="$(mktemp "$(_scratch)/dev-info.XXXXXX")"
     {
         printf '# PROFILER-DEV-INFO.txt — written by profiler/dev/wine-dev.sh sync.\n'
@@ -938,6 +973,7 @@ cmd_sync() {
         shift
     done
     [ "$artifacts" -eq 1 ] || [ "${#dirs[@]}" -eq 0 ] || usage_error "sync: --dir only makes sense with --artifacts"
+    [ "$artifacts" -eq 0 ] || [ "${#dirs[@]}" -gt 0 ] || usage_error "sync: --artifacts needs at least one --dir DIR (e.g. --dir dlls/ntdll)"
     _log_open sync
     _lock_dev
     _banner "sync"
@@ -971,7 +1007,6 @@ cmd_sync() {
     section 3 4 "stage"
     if [ "$artifacts" -eq 1 ]; then
         mode="artifacts"
-        [ "${#dirs[@]}" -gt 0 ] || dirs=(dlls/ntdll)
         step "copying built modules from $BUILD_DIR/{${dirs[*]}} into the stage"
         _artifacts_to_stage "${dirs[@]}" || return 1
         summary_add artifacts "$(_st)" 0 "${dirs[*]}"
@@ -1038,8 +1073,103 @@ _audit_line() {   # _audit_line REGEX DEFAULT → line number in scripts/build-a
     printf '%s\n' "${n:-$2}"
 }
 
+# _official_series DIR GLOB NEWFILE — the patch files of DIR matching GLOB plus
+# NEWFILE (whose basename takes the place of a same-named file), in the order the
+# official pipeline applies them: glob order = sorted by file name
+_official_series() {
+    local dir="$1" glob="$2" new="$3" p
+    {
+        for p in "$dir"/$glob; do
+            [ -f "$p" ] || continue
+            [ "${p##*/}" = "${new##*/}" ] && continue
+            printf '%s\t%s\n' "${p##*/}" "$p"
+        done
+        printf '%s\t%s\n' "${new##*/}" "$new"
+    } | LC_ALL=C sort -t "$(printf '\t')" -k1,1 | cut -f2-
+}
+
+# _rehearse_wine PATCH — replay scripts/container-build.sh:144-166 against PATCH:
+# a throwaway worktree of the dev tree at its base commit ("base 5c23dd1c"), then
+# `git am --3way` of every patches/NNNN-*.patch in file-name order with PATCH in
+# its own place, then patches/performance/*.patch — the order the official build
+# uses. (The dev tree applied the performance series BEFORE the change, so a
+# change that merges cleanly there can still conflict in ./build.sh.) Host git
+# config masked (GIT_CLEAN). 0 = the official order applies; 1 = a conflict
+# (details printed); 2 = could not rehearse.
+_rehearse_wine() {
+    local patch="$1" base wt p n=0 total failed="" log
+    local -a series=()
+    base="$(git -C "$WINE_SRC" rev-list --max-parents=0 HEAD 2>/dev/null | tail -n1 || true)"
+    [ -n "$base" ] || { warn "cannot find the base commit of $WINE_SRC: rehearsal skipped"; return 2; }
+    mapfile -t series < <(_official_series "$REPO/patches" '[0-9][0-9][0-9][0-9]-*.patch' "$patch")
+    for p in "$REPO"/patches/performance/*.patch; do [ -f "$p" ] && series+=("$p"); done
+    total="${#series[@]}"
+    wt="$MARK_DIR/rehearsal.$$"
+    log="$(_scratch)/rehearsal.log"
+    step "rehearsing the official order: base + $total patch(es) (git am --3way in a throwaway worktree, ~1 min)"
+    rm -rf -- "$wt" 2>/dev/null || true
+    if ! "${GIT_CLEAN[@]}" -C "$WINE_SRC" worktree add --detach --quiet "$wt" "$base" > "$log" 2>&1; then
+        _lines < "$log"
+        warn "git worktree add failed: rehearsal skipped"
+        return 2
+    fi
+    for p in "${series[@]}"; do
+        n=$(( n + 1 ))
+        if head -8 -- "$p" | grep -q '^From: '; then
+            "${GIT_CLEAN[@]}" -C "$wt" -c user.email=build@localhost -c user.name=dist am --3way --quiet "$p" >> "$log" 2>&1 || failed="$p"
+        else
+            { printf 'From: dist <build@localhost>\nDate: Thu, 01 Jan 2026 00:00:00 +0000\n'; cat -- "$p"; } \
+                | "${GIT_CLEAN[@]}" -C "$wt" -c user.email=build@localhost -c user.name=dist am --3way --quiet >> "$log" 2>&1 || failed="$p"
+        fi
+        [ -z "$failed" ] || break
+    done
+    if [ -n "$failed" ]; then
+        fail "the official order does not apply: $(basename -- "$failed") (patch $n of $total) fails git am --3way after the patches before it"
+        tail -n 20 -- "$log" | _lines
+        "${GIT_CLEAN[@]}" -C "$wt" am --abort >/dev/null 2>&1 || true
+    else
+        ok "the official order applies: base + $total patch(es), $(basename -- "$patch") at its place"
+    fi
+    "${GIT_CLEAN[@]}" -C "$WINE_SRC" worktree remove --force "$wt" >/dev/null 2>&1 || rm -rf -- "$wt"
+    "${GIT_CLEAN[@]}" -C "$WINE_SRC" worktree prune >/dev/null 2>&1 || true
+    [ -z "$failed" ]
+}
+
+# _rehearse_pipeasio PATCH — replay container-build.sh:251-261: the vendored
+# PipeASIO tarball, then `patch -p1 --no-backup-if-mismatch` of every
+# patches/pipeasio/*.patch in file-name order with PATCH in its own place.
+# patch -p1 (not git am) is what the official pipeline uses, so a diff it cannot
+# consume (noprefix, renames, binary) fails here. Return codes as _rehearse_wine.
+_rehearse_pipeasio() {
+    local patch="$1" dir p n=0 total failed="" log
+    local -a series=()
+    dir="$(_scratch)/pipeasio-rehearsal"
+    log="$(_scratch)/pipeasio-rehearsal.log"
+    rm -rf -- "$dir"; mkdir -p -- "$dir"
+    if ! tar -xzf "$REPO/vendor/pipeasio-1.5.0.tar.gz" -C "$dir" --strip-components=1 2> "$log"; then
+        _lines < "$log"
+        warn "cannot unpack $REPO/vendor/pipeasio-1.5.0.tar.gz: rehearsal skipped"
+        return 2
+    fi
+    mapfile -t series < <(_official_series "$REPO/patches/pipeasio" '*.patch' "$patch")
+    total="${#series[@]}"
+    step "rehearsing the official order: pipeasio-1.5.0 + $total patch(es) with patch -p1"
+    for p in "${series[@]}"; do
+        n=$(( n + 1 ))
+        ( cd -- "$dir" && patch -p1 --no-backup-if-mismatch --batch -i "$p" ) >> "$log" 2>&1 || { failed="$p"; break; }
+    done
+    if [ -n "$failed" ]; then
+        fail "the official order does not apply: $(basename -- "$failed") (patch $n of $total) fails patch -p1"
+        tail -n 20 -- "$log" | _lines
+    else
+        ok "the official order applies: pipeasio-1.5.0 + $total patch(es), $(basename -- "$patch") at its place"
+    fi
+    rm -rf -- "$dir"
+    [ -z "$failed" ]
+}
+
 cmd_format_patch() {
-    local number="" name="" pipeasio=0 outdir="" force=0 src tag file subject count dirty tmp
+    local number="" name="" pipeasio=0 outdir="" force=0 src tag file subject count dirty tmp other rc
     local wt pt fp so tail_var label
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -1078,10 +1208,10 @@ cmd_format_patch() {
     esac
     count="$(git -C "$src" rev-list --count "$tag..HEAD" 2>/dev/null || echo 0)"
     [ "$count" -ge 1 ] || die "no commits since $tag in $src — commit your change first (see  wine-dev.sh edit)" 2
-    dirty="$(git -C "$src" status --porcelain 2>/dev/null | wc -l | tr -d ' ')"
+    dirty="$(_wine_dirty "$src")"
     [ "$dirty" = 0 ] || warn "$dirty uncommitted change(s) in $src are NOT exported (only HEAD is)"
     [ "$count" -eq 1 ] || warn "$count commits since $tag; only HEAD is exported — to ship one patch: git -C $src reset --soft $tag && git -C $src commit"
-    subject="$(git -C "$src" log -1 --format=%s)"
+    subject="$(git -C "$src" log -1 --format=%s 2>/dev/null || true)"
     [ -n "$name" ] || name="$(_slug "$subject")"
     [[ "$name" =~ ^[a-z0-9][a-z0-9.-]*$ ]] || usage_error "--name must be a slug of [a-z0-9.-] (got '$name')"
     if [ -z "$number" ]; then
@@ -1095,17 +1225,41 @@ cmd_format_patch() {
     fi
     file="$outdir/$number-$name.patch"
     if [ -e "$file" ] && [ "$force" -eq 0 ]; then die "$file exists (use --force to overwrite)" 2; fi
-    kv "HEAD" "$(git -C "$src" log -1 --format='%h %s')"
+    for other in "$outdir"/"$number"-*.patch; do
+        [ -e "$other" ] && [ "$other" != "$file" ] || continue
+        warn "$(basename -- "$other") already uses number $number: build-audit.sh refuses duplicate numbers (pass --number)"
+    done
+    kv "HEAD" "$(git -C "$src" log -1 --format='%h %s' 2>/dev/null || true)"
     kv "patch" "$file"
-    step "git format-patch -1 --no-numbered --no-signature --stat=80"
-    tmp="$(mktemp "$(_scratch)/fp.XXXXXX")"
-    git -C "$src" format-patch -1 --no-numbered --no-signature --stat=80 --stdout HEAD > "$tmp" \
+    # exported with the host's ~/.gitconfig and /etc/gitconfig masked (GIT_CLEAN): a
+    # diff.noprefix, mnemonicPrefix, format.signOff/subjectPrefix there must not leak
+    # into a patch that the container's git am --3way / patch -p1 consumes
+    step "git format-patch -1 --no-numbered --no-signature --stat=80 (host git config masked)"
+    mkdir -p -- "$(_scratch)/export"
+    tmp="$(_scratch)/export/$number-$name.patch"
+    "${GIT_CLEAN[@]}" -C "$src" format-patch -1 --no-numbered --no-signature --stat=80 --stdout HEAD > "$tmp" \
         || { rm -f -- "$tmp"; fail "git format-patch failed"; return 1; }
     [ -s "$tmp" ] || { rm -f -- "$tmp"; fail "git format-patch produced nothing"; return 1; }
+    if _is_dry; then
+        info "(dry run) would rehearse the official patch order with $(basename -- "$tmp") before writing it"
+    else
+        rc=0
+        if [ "$pipeasio" -eq 1 ]; then _rehearse_pipeasio "$tmp" || rc=$?; else _rehearse_wine "$tmp" || rc=$?; fi
+        if [ "$rc" -eq 1 ]; then
+            if [ "$force" -eq 1 ]; then
+                warn "writing $file anyway (--force): ./build.sh will fail at the patch step until the conflict is resolved"
+            else
+                summary_add "$number-$name" failed 0 "official order conflicts"
+                info "rebase the change onto the official order (the numbered series, then performance/*), or pass --force to write it anyway"
+                rm -f -- "$tmp"
+                return 1
+            fi
+        fi
+    fi
     run -- install -D -m 0644 -- "$tmp" "$file" || { rm -f -- "$tmp"; return 1; }
     rm -f -- "$tmp"
     summary_add "$number-$name" "$(_st)" 0 "$label"
-    ok "wrote $file"
+    _is_dry || ok "wrote $file"
 
     wt="$(_audit_line '^readonly REQUIRED_WINE_TAIL=' 13)"
     pt="$(_audit_line '^readonly REQUIRED_PIPEASIO_TAIL=' 15)"
@@ -1180,6 +1334,7 @@ cmd_status() {
     if [ -d "$WINE_SRC/.git" ]; then
         kv "HEAD" "$(_wine_head)"
         if _wine_tag_ok; then
+            kv "$MAIN_TAG" "$(git -C "$WINE_SRC" log -1 --format='%h %s' "refs/tags/$MAIN_TAG" 2>/dev/null || echo 'absent (tree initialised before the tag existed)') — the numbered series ends here; the official build applies performance/* after it"
             kv "since $SERIES_TAG" "$(_wine_since) commit(s)"
             git -C "$WINE_SRC" log --format='  %h %s' "$SERIES_TAG..HEAD" 2>/dev/null | head -n 10 | _lines
         else

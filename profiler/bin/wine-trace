@@ -254,7 +254,9 @@ write_pids_tsv()
     : > "$out/pids.tsv"
     for pid in "${pids[@]}"; do
         comm="$(cat "/proc/$pid/comm" 2>/dev/null || true)"
-        image="$(tr '\0' '\n' 2>/dev/null < "/proc/$pid/cmdline" | sed -n '1p')"
+        # || true: the pid may have exited since resolve_pids (the redirection then
+        # fails, and pipefail would abort the start)
+        image="$( { tr '\0' '\n' < "/proc/$pid/cmdline"; } 2>/dev/null | sed -n '1p' || true)"
         image="${image##*\\}"
         image="${image##*/}"
         exe="$(readlink -f -- "/proc/$pid/exe" 2>/dev/null || true)"
@@ -620,7 +622,9 @@ cmd_stop()
     if [ "$backend" = bpftrace ]; then
         [ -s "$out/events.txt" ] || die "$out/events.txt is empty: nothing to reduce"
         if [ -f "$out/bpftrace.stderr" ]; then
-            lost_extra="$(grep -oE 'Lost [0-9]+ events?' "$out/bpftrace.stderr" | awk '{s+=$2} END {print s+0}')"
+            # grep exits 1 when nothing was lost (the normal case): under pipefail that
+            # status must not abort the stop before reduce.py runs
+            lost_extra="$( { grep -oE 'Lost [0-9]+ events?' "$out/bpftrace.stderr" || true; } | awk '{s+=$2} END {print s+0}')"
             if grep -qiE 'error|WARNING' "$out/bpftrace.stderr"; then
                 log "bpftrace stderr has diagnostics ($out/bpftrace.stderr):"
                 tail -n 10 "$out/bpftrace.stderr" >&2 || true

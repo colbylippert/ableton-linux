@@ -25,7 +25,8 @@ CONFIGURE_PREFIX="${INSTALL_PREFIX:-/opt/$NAME}"
 DESTDIR="$WORK/stage"
 PREFIX_ROOT="$DESTDIR$CONFIGURE_PREFIX"
 MARK="$WORK/.dev"
-SERIES_TAG="series-aceb236"
+SERIES_TAG="series-aceb236"     # after the whole series (numbered + performance/*)
+MAIN_TAG="series-main"          # after the numbered series, before performance/* (the official order's seam)
 GIT=(git -c user.email=build@localhost -c user.name=dist)
 
 say()     { printf '== %s ==\n' "$*"; }
@@ -65,6 +66,17 @@ step_unpack() {   # container-build.sh:140-142 (+ build.sh:111 checksum)
 }
 
 # ---------------------------------------------------------------- series ----
+apply_one() {     # container-build.sh:156-164: git am --3way, synthetic header when none
+    local p="$1"
+    if head -8 "$p" | grep -q '^From: '; then
+        "${GIT[@]}" am --3way "$p"
+    else
+        { printf 'From: dist <build@localhost>\nDate: Thu, 01 Jan 2026 00:00:00 +0000\n'
+          cat "$p"
+        } | "${GIT[@]}" am --3way
+    fi
+}
+
 step_series() {   # container-build.sh:144-166
     local base p npatch nperf
     local -a performance_patches=()
@@ -91,6 +103,7 @@ step_series() {   # container-build.sh:144-166
         git reset -q --hard "$base"
         git clean -qfd
         git tag -d "$SERIES_TAG" >/dev/null 2>&1 || true
+        git tag -d "$MAIN_TAG" >/dev/null 2>&1 || true
         echo "   reset to $(git log --oneline -1)"
     else
         git init -q
@@ -100,18 +113,20 @@ step_series() {   # container-build.sh:144-166
     # The series ships without From:/Date: mail headers; git am refuses to commit
     # with an empty author, so supply a fixed neutral ident (fixed date keeps the
     # apply reproducible). Patches that still carry headers keep their own.
-    for p in "$SRC"/patches/[0-9][0-9][0-9][0-9]-*.patch "${performance_patches[@]}"; do
-        if head -8 "$p" | grep -q '^From: '; then
-            "${GIT[@]}" am --3way "$p"
-        else
-            { printf 'From: dist <build@localhost>\nDate: Thu, 01 Jan 2026 00:00:00 +0000\n'
-              cat "$p"
-            } | "${GIT[@]}" am --3way
-        fi
+    # Same order as container-build.sh:156: every numbered patch, then
+    # performance/*; series-main marks the seam (a dev change sits on top of the
+    # performance series here, but goes BEFORE it in the official order —
+    # wine-dev.sh format-patch rehearses that order before writing a patch).
+    for p in "$SRC"/patches/[0-9][0-9][0-9][0-9]-*.patch; do
+        apply_one "$p"
+    done
+    git tag -f "$MAIN_TAG" >/dev/null
+    for p in "${performance_patches[@]}"; do
+        apply_one "$p"
     done
     git tag -f "$SERIES_TAG" >/dev/null
     ( cd "$SRC/patches" && sha256sum [0-9][0-9][0-9][0-9]-*.patch performance/*.patch ) > "$MARK/series.sha256"
-    echo "   HEAD: $(git log --oneline -1)  ($((npatch + nperf)) patches, tag $SERIES_TAG)"
+    echo "   HEAD: $(git log --oneline -1)  ($((npatch + nperf)) patches, tags $MAIN_TAG + $SERIES_TAG)"
     mark series
 }
 

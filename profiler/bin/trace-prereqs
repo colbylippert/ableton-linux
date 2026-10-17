@@ -3,7 +3,7 @@
 # the installed runtime, as a table. Read-only. Exit 1 when any hard
 # requirement FAILs, else 0 (WARN and PENDING rows never fail).
 #
-#   trace-prereqs [--runtime DIR] [--no-color]
+#   trace-prereqs [--runtime DIR] [--no-sudo] [--no-color]
 #
 # Rows: kernel version, kernel/module BTF, bpftool + BTF dump + feature probe
 # (bpf_probe_read_user, JIT), uprobe PMU, tracefs, bpftrace, USDT notes in
@@ -13,6 +13,9 @@
 # (perf_event_paranoid, kptr_restrict, sched_rt_runtime_us, bpf_jit_enable),
 # the privilege route (sudo -n profiler-root-helper version, else sudo -n),
 # ulimit -l, transparent hugepages.
+# --no-sudo (or PROFILER_NO_SUDO=1, which setup-machine.sh --dry-run exports)
+# never invokes sudo: the root-only feature probe is skipped and the privilege
+# route is reported as "not probed" (WARN, never FAIL).
 # Runtime resolution: --runtime > ABLETON_WINE_ROOT > ~/.config/ableton-wine/config
 # runtime_root= > ~/.local/opt/wine-d2d1-nspa-11.13.
 set -uo pipefail     # not -e: every probe may fail and still be reported
@@ -27,16 +30,21 @@ abl_cfg() {
 }
 
 RT="${ABLETON_WINE_ROOT:-}"
+NO_SUDO=0
+[ "${PROFILER_NO_SUDO:-0}" != 1 ] || NO_SUDO=1
 while [ $# -gt 0 ]; do
     case "$1" in
         --runtime) [ $# -ge 2 ] || { echo "trace-prereqs: --runtime needs a directory" >&2; exit 2; }; RT="$2"; shift ;;
         --runtime=*) RT="${1#*=}" ;;
+        --no-sudo) NO_SUDO=1 ;;
         --no-color) export NO_COLOR=1 ;;
-        -h|--help) sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "trace-prereqs: unknown option $1" >&2; exit 2 ;;
     esac
     shift
 done
+# sudo -n, unless --no-sudo: then it is never invoked
+can_sudo() { [ "$NO_SUDO" -eq 0 ] && sudo -n true 2>/dev/null; }
 [ -n "$RT" ] || RT="$(abl_cfg runtime_root)"
 [ -n "$RT" ] || RT="$HOME/.local/opt/wine-d2d1-nspa-11.13"
 
@@ -93,13 +101,15 @@ if command -v bpftool >/dev/null 2>&1; then
         row FAIL "bpftool" "${bt_ver:-present}, but 'btf dump file /sys/kernel/btf/vmlinux format c' prints nothing"
     fi
     probe="$(bpftool feature probe kernel 2>/dev/null || true)"
-    if ! grep -q 'bpf_probe_read_user' <<< "$probe" && sudo -n true 2>/dev/null; then
+    if ! grep -q 'bpf_probe_read_user' <<< "$probe" && can_sudo; then
         probe="$(sudo -n bpftool feature probe kernel 2>/dev/null || true)"
     fi
     if grep -q 'bpf_probe_read_user is available' <<< "$probe"; then
         row OK "bpf feature probe" "bpf_probe_read_user available$(grep -q 'HAVE_BPF_JIT' <<< "$probe" && printf '; HAVE_BPF_JIT')"
     elif grep -q 'bpf_probe_read_user is NOT available' <<< "$probe"; then
         row FAIL "bpf feature probe" "bpf_probe_read_user is NOT available (stack windows cannot be read)"
+    elif [ "$NO_SUDO" -eq 1 ]; then
+        row WARN "bpf feature probe" "not probed (--no-sudo; the helper probes need root: sudo bpftool feature probe kernel)"
     else
         row WARN "bpf feature probe" "could not confirm bpf_probe_read_user (helper probes need root; run: sudo bpftool feature probe kernel)"
     fi
@@ -201,7 +211,13 @@ row OK "sched_rt_runtime_us" "$(sysctl -n kernel.sched_rt_runtime_us 2>/dev/null
 
 # ------------------------------------------------------------- privilege ----
 helper=/usr/local/sbin/profiler-root-helper
-if [ -x "$helper" ] && hv="$(sudo -n "$helper" version 2>/dev/null | first_line)" && [ -n "$hv" ]; then
+if [ "$NO_SUDO" -eq 1 ]; then
+    if [ -x "$helper" ]; then
+        row WARN "privilege route" "not probed (--no-sudo): $helper installed ($("$helper" version 2>/dev/null | first_line))"
+    else
+        row WARN "privilege route" "not probed (--no-sudo): $helper not installed yet (setup phase sudo)"
+    fi
+elif [ -x "$helper" ] && hv="$(sudo -n "$helper" version 2>/dev/null | first_line)" && [ -n "$hv" ]; then
     row OK "privilege route" "sudo -n profiler-root-helper version → $hv"
 elif sudo -n true 2>/dev/null; then
     if [ -x "$helper" ]; then row WARN "privilege route" "passwordless sudo works, but 'sudo -n $helper version' fails (sudoers 91-profiler-helper?)"; else row WARN "privilege route" "passwordless sudo works; profiler-root-helper not installed (setup phase sudo)"; fi

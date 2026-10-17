@@ -16,11 +16,13 @@ _dash_dir() { printf '%s/dashboard\n' "$PROFILER_ROOT"; }
 _dash_unit() { printf '%s/systemd/user/profiler-dashboard.service\n' "${XDG_CONFIG_HOME:-$HOME/.config}"; }
 _dash_url() { printf 'http://%s:%s/\n' "$(hostname 2>/dev/null || echo localhost)" "$PROFILER_DASHBOARD_PORT"; }
 _dash_unit_sum() { sha256sum < "$1" 2>/dev/null | cut -c1-16 || true; }
+# _dash_responds [TRIES] — one quick probe by default (check, verify.sh); apply
+# waits up to ~40 s right after starting the unit
 _dash_responds() {
-    local i
-    for i in 1 2 3 4 5 6 7 8 9 10; do
-        curl -fs -m 3 -o /dev/null "http://127.0.0.1:$PROFILER_DASHBOARD_PORT/" 2>/dev/null && return 0
-        sleep 1
+    local i tries="${1:-1}"
+    for (( i = 1; i <= tries; i++ )); do
+        curl -fs -m 2 -o /dev/null "http://127.0.0.1:$PROFILER_DASHBOARD_PORT/" 2>/dev/null && return 0
+        [ "$i" -ge "$tries" ] || sleep 1
     done
     return 1
 }
@@ -80,12 +82,12 @@ phase_dashboard_apply() {
         run -- systemctl --user restart profiler-dashboard.service || return 1
     fi
     is_dry_run && return 0
-    if _dash_responds; then
+    if _dash_responds 10; then
         ok "dashboard is up: $(_dash_url)"
     else
         warn "the dev server does not answer on port $PROFILER_DASHBOARD_PORT yet: journalctl --user -u profiler-dashboard.service -n 50"
     fi
-    info "from Windows: http://abletonlinux:$PROFILER_DASHBOARD_PORT/ · static build: cd $dir && npm run build"
+    info "from Windows: $(_dash_url) · static build: cd $dir && npm run build"
     phase_note "$(_dash_url)"
     return 0
 }

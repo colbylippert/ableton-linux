@@ -81,7 +81,9 @@ phase_osc_apply() {
     local ul rd inst prefix
     prefix="$(_lp_prefix)"
     if ! ul="$(_osc_user_library)"; then
-        fail "prefix $prefix has no drive_c/users/<user> directory: run phase install first" || return 1
+        prereq_fail "prefix $prefix has no drive_c/users/<user> directory: run phase install first" || return 1
+        info "would record user_library= and run $(_osc_installer) --prefix $prefix --library-path <prefix>/drive_c/users/$(id -un)/Documents/Ableton/User Library"
+        return 0
     fi
     kv "user library" "$ul"
     case "$ul" in

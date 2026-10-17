@@ -10,15 +10,15 @@
 # none exists, and clears stale crash-recovery state.
 #
 # With --yes (non-interactive) nothing is launched: the checklist is printed,
-# an ACTIONS REQUIRED entry asks for `setup-machine.sh --only human`, the phase
-# passes with a warning so the remaining phases can run, and phase golden
-# defers its golden snapshot until the evidence exists.
+# an ACTIONS REQUIRED entry asks for `setup-machine.sh --only human`, and the
+# phase is DEFERRED (phase_defer: no done-marker, summary row "deferred") so the
+# remaining phases can run; phase golden defers its golden snapshot the same
+# way until the evidence exists.
 # PROFILER_HUMAN_TIMEOUT (seconds, default 3600) bounds the wait.
 # Uses the _lp_* helpers from 09-build.sh.
 
 phase_register 13 human "first launch of Live: licence, ASIO/PipeASIO, AbletonOSC (manual checklist)" "install,osc,session"
 
-: "${_HUMAN_DEFERRED:=0}"           # set by apply under --yes: check then passes with a warning
 : "${PROFILER_HUMAN_TIMEOUT:=3600}"
 
 # every Live 12 Preferences directory in the prefix, one per line
@@ -67,11 +67,12 @@ _human_evidence() {
 }
 
 _human_checklist() {
-    local osc_note=""
+    local osc_note="" node=""
     [ "$(cfg_get osc_status)" = installed ] || osc_note=" — (AbletonOSC is not installed yet: skip this item for now)"
-    info "CHECKLIST — in Live on the $(hostname 2>/dev/null || echo VM) desktop (one time per machine):"
-    kv "step 1" "accept the licence; authorise the Trial via ableton.com (browser inside the VM) or continue unauthorised (demo mode: no save/export)"
-    kv "step 2" "Settings > Audio: Driver Type ASIO, Audio Device PipeASIO, Sample Rate 48000 (the buffer size is PipeASIO's: $AUDIO_BUFFER)"
+    if declare -F _install_audio_node >/dev/null; then node="$(_install_audio_node 2>/dev/null || true)"; fi
+    info "CHECKLIST — in Live on the $(hostname 2>/dev/null || echo machine) desktop (one time per machine):"
+    kv "step 1" "accept the licence; authorise the Trial via ableton.com (a browser on this machine) or continue unauthorised (demo mode: no save/export)"
+    kv "step 2" "Settings > Audio: Driver Type ASIO, Audio Device PipeASIO, Sample Rate 48000 (the buffer size is PipeASIO's: $AUDIO_BUFFER; PipeASIO plays into ${node:-the configured sink}$([ "${AUDIO_DEVICE:-null}" = null ] || printf ', muted during benchmark runs'))"
     kv "step 3" "Settings > Link, Tempo & MIDI: Control Surface AbletonOSC, Input/Output None$osc_note"
     kv "step 4" "Settings > Licenses/Maintenance: auto-update and usage data off; Library: Cloud off; leave the GPU renderer at Live's default"
     kv "step 5" "File > Quit (Ctrl+Q) — never SIGTERM/kill Live: that leaves crash-recovery state and reopens the Set next time"
@@ -107,32 +108,28 @@ phase_human_check() {
         phase_note "first launch verified"
         return 0
     fi
-    for r in "${reasons[@]}"; do
-        if [ "$_HUMAN_DEFERRED" = 1 ]; then warn "$r"; else info "$r"; fi
-    done
-    if [ "$_HUMAN_DEFERRED" = 1 ]; then phase_note "deferred (--yes)"; return 0; fi
+    for r in "${reasons[@]}"; do info "$r"; done
     return 1
 }
 
 phase_human_apply() {
     local launcher prefix st launchlog t0 started=0 rc last_hint=0 waited
     launcher="$(_lp_launcher)"; prefix="$(_lp_prefix)"; st="$PROFILER_ROOT/bin/state"
-    [ -x "$launcher" ] || { fail "launcher missing: $launcher (phase install)"; return 1; }
-    [ -n "$(_lp_live_exe "$prefix")" ] || { fail "Live 12 is not installed in $prefix (phase install)"; return 1; }
     [ -x "$st" ] || { fail "missing $st"; return 1; }
+    [ -x "$launcher" ] || prereq_fail "launcher missing: $launcher (phase install)" || return 1
+    [ -n "$(_lp_live_exe "$prefix")" ] || prereq_fail "Live 12 is not installed in $prefix (phase install)" || return 1
     _human_checklist
     if [ "$ASSUME_YES" = 1 ]; then
-        _HUMAN_DEFERRED=1
         warn "non-interactive run (--yes): Live is not launched; complete the checklist later with: $SETUP_ROOT/setup-machine.sh --only human"
         action_required "complete the Live first-launch checklist: setup-machine.sh --only human (interactive, desktop session logged in), then --only golden"
-        phase_note "deferred (--yes)"
+        phase_defer "--yes: the interactive first launch is still to do"
         return 0
     fi
     if _lp_prefix_busy "$prefix"; then
         fail "Live or Wine processes already use $prefix; quit Live (File > Quit) and re-run" || return 1
     fi
     if ! "$PROFILER_ROOT/bin/with-session-env" true >/dev/null 2>&1; then
-        fail "no desktop session (DISPLAY) in 'systemctl --user show-environment': log in on the console (phase session enables SDDM autologin)" || return 1
+        prereq_fail "no desktop session (DISPLAY) in 'systemctl --user show-environment': log in on the console (phase session sets up autologin)" || return 1
     fi
     if "$st" list --names 2>/dev/null | grep -qx post-install; then
         skip "snapshot post-install already exists"

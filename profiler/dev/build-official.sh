@@ -13,7 +13,18 @@
 #      ~/.local/opt/wine-d2d1-nspa-11.13 atomically, keeping a rollback copy)
 #   5. ./scripts/build-audit.sh dist/wine-d2d1-nspa-11.13-<VERSION>.tar.zst
 #      (re-checks the source-tree digest, the patch stack stamp and every
-#      fingerprint against the shipped tarball)
+#      fingerprint against the shipped tarball); a pass is recorded in
+#      ~/.local/state/profiler/build-audit.env — the record setup phase build and
+#      verify.sh read, so they do not re-audit this tarball — and in
+#      ~/.local/state/profiler/dev/last-official-build
+#
+# The golden snapshot and the new runtime: profiler/bin/state records the
+# runtime by identity only and never restores it, so the `state restore --name
+# golden` before the next trial puts back the golden prefix and Live state and
+# leaves THIS runtime in place (restore reports "runtime changed since the
+# snapshot" with both identities). No re-snapshot is needed; to make the new
+# runtime part of the snapshot's record anyway, re-baseline deliberately:
+# profiler/bin/state snapshot --name golden --rebaseline (keeps the old one).
 #
 # While it runs, NOTHING in the repository may change: build.sh snapshots every
 # non-ignored file into /tmp, digests the tree, and aborts if the digest moves
@@ -292,7 +303,7 @@ if [ "$pf_fail" -eq 0 ]; then
     else
         warn "patches/SERIES.sha256 does not satisfy build-audit.sh's series policy: the build's audit will fail (new patch? run ./scripts/build-audit.sh --freeze and update REQUIRED_*_TAIL)"
     fi
-    series_now="$(cd patches && sha256sum [0-9][0-9][0-9][0-9]-*.patch performance/*.patch pipeasio/*.patch 2>/dev/null | sort -k2)"
+    series_now="$(cd patches && { sha256sum [0-9][0-9][0-9][0-9]-*.patch performance/*.patch pipeasio/*.patch 2>/dev/null || true; } | sort -k2)"
     if [ "$series_now" = "$(sort -k2 patches/SERIES.sha256 2>/dev/null)" ]; then
         ok "patches/ matches the frozen series manifest"
     else
@@ -331,13 +342,13 @@ fi
 step "resources"
 mem_avail_kb="$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
 [[ "$mem_avail_kb" =~ ^[0-9]+$ ]] || mem_avail_kb=0
-tmp_avail="$(df -B1 --output=avail /tmp 2>/dev/null | tail -n1 | tr -d ' ')"
+tmp_avail="$(df -B1 --output=avail /tmp 2>/dev/null | tail -n1 | tr -d ' ' || true)"
 [[ "$tmp_avail" =~ ^[0-9]+$ ]] || tmp_avail=0
 tmp_fs="$(findmnt -n -o FSTYPE /tmp 2>/dev/null || echo ?)"
 kv "/tmp" "$(( tmp_avail / 1073741824 )) GiB free ($tmp_fs); build.sh keeps its source snapshot, output stage and host-side audit unpack there (peak ~2.5 GB)"
 if [ "$tmp_avail" -ge $(( 2 * 1073741824 )) ]; then ok "/tmp has >= 2 GiB free"; else pf "/tmp has only $(( tmp_avail / 1048576 )) MiB free; build.sh needs >= 2 GiB there (hard-coded, no TMPDIR)"; fi
 [ "$tmp_fs" != tmpfs ] || info "/tmp is RAM-backed: its peak use counts against the $(( mem_avail_kb / 1048576 )) GiB available to the compile jobs"
-repo_avail="$(df -B1 --output=avail -- "$REPO" 2>/dev/null | tail -n1 | tr -d ' ')"
+repo_avail="$(df -B1 --output=avail -- "$REPO" 2>/dev/null | tail -n1 | tr -d ' ' || true)"
 [[ "$repo_avail" =~ ^[0-9]+$ ]] || repo_avail=0
 kv "free at repo" "$(( repo_avail / 1073741824 )) GiB (dist/ ~1 GB, .ccache up to 5 GB, container storage ~10 GB)"
 [ "$repo_avail" -ge $(( 10 * 1073741824 )) ] || warn "less than 10 GiB free at $REPO"
@@ -427,8 +438,8 @@ else
             summary_add install dry-run $(( $(_now) - t0 ))
         else
             if [ -x "$OFFICIAL_ROOT/bin/wine" ]; then
-                installed_version="$(sed -n 's/^dist-version: *//p' "$OFFICIAL_ROOT/ABLETON-WINE-BUILD-INFO.txt" 2>/dev/null | head -n1)"
-                installed_head="$(sed -n 's/^patch-head: *//p' "$OFFICIAL_ROOT/ABLETON-WINE-BUILD-INFO.txt" 2>/dev/null | head -n1)"
+                installed_version="$(sed -n 's/^dist-version: *//p' "$OFFICIAL_ROOT/ABLETON-WINE-BUILD-INFO.txt" 2>/dev/null | head -n1 || true)"
+                installed_head="$(sed -n 's/^patch-head: *//p' "$OFFICIAL_ROOT/ABLETON-WINE-BUILD-INFO.txt" 2>/dev/null | head -n1 || true)"
                 if cmp -s -- "$OFFICIAL_ROOT/ABLETON-WINE-BUILD-INFO.txt" "dist/BUILD-INFO-$VERSION.txt"; then
                     ok "installed runtime at $OFFICIAL_ROOT is this build (dist-version $installed_version, patch-head ${installed_head:0:12})"
                 else

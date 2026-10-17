@@ -34,7 +34,17 @@
 #     (ts=… stamp=…). A later run always re-evaluates `check`, so phases must be
 #     idempotent: apply only what is missing, re-running must be harmless.
 #   * `check` runs under --dry-run too (it is read-only); `apply` runs as well but
-#     every `run` just prints "[dry-run]" and the post-check is skipped.
+#     every `run` just prints "[dry-run]" and the post-check is skipped. A dry
+#     run previews the whole selection: a phase that fails does not stop the
+#     later ones (a real run stops at the first failure), and inputs an earlier
+#     phase would create are not failures there — use `prereq_fail MSG` for
+#     those (fail normally; under --dry-run a warning) and `require_cmd`, which
+#     only warns under --dry-run (phase packages installs the commands).
+#   * `phase_defer REASON` inside apply (then `return 0`) marks a phase whose
+#     work cannot happen in this run (e.g. the interactive human step under
+#     --yes): the post-check is skipped, NO done-marker is written, the summary
+#     row says "deferred", and the run continues. Add an action_required line
+#     telling the user how to finish it.
 #   * Return codes matter: the runner invokes check/apply as conditions, which
 #     means `set -e` is NOT in effect inside them. Chain every step that must
 #     abort the phase: `run -- cmd || return 1`, `fail "why" || return 1`.
@@ -68,8 +78,20 @@
 #     VM_RAM_CHECK (0|1), ASSUME_YES (0|1), DRY_RUN (0|1), FORCE (0|1), SETUP_ROOT
 #     (profiler/setup), PROFILER_ROOT (profiler/), TEMPLATES_DIR (profiler/setup/
 #     templates), PROFILER_STATE_DIR, PROFILER_TMPDIR (scratch directory the driver
-#     creates before the first phase and removes on exit; use it for temp files).
-#     Helpers: profile_is vm|baremetal, is_dry_run, require_cmd CMD… .
+#     creates before the first phase and removes on exit; use it for temp files),
+#     AUDIO_DEVICE (builtin | null | a PipeWire node.name — option --audio-device;
+#     default builtin on baremetal, null on vm: "builtin" = the default ALSA
+#     Audio/Sink whose node.name contains "Speaker", else the default sink; phase
+#     audio resolves it, records audio_node=<node.name> in setup.conf and mutes it;
+#     profiler/bin/bench re-applies the mute before every run), LAPTOP (1 when a
+#     /sys/class/power_supply/*/type says Battery), PROFILER_NO_SUDO (1 under
+#     --dry-run: helper tools such as profiler/bin/trace-prereqs skip their sudo
+#     probes).
+#     Helpers: profile_is vm|baremetal, is_dry_run, on_laptop, require_cmd CMD…,
+#     prereq_fail MSG, phase_defer REASON. lib/host.sh (sourced by the driver and
+#     verify.sh) adds read-only probes: pwa_resolve_device, pwa_node_id,
+#     pwa_mute_state, pwa_default_sink (PipeWire) and host_has_battery,
+#     host_on_ac, host_power_summary (power supply).
 #   * Templates: write_template SRC DST [--sudo] [--mode M] [--owner U:G] renders
 #     @@VAR@@ tokens from the environment (unresolved tokens are an error), does
 #     nothing when DST already has that content, otherwise installs it through
@@ -77,12 +99,16 @@
 #     line once. With --sudo both probe and read DST as root (`sudo -n test/cat`),
 #     so files in root-only directories such as /etc/sudoers.d are seen; under
 #     --dry-run sudo is never invoked and such files count as absent.
+#   * --dry-run writes nothing at all: no log file, no markers, no setup.conf,
+#     and state_dir/share_dir/cache_dir/config_dir print their path without
+#     creating it. Only PROFILER_TMPDIR (removed on exit) is created.
 #
 # Public API (besides the above): phase_select, phase_run NAME, phases_run_all,
 # phase_list, phase_is_done NAME, sudo_keepalive_start, sudo_keepalive_stop.
 # Variables owned: PHASE_NUMS[] PHASE_NAMES[] PHASE_DESCS[] PHASE_DEPS[]
-# PHASE_INDEX[] PHASES_SELECTED[] CURRENT_PHASE PHASE_NOTE NEED_RELOGIN NEED_REBOOT
-# SUDO_KEEPALIVE_PID SUDO_KEEPALIVE_TRIED PROFILER_TMPDIR_OWNER PHASE_SUMMARY_ON_EXIT.
+# PHASE_INDEX[] PHASES_SELECTED[] CURRENT_PHASE PHASE_NOTE PHASE_DEFERRED
+# NEED_RELOGIN NEED_REBOOT SUDO_KEEPALIVE_PID SUDO_KEEPALIVE_TRIED
+# PROFILER_TMPDIR_OWNER PHASE_SUMMARY_ON_EXIT.
 # Selection inputs: ONLY SKIP FROM FORCE.
 # ==========================================================================
 
@@ -93,6 +119,7 @@ declare -a PHASE_NUMS=() PHASE_NAMES=() PHASE_DESCS=() PHASE_DEPS=() PHASES_SELE
 declare -A PHASE_INDEX=()
 : "${CURRENT_PHASE:=}"
 : "${PHASE_NOTE:=}"
+: "${PHASE_DEFERRED:=0}"
 : "${NEED_RELOGIN:=0}"
 : "${NEED_REBOOT:=0}"
 : "${SUDO_KEEPALIVE_PID:=}"
@@ -115,21 +142,46 @@ declare -A PHASE_INDEX=()
 export PROFILER_STATE_DIR PROFILER_SHARE_DIR PROFILER_CACHE_DIR PROFILER_CONFIG_DIR PROFILER_SETUP_CONF
 
 # ------------------------------------------------------------ helpers ----
-state_dir()  { mkdir -p -- "$PROFILER_STATE_DIR" 2>/dev/null || true; printf '%s\n' "$PROFILER_STATE_DIR"; }
-share_dir()  { mkdir -p -- "$PROFILER_SHARE_DIR" 2>/dev/null || true; printf '%s\n' "$PROFILER_SHARE_DIR"; }
-cache_dir()  { mkdir -p -- "$PROFILER_CACHE_DIR" 2>/dev/null || true; printf '%s\n' "$PROFILER_CACHE_DIR"; }
-config_dir() { mkdir -p -- "$PROFILER_CONFIG_DIR" 2>/dev/null || true; printf '%s\n' "$PROFILER_CONFIG_DIR"; }
+# the state directories (created on first use; under --dry-run only printed)
+_mkdir_unless_dry() { is_dry_run || mkdir -p -- "$1" 2>/dev/null || true; }
+state_dir()  { _mkdir_unless_dry "$PROFILER_STATE_DIR";  printf '%s\n' "$PROFILER_STATE_DIR"; }
+share_dir()  { _mkdir_unless_dry "$PROFILER_SHARE_DIR";  printf '%s\n' "$PROFILER_SHARE_DIR"; }
+cache_dir()  { _mkdir_unless_dry "$PROFILER_CACHE_DIR";  printf '%s\n' "$PROFILER_CACHE_DIR"; }
+config_dir() { _mkdir_unless_dry "$PROFILER_CONFIG_DIR"; printf '%s\n' "$PROFILER_CONFIG_DIR"; }
 profile_is() { [ "$PROFILE" = "$1" ]; }
 is_dry_run() { [ "${DRY_RUN:-0}" = 1 ]; }
+on_laptop()  { [ "${LAPTOP:-0}" = 1 ]; }
 need_relogin() { NEED_RELOGIN=1; action_required "log out and back in (group/limit changes take effect at login)"; }
 need_reboot()  { NEED_REBOOT=1;  action_required "reboot (kernel/package changes take effect at boot)"; }
 phase_note()   { PHASE_NOTE="${PHASE_NOTE:+$PHASE_NOTE; }$*"; }
+# phase_defer REASON — see "WRITING A PHASE": apply calls it, then returns 0
+phase_defer()  { PHASE_DEFERRED=1; phase_note "deferred: $*"; }
 
+# require_cmd CMD… — 0 when every command exists. A real run fails the phase on a
+# missing one; a dry run only warns (phase packages would install it first).
 require_cmd() {
     local c missing=()
     for c in "$@"; do command -v -- "$c" >/dev/null 2>&1 || missing+=("$c"); done
-    [ "${#missing[@]}" -eq 0 ] || { fail "missing command(s): ${missing[*]}"; return 1; }
-    return 0
+    [ "${#missing[@]}" -gt 0 ] || return 0
+    if is_dry_run; then
+        warn "missing command(s): ${missing[*]} (dry run continues; a real run needs them — phase packages installs them)"
+        return 0
+    fi
+    fail "missing command(s): ${missing[*]}"
+    return 1
+}
+
+# prereq_fail MSG — an input that an earlier phase produces is missing (the
+# runtime, the prefix, dist/, the Live media, the desktop session). A real run
+# fails (returns 1, so `… || prereq_fail "…" || return 1`); a dry run warns and
+# continues so the preview reaches every phase.
+prereq_fail() {
+    if is_dry_run; then
+        warn "$* (dry run continues; an earlier phase provides it in a real run)"
+        return 0
+    fi
+    fail "$*"
+    return 1
 }
 
 # true when /dev/tty can actually be opened (permission bits alone lie without a controlling terminal)
@@ -180,6 +232,8 @@ cfg_set() {
     _cfg_key_ok "$key" || { fail "cfg_set: bad key '$key'"; return 1; }
     case "$value" in *$'\n'*) fail "cfg_set: value for $key contains a newline"; return 1 ;; esac
     if is_dry_run; then return 0; fi
+    # no rewrite when the file already holds exactly this value
+    if [ -r "$PROFILER_SETUP_CONF" ] && [ "$(cfg_get "$key" $'\001')" = "$value" ]; then return 0; fi
     mkdir -p -- "$PROFILER_CONFIG_DIR" || { fail "cannot create $PROFILER_CONFIG_DIR"; return 1; }
     tmp="$(mktemp "$PROFILER_CONFIG_DIR/.setup.conf.XXXXXX")" || { fail "cfg_set: mktemp failed"; return 1; }
     if [ -r "$PROFILER_SETUP_CONF" ]; then
@@ -383,7 +437,12 @@ phase_select() {
         missing=""
         while IFS= read -r d; do
             [ -n "$d" ] || continue
-            [ -n "${PHASE_INDEX[$d]+x}" ] || die "phase '$n' depends on unknown phase '$d'" 2
+            if [ -z "${PHASE_INDEX[$d]+x}" ]; then
+                # a phase file that is not delivered (partial tree): --force lets the rest run
+                [ "$FORCE" = 1 ] || die "phase '$n' depends on unknown phase '$d' (missing phase file?)" 2
+                warn "phase '$n' depends on unknown phase '$d' (missing phase file?); continuing because of --force"
+                continue
+            fi
             _in_list "$d" "${sel[@]}" && continue
             phase_is_done "$d" && continue
             missing="${missing:+$missing,}$d"
@@ -429,7 +488,7 @@ phase_run() {
     declare -F "phase_${name}_check" >/dev/null || die "phase '$name' defines no phase_${name}_check" 2
     declare -F "phase_${name}_apply" >/dev/null || die "phase '$name' defines no phase_${name}_apply" 2
     section "$num" "$(_phase_last_num)" "$name"
-    CURRENT_PHASE="$name"; PHASE_NOTE=""
+    CURRENT_PHASE="$name"; PHASE_NOTE=""; PHASE_DEFERRED=0
     t0="$(_now_s)"; warn0="$WARN_COUNT"; fail0="$FAIL_COUNT"
     marker="$(phase_marker "$name")"
     if [ -f "$marker" ]; then
@@ -448,7 +507,10 @@ phase_run() {
     fail0="$FAIL_COUNT"
     step "applying $name"
     if "phase_${name}_apply" && [ "$FAIL_COUNT" -eq "$fail0" ]; then
-        if is_dry_run; then
+        if [ "$PHASE_DEFERRED" = 1 ]; then
+            status="deferred"
+            info "$name deferred: post-check skipped, no done-marker written (see ACTIONS REQUIRED)"
+        elif is_dry_run; then
             status="dry-run"
             ok "$name: dry run complete (post-check skipped)"
         elif "phase_${name}_check"; then
@@ -465,7 +527,7 @@ phase_run() {
     fi
     secs=$(( $(_now_s) - t0 ))
     summary_add "$name" "$status" "$secs" "$PHASE_NOTE"
-    CURRENT_PHASE=""
+    CURRENT_PHASE=""; PHASE_DEFERRED=0
     [ "$status" != failed ]
 }
 
@@ -474,7 +536,8 @@ phases_run_all() {
     [ "${#PHASES_SELECTED[@]}" -gt 0 ] || phase_select
     for (( i = 0; i < ${#PHASES_SELECTED[@]}; i++ )); do
         n="${PHASES_SELECTED[i]}"
-        if [ "$failed" -eq 1 ]; then summary_add "$n" "not-run" 0 "after failure"; continue; fi
+        # a real run stops at the first failure; a dry run previews every phase
+        if [ "$failed" -eq 1 ] && ! is_dry_run; then summary_add "$n" "not-run" 0 "after failure"; continue; fi
         phase_run "$n" || failed=1          # the sudo keepalive starts at the first `run --sudo`, not here
     done
     if [ "$failed" -eq 1 ]; then return 1; fi

@@ -12,10 +12,13 @@
 #       ~/.config/ableton-wine/config (runtime_root=, prefix=) > defaults
 #       (~/.local/opt/wine-d2d1-nspa-11.13, ~/.wine-ableton, ~/.local/bin/ableton-live)
 #   _lp_prefix_pids / _lp_live_pids / _lp_pid_is_wine / _lp_prefix_busy
-#       process detection modelled on scripts/lib/lifecycle.sh (WINEPREFIX= in
-#       /proc/PID/environ; "Ableton Live*.exe" on the command line of a Wine
-#       process — never of a shell that merely names the installer, such as
-#       this driver started with --live-installer)
+#       process detection mirroring scripts/lib/lifecycle.sh
+#       (ableton_prefix_wine_processes_any_runtime + ableton_live_pids): a pid
+#       counts only when /proc/PID/environ carries WINEPREFIX=<prefix> exactly AND
+#       /proc/PID/exe is a Wine binary (any runtime, the dev runtime included);
+#       Live = such a pid whose command line names "Ableton Live…​.exe". A shell
+#       whose arguments merely mention the installer (this driver started with
+#       --live-installer, the `bash -lc` wrapper over SSH) never matches.
 #   _lp_show TEXT        stream captured command output into the terminal + log
 #   _lp_mem_jobs         the driver's MemAvailable job clamp, recomputed now
 #
@@ -65,56 +68,60 @@ _lp_live_exe() {
     done 2>/dev/null | sort -V | tail -n1
     return 0
 }
-# pids whose environment carries WINEPREFIX=<prefix> (any runtime), one per line;
-# this driver and its parent shell are never counted
-_lp_prefix_pids() {
-    local prefix="${1:-$(_lp_prefix)}" proc pid
-    while IFS= read -r -d '' proc; do
-        pid="${proc#/proc/}"; pid="${pid%/environ}"
-        [[ "$pid" =~ ^[0-9]+$ ]] || continue
-        [ "$pid" != "$$" ] && [ "$pid" != "$PPID" ] || continue
-        printf '%s\n' "$pid"
-    done < <(grep -rzlFx --null "WINEPREFIX=$prefix" /proc/[0-9]*/environ 2>/dev/null || true)
-    return 0
+# the runtime roots whose binaries count as Wine besides the generic image names:
+# the configured runtime and its -dev twin (profiler/dev/wine-dev.sh sync)
+_lp_runtime_roots() {
+    local rt
+    rt="$(_lp_runtime_root)"
+    printf '%s\n%s\n' "$rt" "$rt-dev"
 }
-# 0 when PID is a Wine process: /proc/PID/exe resolves to a Wine binary (wine,
-# wine64, the preloaders, wineserver — of any runtime), to a file under the
-# configured runtime root or a */lib/wine/ directory, or its environment carries
-# a WINEPREFIX= (the launcher's children). Mirrors scripts/lib/lifecycle.sh:1-3 —
-# nothing is selected by an image-name match on the command line alone.
+# 0 when PID is a Wine process: /proc/PID/exe resolves to a Wine image (wine,
+# wine64, the preloaders, wineserver[64], .wine-wrapped — any runtime) or to a
+# file under a */lib/wine/ directory or under _lp_runtime_roots. The environment
+# alone never qualifies a process (a shell may carry WINEPREFIX).
 _lp_pid_is_wine() {
     local pid="$1" exe root
     exe="$(readlink -f -- "/proc/$pid/exe" 2>/dev/null || true)"
+    [ -n "$exe" ] || return 1
     case "${exe##*/}" in
         wine|wine64|wine-preloader|wine64-preloader|wineserver|wineserver64|.wine-wrapped) return 0 ;;
     esac
     case "$exe" in */lib/wine/*|*/lib64/wine/*) return 0 ;; esac
-    root="$(readlink -f -- "$(_lp_runtime_root)" 2>/dev/null || true)"
-    if [ -n "$root" ]; then case "$exe" in "$root"/*) return 0 ;; esac; fi
-    grep -qzE '^WINEPREFIX=' "/proc/$pid/environ" 2>/dev/null
+    while IFS= read -r root; do
+        [ -n "$root" ] || continue
+        root="$(readlink -f -- "$root" 2>/dev/null || printf '%s' "$root")"
+        case "$exe" in "$root"/*) return 0 ;; esac
+    done < <(_lp_runtime_roots)
+    return 1
 }
-# pids of every "Ableton Live*.exe" process on the machine: the command line
-# names the Live executable AND the process is a Wine one (_lp_pid_is_wine).
-# A shell whose arguments merely mention "…/Ableton Live 12 Trial Installer.exe"
-# — this driver started with --live-installer, the `bash -lc` / fish wrapper
-# over SSH — is never a match; $$ and $PPID are skipped outright.
-_lp_live_pids() {
-    local proc pid cmd
-    for proc in /proc/[0-9]*; do
-        pid="${proc#/proc/}"
-        [ "$pid" != "$$" ] && [ "$pid" != "$PPID" ] || continue
-        cmd="$(tr '\0' ' ' < "$proc/cmdline" 2>/dev/null || true)"
-        case "$cmd" in *"Ableton Live"*.exe*) ;; *) continue ;; esac
-        _lp_pid_is_wine "$pid" && printf '%s\n' "$pid"
-    done
+# Wine processes of the prefix (WINEPREFIX=<prefix> exactly, any runtime), one
+# pid per line: wineserver, Live, the installer's Inno Setup, Wine services
+_lp_prefix_pids() {
+    local prefix="${1:-}" proc pid
+    [ -n "$prefix" ] || prefix="$(_lp_prefix)"
+    while IFS= read -r -d '' proc; do
+        pid="${proc#/proc/}"; pid="${pid%/environ}"
+        [[ "$pid" =~ ^[0-9]+$ ]] || continue
+        _lp_pid_is_wine "$pid" || continue
+        printf '%s\n' "$pid"
+    done < <(grep -rzlFx --null "WINEPREFIX=$prefix" /proc/[0-9]*/environ 2>/dev/null || true)
     return 0
 }
-# 0 when the prefix is in use: any WINEPREFIX=<prefix> process (wineserver,
-# the launcher, Wine services) or any Live process at all
+# Live processes of the prefix: _lp_prefix_pids whose command line names
+# "Ableton Live…​.exe" (the Live 12 Trial exe, or its installer while phase
+# install runs it)
+_lp_live_pids() {
+    local pid cmd
+    while IFS= read -r pid; do
+        [ -n "$pid" ] || continue
+        cmd="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)"
+        case "$cmd" in *"Ableton Live"*.exe*) printf '%s\n' "$pid" ;; esac
+    done < <(_lp_prefix_pids "${1:-}")
+    return 0
+}
+# 0 when any Wine process uses the prefix (Live, its wineserver, the installer)
 _lp_prefix_busy() {
-    local pids
-    pids="$(_lp_prefix_pids "${1:-}")$(_lp_live_pids)"
-    [ -n "$pids" ]
+    [ -n "$(_lp_prefix_pids "${1:-}")" ]
 }
 # stream TEXT line by line with the "│" prefix to the terminal and the log,
 # exactly like `run` does for command output (for read-only probes in check)
@@ -127,12 +134,12 @@ _lp_show() {
         _log_file "[$ts]     $G_BAR $line"
     done <<< "$1"
 }
-# the driver's formula on the current MemAvailable: max(2, (avail GiB − 2) / 1.2)
+# the driver's formula on the current MemAvailable: max(2, (avail − 2 GiB) / 1.2 GiB)
 _lp_mem_jobs() {
     local avail_kb j
     avail_kb="$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
     [[ "$avail_kb" =~ ^[0-9]+$ ]] || avail_kb=0
-    j=$(( (avail_kb / 1048576 - 2) * 10 / 12 ))
+    j=$(( (avail_kb - 2 * 1048576) * 10 / (12 * 1048576) ))
     [ "$j" -ge 2 ] || j=2
     printf '%s\n' "$j"
 }
@@ -321,9 +328,12 @@ _build_apply_inner() {
     local version tarball jobs mem_jobs ts log t0 secs tmp_avail sum audit_only=0
     require_cmd podman git sha256sum tee zstd tar || return 1
     version="$(_build_version)"
-    [ -n "$version" ] || { fail "cannot read $REPO_DIR/VERSION — run phase repo first"; return 1; }
-    [ -x "$REPO_DIR/build.sh" ] || { fail "no executable build.sh in $REPO_DIR"; return 1; }
-    [ -x "$REPO_DIR/scripts/build-audit.sh" ] || { fail "missing $REPO_DIR/scripts/build-audit.sh"; return 1; }
+    if [ -z "$version" ]; then
+        prereq_fail "cannot read $REPO_DIR/VERSION — run phase repo first" || return 1
+        version="VERSION"
+    fi
+    [ -x "$REPO_DIR/build.sh" ] || prereq_fail "no executable build.sh in $REPO_DIR (phase repo)" || return 1
+    [ -x "$REPO_DIR/scripts/build-audit.sh" ] || prereq_fail "missing $REPO_DIR/scripts/build-audit.sh (phase repo)" || return 1
     tarball="$(_build_tarball "$version")"
 
     # artifacts that already verify need only the audit: the record is missing
@@ -396,7 +406,7 @@ _build_apply_inner() {
     _build_audit_run "$version" "$tarball" || {
         info "the audit failed (exit $RUN_STATUS): the artifacts do not match the patch series — a rebuild follows on the next run"
         if ! is_dry_run && [ -s "$tarball.sha256" ]; then
-            sum="$(awk '{print $1; exit}' "$tarball.sha256")"
+            sum="$(awk '{print $1; exit}' "$tarball.sha256" || true)"
             _build_record_write failed "$version" "$tarball" "$sum" "$log" "$secs" "$jobs" || true
         fi
         fail "scripts/build-audit.sh failed for $tarball" || return 1

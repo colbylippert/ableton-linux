@@ -8,45 +8,83 @@
 #   * --output defaults to ~/.local/share/profiler/runs/<UTC>-<tag>/bench
 #     (never inside the repo: build.sh snapshots every non-ignored file)
 #   * ABLETON_WINE_ROOT is honoured (A/B against the dev runtime) and shown
+#   * bare metal: before every run the audio node PipeASIO drives (audio_node=
+#     in ~/.config/profiler/setup.conf — the built-in speaker sink with
+#     --audio-device builtin) is muted again with `wpctl set-mute ID 1`, so the
+#     real hardware clock runs and nothing is heard; a configured node that is
+#     not in PipeWire stops the run (exit 2), because PipeASIO would fall back
+#     to another device and clock. --no-audio-check skips this.
+#   * a laptop (a Battery power supply) refuses to start on battery: the CPU
+#     clocks and EPP follow the battery policy and the numbers are not
+#     comparable (exit 2). --allow-battery overrides.
 #   * every other argument is forwarded unchanged — see scripts/bench-suite.sh
 #     --help (--tag, --duration, --trace off|interface|drilldown, --scenario,
-#     --sets, --dry-run, …)
+#     --sets, --dry-run, …); under the suite's --dry-run nothing is muted
+#     (the mute is printed instead)
 # The run directory is printed at the end, also after a failure or a dry run.
 set -euo pipefail
 
 here="$(cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")" && pwd -P)"
 repo="$(cd -- "$here/../.." && pwd -P)"
 suite="$repo/scripts/bench-suite.sh"
+host_lib="$here/../setup/lib/host.sh"
 runs_root="${PROFILER_SHARE_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/profiler}/runs"
+setup_conf="${PROFILER_SETUP_CONF:-${XDG_CONFIG_HOME:-$HOME/.config}/profiler/setup.conf}"
 
 usage() {
     cat <<EOF
-usage: profiler/bin/bench [--tag LABEL] [--output DIR] [bench-suite options...]
+usage: profiler/bin/bench [--tag LABEL] [--output DIR] [--allow-battery] [--no-audio-check]
+                          [bench-suite options...]
 
 Wrapper around scripts/bench-suite.sh: exports ABL_BENCH_OSC_SEND=11000 and
 ABL_BENCH_OSC_RECV=11001 (AbletonOSC bench handler) unless already set, runs the
 suite inside the desktop session (with-session-env), defaults --output to
 $runs_root/<UTC>-<tag>/bench
 and prints the run directory at the end. ABLETON_WINE_ROOT selects the runtime.
+
+Before every run it mutes the audio node PipeASIO drives (audio_node= in
+$setup_conf) and, on a laptop, refuses to run on battery.
+  --allow-battery     measure on battery anyway (numbers are not comparable)
+  --no-audio-check    do not check or mute the audio node
 Everything else is passed through; the suite's own help follows.
 
 EOF
 }
 
-[ -x "$suite" ] || { printf 'bench: missing %s\n' "$suite" >&2; exit 2; }
+say() { printf 'bench: %s\n' "$*"; }
+die() { printf 'bench: %s\n' "$*" >&2; exit "${2:-2}"; }
+cfg() {   # KEY → last value in setup.conf ("" when absent)
+    local line value=""
+    [ -r "$setup_conf" ] || return 0
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in "$1="*) value="${line#*=}" ;; esac
+    done < "$setup_conf"
+    printf '%s\n' "$value"
+}
+
+[ -x "$suite" ] || die "missing $suite"
+[ -r "$host_lib" ] || die "missing $host_lib"
+# shellcheck source=../setup/lib/host.sh
+. "$host_lib"
 export ABL_BENCH_OSC_SEND="${ABL_BENCH_OSC_SEND:-11000}"
 export ABL_BENCH_OSC_RECV="${ABL_BENCH_OSC_RECV:-11001}"
 
 tag=manual
 output=""
+allow_battery=0
+audio_check=1
+suite_dry=0
 args=()
 while [ $# -gt 0 ]; do
     case "$1" in
         -h|--help) usage; exec "$suite" --help ;;
-        --tag) [ $# -ge 2 ] || { printf 'bench: --tag needs a value\n' >&2; exit 2; }; tag="$2"; args+=(--tag "$2"); shift ;;
+        --tag) [ $# -ge 2 ] || die "--tag needs a value"; tag="$2"; args+=(--tag "$2"); shift ;;
         --tag=*) tag="${1#*=}"; args+=(--tag "$tag") ;;
-        --output) [ $# -ge 2 ] || { printf 'bench: --output needs a value\n' >&2; exit 2; }; output="$2"; args+=(--output "$2"); shift ;;
+        --output) [ $# -ge 2 ] || die "--output needs a value"; output="$2"; args+=(--output "$2"); shift ;;
         --output=*) output="${1#*=}"; args+=(--output "$output") ;;
+        --allow-battery) allow_battery=1 ;;
+        --no-audio-check) audio_check=0 ;;
+        --dry-run) suite_dry=1; args+=("$1") ;;
         *) args+=("$1") ;;
     esac
     shift
@@ -64,11 +102,52 @@ else
     run_dir="$(dirname -- "$output")"
 fi
 
-printf 'bench: runtime  %s\n' "${ABLETON_WINE_ROOT:-(configured default: ~/.config/ableton-wine/config or ~/.local/opt/wine-d2d1-nspa-11.13)}"
-printf 'bench: osc      send %s / recv %s\n' "$ABL_BENCH_OSC_SEND" "$ABL_BENCH_OSC_RECV"
-printf 'bench: output   %s\n' "$output"
+# ------------------------------------------------------------- power ----
+if host_has_battery; then
+    say "power    $(host_power_summary)"
+    if ! host_on_ac; then
+        if [ "$allow_battery" -eq 1 ]; then
+            say "WARNING: on battery (--allow-battery): CPU clocks and EPP follow the battery policy; these numbers are not comparable with runs on AC"
+        else
+            die "the laptop runs on battery: plug in the charger, or pass --allow-battery for a run whose numbers are not comparable"
+        fi
+    fi
+fi
+say "cpufreq  governor $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo '?'), EPP $(cat /sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference 2>/dev/null || echo '?'), profile $(timeout 5 powerprofilesctl get 2>/dev/null || echo '?')"
+
+# ------------------------------------------------------------- audio ----
+audio_device="$(cfg audio_device)"
+audio_node="$(cfg audio_node)"
+if [ "$audio_check" -eq 1 ] && [ -z "$audio_node" ] && [ -n "$audio_device" ] && [ "$audio_device" != null ]; then
+    audio_node="$(pwa_resolve_device "$audio_device" || true)"
+    [ -z "$audio_node" ] || say "WARNING: audio_node is not recorded in $setup_conf (setup phase audio); --audio-device $audio_device resolves to $audio_node"
+fi
+if [ "$audio_check" -eq 0 ]; then
+    say "audio    not checked (--no-audio-check)"
+elif [ -z "$audio_node" ] || [ "$audio_node" = profiler-null ]; then
+    say "audio    ${audio_node:-profiler-null} (virtual sink: nothing to mute)"
+else
+    pipeasio_ini="${XDG_CONFIG_HOME:-$HOME/.config}/pipeasio/config.ini"
+    configured="$(sed -n 's/^[[:space:]]*output_device[[:space:]]*=[[:space:]]*//p' "$pipeasio_ini" 2>/dev/null | tail -n1 | sed 's/[[:space:]]*$//' || true)"
+    [ "$configured" = "$audio_node" ] || say "WARNING: PipeASIO's output_device is '${configured:-unset}', not $audio_node ($pipeasio_ini; setup phase install)"
+    if ! node_id="$(pwa_node_id "$audio_node")"; then
+        die "audio node $audio_node (audio_node= in $setup_conf) is not in PipeWire: PipeASIO would fall back to another device and clock — check wpctl status / setup-machine.sh --only audio, or pass --no-audio-check"
+    fi
+    if [ "$suite_dry" -eq 1 ]; then
+        say "audio    $audio_node (id $node_id, $(pwa_mute_state "$audio_node")); dry run: would run  wpctl set-mute $node_id 1"
+    else
+        wpctl set-mute "$node_id" 1 || die "wpctl set-mute $node_id 1 failed for $audio_node"
+        state="$(pwa_mute_state "$audio_node")"
+        [ "$state" = muted ] || say "WARNING: $audio_node reports '$state' after wpctl set-mute"
+        say "audio    $audio_node (id $node_id) muted"
+    fi
+fi
+
+say "runtime  ${ABLETON_WINE_ROOT:-(configured default: ~/.config/ableton-wine/config or ~/.local/opt/wine-d2d1-nspa-11.13)}"
+say "osc      send $ABL_BENCH_OSC_SEND / recv $ABL_BENCH_OSC_RECV"
+say "output   $output"
 
 rc=0
 "$here/with-session-env" "$suite" ${args[@]+"${args[@]}"} || rc=$?
-printf 'bench: run directory %s (exit %s)\n' "$run_dir" "$rc"
+say "run directory $run_dir (exit $rc)"
 exit "$rc"

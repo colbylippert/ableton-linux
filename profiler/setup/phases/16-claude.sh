@@ -12,6 +12,12 @@
 phase_register 16 claude "Claude Code native install, PATH for bash and fish, login instructions" ""
 
 _claude_marker='profiler PATH'
+# 0 when FILE has an uncommented statement that sources ~/.bashrc
+# (`[[ -f ~/.bashrc ]] && . ~/.bashrc`, `source "$HOME/.bashrc"`, …) — a mere
+# mention of the name (a comment, the snippet's own text) does not count
+_claude_sources_bashrc() {
+    grep -qE '^[^#]*(\.|source)[[:space:]]+"?(~|\$HOME|\$\{HOME\})/\.bashrc' "$1" 2>/dev/null
+}
 _claude_bin() { printf '%s/.local/bin/claude\n' "$HOME"; }
 _claude_fish_conf() { printf '%s/fish/conf.d/profiler.fish\n' "${XDG_CONFIG_HOME:-$HOME/.config}"; }
 _claude_env_file() { printf '%s/env\n' "$PROFILER_CONFIG_DIR"; }
@@ -46,6 +52,7 @@ phase_claude_check() {
     if [ -f "$(_claude_fish_conf)" ]; then ok "fish PATH snippet present ($(_claude_fish_conf))"; else info "fish PATH snippet missing"; return 1; fi
     if grep -qF "$_claude_marker" "$HOME/.bashrc" 2>/dev/null; then ok "~/.bashrc has the PATH snippet"; else info "~/.bashrc lacks the PATH snippet"; return 1; fi
     if grep -qF "$_claude_marker" "$HOME/.bash_profile" 2>/dev/null; then ok "~/.bash_profile has the PATH snippet"; else info "~/.bash_profile lacks the PATH snippet"; return 1; fi
+    if _claude_sources_bashrc "$HOME/.bash_profile"; then ok "~/.bash_profile sources ~/.bashrc"; else info "~/.bash_profile does not source ~/.bashrc (login shells would skip it)"; return 1; fi
     if command -v fish >/dev/null 2>&1; then
         if fish -c 'command -v claude' >/dev/null 2>&1; then ok "fish -c 'command -v claude' works"; else warn "a fresh fish does not find claude (check ~/.config/fish/conf.d/profiler.fish)"; fi
     fi
@@ -84,11 +91,25 @@ phase_claude_apply() {
     fi
     step "PATH snippets for fish and bash"
     write_template "$TEMPLATES_DIR/profiler.fish" "$(_claude_fish_conf)" --mode 0644 || return 1
+    # ~/.bash_profile must source ~/.bashrc BEFORE anything is appended to it. A
+    # login bash reads only the first of ~/.bash_profile, ~/.bash_login and
+    # ~/.profile, so creating ~/.bash_profile from the snippet alone would stop
+    # login shells from reading ~/.bashrc and ~/.profile. When it is created
+    # here, it first sources the file a login bash read until now.
+    if [ ! -e "$HOME/.bash_profile" ]; then
+        if [ -f "$HOME/.bash_login" ]; then
+            ensure_line "$HOME/.bash_profile" '[[ -f ~/.bash_login ]] && . ~/.bash_login' || return 1
+        elif [ -f "$HOME/.profile" ]; then
+            ensure_line "$HOME/.bash_profile" '[[ -f ~/.profile ]] && . ~/.profile' || return 1
+        fi
+    fi
+    if ! _claude_sources_bashrc "$HOME/.bash_profile"; then
+        ensure_line "$HOME/.bash_profile" '[[ -f ~/.bashrc ]] && . ~/.bashrc' || return 1
+    else
+        skip "~/.bash_profile already sources ~/.bashrc"
+    fi
     _claude_append_snippet "$HOME/.bashrc" || return 1
     _claude_append_snippet "$HOME/.bash_profile" || return 1
-    if ! grep -q bashrc "$HOME/.bash_profile" 2>/dev/null; then
-        ensure_line "$HOME/.bash_profile" '[[ -f ~/.bashrc ]] && . ~/.bashrc' || return 1
-    fi
     envf="$(_claude_env_file)"
     if [ ! -e "$envf" ]; then
         tmp="$(mktemp "${PROFILER_TMPDIR:-${TMPDIR:-/tmp}}/profiler-env.XXXXXX")" || { fail "mktemp failed"; return 1; }

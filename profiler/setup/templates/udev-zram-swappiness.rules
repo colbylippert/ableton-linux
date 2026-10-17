@@ -1,0 +1,8 @@
+# /etc/udev/rules.d/99-profiler-zram-swappiness.rules — written by
+# profiler/setup/phases/04-limits.sh when a distribution udev rule sets
+# vm.swappiness as zram0 comes up (CachyOS: cachyos-settings'
+# /usr/lib/udev/rules.d/30-zram.rules sets 150 at every boot, after
+# systemd-sysctl has applied /etc/sysctl.d/90-ableton-rt.conf). udev runs rules
+# files in lexical order across directories, so this later rule leaves the RT
+# profile's value (scripts/setup-realtime.sh) in force. Delete it to revert.
+ACTION=="change", KERNEL=="zram0", ATTR{initstate}=="1", SYSCTL{vm.swappiness}="@@SWAPPINESS@@"

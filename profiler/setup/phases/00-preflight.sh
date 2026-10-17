@@ -13,14 +13,256 @@
 #     running kernel
 # Read-only probes call commands directly (not through `run`), so they keep
 # working under --dry-run.
+#
+# Bare metal (the laptop) adds, as facts and warnings — never as hard failures,
+# since later phases fix most of it: power (AC vs battery, battery capacity;
+# profiler/bin/bench refuses to measure on battery), the hybrid CPU topology
+# (/sys/devices/cpu_core/cpus = P-cores, cpu_atom/cpus = E-cores), cpufreq
+# driver/governor/EPP/turbo, power-profiles-daemon and its profile, ananicy-cpp,
+# irqbalance and rtkit, the graphics adapters (Intel iGPU + NVIDIA dGPU note),
+# the network path (Wi-Fi vs Ethernet, Wi-Fi power save), the display manager
+# and its autologin, the lid-switch policy and the audio device that
+# --audio-device resolves to. PREFLIGHT_NO_NET=1 (verify.sh --quick) skips the
+# reachability probes.
 
-phase_register 00 preflight "distro, CPU, kernel, tracing facilities, resources, network, session" ""
+phase_register 00 preflight "distro, CPU, kernel, tracing facilities, resources, power, network, session, audio" ""
 
 : "${PREFLIGHT_RC:=}"          # cached audit result for this process ("" = not run yet)
 : "${PF_HARD:=0}"
+: "${PREFLIGHT_NO_NET:=0}"
 declare -a PREFLIGHT_FACTS=()
 
 _pf_fact() { PREFLIGHT_FACTS+=("$1=$2"); }
+_pf_read() { cat -- "$1" 2>/dev/null | head -n1 | tr -d '\n' || true; }   # first line of a sysfs file, "" when absent
+
+# --------------------------------------------------- bare-metal sections ----
+# power supply: AC vs battery (a measurement on battery is invalid: the CPU
+# clocks and EPP follow the battery policy)
+_pf_power() {
+    local line
+    declare -F host_has_battery >/dev/null || return 0      # lib/host.sh not loaded
+    step "power"
+    if ! host_has_battery; then
+        kv "power supply" "$(host_power_summary)"
+        _pf_fact laptop 0
+        return 0
+    fi
+    kv "power supply" "$(host_power_summary)"
+    _pf_fact laptop 1
+    while IFS= read -r line; do _pf_fact "${line%%=*}" "${line#*=}"; done < <(host_battery_facts)
+    if host_on_ac; then
+        ok "laptop on AC power"
+    else
+        warn "the laptop runs on BATTERY: plug in the charger — the build drains it, and profiler/bin/bench refuses to measure on battery (--allow-battery overrides)"
+    fi
+}
+
+# CPU: model, hybrid P/E topology, cpufreq policy, power profile, schedulers' helpers
+_pf_cpu() {
+    local model core atom drv gov epp noturbo ppd prof svc st
+    step "CPU topology and power policy"
+    model="$(sed -n 's/^model name[[:space:]]*:[[:space:]]*//p' /proc/cpuinfo 2>/dev/null | head -n1 || true)"
+    kv "cpu" "${model:-?} ($(nproc 2>/dev/null || echo ?) threads)"
+    _pf_fact cpu_model "${model:-}"
+    core="$(_pf_read /sys/devices/cpu_core/cpus)"; atom="$(_pf_read /sys/devices/cpu_atom/cpus)"
+    if [ -n "$core" ] && [ -n "$atom" ]; then
+        kv "hybrid topology" "P-cores (cpu_core) $core · E-cores (cpu_atom) $atom"
+        info "hybrid CPU: pin the measured threads to P-cores ($core); E-cores ($atom) are slower and add variance"
+    elif [ -n "$core" ]; then
+        kv "topology" "cpu_core $core (no E-cores)"
+    fi
+    _pf_fact cpu_core_cpus "$core"
+    _pf_fact cpu_atom_cpus "$atom"
+    drv="$(_pf_read /sys/devices/system/cpu/cpu0/cpufreq/scaling_driver)"
+    gov="$(_pf_read /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor)"
+    epp="$(_pf_read /sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference)"
+    noturbo="$(_pf_read /sys/devices/system/cpu/intel_pstate/no_turbo)"
+    st="$(_pf_read /sys/devices/system/cpu/intel_pstate/status)"
+    kv "cpufreq" "driver ${drv:-?}${st:+ ($st)}, governor ${gov:-?}, EPP ${epp:-?}${noturbo:+, no_turbo $noturbo}"
+    _pf_fact cpufreq_driver "$drv"; _pf_fact governor "$gov"; _pf_fact epp "$epp"; _pf_fact no_turbo "$noturbo"
+    ppd=""; prof=""
+    if systemctl is-active -q power-profiles-daemon.service 2>/dev/null; then
+        ppd=active
+        prof="$(timeout 5 powerprofilesctl get 2>/dev/null || true)"
+        kv "power profile" "${prof:-?} (power-profiles-daemon; the launcher holds 'performance' while Live runs with --power=performance)"
+    else
+        ppd=inactive
+        kv "power profile" "power-profiles-daemon not active"
+    fi
+    _pf_fact power_profiles_daemon "$ppd"; _pf_fact power_profile "$prof"
+    for svc in ananicy-cpp irqbalance rtkit-daemon; do
+        st="$(systemctl is-active "$svc.service" 2>/dev/null || true)"
+        _pf_fact "svc_${svc//-/_}" "${st:-unknown}"
+    done
+    st="$(systemctl is-active ananicy-cpp.service 2>/dev/null || true)"
+    if [ "$st" = active ]; then
+        if profile_is baremetal; then
+            info "ananicy-cpp is active: it renices processes by rule (Wine/Live included) — setup disables it through the root helper (profiler-root-helper knob set ananicy off; reset restores it)"
+        else
+            kv "ananicy-cpp" "active"
+        fi
+    else
+        kv "ananicy-cpp" "${st:-not installed}"
+    fi
+    kv "irqbalance / rtkit" "$(systemctl is-active irqbalance.service 2>/dev/null || echo '?') / $(systemctl is-active rtkit-daemon.service 2>/dev/null || echo '?')"
+}
+
+# graphics adapters: the Intel iGPU drives the desktop (Xwayland :0, where Live
+# renders); an NVIDIA dGPU stays idle unless something is launched with prime-run
+_pf_gpu() {
+    local gpus nv=0 intel=0 ver rpm="" d
+    command -v lspci >/dev/null 2>&1 || { kv "graphics" "lspci not installed (pciutils)"; return 0; }
+    gpus="$(lspci 2>/dev/null | grep -Ei 'vga|3d controller|display controller' || true)"
+    [ -n "$gpus" ] || return 0
+    step "graphics"
+    _pf_show_lines "$gpus"
+    if grep -qi nvidia <<< "$gpus"; then nv=1; fi
+    if grep -qi intel <<< "$gpus"; then intel=1; fi
+    _pf_fact gpu_nvidia "$nv"; _pf_fact gpu_intel "$intel"
+    if [ "$nv" -eq 1 ] && [ "$intel" -eq 1 ]; then
+        ver="$(sed -n 's/^NVRM version: *//p' /proc/driver/nvidia/version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n1 || true)"
+        for d in /sys/bus/pci/devices/*; do
+            [ "$(_pf_read "$d/vendor")" = 0x10de ] || continue
+            case "$(_pf_read "$d/class")" in 0x0300*|0x0302*) rpm="$(_pf_read "$d/power/runtime_status")"; break ;; esac
+        done
+        info "hybrid graphics: the Intel iGPU drives the Plasma session and Xwayland (where Live draws); the NVIDIA dGPU${ver:+ (driver $ver)} stays unused unless a program starts with prime-run${rpm:+; its runtime PM state is '$rpm'}"
+        _pf_fact gpu_nvidia_runtime_pm "$rpm"
+    fi
+}
+
+# network path: Wi-Fi vs Ethernet and the Wi-Fi power-save state (power save on
+# adds ~100 ms latency spikes to the SSH link the profiler is driven over)
+_pf_netpath() {
+    local dev wifi=0 ps="" n carrier
+    dev="$(ip route show default 2>/dev/null | sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -n1 || true)"
+    [ -n "$dev" ] || { kv "default route" "none"; _pf_fact net_default_dev ""; return 0; }
+    if [ -d "/sys/class/net/$dev/wireless" ] || [ -e "/sys/class/net/$dev/phy80211" ]; then wifi=1; fi
+    _pf_fact net_default_dev "$dev"; _pf_fact net_wifi "$wifi"
+    if [ "$wifi" -eq 1 ]; then
+        if command -v iw >/dev/null 2>&1; then
+            ps="$(iw dev "$dev" get power_save 2>/dev/null | sed -n 's/^Power save: *//p' | head -n1 || true)"
+        fi
+        kv "network" "Wi-Fi ($dev), power save ${ps:-unknown}"
+        _pf_fact wifi_power_save "${ps:-unknown}"
+        if [ "$ps" = on ]; then
+            info "Wi-Fi power save is on (~100 ms latency spikes): setup turns it off (NetworkManager drop-in + iw)"
+        fi
+        for n in /sys/class/net/*; do
+            [ -e "$n/device" ] || continue
+            if [ -d "$n/wireless" ] || [ -e "$n/phy80211" ]; then continue; fi
+            carrier="$(_pf_read "$n/carrier")"
+            [ "$carrier" = 1 ] || info "Ethernet ${n##*/} is present but has no link: a cable gives a steadier SSH connection than Wi-Fi"
+        done
+    else
+        kv "network" "wired ($dev)"
+    fi
+}
+
+# display manager and its autologin user (Plasma Login Manager reads
+# /usr/lib/plasmalogin/plasmalogin.conf.d, /etc/plasmalogin.conf.d, then
+# /etc/plasmalogin.conf — the last User= wins; SDDM the same with sddm.conf)
+_pf_display_manager() {
+    local unit dm="" user=""
+    unit="$(readlink -f /etc/systemd/system/display-manager.service 2>/dev/null || true)"
+    case "${unit##*/}" in
+        plasmalogin.service) dm=plasmalogin ;;
+        sddm.service) dm=sddm ;;
+        "") dm="" ;;
+        *) dm="${unit##*/}"; dm="${dm%.service}" ;;
+    esac
+    _pf_fact display_manager "${dm:-none}"
+    case "$dm" in
+        plasmalogin|sddm)
+            user="$(_pf_autologin_user "$dm")"
+            kv "display manager" "$dm (autologin user: ${user:-none})"
+            _pf_fact autologin_user "$user"
+            if [ "${AUTOLOGIN:-0}" = 1 ] && [ "$user" != "$(id -un)" ]; then
+                info "autologin is not set for $(id -un) yet: phase session configures $dm (--autologin)"
+            fi ;;
+        "") kv "display manager" "none (display-manager.service is not linked)" ;;
+        *) kv "display manager" "$dm (not plasmalogin/sddm: --autologin is not supported for it)" ;;
+    esac
+}
+# the effective [Autologin] User= of DM (plasmalogin|sddm), "" when none
+_pf_autologin_user() {
+    local dm="$1" f user="" sect="" line
+    local -a files=()
+    shopt -s nullglob
+    files=(/usr/lib/"$dm"/"$dm".conf.d/*.conf /etc/"$dm".conf.d/*.conf /etc/"$dm".conf)
+    shopt -u nullglob
+    for f in "${files[@]}"; do
+        [ -r "$f" ] || continue
+        sect=""
+        while IFS= read -r line || [ -n "$line" ]; do
+            line="${line%$'\r'}"
+            case "$line" in
+                \[*\]) sect="$line" ;;
+                User=*) if [ "$sect" = "[Autologin]" ]; then user="${line#User=}"; fi ;;
+            esac
+        done < "$f"
+    done
+    printf '%s\n' "$user"
+}
+
+# lid switch: closing the lid on AC must not suspend an unattended run
+_pf_lid() {
+    local lid ext dock
+    command -v busctl >/dev/null 2>&1 || return 0
+    lid="$(busctl get-property org.freedesktop.login1 /org/freedesktop/login1 org.freedesktop.login1.Manager HandleLidSwitch 2>/dev/null | sed -n 's/^s "\(.*\)"$/\1/p' || true)"
+    ext="$(busctl get-property org.freedesktop.login1 /org/freedesktop/login1 org.freedesktop.login1.Manager HandleLidSwitchExternalPower 2>/dev/null | sed -n 's/^s "\(.*\)"$/\1/p' || true)"
+    dock="$(busctl get-property org.freedesktop.login1 /org/freedesktop/login1 org.freedesktop.login1.Manager HandleLidSwitchDocked 2>/dev/null | sed -n 's/^s "\(.*\)"$/\1/p' || true)"
+    kv "lid switch" "battery ${lid:-?} · AC ${ext:-(same as battery)} · docked ${dock:-?}"
+    _pf_fact lid_switch "$lid"; _pf_fact lid_switch_external_power "$ext"; _pf_fact lid_switch_docked "$dock"
+    [ -n "$ext" ] || ext="$lid"
+    if [ "$ext" != ignore ]; then
+        info "closing the lid on AC would $ext the laptop: setup sets HandleLidSwitchExternalPower=ignore (logind drop-in)"
+    fi
+}
+
+# audio: PipeWire, the default sink and the node --audio-device resolves to
+_pf_audio() {
+    local def res
+    declare -F pwa_available >/dev/null || return 0      # lib/host.sh not loaded
+    step "audio"
+    if ! pwa_available; then
+        warn "PipeWire is not reachable for $(id -un) (pw-cli): the installer needs a running PipeWire >= 1.4.2 — log in to the desktop session"
+        _pf_fact pipewire 0
+        return 0
+    fi
+    _pf_fact pipewire 1
+    kv "pipewire" "$(pw-cli --version 2>/dev/null | sed -n 's/^Linked with libpipewire //p' | head -n1 || true)"
+    def="$(pwa_default_sink || true)"
+    kv "default sink" "${def:-none}"
+    _pf_fact audio_default_sink "${def:-}"
+    _pf_fact audio_device "${AUDIO_DEVICE:-}"
+    case "${AUDIO_DEVICE:-null}" in
+        null)
+            kv "audio device" "null → profiler-null (virtual sink created by phase audio)" ;;
+        *)
+            if res="$(pwa_resolve_device "$AUDIO_DEVICE")" && [ -n "$res" ]; then
+                if pwa_node_id "$res" >/dev/null; then
+                    kv "audio device" "$AUDIO_DEVICE → $res (state: $(pwa_mute_state "$res"))"
+                    [ "$AUDIO_DEVICE" != builtin ] || case "$res" in *Speaker*) ;; *) warn "no ALSA sink has \"Speaker\" in its node.name: --audio-device builtin falls back to the default sink $res" ;; esac
+                else
+                    warn "audio device '$res' is not a PipeWire node right now (wpctl status / pw-cli ls Node list the names)"
+                fi
+                _pf_fact audio_resolved "$res"
+            else
+                warn "--audio-device $AUDIO_DEVICE resolves to no PipeWire sink (no ALSA sink and no default sink)"
+            fi ;;
+    esac
+}
+
+# print multi-line text as "│" lines (terminal + log)
+_pf_show_lines() {
+    local line ts
+    while IFS= read -r line || [ -n "$line" ]; do
+        [ -n "$line" ] || continue
+        ts="$(now_hms)"
+        printf '%s[%s]%s     %s%s%s %s\n' "$C_DIM" "$ts" "$C_RESET" "$C_DIM" "$G_BAR" "$C_RESET" "$line" >&"$LOG_FD"
+        _log_file "[$ts]     $G_BAR $line"
+    done <<< "$1"
+}
 _pf_fail() { PF_HARD=$(( PF_HARD + 1 )); fail "$*" || true; }
 _pf_http() {   # _pf_http URL [--any] → prints the HTTP status code ("" when unreachable)
     local url="$1" code
@@ -163,7 +405,11 @@ _preflight_audit() {
     else
         ok "RAM ${mem_gib} GiB"
     fi
-    kv "build jobs" "${JOBS:-?} (${JOBS_SOURCE:-auto})"
+    if [ "${JOBS_SOURCE:-auto}" = auto ]; then
+        kv "build jobs" "${JOBS:-?} = min(nproc $(nproc 2>/dev/null || echo ?), max(2, (MemAvailable $(( avail_kb / 1024 )) MiB - 2 GiB) / 1.2 GiB))"
+    else
+        kv "build jobs" "${JOBS:-?} (${JOBS_SOURCE})"
+    fi
     _pf_fact jobs "${JOBS:-}"
     if [ "$swap_kb" -gt 0 ]; then ok "swap present ($(( (swap_kb + 524288) / 1048576 )) GiB)"; else warn "no swap: a -j${JOBS:-?} Wine build may run out of memory"; fi
     home_avail="$(df -B1 --output=avail -- "$HOME" 2>/dev/null | tail -n1 | tr -d ' ')"
@@ -195,27 +441,37 @@ _preflight_audit() {
     kv "transparent hugepages" "$thp"
     _pf_fact thp "$thp"
 
+    # ----------------------------------------- power, CPU policy, graphics
+    _pf_power
+    _pf_cpu
+    _pf_gpu
+
     # ------------------------------------------------------------- network
     step "network"
-    for url in https://github.com https://snapshot.ubuntu.com https://apt.llvm.org; do
-        code="$(_pf_http "$url")"
-        if [[ "$code" =~ ^[23][0-9][0-9]$ ]]; then ok "$url ($code)"; else warn "$url unreachable (http ${code:-none}); the container image build needs it"; fi
-    done
-    code="$(_pf_http https://registry-1.docker.io/v2/ --any)"
-    case "$code" in
-        2[0-9][0-9]|401) ok "https://registry-1.docker.io/v2/ ($code)" ;;
-        *) warn "docker registry unreachable (http ${code:-none}); the base image pull needs it" ;;
-    esac
-    if command -v pacman-conf >/dev/null 2>&1; then
-        url="$(pacman-conf -r core Server 2>/dev/null | head -n1)"
-        if [ -n "$url" ]; then
-            code="$(_pf_http "$url/core.db")"
-            if [[ "$code" =~ ^[23][0-9][0-9]$ ]]; then ok "pacman mirror $url ($code)"; else warn "pacman mirror $url unreachable (http ${code:-none})"; fi
-        else
-            warn "pacman-conf lists no server for [core]"
-        fi
+    _pf_netpath
+    if [ "$PREFLIGHT_NO_NET" = 1 ]; then
+        info "reachability probes skipped (PREFLIGHT_NO_NET=1)"
     else
-        warn "pacman-conf not found; mirror reachability not checked"
+        for url in https://github.com https://snapshot.ubuntu.com https://apt.llvm.org; do
+            code="$(_pf_http "$url")"
+            if [[ "$code" =~ ^[23][0-9][0-9]$ ]]; then ok "$url ($code)"; else warn "$url unreachable (http ${code:-none}); the container image build needs it"; fi
+        done
+        code="$(_pf_http https://registry-1.docker.io/v2/ --any)"
+        case "$code" in
+            2[0-9][0-9]|401) ok "https://registry-1.docker.io/v2/ ($code)" ;;
+            *) warn "docker registry unreachable (http ${code:-none}); the base image pull needs it" ;;
+        esac
+        if command -v pacman-conf >/dev/null 2>&1; then
+            url="$(pacman-conf -r core Server 2>/dev/null | head -n1 || true)"
+            if [ -n "$url" ]; then
+                code="$(_pf_http "$url/core.db")"
+                if [[ "$code" =~ ^[23][0-9][0-9]$ ]]; then ok "pacman mirror $url ($code)"; else warn "pacman mirror $url unreachable (http ${code:-none})"; fi
+            else
+                warn "pacman-conf lists no server for [core]"
+            fi
+        else
+            warn "pacman-conf not found; mirror reachability not checked"
+        fi
     fi
 
     # ------------------------------------------------------------- session
@@ -236,13 +492,23 @@ _preflight_audit() {
     if command -v vmware-toolbox-cmd >/dev/null 2>&1; then
         kv "vmware timesync" "$(vmware-toolbox-cmd timesync status 2>/dev/null || true)"
     fi
+    _pf_display_manager
+    if host_has_battery 2>/dev/null; then _pf_lid; fi
+
+    # --------------------------------------------------------------- audio
+    _pf_audio
 
     # --------------------------------------------------------------- tools
+    # checked directly, not with require_cmd: these are hard requirements of the
+    # driver itself, in a dry run too
     step "tools this script needs"
-    if require_cmd sudo curl git tar zstd sha256sum timeout flock; then
+    local c
+    local -a tmiss=()
+    for c in sudo curl git tar zstd sha256sum timeout flock; do command -v -- "$c" >/dev/null 2>&1 || tmiss+=("$c"); done
+    if [ "${#tmiss[@]}" -eq 0 ]; then
         ok "sudo curl git tar zstd sha256sum timeout flock"
     else
-        PF_HARD=$(( PF_HARD + 1 ))
+        _pf_fail "missing command(s) the setup itself needs: ${tmiss[*]} (pacman -S --needed ${tmiss[*]})"
     fi
 
     PREFLIGHT_RC="$PF_HARD"

@@ -6,9 +6,10 @@
 # snapshot, tracer prerequisites, Claude Code and the dashboard.
 #
 # Run as your own user (never root), on the target machine:
-#   profiler/setup/setup-machine.sh --profile vm
-# Over SSH (the login shell is fish, so go through bash -lc; -t for sudo):
-#   ssh -t abletonlinux 'bash -lc "~/Projects/ableton-linux/profiler/setup/setup-machine.sh --profile vm"'
+#   profiler/setup/setup-machine.sh --profile baremetal --passwordless-sudo --autologin
+# Over SSH (the login shell is fish, so go through bash -lc; -t for the one sudo prompt):
+#   ssh -t ableton-laptop 'bash -lc "~/Projects/ableton-linux/profiler/setup/setup-machine.sh --profile baremetal --passwordless-sudo --autologin"'
+# (profiler/setup/bootstrap.md has the Windows-side steps before the first run.)
 #
 # Options persist to ~/.config/profiler/setup.conf, so re-runs need no flags.
 # Each phase is idempotent and resumable; see lib/phase.sh for the conventions.
@@ -46,27 +47,38 @@ phase checks the host first and only applies what is missing, so the script
 is safe to re-run after a failure, a reboot or a re-login.
 
 Profile (required on the first run; remembered in ~/.config/profiler/setup.conf):
-  --profile vm          development VM: passwordless sudo on, SDDM autologin on,
-                        PipeASIO buffer 128, no timing claims
-  --profile baremetal   measurement machine: passwordless sudo off, autologin off,
-                        buffer 64 (the root helper still gets a NOPASSWD rule)
+  --profile vm          development VM: passwordless sudo on, autologin on,
+                        PipeASIO buffer 128 on the profiler-null sink, no timing claims
+  --profile baremetal   measurement machine (the laptop): buffer 64, PipeASIO on
+                        the built-in speaker sink (muted), timing claims valid;
+                        passwordless sudo and autologin off unless asked for
+                        (the root helper always gets its own NOPASSWD rule)
 
 Paths and build:
   --live-installer PATH  Ableton Live 12 Trial installer .exe (the -N.bin slices
                          must sit beside it)  [MEDIA_DIR/Ableton Live 12 Trial Installer.exe]
   --media-dir DIR        where the Live media lives            [~/Proprietary/ableton]
   --repo-dir DIR         the ableton-linux checkout to build   [~/Projects/ableton-linux]
-  --jobs N               build parallelism [min(nproc, (MemAvailable-2 GiB)/1.2 GiB)]
+  --jobs N               build parallelism [min(nproc, max(2, (MemAvailable-2 GiB)/1.2 GiB))]
   --audio-buffer N       PipeASIO buffer: 64|128|256|512|1024  [vm 128, baremetal 64]
+  --audio-device D       the PipeWire sink PipeASIO drives     [vm null, baremetal builtin]
+                           builtin   the default ALSA sink whose node.name contains
+                                     "Speaker" (else the default sink): a real
+                                     hardware clock, muted during benchmark runs
+                           null      the profiler-null sink (virtual clock)
+                           NODE      a PipeWire node.name, verbatim (wpctl status,
+                                     pw-cli ls Node)
 
 Host policy (profile defaults; --no-… turns a default off):
   --passwordless-sudo / --no-passwordless-sudo   NOPASSWD ALL rule for this user
-  --autologin / --no-autologin                   SDDM autologin into Plasma Wayland
+  --autologin / --no-autologin                   display-manager autologin into
+                                                 Plasma (Plasma Login Manager or SDDM)
   --vm-ram-check         warn and print the .vmx instructions when RAM < 12 GiB
 
 Run control:
   --yes                  non-interactive: no checklist wait, accept defaults
-  --dry-run              print every command, change nothing (sudo never invoked)
+  --dry-run              print every command, change nothing (sudo never invoked,
+                         no log file, nothing saved); every phase is previewed
   --only P[,P]           run only these phases (dependencies must be done already)
   --skip P[,P]           skip these phases
   --from P               start at phase P
@@ -81,6 +93,8 @@ and a summary table with warnings and required actions at the end.
 Exit codes: 0 ok · 1 phase failed · 2 usage · 3 re-login/reboot required.
 
 Examples:
+  setup-machine.sh --profile baremetal --passwordless-sudo --autologin
+  setup-machine.sh --profile baremetal --dry-run
   setup-machine.sh --profile vm --vm-ram-check
   setup-machine.sh --from build --yes
   setup-machine.sh --only audio,install --dry-run
@@ -94,7 +108,7 @@ usage_error() {
 }
 
 # ---------------------------------------------------------- option parsing ----
-opt_profile="" opt_installer="" opt_media="" opt_repo="" opt_jobs="" opt_buffer=""
+opt_profile="" opt_installer="" opt_media="" opt_repo="" opt_jobs="" opt_buffer="" opt_audio=""
 opt_pwsudo="" opt_autologin="" opt_ramcheck="" list_phases=0
 ASSUME_YES=0 DRY_RUN=0 FORCE=0 ONLY="" SKIP="" FROM=""
 
@@ -118,6 +132,7 @@ while [ $# -gt 0 ]; do
         --repo-dir)       need_value "$@"; opt_repo="$2"; shift ;;
         --jobs)           need_value "$@"; opt_jobs="$2"; shift ;;
         --audio-buffer)   need_value "$@"; opt_buffer="$2"; shift ;;
+        --audio-device)   need_value "$@"; opt_audio="$2"; shift ;;
         --passwordless-sudo)    opt_pwsudo=1 ;;
         --no-passwordless-sudo) opt_pwsudo=0 ;;
         --autologin)            opt_autologin=1 ;;
@@ -143,11 +158,14 @@ done
 case "$opt_profile" in ""|vm|baremetal) ;; *) usage_error "--profile must be vm or baremetal (got '$opt_profile')" ;; esac
 [ -z "$opt_jobs" ] || [[ "$opt_jobs" =~ ^[1-9][0-9]*$ ]] || usage_error "--jobs needs a positive integer (got '$opt_jobs')"
 case "$opt_buffer" in ""|64|128|256|512|1024) ;; *) usage_error "--audio-buffer must be 64, 128, 256, 512 or 1024 (got '$opt_buffer')" ;; esac
+# a PipeWire node.name: letters, digits and _ . : @ + - (alsa_output.pci-0000_00_1f.3-platform-…__sink)
+audio_device_ok() { [[ "$1" =~ ^[A-Za-z0-9_][A-Za-z0-9_.:@+-]{0,254}$ ]]; }
+[ -z "$opt_audio" ] || audio_device_ok "$opt_audio" || usage_error "--audio-device must be builtin, null or a PipeWire node.name (got '$opt_audio')"
 [ -n "$ONLY$SKIP$FROM" ] && [ "$list_phases" -eq 1 ] && usage_error "--list-phases takes no phase selection"
 [ -z "$ONLY" ] || [ -z "$FROM" ] || usage_error "--only and --from exclude each other"
 
 # ------------------------------------------------------------- libraries ----
-for lib in log.sh phase.sh; do
+for lib in log.sh phase.sh host.sh; do
     [ -r "$SETUP_ROOT/lib/$lib" ] || { printf '!! missing library %s\n' "$SETUP_ROOT/lib/$lib" >&2; exit 2; }
     # shellcheck source=/dev/null
     . "$SETUP_ROOT/lib/$lib"
@@ -180,9 +198,9 @@ fi
 case "$PROFILE" in vm|baremetal) ;; *) usage_error "saved profile '$PROFILE' in $PROFILER_SETUP_CONF is invalid; pass --profile" ;; esac
 
 if [ "$PROFILE" = vm ]; then
-    def_pwsudo=1 def_autologin=1 def_buffer=128
+    def_pwsudo=1 def_autologin=1 def_buffer=128 def_audio=null
 else
-    def_pwsudo=0 def_autologin=0 def_buffer=64
+    def_pwsudo=0 def_autologin=0 def_buffer=64 def_audio=builtin
 fi
 
 default_repo="$HOME/Projects/ableton-linux"
@@ -207,9 +225,14 @@ AUDIO_BUFFER="${opt_buffer:-$(cfg_get audio_buffer "$def_buffer")}"
 PASSWORDLESS_SUDO="${opt_pwsudo:-$(cfg_get passwordless_sudo "$def_pwsudo")}"
 AUTOLOGIN="${opt_autologin:-$(cfg_get autologin "$def_autologin")}"
 VM_RAM_CHECK="${opt_ramcheck:-$(cfg_get vm_ram_check 0)}"
+AUDIO_DEVICE="${opt_audio:-$(cfg_get audio_device "$def_audio")}"
 case "$AUDIO_BUFFER" in 64|128|256|512|1024) ;; *) usage_error "saved audio_buffer '$AUDIO_BUFFER' is invalid; pass --audio-buffer" ;; esac
+audio_device_ok "$AUDIO_DEVICE" || usage_error "saved audio_device '$AUDIO_DEVICE' is invalid; pass --audio-device builtin|null|NODE"
+# a laptop: some /sys/class/power_supply/*/type says Battery (lib/host.sh)
+if host_has_battery; then LAPTOP=1; else LAPTOP=0; fi
 
-# build parallelism: option > saved > min(nproc, max(2, (MemAvailable - 2 GiB) / 1.2 GiB))
+# build parallelism: option > saved > min(nproc, max(2, (MemAvailable - 2 GiB) / 1.2 GiB)),
+# ~1.2 GiB per compile job (16 GiB laptop, ~13.5 GiB available: 9 jobs of 16 threads)
 JOBS_SOURCE=option
 JOBS="$opt_jobs"
 if [ -z "$JOBS" ]; then JOBS="$(cfg_get jobs)"; JOBS_SOURCE=config; fi
@@ -219,37 +242,43 @@ if [ -z "$JOBS" ] || ! [[ "$JOBS" =~ ^[1-9][0-9]*$ ]]; then
     if [ -r /proc/meminfo ]; then
         avail_kb="$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)"
         if [[ "$avail_kb" =~ ^[0-9]+$ ]]; then
-            mem_jobs=$(( (avail_kb / 1048576 - 2) * 10 / 12 ))
+            mem_jobs=$(( (avail_kb - 2 * 1048576) * 10 / (12 * 1048576) ))
             [ "$mem_jobs" -ge 2 ] || mem_jobs=2
             [ "$mem_jobs" -ge "$JOBS" ] || JOBS="$mem_jobs"
         fi
     fi
 fi
+# under --dry-run, helper tools the checks call (profiler/bin/trace-prereqs) skip sudo
+if [ "$DRY_RUN" = 1 ]; then PROFILER_NO_SUDO=1; else PROFILER_NO_SUDO="${PROFILER_NO_SUDO:-0}"; fi
 export PROFILE MEDIA_DIR LIVE_INSTALLER REPO_DIR AUDIO_BUFFER PASSWORDLESS_SUDO AUTOLOGIN VM_RAM_CHECK JOBS JOBS_SOURCE
+export AUDIO_DEVICE LAPTOP PROFILER_NO_SUDO
 
 # ------------------------------------------------------------- go ----
-log_init
+# a dry run writes nothing, not even its log (the terminal shows everything)
+if [ "$DRY_RUN" = 1 ]; then log_init --no-file; else log_init; fi
 # one scratch directory for the whole run, created here (in this shell, so the EXIT
 # trap in lib/phase.sh removes it) and inherited by every phase as PROFILER_TMPDIR
 _tmpdir >/dev/null || exit 2
 printf '%s%sWine Interface Profiler — machine setup%s  %s(%s profile)%s\n' "$C_BOLD" "$C_CYAN" "$C_RESET" "$C_DIM" "$PROFILE" "$C_RESET" >&"$LOG_FD"
 _log_file "Wine Interface Profiler — machine setup ($PROFILE profile)"
-kv "host" "$(hostname 2>/dev/null || uname -n) · $(id -un)"
+kv "host" "$(hostname 2>/dev/null || uname -n) · $(id -un)$([ "$LAPTOP" = 1 ] && printf ' · laptop (%s)' "$(host_power_summary)")"
 kv "repo" "$REPO_DIR"
 kv "media dir" "$MEDIA_DIR"
 kv "live installer" "$LIVE_INSTALLER"
 kv "jobs" "$JOBS ($JOBS_SOURCE)"
 kv "audio buffer" "$AUDIO_BUFFER"
+kv "audio device" "$AUDIO_DEVICE$([ "$AUDIO_DEVICE" = builtin ] && printf ' (speaker sink, muted during runs)')"
 kv "passwordless sudo" "$([ "$PASSWORDLESS_SUDO" = 1 ] && echo on || echo off)"
 kv "autologin" "$([ "$AUTOLOGIN" = 1 ] && echo on || echo off)"
 kv "log" "${LOGFILE:-(none)}"
-[ "$DRY_RUN" != 1 ] || info "dry run: commands are printed, nothing is changed, options are not saved"
+[ "$DRY_RUN" != 1 ] || info "dry run: commands are printed, nothing is changed (no sudo, no log, options not saved); every phase is previewed"
 [ "$FORCE" != 1 ] || info "force: done-markers and passing checks are ignored"
 
 # persist the effective options so re-runs need no flags
 if [ "$DRY_RUN" != 1 ]; then
     cfg_set profile "$PROFILE" && cfg_set media_dir "$MEDIA_DIR" && cfg_set live_installer "$LIVE_INSTALLER" \
         && cfg_set repo_dir "$REPO_DIR" && cfg_set audio_buffer "$AUDIO_BUFFER" \
+        && cfg_set audio_device "$AUDIO_DEVICE" \
         && cfg_set passwordless_sudo "$PASSWORDLESS_SUDO" && cfg_set autologin "$AUTOLOGIN" \
         && cfg_set vm_ram_check "$VM_RAM_CHECK" || die "cannot save options to $PROFILER_SETUP_CONF" 2
     [ "$JOBS_SOURCE" = auto ] || cfg_set jobs "$JOBS" || true

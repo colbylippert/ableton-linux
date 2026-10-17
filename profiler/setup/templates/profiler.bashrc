@@ -1,6 +1,7 @@
 # profiler PATH — appended by profiler/setup/phases/16-claude.sh (do not remove this marker line)
 # Claude Code (native install) and the project's user-level tools live in ~/.local/bin.
-# This block sits in ~/.bashrc (interactive shells) and ~/.bash_profile (bash -lc …).
+# The same block is appended to the interactive rc file and to the login profile
+# (bash -lc …, the remote invocation form): it is idempotent, so both may run.
 case ":${PATH}:" in
     *":${HOME}/.local/bin:"*) ;;
     *) PATH="${HOME}/.local/bin:${PATH}" ;;
