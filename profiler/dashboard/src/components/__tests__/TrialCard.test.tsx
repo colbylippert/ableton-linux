@@ -78,7 +78,8 @@ describe('<TrialCard>', () => {
     expect(m.$$('.tc-runref .chip').filter((c) => c.textContent?.includes('missing record'))).toHaveLength(2);
     expect(m.$('.tc-missing')?.textContent).toContain('2 run references');
     expect(m.$('.tc-guard')?.textContent).toContain('reject');
-    expect(m.$('.tc-guard')?.textContent).toContain('1 xrun on B');
+    // the guard compares B with A per Set (xruns 0 on A, 1 on B)
+    expect(m.$('.tc-guard')?.textContent).toContain('xruns 0 → 1 on B');
   });
 
   it('dims a tooling trial and reports no runs', () => {

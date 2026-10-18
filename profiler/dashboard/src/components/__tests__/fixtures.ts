@@ -144,6 +144,7 @@ export const FIXTURE_TRIALS: Trial[] = [
       primary: 'late_blocks',
       per_set: { Benchmark_Zero: { a_median: 20.1, b_median: 17.0, aa_spread: 0.3, delta: -3.1, ratio_to_spread: 10.3 } },
       xruns: { a: 0, b: 0 },
+      pipewire_errors: null,
       cpu_live_pct: { a: 20.1, b: 17.0 },
     },
     traced_confirmation: { call_site_share_before: 0.62, after: 0.2 },

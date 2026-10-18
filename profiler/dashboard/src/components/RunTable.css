@@ -5,7 +5,10 @@
 }
 
 .rt-sets {
-  font-size: 12px;
+  display: inline-flex;
+  gap: 4px;
+  align-items: center;
+  white-space: nowrap;
 }
 
 .rt table.data td .chip {

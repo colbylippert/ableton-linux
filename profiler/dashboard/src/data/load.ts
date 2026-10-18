@@ -378,6 +378,7 @@ function normalizeMetrics(v: unknown): TrialMetrics | null {
     primary: str(v.primary) ?? '',
     per_set,
     xruns: normalizeArmValues(v.xruns),
+    pipewire_errors: normalizeArmValues(v.pipewire_errors),
     cpu_live_pct: normalizeArmValues(v.cpu_live_pct),
   };
 }

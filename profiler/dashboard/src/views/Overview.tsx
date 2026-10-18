@@ -253,6 +253,62 @@ export function armDropouts(join: TrialJoin): { a: number; b: number; setRuns: n
   return setRuns > 0 ? { a, b, setRuns } : null;
 }
 
+/** Dropouts per minute of audio and the median DSP load average over every Set of these runs. */
+export interface ArmFigures {
+  errorsPerMinute: number | null;
+  dspMedian: number | null;
+  setRuns: number;
+}
+
+export function armFigures(runs: readonly Run[]): ArmFigures {
+  let errors = 0;
+  let minutes = 0;
+  let setRuns = 0;
+  const dsp: number[] = [];
+  for (const run of runs) {
+    for (const m of Object.values(run.sets)) {
+      if (typeof m.pipewire_errors === 'number' && run.duration_s) {
+        errors += m.pipewire_errors;
+        minutes += run.duration_s / 60;
+        setRuns += 1;
+      }
+      if (typeof m.dsp_avg === 'number') dsp.push(m.dsp_avg);
+    }
+  }
+  dsp.sort((a, b) => a - b);
+  const dspMedian = dsp.length ? (dsp.length % 2 ? dsp[(dsp.length - 1) / 2]! : (dsp[dsp.length / 2 - 1]! + dsp[dsp.length / 2]!) / 2) : null;
+  return { errorsPerMinute: minutes > 0 ? errors / minutes : null, dspMedian, setRuns };
+}
+
+export interface KeptGain {
+  baseTrial: string;
+  nowTrial: string;
+  before: ArmFigures;
+  after: ArmFigures;
+  /** Fewer dropouts = positive (the dashboard's sign convention: positive = improvement). */
+  dropoutPct: number | null;
+}
+
+/**
+ * What the kept trials deliver together: the earliest kept trial's A arm (none of the kept changes) against
+ * the latest trial's A arm (every kept change on, because later trials keep them on both arms).
+ */
+export function keptTrialGain(joins: readonly TrialJoin[]): KeptGain | null {
+  const armA = (j: TrialJoin) => j.runs.abab.map((p) => p.a).filter((r): r is Run => r !== null);
+  const byDate = [...joins].sort((x, y) => Date.parse(x.trial.date) - Date.parse(y.trial.date));
+  const base = byDate.find((j) => j.trial.verdict === 'keep' && armA(j).length > 0);
+  if (!base) return null;
+  const now = [...byDate].reverse().find((j) => armA(j).length > 0);
+  if (!now) return null;
+  const before = armFigures(armA(base));
+  const after = armFigures(armA(now));
+  const dropoutPct =
+    before.errorsPerMinute !== null && after.errorsPerMinute !== null && before.errorsPerMinute > 0
+      ? (before.errorsPerMinute - after.errorsPerMinute) / before.errorsPerMinute
+      : null;
+  return { baseTrial: base.trial.trial, nowTrial: now.trial.trial, before, after, dropoutPct };
+}
+
 const countFormat = (v: number | null): string => (v === null ? NULL_TEXT : String(Math.round(v)));
 
 export default function OverviewView({ data, filter, onFilterChange }: ViewProps) {
@@ -406,6 +462,11 @@ export default function OverviewView({ data, filter, onFilterChange }: ViewProps
   ];
 
   const heroTone = heroStatus(hero.significance, heroDirection);
+  const keptGainRaw = keptTrialGain(joins);
+  const keptGain = keptGainRaw && keptGainRaw.dropoutPct !== null ? keptGainRaw : null;
+  const keptDirection = keptGain ? pctDirection(keptGain.dropoutPct) : 'flat';
+  const perMinute = (v: number | null) => (v === null ? NULL_TEXT : v.toFixed(v < 1 ? 2 : 1));
+  const dspText = (v: number | null) => (v === null ? NULL_TEXT : `${v.toFixed(1)}%`);
 
   return (
     <section className="view view-overview">
@@ -424,21 +485,36 @@ export default function OverviewView({ data, filter, onFilterChange }: ViewProps
       <SetChips sets={allSetNames} filter={filter} onFilterChange={onFilterChange} />
 
       <div className="overview-top">
-        <section className={`card overview-hero tone-${heroTone}`}>
-          <HeroFigure
-            label="Cumulative gain"
-            value={formatPctSigned(hero.medianPct)}
-            direction={heroDirection}
-            significant={hero.significance === 'beyond'}
-            sub={
-              hero.medianPct === null
-                ? `${heroDef.label}: no baseline or no latest value in the slice`
-                : `${heroDef.label}, median of ${hero.sets} Set${hero.sets === 1 ? '' : 's'} vs baseline${heroBaseline ? ` ${formatDate(heroBaseline.startedAt)}` : ''}`
-            }
-            kept={kept}
-          />
+        <section className={`card overview-hero tone-${keptGain ? (keptDirection === 'better' ? 'good' : keptDirection === 'worse' ? 'critical' : 'dim') : heroTone}`}>
+          {keptGain ? (
+            <HeroFigure
+              label="Cumulative gain"
+              value={formatPctSigned(keptGain.dropoutPct)}
+              direction={keptDirection}
+              significant={keptDirection === 'better'}
+              sub={`Fewer dropouts: PipeWire errors per minute ${perMinute(keptGain.before.errorsPerMinute)} → ${perMinute(keptGain.after.errorsPerMinute)}; DSP load ${dspText(keptGain.before.dspMedian)} → ${dspText(keptGain.after.dspMedian)} (untraced, ${keptGain.baseTrial} arm A → ${keptGain.nowTrial} arm A)`}
+              kept={kept}
+            />
+          ) : (
+            <HeroFigure
+              label="Cumulative gain"
+              value={formatPctSigned(hero.medianPct)}
+              direction={heroDirection}
+              significant={hero.significance === 'beyond'}
+              sub={
+                hero.medianPct === null
+                  ? `${heroDef.label}: no baseline or no latest value in the slice`
+                  : `${heroDef.label}, median of ${hero.sets} Set${hero.sets === 1 ? '' : 's'} vs baseline${heroBaseline ? ` ${formatDate(heroBaseline.startedAt)}` : ''}`
+              }
+              kept={kept}
+            />
+          )}
           <div className="overview-hero-chips">
-            <Badge {...significanceBadge(hero.significance, heroDirection)} />
+            {keptGain ? (
+              <Badge kind="significance" value="kept by pre-registered trials" status="good" icon="✓" title="Every kept change passed its own pre-registered ABAB rule" />
+            ) : (
+              <Badge {...significanceBadge(hero.significance, heroDirection)} />
+            )}
             {keptTrials.map((j) => (
               <Badge key={j.trial.trial} kind="switch" value={j.trial.change.switch ?? j.trial.trial} title={`${j.trial.trial} kept`} />
             ))}

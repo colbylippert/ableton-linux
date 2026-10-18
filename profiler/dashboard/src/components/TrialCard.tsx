@@ -23,7 +23,6 @@ import {
   formatNumber,
   formatShare,
   identityOf,
-  isGuardReject,
   METRICS,
   metric,
   metricValue,
@@ -80,6 +79,34 @@ export function probeText(trial: Trial): string {
   const p = trial.probe_result;
   if (!p) return NULL_TEXT;
   return `${p.pass} ✓ ${p.fail} ✗ ${p.skip} ↷`;
+}
+
+/**
+ * Dropout guard (DESIGN.md §4.3): per Set, the PipeWire errors and the xruns summed over every ABAB pair
+ * whose A and B runs are both in history; a Set fails when B's total is higher than A's.
+ */
+export function dropoutGuardHits(join: TrialJoin): string[] {
+  const totals = new Map<string, { ea: number; eb: number; xa: number; xb: number }>();
+  for (const p of join.runs.abab) {
+    if (!p.a || !p.b) continue;
+    for (const [set, mb] of Object.entries(p.b.sets)) {
+      const ma = p.a.sets[set];
+      if (!ma) continue;
+      const t = totals.get(set) ?? { ea: 0, eb: 0, xa: 0, xb: 0 };
+      t.ea += ma.pipewire_errors ?? 0;
+      t.eb += mb.pipewire_errors ?? 0;
+      t.xa += ma.xruns ?? 0;
+      t.xb += mb.xruns ?? 0;
+      totals.set(set, t);
+    }
+  }
+  const hits: string[] = [];
+  for (const set of orderSets(totals.keys())) {
+    const t = totals.get(set)!;
+    if (t.eb > t.ea) hits.push(`${setLabel(set)}: PipeWire errors ${formatInt(t.ea)} → ${formatInt(t.eb)} on B`);
+    if (t.xb > t.xa) hits.push(`${setLabel(set)}: xruns ${formatInt(t.xa)} → ${formatInt(t.xb)} on B`);
+  }
+  return hits;
 }
 
 /** Share of `key` in `run.sets[set].call_sites_top`, or null. */
@@ -151,17 +178,20 @@ export default function TrialCard({ join, runs, trials }: TrialCardProps) {
   const hostVirt = typeof trial.host === 'string' && trial.host.startsWith('vm:') ? trial.host.slice(3) || 'unknown' : null;
   const virtualisation = virtualisedRuns[0]?.virtualization ?? hostVirt;
 
-  // Guard: any B run with xruns / PipeWire errors, or the ledger's own xruns on B.
-  const guardHits: string[] = [];
-  for (const p of join.runs.abab) {
-    if (!p.b) continue;
-    for (const [set, m] of Object.entries(p.b.sets)) {
-      if (isGuardReject('xruns', m.xruns)) guardHits.push(`${setLabel(set)}: ${formatInt(m.xruns)} xrun${m.xruns === 1 ? '' : 's'} on B`);
-      if (isGuardReject('pipewire_errors', m.pipewire_errors)) guardHits.push(`${setLabel(set)}: ${formatInt(m.pipewire_errors)} PipeWire errors on B`);
+  // Guard: the dropout counts must not be worse on B than on A. Totals per Set over the ABAB pairs
+  // whose two runs are both in history (one chip per Set and metric); the ledger's own totals are the
+  // fallback when no pair resolves.
+  const guardHits = dropoutGuardHits(join);
+  const ledgerErrors = trial.metrics?.pipewire_errors ?? null;
+  const ledgerXruns = trial.metrics?.xruns ?? null;
+  if (guardHits.length === 0 && !join.runs.abab.some((p) => p.a && p.b)) {
+    if (ledgerErrors && ledgerErrors.a !== null && ledgerErrors.b !== null && ledgerErrors.b > ledgerErrors.a) {
+      guardHits.push(`PipeWire errors ${formatInt(ledgerErrors.a)} → ${formatInt(ledgerErrors.b)} on B (ledger)`);
+    }
+    if (ledgerXruns && ledgerXruns.a !== null && ledgerXruns.b !== null && ledgerXruns.b > ledgerXruns.a) {
+      guardHits.push(`xruns ${formatInt(ledgerXruns.a)} → ${formatInt(ledgerXruns.b)} on B (ledger)`);
     }
   }
-  const ledgerXruns = trial.metrics?.xruns;
-  if (ledgerXruns && ledgerXruns.b !== null && ledgerXruns.b > 0 && guardHits.length === 0) guardHits.push(`${formatInt(ledgerXruns.b)} xruns on B (ledger)`);
 
   // Traced confirmation: ledger values first, else derived from the traced runs' call sites.
   const evidence = trial.evidence[0] ?? null;
@@ -256,6 +286,14 @@ export default function TrialCard({ join, runs, trials }: TrialCardProps) {
               <>
                 <dt>primary</dt>
                 <dd className="mono">{trial.metrics.primary || NULL_TEXT}</dd>
+                {trial.metrics.pipewire_errors ? (
+                  <>
+                    <dt>PipeWire errors A / B</dt>
+                    <dd>
+                      {formatInt(trial.metrics.pipewire_errors.a)} / {formatInt(trial.metrics.pipewire_errors.b)}
+                    </dd>
+                  </>
+                ) : null}
                 <dt>xruns A / B</dt>
                 <dd>
                   {formatInt(trial.metrics.xruns?.a ?? null)} / {formatInt(trial.metrics.xruns?.b ?? null)}

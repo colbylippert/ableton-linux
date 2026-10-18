@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { RUN, runById } from '../../data/__fixtures__';
-import RunTable, { runTableColumns, switchesText, toggleSelection } from '../RunTable';
+import RunTable, { audioDeviceLabel, runTableColumns, switchesText, toggleSelection } from '../RunTable';
 import { click, mount, type Mounted } from './d3-harness';
 
 describe('toggleSelection / switchesText', () => {
@@ -52,5 +52,10 @@ describe('<RunTable>', () => {
     expect(m.$('tr.is-selected')?.textContent).toContain(RUN.baseline);
     m.rerender(<RunTable runs={[]} selected={[]} onSelect={() => undefined} />);
     expect(m.text()).toContain('No runs in this slice.');
+  });
+
+  it('shortens PipeWire node names to a readable device label', () => {
+    expect(audioDeviceLabel('alsa_output.usb-Focusrite_Scarlett_2i4_USB-00.pro-output-0')).toBe('Focusrite_Scarlett_2i4 · pro-output-0');
+    expect(audioDeviceLabel('alsa_output.pci-0000_00_1f.3-platform-skl_hda_dsp_generic.HiFi__Speaker__sink').endsWith('…')).toBe(true);
   });
 });

@@ -187,6 +187,8 @@ export interface TrialMetrics {
   primary: string;
   per_set: Record<string, TrialSetMetrics>;
   xruns: ArmValues | null;
+  /** Total PipeWire errors per arm (T0003 onward; T0001/T0002 recorded these totals under `xruns`). */
+  pipewire_errors: ArmValues | null;
   cpu_live_pct: ArmValues | null;
 }
 

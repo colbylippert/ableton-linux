@@ -96,7 +96,8 @@ export const PALETTE: Readonly<Record<ThemeMode, PaletteTokens>> = {
     border: 'rgba(255, 255, 255, 0.12)',
     deltaGoodText: '#4be3a0',
     focus: '#3fe0e6',
-    series: ['#3fe0e6', '#ff8a5c', '#a6e85a', '#ffd257', '#ff74b8', '#7aa8ff', '#c79bff', '#ff6b72'],
+    // slots 3 and 6 swapped from the Abyss template: Inbuilts periwinkle vs Max4Live amber passes the CVD check
+    series: ['#3fe0e6', '#ff8a5c', '#7aa8ff', '#ffd257', '#ff74b8', '#a6e85a', '#c79bff', '#ff6b72'],
     seriesDim: '#5f7f87',
     seq: SEQ,
     divNeg: '#ff6b72',

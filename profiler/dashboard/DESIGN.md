@@ -191,7 +191,7 @@ view). Views never own filter state; they may narrow it (clicking a Set name set
 |---|---|---|
 | `EnvironmentBadge` | `{ machineId, hostname, virtualization }` | headline identity |
 | `NoTimingRibbon` | `{ virtualization, hostname, runs }` | shown when the slice contains virtualised runs |
-| `HeroFigure` | `{ label: 'Cumulative gain', value: '▲ 18.4%', sub: 'late blocks / min, median of 5 Sets vs baseline 2026-10-16', chip: Badge(significance), kept: 3 }` | §3 cumulative gain |
+| `HeroFigure` | `{ label: 'Cumulative gain', value: '▲ 95.6%', sub: 'Fewer dropouts: PipeWire errors per minute 11.3 → 0.50; DSP load 11.0% → 10.5% (untraced, T0003 arm A → T0007 arm A)', kept: 2 }` | `keptTrialGain`: the earliest kept trial's A arm (none of the kept changes) against the latest trial's A arm (every kept change on). Dropouts are normalised per minute of audio. The badge reads "kept by pre-registered trials". Falls back to the §3 cumulative gain when no kept trial has its runs in history. |
 | `KpiTile` × 4 per Set (one `grid-kpi` row per Set, Set name as the row heading with its colour dot) | late blocks / min · PipeWire errors + xruns (guard tile, `value: '0 / 0'`) · Live CPU / core · slack p01 | `computeGains` rows for the Set |
 | `DataTable` (tile twin) | columns: Set, metric, baseline, latest, best, delta, significance, runs | same rows |
 | Set chips (`.set-chips`) | one `.chip.set-chip` button per Set (`aria-pressed` = filtered) | the slice's Sets; click narrows the shared filter |
@@ -429,10 +429,10 @@ hex values for Recharts.
 |---|---|---|---|---|---|
 | 1 | indigo / cyan | `#4f46e5` | `#3fe0e6` | Benchmark_Zero | `--set-zero` |
 | 2 | tangerine / coral | `#ff6b35` | `#ff8a5c` | Benchmark_Empty | `--set-empty` |
-| 3 | teal / lime | `#00c2a8` | `#a6e85a` | Benchmark_Inbuilts | `--set-inbuilts` |
+| 3 | teal / periwinkle | `#00c2a8` | `#7aa8ff` | Benchmark_Inbuilts | `--set-inbuilts` |
 | 4 | amber | `#ffc233` | `#ffd257` | Benchmark_Max4Live | `--set-max4live` |
 | 5 | pink | `#ff4fa3` | `#ff74b8` | Benchmark_VSTs | `--set-vsts` |
-| 6 | sky / periwinkle | `#22a6f2` | `#7aa8ff` | other (any non-canonical Set) | `--set-other` |
+| 6 | sky / lime | `#22a6f2` | `#a6e85a` | other (any non-canonical Set) | `--set-other` |
 | 7 | violet | `#9b5de5` | `#c79bff` | reserved (unused) | `--series-7` |
 | 8 | red | `#f2545b` | `#ff6b72` | reserved (unused) | `--series-8` |
 | — | de-emphasis | `#8a8fb0` | `#5f7f87` | context series in the emphasis form, sparkline body | `--series-dim` |
@@ -442,9 +442,11 @@ Sets in one overlay would share slot 6, so the overlay excludes them (they keep 
 small-multiple card, where one series needs no hue distinction).
 
 The table twin on every chart and the end-value direct label are both mandatory, never
-optional, for two reasons (§7.4):
-- in light mode, slots 2, 3, 4 and 6 sit below 3:1 on the surface;
-- in dark mode, slots 3 and 4 (Inbuilts and Max4Live) are close in hue.
+optional: in light mode, slots 2, 3, 4 and 6 sit below 3:1 on the surface (§7.4).
+
+In dark mode, the Abyss template's slots 3 and 6 are swapped (user decision, 2026-10-18).
+Inbuilts takes periwinkle `#7aa8ff` and "other Sets" takes lime `#a6e85a`, because the
+template's lime Inbuilts was hard to tell from amber Max4Live.
 
 ### 7.2 Sequential, diverging, ordinal, status
 
@@ -545,10 +547,12 @@ $ validate_palette.js "#1f7f86,#8ff2f5" --ordinal --mode dark --surface "#0c2129
 These are the designer's palettes, shipped as chosen. What the failures mean:
 - **Dark lightness band.** Abyss's neon series are brighter than the validator's dark band
   (L 0.48–0.67). That is a deliberate look; contrast on the surface is ≥ 6:1 for every slot.
-- **Inbuilts vs Max4Live in dark.** Lime `#a6e85a` vs amber `#ffd257` are hard to tell apart:
+- **Inbuilts vs Max4Live in dark (fixed 2026-10-18 by swapping slots 3 and 6).** Lime `#a6e85a` vs amber `#ffd257` were hard to tell apart:
   ΔE 12.6 for normal vision and 2.6 for protan. This is the one failure that bites, because the
-  heavy-Set overlay draws them together. The end labels and the table twin carry the
-  distinction until the hue is moved (an open design question).
+  heavy-Set overlay draws them together. With Inbuilts on periwinkle the 6-slot check passes:
+  `validate_palette.js "#3fe0e6,#ff8a5c,#7aa8ff,#ffd257,#ff74b8,#a6e85a" --mode dark --surface "#0c2129"`
+  gives CVD separation PASS (worst adjacent ΔE 17.2, deutan), normal-vision PASS (ΔE 27.3) and
+  contrast PASS. Only the stylistic lightness band still fails.
 - **Slots 6/7 in dark.** Near-identical for protan, but slot 7 is reserved and unused, so the
   pair never meets.
 - **Light amber.** `#ffc233` is too light (1.6:1). Max4Live marks rely on their labels.

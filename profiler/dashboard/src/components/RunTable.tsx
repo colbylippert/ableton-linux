@@ -6,7 +6,8 @@
  * two (FIFO, so picking a third replaces the oldest pick).
  */
 import type { Run } from '../data/types';
-import { formatDate, formatInt, setLabel, startedMs } from '../data';
+import { formatDate, formatInt, setLabel, setSlot, startedMs } from '../data';
+import { seriesVar } from '../palette';
 import Badge, { environmentBadge, traceBadge } from './Badge';
 import DataTable, { type Column } from './DataTable';
 import './RunTable.css';
@@ -34,17 +35,25 @@ export function switchesText(switches: Record<string, string>): string {
   return entries.map(([k, v]) => (v === '' ? k : `${k}=${v}`)).join(', ');
 }
 
+/** `alsa_output.usb-Focusrite_Scarlett_2i4_USB-00.pro-output-0` → `Focusrite_Scarlett_2i4 · pro-output-0`. */
+export function audioDeviceLabel(device: string): string {
+  const name = device.replace(/^alsa_(output|input)\./, '').replace(/^usb-/, '');
+  const usb = /^(.*?)_USB-\d+\.(.*)$/.exec(name);
+  const label = usb ? `${usb[1]} · ${usb[2]}` : name;
+  return label.length > 40 ? `${label.slice(0, 39)}…` : label;
+}
+
 export function runTableColumns(): Column<Run>[] {
   return [
     { key: 'started', header: 'Started (UTC)', render: (r) => <span className="rt-nowrap">{formatDate(r.started_at)}</span>, sortValue: (r) => startedMs(r) },
     { key: 'run_id', header: 'Run', render: (r) => <span className="cell-mono">{r.run_id}</span>, sortValue: (r) => r.run_id },
-    { key: 'tag', header: 'Tag', render: (r) => r.tag || '—', sortValue: (r) => r.tag },
+    { key: 'tag', header: 'Tag', title: 'Shown when it differs from the run id', render: (r) => (r.tag && r.tag !== r.run_id ? r.tag : '—'), sortValue: (r) => r.tag },
     {
       key: 'machine',
       header: 'Machine',
       render: (r) => (
-        <span className="rt-nowrap">
-          {r.hostname || '—'} <span className="mono muted">{r.machine_id}</span>
+        <span className="rt-nowrap" title={r.machine_id}>
+          {r.hostname || '—'} <span className="mono muted">{r.machine_id.slice(0, 8)}</span>
         </span>
       ),
       sortValue: (r) => `${r.hostname}|${r.machine_id}`,
@@ -56,7 +65,7 @@ export function runTableColumns(): Column<Run>[] {
       title: 'PipeWire default sink when the run started; runs on different devices never compare',
       render: (r) => (
         <span className="cell-mono" title={r.audio_device ?? 'unknown (recorded before the audio device was part of a run)'}>
-          {r.audio_device ? r.audio_device.replace(/^alsa_output\./, '') : '—'}
+          {r.audio_device ? audioDeviceLabel(r.audio_device) : '—'}
         </span>
       ),
       sortValue: (r) => r.audio_device ?? null,
@@ -68,7 +77,7 @@ export function runTableColumns(): Column<Run>[] {
       sortValue: (r) => `${r.structure}/${r.scenario ?? '-'}`,
     },
     { key: 'trace', header: 'Trace', render: (r) => <Badge {...traceBadge(r.trace_mode)} />, sortValue: (r) => r.trace_mode },
-    { key: 'switches', header: 'Switches', render: (r) => <span className="cell-switches">{switchesText(r.switches)}</span>, sortValue: (r) => switchesText(r.switches) },
+    { key: 'switches', header: 'Switches', render: (r) => <span className="cell-switches rt-nowrap">{switchesText(r.switches)}</span>, sortValue: (r) => switchesText(r.switches) },
     {
       key: 'trial',
       header: 'Trial / arm',
@@ -82,7 +91,15 @@ export function runTableColumns(): Column<Run>[] {
       header: 'Sets',
       render: (r) => {
         const names = Object.keys(r.sets);
-        return names.length === 0 ? '—' : <span className="rt-sets">{names.map(setLabel).join(', ')}</span>;
+        if (names.length === 0) return '—';
+        const label = names.map(setLabel).join(', ');
+        return (
+          <span className="rt-sets" role="img" aria-label={label} title={label}>
+            {names.map((n) => (
+              <span key={n} className="set-dot" style={{ background: seriesVar(setSlot(n)) }} aria-hidden="true" />
+            ))}
+          </span>
+        );
       },
       sortValue: (r) => Object.keys(r.sets).length,
     },

@@ -212,7 +212,8 @@ export function PairedDots({ pairs, unit, direction, format, spread = null, labe
   const height = MARGIN.top + plotH + MARGIN.bottom;
   const x = (v: number) => MARGIN.left + ((v - dMin) / (dMax - dMin)) * plotW;
   const clampX = (v: number) => Math.min(MARGIN.left + plotW, Math.max(MARGIN.left, x(v)));
-  const ticks = niceTicks(dMin, dMax, 5);
+  // Five ticks need ~200 px of plot; narrower frames (four per row at 1280 px) get three, so labels never overlap.
+  const ticks = niceTicks(dMin, dMax, plotW < 200 ? 3 : 5);
   const axisY = MARGIN.top + plotH;
 
   const show = (cx: number, cy: number, arm: 'A' | 'B', p: PairedDotsPair) => {

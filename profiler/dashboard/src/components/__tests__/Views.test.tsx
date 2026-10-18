@@ -5,7 +5,9 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { DEFAULT_FILTER, type FilterState } from '../../data/types';
-import OverviewView, { heroStatus, niceCeil, quarterDomain } from '../../views/Overview';
+import OverviewView, { armFigures, heroStatus, keptTrialGain, niceCeil, quarterDomain } from '../../views/Overview';
+import type { Run, Trial, TrialJoin } from '../../data/types';
+import { FIXTURE_RUNS, FIXTURE_TRIALS, makeSet } from './fixtures';
 import TrendsView from '../../views/Trends';
 import { EMPTY_DATA, FIXTURE_DATA } from './fixtures';
 import { all, byText, choose, click, mount, text, type Mounted } from './harness';
@@ -82,6 +84,28 @@ describe('Overview view', () => {
     expect(text(c.querySelector('.overview-charts'))).toContain('T0007');
     // recent trials, newest first
     expect(all(c, '.overview-trials tbody tr').map((r) => text(r.querySelector('td')))).toEqual(['T0008', 'T0007']);
+  });
+
+  it('measures the kept trials gain from the first kept A arm to the latest A arm', () => {
+    const base = FIXTURE_RUNS[0]!;
+    const runWith = (id: string, errors: number, dsp: number): Run => ({
+      ...base,
+      run_id: id,
+      duration_s: 120,
+      sets: { Benchmark_VSTs: makeSet({ pipewire_errors: errors, dsp_avg: dsp }), Benchmark_Max4Live: makeSet({ pipewire_errors: errors, dsp_avg: dsp + 1 }) },
+    });
+    // 2 Sets x 2 minutes: 20 errors -> 5 per minute; 2 errors -> 0.5 per minute
+    expect(armFigures([runWith('x', 10, 10)])).toEqual({ errorsPerMinute: 5, dspMedian: 10.5, setRuns: 2 });
+    const kept = { ...FIXTURE_TRIALS[0]!, trial: 'T0100', date: '2026-10-17T00:00:00Z', verdict: 'keep' as const };
+    const later = { ...FIXTURE_TRIALS[0]!, trial: 'T0101', date: '2026-10-18T00:00:00Z', verdict: 'revert' as const };
+    const join = (trial: Trial, a: Run): TrialJoin => ({ trial, runs: { aa: [], abab: [{ a, b: a }], traced: null }, missing: [] });
+    const gain = keptTrialGain([join(later, runWith('now', 1, 9)), join(kept, runWith('before', 10, 11))]);
+    expect(gain?.baseTrial).toBe('T0100');
+    expect(gain?.nowTrial).toBe('T0101');
+    expect(gain?.before.errorsPerMinute).toBe(5);
+    expect(gain?.after.errorsPerMinute).toBe(0.5);
+    expect(gain?.dropoutPct).toBeCloseTo(0.9);
+    expect(keptTrialGain([join(later, runWith('now', 1, 9))])).toBeNull();
   });
 
   it('maps the cumulative gain to the hero tone and rounds bar scales up', () => {

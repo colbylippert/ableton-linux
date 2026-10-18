@@ -24,8 +24,8 @@
   All of this is synced back into `src/theme.css`, `src/palette.ts`, `src/App.tsx` and
   `src/views/Overview.tsx`. Token names are unchanged. Series and status colours keep their rules
   (fixed Set slots, status on dots only). The dataviz validator fails these palettes on some checks
-  (DESIGN.md §7.4). The one that matters: in dark mode, Inbuilts lime and Max4Live amber are hard to
-  tell apart. That is an open design question for the user.
+  (DESIGN.md §7.4). Abyss slots 3 and 6 are swapped (user decision, 2026-10-18): Inbuilts is periwinkle
+  and other Sets are lime, so Inbuilts no longer reads like Max4Live.
 - `templates/**` in the Claude Design project is the user's design work. It is not produced by
   this build. Never delete it (the plan's delete globs exclude it), and never overwrite it.
 
@@ -73,7 +73,16 @@
   460–520 px `maxWidth` div.
 - **CompareDrawer.** At most 12 rows fit 900×700.
 
-## Component findings (src/, not fixed by the sync — candidates for design work)
+## Component findings (src/) — fixed 2026-10-18 unless noted
+Status of each item below:
+- RunTable: fixed. The tag shows only when it differs from the run id, the machine id is shortened, the device label is friendly, Sets are dots, and long switches stay on one line.
+- TrialCard: fixed. The guard compares B with A per Set, which also removed the duplicate chips; the card shows `PipeWire errors A / B`.
+- DataTable empty-state centring: fixed.
+- PairedDots: fixed (three ticks below 200 px of plot).
+- CallSiteTrend legend: fixed (left-aligned).
+- Ledger `xruns` naming: T0003 onward records `pipewire_errors` separately, and the card shows both.
+
+Original findings:
 - **RunTable** never fits the app's 1280 px max width, so 5-Set rows are 5 lines tall. A fix:
   `white-space: nowrap` on `.rt-sets`, or Set initials.
 - **TrialCard** keys guard chips by their text, so equal counts on two B runs (real T0002 data) render

@@ -561,6 +561,7 @@
   display: inline-flex;
   align-items: center;
   gap: 6px;
+  text-align: left;
   min-height: 24px;
   padding: 2px 6px;
   border: 1px solid transparent;
@@ -742,7 +743,8 @@ tr.is-selected {
   background: var(--surface-2);
 }
 
-.table-empty {
+.table-empty,
+table.data td.table-empty {
   color: var(--text-secondary);
   text-align: center;
 }
