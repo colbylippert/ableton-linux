@@ -458,6 +458,9 @@ Next candidates (user to choose; none pre-registered yet):
 - This confirms the hypothesis: Live's audio side needs its loop at the display rate, not the frames shown. Skipping keeps the audio as it is (0 errors, normal DSP peak) and saves the presentation work: about 2.4 points of a core (compositor 3.9 → 1.6, `wined3d_cs` 1.7 → 1.2). Live's own drawing on its UI thread is unchanged; Wine cannot skip it.
 - Trade-off: the screen and input feedback update at 60/N fps.
 - Next: the user tries it by hand. Then a pre-registered trial: A today (OpenGL, renderer off) vs B Vulkan + GPU renderer + present skipping at the N the user accepts. If kept, the switch becomes a numbered patch with its audit entries and an official build.
+- Occluded variant (user: "lets try setting live is occluded during draw"): `WINED3D_PRESENT_SKIP_OCCLUDED=1` makes skipped presents return `DXGI_STATUS_OCCLUDED` (0x087a0001), the status DXGI gives a hidden window, in the hope that Live would also skip its own drawing.
+  - Both winediag lines confirm the switch was active. Live ignores the status: it kept presenting 60 times a second (10.0 fps shown at N = 6), its UI thread stayed at 9.6, and the audio was unchanged (DSP 9.89 / 18.49, 0 errors).
+  - So Live's own drawing cannot be reduced from Wine without slowing its loop, which raises dropouts (G0b/G0c). Present skipping, at about 2.4 points, is the most the presentation side gives.
 
 **RT-BORE kernel phase (user decision 2026-10-18: after T0013, stop and try the RT-BORE kernel with the NVIDIA driver; the same day the user moved it after T0014; pre-research only so far)**
 - What the laptop has:
