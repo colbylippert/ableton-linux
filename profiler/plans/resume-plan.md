@@ -515,6 +515,12 @@ Next candidates (user to choose; none pre-registered yet):
       - golden is rebaselined from golden-gpu; the previous golden is kept as `golden.<UTC>`.
       - Desktop launches get the two variables from `~/.config/environment.d/90-profiler-ableton-display.conf`. `with-session-env` copies only display and D-Bus variables, so trials stay unaffected and set their switches explicitly.
     - Not trial-verified: adopted on the G0 and G0d feasibility data. Trials from T0016 on run with it in both arms.
+    - Done 2026-10-18:
+      - Patch 0110 committed (79ec25c). The workstation's official build took 4 minutes (source tree `273eb76e183d`), the audit passed (patch stack, fingerprints including 0110's, source digest), and the runtime is installed on the laptop.
+      - Of `make test`, 22 of 23 scripts pass; `test-installer-lifecycle.sh` needs `xdg-mime`, which the WSL build host lacks, and fails at an unrelated point there even on the previous commit.
+      - The probe on the official runtime (Vulkan back end) passes. Switch off: 240 frames in 3.93 s (16.4 ms per frame, one per refresh). `WINED3D_PRESENT_SKIP=6`: 0.59 s (2.5 ms per frame). Every present returned S_OK, and the waitable-object loop did not hang (0.60 s).
+        - The first Wine start after a runtime install updates the prefix, and without the launcher's `WINEDLLOVERRIDES=mscoree,mshtml=` that update stops at Wine's Mono installer dialog. Probe runs must set it.
+      - golden was rebaselined from golden-gpu (previous golden: `golden.20261018T223420Z`), and `~/.config/environment.d/90-profiler-ableton-display.conf` is written.
   - **T0016, the RT-BORE kernel with raised audio priorities vs the normal kernel.** As first registered, both arms ran the RT kernel with B adding the priorities. After T0015 the useful question is the normal kernel against RT with the priorities fixed, so it was redesigned before running (user: "run 16 and 17"):
     - A: `linux-cachyos` 7.2.11-1 with stock priorities (pipeasio-rt FIFO 15, Live RR 10; IRQs are not threaded).
     - B: `linux-cachyos-rt-bore` 7.2.11-1 with raised priorities: the Focusrite's USB controller IRQ thread (`irq/N-xhci_hcd`) at FIFO 90, pipeasio-rt at FIFO 85 and every AudioCalc at FIFO 80. The driver's watcher sets them for every Live process. Other Live threads keep RR 10; other IRQ threads keep FIFO 50.
