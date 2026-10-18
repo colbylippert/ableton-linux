@@ -288,6 +288,24 @@ Next candidates (user to choose; none pre-registered yet):
 - Mechanism check: wineserver's voluntary context switches and CPU fall in every B Set-run (`proc-delta.json`), and `WINE_APC_FASTPATH=1` is recorded as a switch on B.
 - Driver: ~/.local/state/profiler/trial-T0012.sh, started by `queue-T0012.sh` after T0011. Scored by `plans/tools/trial-analyze.py T0012 --rule t0004`.
 
+**Trial T0013 (user decision 2026-10-18: "Lets queue T0013 now"; pre-registered before running): user-mode QueryPerformanceCounter (patch 0109).**
+- Runtime: the official build with 0109 (cf2fe55). It was built on the workstation and installs on the laptop when T0012 releases the session lock; the queue starts T0013 only once that runtime is in place.
+- Setup:
+  - Both arms keep the configuration: `PIPEASIO_REALTIME=1`, with pipeasio-rt and every `AudioCalc` worker pinned to CPUs 0–11 (shared), nine workers, the normal window, and snapshot `golden`.
+  - Both arms also carry T0012's verdict: `WINE_APC_FASTPATH=1` on both if it passes.
+  - A: `WINE_QPC_TSC` unset (the syscall route).
+  - B: `WINE_QPC_TSC=1` (user mode).
+  - ABAB × 3; Inbuilts, Max4Live, VSTs; 120 s. Then one traced run per arm (`--trace interface`, 60 s per Set).
+- Why: D0001 shows Live calls `RtlQueryPerformanceCounter` about 67 times per block: two Live sites at ~31.5 each, `timeGetTime` 1.5 and Max's msvcp140 1.8. Each call is a 76 ns syscall; in user mode it takes 14 ns. That is about 4 µs of audio-thread CPU per 1.33 ms block, below what the dropout count can detect. The trial mainly guards against a regression under real load and confirms the mechanism.
+- PASS rule: the same as T0004. Verdicts:
+  - PASS: keep (later trials run with the switch);
+  - FAIL with both guards passing and the mechanism confirmed: mechanism-confirmed (no regression; the switch stays available, off by default);
+  - a failed guard: revert.
+- Mechanism check:
+  - In every B Set-run, Live's view of the shared user data page shows the mapping enabled: offset `0xf04` = 1, read through `/proc/<pid>/mem`. A shows 0.
+  - The traced runs show about 67 `NtQueryPerformanceCounter` syscalls per block in A and about 0 in B.
+- Driver: ~/.local/state/profiler/trial-T0013.sh, started by `queue-T0013.sh` after T0012 and the 0109 install. Scored by `plans/tools/trial-analyze.py T0013 --rule t0004`.
+
 **Wine hot-path research (2026-10-18 morning)**
 
 Diagnostic D0001: one traced run on the kept configuration (heavy Sets, 60 s each, 45,000 blocks per Set; history `diag-D0001-traced`).
