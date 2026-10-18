@@ -314,6 +314,14 @@ Next candidates (user to choose; none pre-registered yet):
   - The traced runs show about 67 `NtQueryPerformanceCounter` syscalls per block in A and about 0 in B.
 - Driver: ~/.local/state/profiler/trial-T0013.sh, started by `queue-T0013.sh` after T0012 and the 0109 install. Scored by `plans/tools/trial-analyze.py T0013 --rule t0004`.
 
+**Trial T0013 — REVERT (2026-10-18):** rule FAIL; the DSP guard passes, the error guard fails.
+- Dropouts: PipeWire ERR 5 → 17. B had more errors in 4 Set-pairs, fewer in 2 and the same in 3 (sign test p = 0.34); 10 of B's 17 came from B3.
+- DSP: the median DSP average was within 0.21 pt on every Set. Live CPU was 47.3 vs 48.8 %.
+- Mechanism: the user-mode mapping was enabled in 9 of 9 B sessions and 0 of 9 A sessions. Traced A counted 66.6, 71.8 and 77.2 `NtQueryPerformanceCounter` syscalls per block (Inbuilts, Max4Live, VSTs). `qpcprobe` on the official runtime passed 4 of 4.
+- Traced B did not run: the Focusrite was unplugged by accident at 14:29, during traced A's Max4Live Set. Only traced A's Inbuilts Set ran on the interface, so the traced pair is not cited, and traced A's record stays out of history.
+- Context, not part of the rule: earlier arms on the kept configuration had 10, 4, 16, 18 and 12 errors (T0008–T0012). B's 17 is inside that range and A's 5 near its floor. The trial shows neither clear harm nor that the switch is harmless.
+- `WINE_QPC_TSC` stays off by default and remains available as an opt-in switch.
+
 **Trial T0014 (user decision 2026-10-18: "Lets reorder this nvidia gpu test before rt bore test"; pre-registered before running): the built-in screen on the NVIDIA GPU (discrete mode).**
 - Setup:
   - Both arms keep the configuration: `PIPEASIO_REALTIME=1`, with pipeasio-rt and every `AudioCalc` worker pinned to CPUs 0–11 (shared), nine workers, the normal window, snapshot `golden` (Live draws its UI on the CPU) and the normal kernel. Both arms also carry T0013's verdict: `WINE_QPC_TSC=1` on both if it is kept.
@@ -339,6 +347,11 @@ Next candidates (user to choose; none pre-registered yet):
   - At every boot the driver records which GPU drives the built-in screen (the connected `eDP` connector and its DRM driver) and which DRM devices KWin holds. A run whose arm does not match the screen's GPU does not start; the driver stops and reports the mismatch.
   - Secondary readouts per run: CPU package power (RAPL) and temperature, P-core frequency, the NVIDIA GPU's power state and draw, and Live's per-thread CPU.
 - Driver: ~/.local/state/profiler/trial-T0014.sh runs one step per boot. A waiter on the controlling host starts each step once the laptop is back, and reports when a firmware change is due. Scored by `plans/tools/trial-analyze.py T0014 --rule t0004`; the drift guard is computed beside it.
+- Status (2026-10-18 14:50): not started.
+  - The user changed a firmware setting after T0013. It made the NVIDIA GPU the boot VGA device: the iGPU now reports PCI class 0x0380, and the DRM card numbers swapped.
+  - The built-in screen stayed on the Intel GPU (`eDP-1` on `i915`; `eDP-2` on NVIDIA disconnected). KWin composites on Mesa Intel, and GLX clients such as wined3d render on Mesa Intel. So the MUX did not switch.
+  - MSI documents the GPU switch for this model in MSI Center on Windows (FAQ 8805), not in the firmware setup.
+  - Also changed since T0013: the laptop is on wired Ethernet (`enp3s0`) with Wi-Fi off.
 
 **RT-BORE kernel phase (user decision 2026-10-18: after T0013, stop and try the RT-BORE kernel with the NVIDIA driver; the same day the user moved it after T0014; pre-research only so far)**
 - What the laptop has:
