@@ -27,6 +27,7 @@ VERDICTS = ("keep", "revert", "inconclusive", "tooling", "mechanism-confirmed")
 # A virtualised host supports no timing claim (CLAUDE.md).
 VIRTUAL_VERDICTS = ("tooling", "mechanism-confirmed")
 CHANGE_KINDS = ("wine-patch", "pipeasio-patch", "launcher", "config", "tooling")
+PATCH_KINDS = ("wine-patch", "pipeasio-patch")
 FIELDS = (
     "schema", "trial", "date", "host", "branch", "hypothesis", "evidence", "change", "probe_result",
     "runs", "metrics", "traced_confirmation", "verdict", "rationale", "commit", "minutes",
@@ -37,13 +38,19 @@ PROBE_KEYS = ("pass", "fail", "skip", "log")
 RUNS_KEYS = ("aa", "abab", "traced")
 PAIR_KEYS = ("a", "b")
 METRICS_KEYS = ("primary", "per_set", "xruns", "cpu_live_pct")
+# Dropout trials (T0003 on) also record the arms' PipeWire error totals with their
+# sign-test figures, and the secondary metrics they report beside the primary one.
+OPTIONAL_METRICS_KEYS = ("pipewire_errors", "secondary")
 PER_SET_KEYS = ("a_median", "b_median", "aa_spread", "delta", "ratio_to_spread")
+OPTIONAL_PER_SET_KEYS = ("aa_spread_from", "a_runs", "b_runs")
+# Trials recorded directly on the work branch, one commit each (what the bare-metal
+# campaign does), next to the agent loop's trial/T<id>-<slug> branches.
+WORK_BRANCHES = ("profiler",)
 CONFIRMATION_KEYS = ("call_site_share_before", "after")
 TRIAL_RE = re.compile(r"T[0-9]{4}")
 DATE_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?Z")
 HOST_RE = re.compile(r"bare-metal|vm:[A-Za-z0-9._-]+")
 SLUG_RE = re.compile(r"[A-Za-z0-9._-]+")
-SWITCH_RE = re.compile(r"[A-Z][A-Z0-9_]*=.+")
 COMMIT_RE = re.compile(r"[0-9a-f]{7,40}")
 MIN_ABAB_PAIRS = 3
 HYPOTHESIS_CELL_LIMIT = 100
@@ -64,11 +71,11 @@ def is_count(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value >= 0
 
 
-def expect_object(value: Any, where: str, keys: tuple[str, ...]) -> list[str]:
+def expect_object(value: Any, where: str, keys: tuple[str, ...], optional: tuple[str, ...] = ()) -> list[str]:
     if not isinstance(value, dict):
         return [f"{where} must be an object"]
     problems = [f"{where} is missing {name}" for name in keys if name not in value]
-    problems.extend(f"{where} has unknown key {name}" for name in value if name not in keys)
+    problems.extend(f"{where} has unknown key {name}" for name in value if name not in keys and name not in optional)
     return problems
 
 
@@ -114,9 +121,11 @@ def validate_change(value: Any) -> list[str]:
     for name in ("patch", "probe", "note"):
         if value[name] is not None and not is_text(value[name]):
             problems.append(f"change.{name} must be null or a path")
+    # NAME=value for an environment switch; a configuration trial names its change
+    # in words (chrt -a -r -p 10 wineserver), so one line of text is accepted too
     switch = value["switch"]
-    if switch is not None and not (isinstance(switch, str) and SWITCH_RE.fullmatch(switch)):
-        problems.append("change.switch must be null or NAME=value")
+    if switch is not None and not (is_text(switch) and "\n" not in switch):
+        problems.append("change.switch must be null or one line (NAME=value for an environment switch)")
     return problems
 
 
@@ -155,7 +164,7 @@ def validate_runs(value: Any) -> list[str]:
 def validate_metrics(value: Any) -> list[str]:
     if value is None:
         return []
-    problems = expect_object(value, "metrics", METRICS_KEYS)
+    problems = expect_object(value, "metrics", METRICS_KEYS, OPTIONAL_METRICS_KEYS)
     if problems:
         return problems
     if not is_text(value["primary"]):
@@ -165,13 +174,29 @@ def validate_metrics(value: Any) -> list[str]:
     else:
         for name, values in value["per_set"].items():
             where = f"metrics.per_set[{name}]"
-            set_problems = expect_object(values, where, PER_SET_KEYS)
+            set_problems = expect_object(values, where, PER_SET_KEYS, OPTIONAL_PER_SET_KEYS)
             if set_problems:
                 problems.extend(set_problems)
                 continue
             problems.extend(f"{where}.{key} must be null or a number" for key in PER_SET_KEYS if values[key] is not None and not is_number(values[key]))
+            if "aa_spread_from" in values and not is_text(values["aa_spread_from"]):
+                problems.append(f"{where}.aa_spread_from must be a non-empty string")
+            for key in ("a_runs", "b_runs"):
+                if key in values and not (isinstance(values[key], list) and all(item is None or is_number(item) for item in values[key])):
+                    problems.append(f"{where}.{key} must be a list of numbers")
     problems.extend(expect_arm_values(value["xruns"], "metrics.xruns"))
     problems.extend(expect_arm_values(value["cpu_live_pct"], "metrics.cpu_live_pct"))
+    errors = value.get("pipewire_errors")
+    if "pipewire_errors" in value:
+        if not isinstance(errors, dict) or any(name not in errors for name in PAIR_KEYS):
+            problems.append("metrics.pipewire_errors must be an object with a and b")
+        else:
+            # a and b are the arms' totals; the sign-test figures and any per-Set
+            # breakdown beside them are free-form
+            problems.extend(f"metrics.pipewire_errors.{name} must be null or a number"
+                            for name in PAIR_KEYS if errors[name] is not None and not is_number(errors[name]))
+    if "secondary" in value and not isinstance(value["secondary"], dict):
+        problems.append("metrics.secondary must be an object")
     return problems
 
 
@@ -191,25 +216,31 @@ def verdict_rules(value: dict[str, Any]) -> list[str]:
     if value["host"] != "bare-metal" and verdict not in VIRTUAL_VERDICTS:
         problems.append("verdicts on a virtualised host are limited to " + " or ".join(VIRTUAL_VERDICTS))
     if verdict == "keep":
+        # A code change targets a call site: it needs its probe and a traced run per
+        # arm confirming that site's share dropped. A configuration change (scheduling,
+        # worker count) is kept on its pre-registered untraced A/B rule alone.
+        patch = value["change"]["kind"] in PATCH_KINDS
         if not runs["aa"]:
             problems.append("verdict keep needs an A/A pair in runs.aa")
         if len(runs["abab"]) < MIN_ABAB_PAIRS:
             problems.append(f"verdict keep needs at least {MIN_ABAB_PAIRS} untraced A/B pairs in runs.abab")
-        if runs["traced"] is None:
+        if patch and runs["traced"] is None:
             problems.append("verdict keep needs one traced run per arm in runs.traced")
         metrics = value["metrics"]
         if metrics is None:
             problems.append("verdict keep needs metrics")
         else:
+            # the kept arm must be xrun-free; the baseline arm's xruns are not the change's
             xruns = metrics["xruns"]
-            if xruns is None or xruns["a"] != 0 or xruns["b"] != 0:
-                problems.append("verdict keep needs metrics.xruns recorded as 0 for both arms")
+            if xruns is None or xruns["b"] != 0:
+                problems.append("verdict keep needs metrics.xruns with 0 on the kept arm (b)")
             if not metrics["per_set"]:
                 problems.append("verdict keep needs metrics.per_set")
         probe = value["probe_result"]
-        if probe is None or probe["fail"] != 0:
+        if patch and (probe is None or probe["fail"] != 0):
             problems.append("verdict keep needs probe_result with fail 0")
-        problems.extend(f"verdict keep needs change.{name}" for name in ("switch", "probe", "note") if value["change"][name] is None)
+        needed = ("switch", "probe", "note") if patch else ("switch", "note")
+        problems.extend(f"verdict keep needs change.{name}" for name in needed if value["change"][name] is None)
     if verdict == "mechanism-confirmed":
         if runs["traced"] is None:
             problems.append("verdict mechanism-confirmed needs runs.traced")
@@ -233,10 +264,10 @@ def validate_trial(value: Any) -> list[str]:
     if not (isinstance(value["host"], str) and HOST_RE.fullmatch(value["host"])):
         problems.append("host must be bare-metal or vm:<name>")
     branch = value["branch"]
-    if trial is not None:
+    if trial is not None and branch not in WORK_BRANCHES:
         prefix = f"trial/{trial}-"
         if not (isinstance(branch, str) and branch.startswith(prefix) and SLUG_RE.fullmatch(branch[len(prefix):])):
-            problems.append(f"branch must be {prefix}<slug>")
+            problems.append(f"branch must be {prefix}<slug> or the work branch {WORK_BRANCHES[0]}")
     problems.extend(f"{name} must be a non-empty string" for name in ("hypothesis", "rationale") if not is_text(value[name]))
     problems.extend(validate_evidence(value["evidence"]))
     problems.extend(validate_change(value["change"]))

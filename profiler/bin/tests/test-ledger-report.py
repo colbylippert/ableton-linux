@@ -120,7 +120,8 @@ class ValidationTests(unittest.TestCase):
         self.assertEqual(problems(trial="7"), ["trial must look like T0007"])
         self.assertEqual(problems(date="2026-10-17"), ["date must be UTC ISO 8601 like 2026-10-17T10:00:00Z"])
         self.assertEqual(problems(host="laptop"), ["host must be bare-metal or vm:<name>"])
-        self.assertEqual(problems(branch="feature/x"), ["branch must be trial/T0007-<slug>"])
+        self.assertEqual(problems(branch="feature/x"), ["branch must be trial/T0007-<slug> or the work branch profiler"])
+        self.assertEqual(problems(branch="profiler"), [])
         self.assertEqual(problems(hypothesis=" "), ["hypothesis must be a non-empty string"])
         self.assertEqual(problems(verdict="maybe"), ["verdict must be one of " + ", ".join(ledger.VERDICTS)])
         self.assertEqual(problems(commit="xyz"), ["commit must be null or 7-40 hex characters"])
@@ -132,7 +133,11 @@ class ValidationTests(unittest.TestCase):
         self.assertEqual(problems(evidence=[{"run": "r", "set": "s", "call_site": "c", "share_of_lost_slack": 1.5}]),
                          ["evidence[0].share_of_lost_slack must be a number between 0 and 1"])
         self.assertEqual(problems(change={**trial()["change"], "kind": "magic"}), ["change.kind must be one of " + ", ".join(ledger.CHANGE_KINDS)])
-        self.assertEqual(problems(change={**trial()["change"], "switch": "lowercase"}), ["change.switch must be null or NAME=value"])
+        self.assertEqual(problems(change={**trial()["change"], "switch": " "}),
+                         ["change.switch must be null or one line (NAME=value for an environment switch)"])
+        self.assertEqual(problems(change={**trial()["change"], "switch": "a\nb"}),
+                         ["change.switch must be null or one line (NAME=value for an environment switch)"])
+        self.assertEqual(problems(change={**trial()["change"], "switch": "chrt -a -r -p 10 wineserver"}), [])
         self.assertEqual(problems(probe_result={"pass": 1, "fail": -1, "skip": 0, "log": None}), ["probe_result.fail must be a count"])
         self.assertEqual(problems(probe_result={"pass": True, "fail": 0, "skip": 0, "log": None}), ["probe_result.pass must be a count"])
         runs = trial()["runs"]
@@ -144,6 +149,22 @@ class ValidationTests(unittest.TestCase):
                          ["metrics.per_set[S] is missing b_median", "metrics.per_set[S] is missing aa_spread",
                           "metrics.per_set[S] is missing delta", "metrics.per_set[S] is missing ratio_to_spread"])
         self.assertEqual(problems(metrics={**metrics, "xruns": {"a": "0", "b": 0}}), ["metrics.xruns.a must be null or a number"])
+        # dropout trials: error totals with sign-test figures, secondary metrics, per-Set run values
+        per_set = {"S": {"a_median": 3, "b_median": 1, "aa_spread": 2, "delta": -2, "ratio_to_spread": 1.0,
+                         "aa_spread_from": "range of the three A runs", "a_runs": [3, 1, 3], "b_runs": [0, 1, None]}}
+        dropouts = {**metrics, "per_set": per_set,
+                    "pipewire_errors": {"a": 20, "b": 10, "drop": 0.5, "fewer_pairs": 6, "n_pairs": 9, "p_b_fewer": 0.049},
+                    "secondary": {"dsp_avg": {"S": {"a_median": 10.5, "b_median": 9.9}}}}
+        self.assertEqual(problems(metrics=dropouts), [])
+        self.assertEqual(problems(metrics={**dropouts, "pipewire_errors": {"a": "20", "b": 10}}),
+                         ["metrics.pipewire_errors.a must be null or a number"])
+        self.assertEqual(problems(metrics={**dropouts, "pipewire_errors": {"a": 20}}),
+                         ["metrics.pipewire_errors must be an object with a and b"])
+        self.assertEqual(problems(metrics={**dropouts, "secondary": []}), ["metrics.secondary must be an object"])
+        self.assertEqual(problems(metrics={**dropouts, "per_set": {"S": {**per_set["S"], "a_runs": ["3"]}}}),
+                         ["metrics.per_set[S].a_runs must be a list of numbers"])
+        self.assertEqual(problems(metrics={**dropouts, "per_set": {"S": {**per_set["S"], "extra": 1}}}),
+                         ["metrics.per_set[S] has unknown key extra"])
         self.assertEqual(problems(traced_confirmation={"call_site_share_before": 0.6}), ["traced_confirmation is missing after"])
 
     def test_keep_gate(self):
@@ -158,8 +179,14 @@ class ValidationTests(unittest.TestCase):
         self.assertEqual(problems(runs={**runs, "traced": None}), ["verdict keep needs one traced run per arm in runs.traced"])
         self.assertEqual(problems(runs={**runs, "traced": None}, verdict="inconclusive"), [])
         metrics = trial()["metrics"]
-        self.assertEqual(problems(metrics={**metrics, "xruns": {"a": 0, "b": 1}}), ["verdict keep needs metrics.xruns recorded as 0 for both arms"])
-        self.assertEqual(problems(metrics={**metrics, "xruns": None}), ["verdict keep needs metrics.xruns recorded as 0 for both arms"])
+        self.assertEqual(problems(metrics={**metrics, "xruns": {"a": 0, "b": 1}}), ["verdict keep needs metrics.xruns with 0 on the kept arm (b)"])
+        self.assertEqual(problems(metrics={**metrics, "xruns": None}), ["verdict keep needs metrics.xruns with 0 on the kept arm (b)"])
+        self.assertEqual(problems(metrics={**metrics, "xruns": {"a": 2, "b": 0}}), [])
+        # a configuration change is kept on its untraced A/B rule: no probe or traced runs needed
+        config = {"kind": "config", "patch": None, "switch": "ABLETON_MAX_AUDIO_THREADS=9", "probe": None, "note": "profiler/plans/resume-plan.md"}
+        self.assertEqual(problems(change=config, probe_result=None, runs={**runs, "traced": None}, traced_confirmation=None), [])
+        self.assertEqual(problems(change={**config, "note": None}, probe_result=None, runs={**runs, "traced": None}),
+                         ["verdict keep needs change.note"])
         self.assertEqual(problems(metrics=None), ["verdict keep needs metrics"])
         self.assertEqual(problems(probe_result={"pass": 4, "fail": 1, "skip": 0, "log": None}), ["verdict keep needs probe_result with fail 0"])
         self.assertEqual(problems(change={**trial()["change"], "note": None}), ["verdict keep needs change.note"])
