@@ -46,11 +46,13 @@
 #                                    the staged Wine
 #   pipeasio-build [--test]          cmake --build + install into the stage (--test also
 #                                    runs the non-integration CTest scope)
-#   sync [--strip] [--artifacts --dir DIR…] [--fast]
+#   sync [--strip] [--artifacts --dir DIR…] [--fast] [--remote HOST|--local] [--lock-wait S]
 #                                    first run: reflink-copy the official runtime to the
 #                                    dev runtime; every run: rsync the stage over it
 #                                    (checksum compare; --fast: size+mtime), list the
 #                                    changed files, write PROFILER-DEV-INFO.txt.
+#                                    --remote HOST: the dev runtime is HOST's (see
+#                                    "Build here, run there" below).
 #                                    --artifacts: first copy the freshly built modules
 #                                    of every --dir from /work/build into the stage (no
 #                                    make install needed): DIR/<arch>-windows/* → lib/
@@ -90,6 +92,17 @@
 #   INSTALL_PREFIX=/opt/wine-d2d1-nspa-11.13
 #   WINE_OFFICIAL_ROOT=runtime_root from ~/.config/ableton-wine/config, else
 #                                      ~/.local/opt/wine-d2d1-nspa-11.13
+#   WINE_DEV_REMOTE=deploy_host from setup.conf, else none (WINE_DEV_REMOTE= forces local)
+#
+# Build here, run there: on a build-only machine (the workstation's WSL distro)
+# set deploy_host=HOST in ~/.config/profiler/setup.conf, or pass sync --remote
+# HOST. sync then pipes profiler/dev/remote-runtime.sh to HOST over ssh (HOST
+# needs no checkout at a matching commit), which seeds HOST's dev runtime from
+# HOST's official runtime on first use, and rsyncs the stage into it while
+# holding HOST's session lock (~/.local/state/profiler/live-session.lock, which
+# every trial, bench run and Live session holds): a sync never lands in the
+# middle of a trial, not even between two of its runs. It refuses at once while
+# the lock is held; --lock-wait S waits up to S seconds instead.
 #
 # Launching Live on the dev runtime (the launcher validates only bin/wine,
 # bin/wineserver and the prefix's system.reg):
@@ -136,10 +149,12 @@ Subcommands:
   build [--dir DIR]... [--install]   incremental make (+ make install into the stage)
   pipeasio-init                      unpack + patch + configure PipeASIO
   pipeasio-build [--test]            build + install PipeASIO into the stage
-  sync [--strip] [--artifacts --dir DIR...] [--fast]
+  sync [--strip] [--artifacts --dir DIR...] [--fast] [--remote HOST|--local] [--lock-wait S]
                                      update ~/.local/opt/wine-d2d1-nspa-11.13-dev from the stage
                                      (--artifacts: copy the modules built in each DIR into the
-                                     stage first — PE files and the unix DIR/<module>.so)
+                                     stage first — PE files and the unix DIR/<module>.so;
+                                     --remote HOST: HOST's dev runtime, over ssh, under HOST's
+                                     session lock; default: deploy_host in setup.conf)
   format-patch [--number NNNN] [--name SLUG] [--pipeasio] [--out DIR] [--force]
                                      export HEAD into patches/ (host git config masked), rehearse
                                      the official patch order, print the audit checklist
@@ -149,7 +164,7 @@ Subcommands:
   reset [--keep-work] [--runtime]    remove the container (and the work tree / dev runtime)
 
 Environment: WINE_DEV_NAME IMAGE WINE_DEV_WORK REPO CCACHE DEV_ROOT JOBS
-             INSTALL_PREFIX WINE_OFFICIAL_ROOT (see the header of this script)
+             INSTALL_PREFIX WINE_OFFICIAL_ROOT WINE_DEV_REMOTE (see the header of this script)
 
 Typical loop:
   wine-dev.sh init                       # once
@@ -267,6 +282,7 @@ CCACHE="${CCACHE:-$REPO/.ccache}"
 DEV_ROOT="${DEV_ROOT:-$HOME/.local/opt/$RUNTIME_NAME-dev}"
 INSTALL_PREFIX="${INSTALL_PREFIX:-/opt/$RUNTIME_NAME}"
 OFFICIAL_ROOT="${WINE_OFFICIAL_ROOT:-$(_kv_file_get "$ABLETON_CONF" runtime_root "$HOME/.local/opt/$RUNTIME_NAME")}"
+DEPLOY_HOST="${WINE_DEV_REMOTE-$(_kv_file_get "$SETUP_CONF" deploy_host)}"   # sync's default target host; empty = this machine
 if [ -n "$JOBS_OPT" ]; then JOBS="$JOBS_OPT"
 elif [[ "${JOBS:-}" =~ ^[1-9][0-9]*$ ]]; then :
 else JOBS="$(_default_jobs)"; fi
@@ -324,8 +340,12 @@ _banner() {
     kv "work tree" "$WINE_DEV_WORK"
     kv "repo" "$REPO"
     kv "ccache" "$CCACHE"
-    kv "dev runtime" "$DEV_ROOT"
-    kv "official runtime" "$OFFICIAL_ROOT"
+    if [ -n "$DEPLOY_HOST" ]; then
+        kv "runtimes" "on $DEPLOY_HOST (sync updates its dev runtime over ssh)"
+    else
+        kv "dev runtime" "$DEV_ROOT"
+        kv "official runtime" "$OFFICIAL_ROOT"
+    fi
     kv "jobs" "$JOBS"
     kv "log" "${LOGFILE:-(none)}"
     ! _is_dry || info "dry run: commands are printed, nothing is changed"
@@ -416,6 +436,28 @@ _refuse_if_runtime_busy() {   # _refuse_if_runtime_busy ROOT…
     return 1
 }
 
+# ------------------------------------------------------ the deploy host ----
+# remote-runtime.sh travels base64-encoded inside one plain pipeline, so the
+# host's login shell (fish on the laptop) never parses it; arguments are
+# checked against a quoting-free alphabet instead of being quoted.
+_remote_rt() {   # _remote_rt HOST SUBCOMMAND [ARG…] — run remote-runtime.sh on HOST
+    local host="$1" a b64
+    shift
+    for a in "$host" "$@"; do
+        [[ "$a" =~ ^[A-Za-z0-9._/@:+=-]+$ ]] || { fail "refusing to pass '$a' to the remote shell (allowed: A-Z a-z 0-9 . _ / @ : + = -)"; return 2; }
+    done
+    b64="$(base64 -w0 < "$DEV_DIR/remote-runtime.sh")" || { fail "cannot read $DEV_DIR/remote-runtime.sh"; return 1; }
+    ssh -o BatchMode=yes -o ConnectTimeout=10 -- "$host" "printf %s $b64 | base64 -d | bash -s -- $*"
+}
+declare -A RF=()
+_remote_probe() {   # _remote_probe HOST → RF[key]=value (remote-runtime.sh probe)
+    local out line
+    out="$(_remote_rt "$1" probe 2>&1)" || { fail "cannot run the probe on $1 over ssh (ssh -o BatchMode=yes $1 must work without a prompt): ${out:0:300}"; return 1; }
+    RF=()
+    while IFS= read -r line; do case "$line" in *=*) RF["${line%%=*}"]="${line#*=}" ;; esac; done <<< "$out"
+    [ -n "${RF[home]:-}" ] && [ -n "${RF[dev_root]:-}" ] || { fail "unexpected probe answer from $1: ${out:0:300}"; return 1; }
+}
+
 # -------------------------------------------------------------- podman ----
 _podman_state() { podman inspect -f '{{.State.Status}}' "$WINE_DEV_NAME" 2>/dev/null || printf 'absent\n'; }
 
@@ -429,7 +471,10 @@ _require_container() {
             fail "container '$WINE_DEV_NAME' does not exist: run  wine-dev.sh init"; return 1 ;;
         *)
             step "starting container $WINE_DEV_NAME (was $st)"
-            run -- podman start "$WINE_DEV_NAME" || return 1 ;;
+            # conmon and slirp4netns outlive `podman start` and inherit its open fds
+            # (podman 4.9): with fd 9, the wine-dev lock, among them they would hold
+            # the lock for as long as the container runs
+            run -- bash -c 'exec 9>&- podman start "$1"' wine-dev-start "$WINE_DEV_NAME" || return 1 ;;
     esac
 }
 
@@ -562,8 +607,13 @@ _warn_series_drift() {
 }
 
 _launch_hint() {
-    info "launch Live on the dev runtime:"
-    info "  ABLETON_WINE_ROOT=$DEV_ROOT WINE_X=1 $REPO/profiler/bin/with-session-env $REPO/scripts/ableton-live SET.als"
+    if [ -n "$DEPLOY_HOST" ]; then
+        info "launch Live on $DEPLOY_HOST's dev runtime (from its checkout, holding its session lock):"
+        info "  ABLETON_WINE_ROOT=${RF[dev_root]:-~/.local/opt/$RUNTIME_NAME-dev} WINE_X=1 profiler/bin/with-session-env scripts/ableton-live SET.als"
+    else
+        info "launch Live on the dev runtime:"
+        info "  ABLETON_WINE_ROOT=$DEV_ROOT WINE_X=1 $REPO/profiler/bin/with-session-env $REPO/scripts/ableton-live SET.als"
+    fi
     info "  A/B: WINE_X=0 vs WINE_X=1 on this one runtime; a 'keep' needs profiler/dev/build-official.sh"
 }
 
@@ -926,21 +976,30 @@ strip --strip-unneeded \"\$P\"/lib/wine/*-unix/*.so
 for f in \"\$P\"/bin/*; do strip --strip-unneeded \"\$f\" 2>/dev/null || true; done"
 }
 
-_write_dev_info() {   # _write_dev_info STRIPPED MODE
-    local tmp head dirty since pa official_version
+_write_dev_info() {   # _write_dev_info STRIPPED MODE — into the dev runtime (DEPLOY_HOST's when set; RF from _remote_probe)
+    local tmp head dirty since pa official_version seeded_from dest
     # every substitution here must survive a missing input (no wine-src git tree
     # yet, no official runtime yet): `|| true` / `|| echo`, never a bare pipeline
     head="$(git -C "$WINE_SRC" log -1 --format='%H %s' 2>/dev/null || echo unknown)"
     dirty="$(_wine_dirty || true)"
     since="$(git -C "$WINE_SRC" log --format='  %h %s' "$SERIES_TAG..HEAD" 2>/dev/null || true)"
     pa="$(git -C "$PIPEASIO_SRC" log -1 --format='%H %s' 2>/dev/null || echo none)"
-    official_version="$(sed -n 's/^dist-version: *//p' "$OFFICIAL_ROOT/ABLETON-WINE-BUILD-INFO.txt" 2>/dev/null | head -n1 || true)"
+    if [ -n "$DEPLOY_HOST" ]; then
+        official_version="${RF[official_version]:-}"
+        seeded_from="$DEPLOY_HOST:${RF[official_root]:-?}"
+        dest="$DEPLOY_HOST:${RF[dev_root]:-?}/PROFILER-DEV-INFO.txt"
+    else
+        official_version="$(sed -n 's/^dist-version: *//p' "$OFFICIAL_ROOT/ABLETON-WINE-BUILD-INFO.txt" 2>/dev/null | head -n1 || true)"
+        seeded_from="$OFFICIAL_ROOT"
+        dest="$DEV_ROOT/PROFILER-DEV-INFO.txt"
+    fi
     tmp="$(mktemp "$(_scratch)/dev-info.XXXXXX")"
     {
         printf '# PROFILER-DEV-INFO.txt — written by profiler/dev/wine-dev.sh sync.\n'
         printf '# This runtime is a DEVELOPMENT build (unofficial): ABLETON-WINE-BUILD-INFO.txt here\n'
         printf '# still describes the official runtime it was seeded from, not these binaries.\n'
         printf 'synced=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        printf 'built_on=%s\n' "$(uname -n)"
         printf 'source=%s\n' "$WINE_SRC"
         printf 'head=%s\n' "$head"
         printf 'dirty=%s\n' "$([ "$dirty" = 0 ] && echo no || echo "yes ($dirty uncommitted change(s))")"
@@ -951,16 +1010,26 @@ _write_dev_info() {   # _write_dev_info STRIPPED MODE
         printf 'stripped=%s\n' "$1"
         printf 'mode=%s\n' "$2"
         printf 'jobs=%s\n' "$JOBS"
-        printf 'seeded_from=%s%s\n' "$OFFICIAL_ROOT" "${official_version:+ (dist-version $official_version)}"
+        printf 'seeded_from=%s%s\n' "$seeded_from" "${official_version:+ (dist-version $official_version)}"
     } > "$tmp"
-    run --quiet -- install -m 0644 -- "$tmp" "$DEV_ROOT/PROFILER-DEV-INFO.txt" || { rm -f -- "$tmp"; return 1; }
+    if [ -n "$DEPLOY_HOST" ]; then
+        run --quiet -- rsync --chmod=F644 -e "ssh -o BatchMode=yes" --rsync-path="$(_rsync_path_locked)" -- "$tmp" "$dest" || { rm -f -- "$tmp"; return 1; }
+    else
+        run --quiet -- install -m 0644 -- "$tmp" "$dest" || { rm -f -- "$tmp"; return 1; }
+    fi
     rm -f -- "$tmp"
-    ok "wrote $DEV_ROOT/PROFILER-DEV-INFO.txt (head ${head%% *}, dirty=$dirty, stripped=$1)"
+    ok "wrote $dest (head ${head%% *}, dirty=$dirty, stripped=$1)"
+}
+
+_rsync_path_locked() {   # --rsync-path that makes the deploy host's rsync hold its session lock
+    if [ "${LOCK_WAIT:-0}" -gt 0 ]; then printf 'flock -w %s %s rsync' "$LOCK_WAIT" "${RF[session_lock]:-}"
+    else printf 'flock -n %s rsync' "${RF[session_lock]:-}"; fi
 }
 
 cmd_sync() {
-    local strip=0 artifacts=0 fast=0 t0 changes n mode="stage-rsync"
+    local strip=0 artifacts=0 fast=0 t0 changes n mode="stage-rsync" dest have_dest=0 errf busy
     local -a dirs=() rsync_opts=()
+    LOCK_WAIT=0
     while [ $# -gt 0 ]; do
         case "$1" in
             --strip) strip=1 ;;
@@ -968,40 +1037,99 @@ cmd_sync() {
             --dir) [ $# -ge 2 ] || usage_error "--dir needs a directory"; dirs+=("$2"); shift ;;
             --dir=*) dirs+=("${1#*=}") ;;
             --fast) fast=1 ;;
+            --remote) [ $# -ge 2 ] || usage_error "--remote needs a host"; DEPLOY_HOST="$2"; shift ;;
+            --remote=*) DEPLOY_HOST="${1#*=}" ;;
+            --local) DEPLOY_HOST="" ;;
+            --lock-wait) [ $# -ge 2 ] || usage_error "--lock-wait needs seconds"; LOCK_WAIT="$2"; shift ;;
+            --lock-wait=*) LOCK_WAIT="${1#*=}" ;;
             *) usage_error "sync: unknown option $1" ;;
         esac
         shift
     done
     [ "$artifacts" -eq 1 ] || [ "${#dirs[@]}" -eq 0 ] || usage_error "sync: --dir only makes sense with --artifacts"
     [ "$artifacts" -eq 0 ] || [ "${#dirs[@]}" -gt 0 ] || usage_error "sync: --artifacts needs at least one --dir DIR (e.g. --dir dlls/ntdll)"
+    [[ "$LOCK_WAIT" =~ ^[0-9]+$ ]] || usage_error "sync: --lock-wait needs whole seconds (got '$LOCK_WAIT')"
+    [ -n "$DEPLOY_HOST" ] || [ "$LOCK_WAIT" -eq 0 ] || usage_error "sync: --lock-wait applies to a deploy host (--remote HOST)"
     _log_open sync
     _lock_dev
     _banner "sync"
-    _check_tools rsync cp install || die "cannot continue" 2
-    if _official_build_running; then
-        die "build-official.sh is running: it replaces $OFFICIAL_ROOT (the seed of the dev runtime) — wait for it" 2
+    if [ -n "$DEPLOY_HOST" ]; then
+        _check_tools rsync ssh base64 || die "cannot continue" 2
+    else
+        _check_tools rsync cp install || die "cannot continue" 2
+        if _official_build_running; then
+            die "build-official.sh is running: it replaces $OFFICIAL_ROOT (the seed of the dev runtime) — wait for it" 2
+        fi
     fi
 
     section 1 4 "safety"
-    _refuse_if_runtime_busy "$OFFICIAL_ROOT" "$DEV_ROOT" || return 1
-    ok "no process runs from $OFFICIAL_ROOT or $DEV_ROOT"
+    if [ -n "$DEPLOY_HOST" ]; then
+        _remote_probe "$DEPLOY_HOST" || return 1
+        kv "deploy host" "$DEPLOY_HOST (${RF[host]:-?}): dev runtime ${RF[dev_root]}, official ${RF[official_root]:-?}${RF[official_version]:+ (dist-version ${RF[official_version]})}"
+        [ "${RF[rsync]:-no}" = yes ] || die "rsync is not installed on $DEPLOY_HOST" 2
+        [[ "${RF[session_lock]:-}" =~ ^[A-Za-z0-9._/@:+=-]+$ ]] && [[ "${RF[dev_root]}" =~ ^[A-Za-z0-9._/@:+=-]+$ ]] \
+            || die "unexpected paths from $DEPLOY_HOST (session lock '${RF[session_lock]:-}', dev runtime '${RF[dev_root]}')" 2
+        busy="${RF[busy]:-}"
+        if [ -n "${busy// /}" ]; then
+            fail "processes run from $DEPLOY_HOST's runtimes (pid ${busy% }) — refusing to replace files under them" || true
+            info "quit Live there (File > Quit) and wait for wineserver to exit; then re-run"
+            return 1
+        fi
+        ok "no process runs from $DEPLOY_HOST's runtimes"
+        if [ "${RF[lock]:-free}" = held ]; then
+            [ "$LOCK_WAIT" -gt 0 ] || die "$DEPLOY_HOST's session lock is held (a trial, bench run or Live session is in progress): retry when it is free, or pass --lock-wait SECONDS" 2
+            warn "$DEPLOY_HOST's session lock is held: each step below waits up to ${LOCK_WAIT}s for it"
+        else
+            ok "$DEPLOY_HOST's session lock is free (the seed and the copy each hold it while they run)"
+        fi
+    else
+        _refuse_if_runtime_busy "$OFFICIAL_ROOT" "$DEV_ROOT" || return 1
+        ok "no process runs from $OFFICIAL_ROOT or $DEV_ROOT"
+    fi
     [ -x "$STAGE_ROOT/bin/wine" ] || _is_dry || die "no staged Wine at $STAGE_ROOT — run  wine-dev.sh init  (or build --install)" 2
     _warn_series_drift
     kv "tree" "$(_wine_head), $(_wine_dirty) uncommitted change(s), $(_wine_since) commit(s) since $SERIES_TAG"
 
     section 2 4 "dev runtime"
-    if [ -d "$DEV_ROOT" ]; then
-        ok "dev runtime exists at $DEV_ROOT"
-    else
-        if [ ! -x "$OFFICIAL_ROOT/bin/wine" ]; then
-            _is_dry || die "no official runtime at $OFFICIAL_ROOT to seed the dev runtime (setup phase 'install' or build-official.sh first)" 2
-            warn "no official runtime at $OFFICIAL_ROOT yet (dry run continues)"
+    if [ -n "$DEPLOY_HOST" ]; then
+        dest="$DEPLOY_HOST:${RF[dev_root]}"
+        if [ "${RF[dev_present]:-no}" = yes ]; then
+            ok "dev runtime exists at $dest"
+        else
+            if [ "${RF[official_present]:-no}" != yes ]; then
+                _is_dry || die "no official runtime on $DEPLOY_HOST at ${RF[official_root]:-?} to seed the dev runtime (install one there first)" 2
+                warn "no official runtime on $DEPLOY_HOST yet (dry run continues)"
+            fi
+            t0="$(_now)"
+            step "seeding $dest from ${RF[official_root]:-?} (cp -a --reflink=auto on $DEPLOY_HOST, under its session lock)"
+            if _is_dry; then
+                info "(dry run) would run remote-runtime.sh seed-dev --lock-wait $LOCK_WAIT on $DEPLOY_HOST"
+            else
+                if ! _remote_rt "$DEPLOY_HOST" seed-dev --lock-wait "$LOCK_WAIT" 2>&1 | _lines; then
+                    summary_add seed failed $(( $(_now) - t0 ))
+                    fail "seeding the dev runtime on $DEPLOY_HOST failed"
+                    return 1
+                fi
+            fi
+            summary_add seed "$(_st)" $(( $(_now) - t0 ))
         fi
-        t0="$(_now)"
-        step "seeding $DEV_ROOT from $OFFICIAL_ROOT (cp -a --reflink=auto: instant on btrfs)"
-        run -- cp -a --reflink=auto -- "$OFFICIAL_ROOT" "$DEV_ROOT" || return 1
-        summary_add seed "$(_st)" $(( $(_now) - t0 ))
-        ! _is_dry || info "(dry run) the following steps assume the seed exists"
+        if [ "${RF[dev_present]:-no}" = yes ] || ! _is_dry; then have_dest=1; fi
+    else
+        dest="$DEV_ROOT"
+        if [ -d "$DEV_ROOT" ]; then
+            ok "dev runtime exists at $DEV_ROOT"
+        else
+            if [ ! -x "$OFFICIAL_ROOT/bin/wine" ]; then
+                _is_dry || die "no official runtime at $OFFICIAL_ROOT to seed the dev runtime (setup phase 'install' or build-official.sh first)" 2
+                warn "no official runtime at $OFFICIAL_ROOT yet (dry run continues)"
+            fi
+            t0="$(_now)"
+            step "seeding $DEV_ROOT from $OFFICIAL_ROOT (cp -a --reflink=auto: instant on btrfs)"
+            run -- cp -a --reflink=auto -- "$OFFICIAL_ROOT" "$DEV_ROOT" || return 1
+            summary_add seed "$(_st)" $(( $(_now) - t0 ))
+            ! _is_dry || info "(dry run) the following steps assume the seed exists"
+        fi
+        if [ -d "$DEV_ROOT" ]; then have_dest=1; fi
     fi
 
     section 3 4 "stage"
@@ -1021,10 +1149,14 @@ cmd_sync() {
     section 4 4 "copy"
     rsync_opts=(-a --itemize-changes --exclude 'ABLETON-WINE-*.txt' --exclude '.ableton-linux-runtime' --exclude 'PROFILER-DEV-INFO.txt')
     [ "$fast" -eq 1 ] || rsync_opts+=(--checksum)
+    [ -z "$DEPLOY_HOST" ] || rsync_opts+=(-e "ssh -o BatchMode=yes")
     t0="$(_now)"
-    if [ -d "$DEV_ROOT" ] && [ -d "$STAGE_ROOT" ]; then
-        step "comparing $STAGE_ROOT with $DEV_ROOT ($([ "$fast" -eq 1 ] && echo 'size+mtime' || echo 'checksums'))"
-        changes="$(rsync "${rsync_opts[@]}" --dry-run -- "$STAGE_ROOT/" "$DEV_ROOT/" 2>/dev/null | grep -E '^[>ch*]' || true)"
+    if [ "$have_dest" -eq 1 ] && [ -d "$STAGE_ROOT" ]; then
+        step "comparing $STAGE_ROOT with $dest ($([ "$fast" -eq 1 ] && echo 'size+mtime' || echo 'checksums'))"
+        errf="$(_scratch)/rsync-compare.err"
+        changes="$(rsync "${rsync_opts[@]}" --dry-run -- "$STAGE_ROOT/" "$dest/" 2>"$errf")" \
+            || { fail "comparing with $dest failed: $(head -c 400 -- "$errf")"; return 1; }
+        changes="$(printf '%s\n' "$changes" | grep -E '^[>ch*]' || true)"
         n="$(printf '%s' "$changes" | grep -c . || true)"
         if [ "$n" -eq 0 ]; then
             ok "dev runtime already matches the stage"
@@ -1037,16 +1169,31 @@ cmd_sync() {
         info "(dry run) nothing to compare yet"
     fi
     if [ "$n" != 0 ]; then
-        step "rsync stage → dev runtime"
-        run --quiet -- rsync "${rsync_opts[@]}" -- "$STAGE_ROOT/" "$DEV_ROOT/" || { summary_add rsync failed $(( $(_now) - t0 )); return 1; }
+        step "rsync stage → $dest"
+        if [ -n "$DEPLOY_HOST" ]; then
+            if ! run --quiet -- rsync "${rsync_opts[@]}" --rsync-path="$(_rsync_path_locked)" -- "$STAGE_ROOT/" "$dest/"; then
+                summary_add rsync failed $(( $(_now) - t0 ))
+                if _remote_probe "$DEPLOY_HOST" 2>/dev/null && [ "${RF[lock]:-}" = held ]; then
+                    info "$DEPLOY_HOST's session lock is held now (a trial started?): its rsync never ran; re-run when the lock is free, or pass --lock-wait SECONDS"
+                fi
+                return 1
+            fi
+        else
+            run --quiet -- rsync "${rsync_opts[@]}" -- "$STAGE_ROOT/" "$dest/" || { summary_add rsync failed $(( $(_now) - t0 )); return 1; }
+        fi
     fi
     summary_add rsync "$(_st)" $(( $(_now) - t0 )) "$n file(s)"
     if ! _is_dry; then
-        [ -x "$DEV_ROOT/bin/wine" ] && [ -x "$DEV_ROOT/bin/wineserver" ] || { fail "dev runtime is incomplete: bin/wine or bin/wineserver missing under $DEV_ROOT"; return 1; }
+        if [ -n "$DEPLOY_HOST" ]; then
+            _remote_probe "$DEPLOY_HOST" || return 1
+            [ "${RF[dev_complete]:-no}" = yes ] || { fail "dev runtime is incomplete: bin/wine or bin/wineserver missing under $dest"; return 1; }
+        else
+            [ -x "$DEV_ROOT/bin/wine" ] && [ -x "$DEV_ROOT/bin/wineserver" ] || { fail "dev runtime is incomplete: bin/wine or bin/wineserver missing under $DEV_ROOT"; return 1; }
+        fi
     fi
     _write_dev_info "$([ "$strip" -eq 1 ] && echo yes || echo no)" "$mode" || return 1
-    _record last-sync "$mode${dirs[*]:+ ${dirs[*]}}"
-    ok "dev runtime at $DEV_ROOT is up to date"
+    _record last-sync "$mode${dirs[*]:+ ${dirs[*]}}${DEPLOY_HOST:+ → $DEPLOY_HOST}"
+    ok "dev runtime at $dest is up to date"
     _launch_hint
 }
 
