@@ -188,6 +188,17 @@ Next candidates (user to choose; none pre-registered yet):
 - Ledger + runs 7477ea9.
 - Next: a traced diagnostic run on the kept configuration, to name the ~4 per-block wineserver requests and count the Wine crossings per block. That leads into the first Wine hot-path patch (the event fast path for the worker fan-out).
 
+**Trial T0008 (user decision 2026-10-18: "the 8–9 worker trial"; pre-registered before running): nine audio workers.**
+- Setup:
+  - Both arms keep the kept configuration: `PIPEASIO_REALTIME=1`, with pipeasio-rt and every `AudioCalc` worker pinned to the P-core CPUs 0–11 (shared, as in T0004).
+  - A: Live's 15 workers (launcher auto).
+  - B: `ABLETON_MAX_AUDIO_THREADS=9`. Only the worker count changes; T0006 changed both count and per-core pinning.
+  - ABAB × 3; Inbuilts, Max4Live, VSTs; 120 s.
+- Why: T0006's six workers cut Live's CPU 37 % and lowered DSP load, but Max4Live dropouts rose. Nine workers plus the callback (10 threads) still fit the 12 P-core CPUs with no queueing, keep more parallel capacity, and should keep most of the fan-out saving (syncbench: ~11 → ~8 µs per round).
+- PASS rule: the same as T0004 ([D] or [E], plus both guards).
+- Mechanism check: 9 `AudioCalc` threads in every B Set-run (15 in A), all allowed on 0–11.
+- Driver: ~/.local/state/profiler/trial-T0008.sh. Scored by `plans/tools/trial-analyze.py T0008 --rule t0004`. If it passes or is inconclusive, eight workers is the follow-up.
+
 **Wine hot-path research (2026-10-18 morning)**
 
 Diagnostic D0001: one traced run on the kept configuration (heavy Sets, 60 s each, 45,000 blocks per Set; history `diag-D0001-traced`).
