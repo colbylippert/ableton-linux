@@ -24,6 +24,7 @@
  *   --reps N         repetitions (default 5)
  *   --workers K      fanout workers (default 15)
  *   --work-ns N      busy work per worker per round in fanout (default 0)
+ *   --cpus a,b,...   pin the main thread to a and thread i to the i-th entry (wrapping)
  *   --help
  *
  * The probe is a plain PE without a CRT (kernel32 only). Timing uses
@@ -49,6 +50,25 @@ static void emit( const char *s )
 
 static const char *g_only;
 static UINT g_iters = 200000, g_rounds = 20000, g_reps = 5, g_workers = 15, g_work_ns;
+static UINT g_cpus[64], g_ncpus;   /* --cpus a,b,c: thread i runs on g_cpus[i % g_ncpus] (0 = main) */
+
+static void parse_cpus( const char *s )
+{
+    UINT v = 0; int have = 0;
+    for (;; s++)
+    {
+        if (*s >= '0' && *s <= '9') { v = v * 10 + (*s - '0'); have = 1; continue; }
+        if (have && g_ncpus < 64) g_cpus[g_ncpus++] = v;
+        v = 0; have = 0;
+        if (*s != ',') break;
+    }
+}
+
+static void pin_self( UINT slot )
+{
+    if (!g_ncpus) return;
+    SetThreadAffinityMask( GetCurrentThread(), (DWORD_PTR)1 << g_cpus[slot % g_ncpus] );
+}
 
 static const char *skip_ws( const char *p ) { while (*p == ' ' || *p == '\t') p++; return p; }
 
@@ -233,6 +253,7 @@ static volatile LONG g_stop;
 static DWORD WINAPI pong_thread( void *arg )
 {
     (void)arg;
+    pin_self( 1 );
     for (;;)
     {
         WaitForSingleObject( g_ping, INFINITE );
@@ -272,6 +293,7 @@ static volatile LONG g_left;
 static DWORD WINAPI fan_worker( void *arg )
 {
     UINT idx = (UINT)(ULONG_PTR)arg;
+    pin_self( idx + 1 );
     for (;;)
     {
         WaitForSingleObject( g_work_ev[idx], INFINITE );
@@ -341,6 +363,11 @@ void mainCRTStartup( void )
         ExitProcess( 0 );
     }
     g_only = opt_str( "--only", only, sizeof(only) );
+    {
+        char cpus[256];
+        if (opt_str( "--cpus", cpus, sizeof(cpus) )) parse_cpus( cpus );
+        pin_self( 0 );
+    }
     if (opt_uint( "--iters", &g_iters ) < 0 || opt_uint( "--rounds", &g_rounds ) < 0 ||
         opt_uint( "--reps", &g_reps ) < 0 || opt_uint( "--workers", &g_workers ) < 0 ||
         opt_uint( "--work-ns", &g_work_ns ) < 0 || !g_iters || !g_rounds || !g_reps || g_reps > 64)

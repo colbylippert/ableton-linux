@@ -11,7 +11,7 @@
  * (ntsync minus futex).
  *
  * build: gcc -O2 -pthread -o syncbench_native syncbench_native.c
- * run:   chrt -r 10 taskset -c 0-11 ./syncbench_native [workers] [rounds] [reps]
+ * run:   chrt -r 10 taskset -c 0-11 ./syncbench_native [workers] [rounds] [reps] [cpu,list]
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -41,6 +41,15 @@ static uint64_t now_ns( void )
 struct ev { int fd; _Atomic int word; int manual; };
 static int g_dev = -1;
 static int g_impl; /* 0 = ntsync, 1 = futex */
+static int g_cpus[64], g_ncpus;   /* argv[4] "a,b,c": thread i on g_cpus[i % n] (0 = main) */
+
+static void pin_self( int slot )
+{
+    cpu_set_t set;
+    if (!g_ncpus) return;
+    CPU_ZERO( &set ); CPU_SET( g_cpus[slot % g_ncpus], &set );
+    pthread_setaffinity_np( pthread_self(), sizeof(set), &set );
+}
 
 static void ev_init( struct ev *e, int manual )
 {
@@ -97,6 +106,7 @@ static _Atomic int g_left, g_stop;
 static void *worker( void *arg )
 {
     int idx = (int)(intptr_t)arg;
+    pin_self( idx + 1 );
     for (;;)
     {
         ev_wait( &g_work[idx] );
@@ -138,6 +148,7 @@ static struct ev g_ping, g_pong;
 static void *pong( void *arg )
 {
     (void)arg;
+    pin_self( 1 );
     for (;;)
     {
         ev_wait( &g_ping );
@@ -188,6 +199,8 @@ int main( int argc, char **argv )
     int rounds = argc > 2 ? atoi( argv[2] ) : 20000;
     int reps = argc > 3 ? atoi( argv[3] ) : 5;
     if (k < 1 || k > MAXW) k = 15;
+    if (argc > 4) for (char *s = argv[4]; *s && g_ncpus < 64; ) { g_cpus[g_ncpus++] = (int)strtol( s, &s, 10 ); if (*s == ',') s++; }
+    pin_self( 0 );
     g_dev = open( "/dev/ntsync", O_RDWR | O_CLOEXEC );
     if (g_dev < 0) { perror( "/dev/ntsync" ); return 1; }
 
