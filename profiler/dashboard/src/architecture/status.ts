@@ -12,7 +12,7 @@ export interface PartStatus {
   note: string;
 }
 
-export const STATUS_AS_OF = '18 October 2026 (trials T0001–T0010)';
+export const STATUS_AS_OF = '18 October 2026 (trials T0001–T0011)';
 
 export const STATUS_ROWS: readonly PartStatus[] = [
   {
@@ -91,7 +91,7 @@ export const STATUS_ROWS: readonly PartStatus[] = [
     part: 'A/B trials',
     paths: ['profiler/ledger.jsonl', 'profiler/history/runs/'],
     state: 'in progress',
-    note: 'Kept: PipeASIO realtime (T0003, PipeWire errors 204 to 30), P-core audio threads (T0004, 38 to 17) and nine audio workers (T0008, 20 to 10, Live CPU -23 %). Inconclusive: six audio workers (T0006). Reverted: T0001, T0005, T0007, T0009 (eight workers). Diagnostic: Live minimised during playback (T0010) changed nothing.',
+    note: 'Kept: PipeASIO realtime (T0003, PipeWire errors 204 to 30), P-core audio threads (T0004, 38 to 17) and nine audio workers (T0008, 20 to 10, Live CPU -23 %). Inconclusive: six audio workers (T0006). Reverted: T0001, T0005, T0007, T0009 (eight workers), T0011 (Live\'s GPU renderer, which costs CPU under Wine). Diagnostic: Live minimised during playback (T0010) changed nothing.',
   },
   {
     part: 'History and dashboard',

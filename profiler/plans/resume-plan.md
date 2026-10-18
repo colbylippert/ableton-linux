@@ -264,6 +264,15 @@ Next candidates (user to choose; none pre-registered yet):
 - Mechanism check: Live's `Log.txt` reads `GPU Renderer: On` for every B launch and `Off` for every A one. The driver aborts after B1 unless all three of its launches ran with the GPU renderer on. The per-thread CPU of the UI thread and `wined3d_cs` is reported per arm.
 - Driver: ~/.local/state/profiler/trial-T0011.sh. Scored by `plans/tools/trial-analyze.py T0011 --rule t0004`.
 
+**Trial T0011 — REVERT (2026-10-18):** rule FAIL; both guards pass.
+- Dropouts: PipeWire ERR 18 → 18 (B fewer in 3 of 9 Set-pairs).
+- DSP: the median DSP average was within 0.19 pt on every Set.
+- Mechanism held: the GPU renderer was on in 9 of 9 B launches (`GPU Renderer: OnAlways (User setting)`).
+- Under Wine the GPU renderer costs CPU instead of saving it. Medians, % of one core: UI thread 10.7 → 11.4, `wined3d_cs` 2.3 → 3.0, wineserver 1.6 → 1.7, Live 48.1 → 51.1.
+- Why: Wine translates Live's D3D11 drawing to OpenGL on the CPU, on the calling thread.
+- `golden` (renderer off) stays the baseline. `golden-gpu` is kept for a later test with a different Wine rendering path (DXVK or wined3d's Vulkan renderer).
+- Ledger + runs 9573c20.
+
 **Trial T0012 (user decision 2026-10-18: "q t0012"; pre-registered before running): the APC fast path.**
 - Setup:
   - Both arms keep the configuration: `PIPEASIO_REALTIME=1`, with pipeasio-rt and every `AudioCalc` worker pinned to CPUs 0–11 (shared), nine workers, the normal window, and snapshot `golden`. If T0011 passes, its snapshot becomes the baseline first, and the queue holds for that.
@@ -314,6 +323,14 @@ Implications:
 - The dropouts come from Live's own work spikes. Next evidence: scheduler and page-fault tracing of the callback in late blocks.
 - First Wine patch: `0109` user-mode QPC behind an opt-in switch, measured with syncbench + a traced run + ABAB.
 - `0109` keeps QPC in 100 ns ticks at 10 MHz (design correction, 2026-10-18). Wine's own code calls `NtQueryPerformanceCounter(&now, NULL)` and treats the result as 100 ns ticks: the threadpool timers, the wait timeouts in `unix/sync.c` and `unix/server.c`, win32u input, nsiproxy and the OSS/CoreAudio drivers. So the Windows layout (`QpcBypassEnabled` with a TSC-derived `QpcFrequency`) would break them. Instead, the TSC is scaled to 100 ns ticks, and `NtQueryPerformanceCounter` uses the same formula, so both paths agree. The parameters live in the shared user data, so every process in the prefix gets the same values.
+- **Built and tested (2026-10-18, on the workstation build host, then on the laptop's dev runtime between T0011 and T0012):**
+  - wineserver calibrates the TSC over 1 s, publishes a two-copy latch at offset 0xf00 of the shared user data page, and re-anchors it on every refresh.
+  - The rate is re-measured every second; the phase is slewed by at most 1 %, never stepping.
+  - `tools/qpcprobe.exe` passed every check on the laptop.
+  - Cost per call: QPC 76 → 14 ns (`syncbench` qpc median 76.5 → 15.0 ns).
+  - 2,000,000 alternating values from both routes never went backwards, and the routes agree (mean gap 0.49 ticks).
+  - Tracking: `WINE_QPC_TSC=debug` logged QPC +955 ns from `CLOCK_BOOTTIME`, settling to −62…−106 ns, with the rate within 1 ppm.
+  - WSL is not a valid place to test tracking: timesyncd slews WSL's clock by ±5 %.
 - The mapping must follow the kernel clock's rate, not a fixed calibration. PipeASIO stamps the ASIO system time with PipeWire's `clock.nsec` (`CLOCK_MONOTONIC`), and Wine's QPC (`CLOCK_BOOTTIME`) runs at that same rate today. A fixed TSC calibration would drift from those stamps by the NTP correction, a few ppm, which is tens of ms per hour. So wineserver, which already refreshes the shared user data every ~16 ms, re-anchors the published TSC mapping against `CLOCK_BOOTTIME` under a seqlock, the way the kernel's vDSO data works, and slews rather than steps so QPC stays monotonic.
 - Dev loop: `wine-dev` container initialised at 08:04 (`~/wine-dev/work/wine-src`, HEAD 10d4ce9).
 
