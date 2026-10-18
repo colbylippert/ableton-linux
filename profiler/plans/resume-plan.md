@@ -240,6 +240,30 @@ Next candidates (user to choose; none pre-registered yet):
   - Live's CPU is lower in B than in A. If it is not, minimising did not stop the rendering, and the trial says nothing about the UI.
 - Driver: ~/.local/state/profiler/trial-T0010.sh. Scored by `plans/tools/trial-analyze.py T0010 --rule t0004`.
 
+**Trial T0010 — REVERT (diagnostic, 2026-10-18):** rule FAIL. Started by a laptop-side queue runner (`queue-T0010.sh`) when T0009 ended, on nine workers.
+- Dropouts: PipeWire ERR 16 → 28. B was fewer in only 2 of 9 Set-pairs, so the error guard failed.
+- DSP: the median DSP average was within 0.11 pt on every Set. Live CPU was 47.0 vs 46.6 % of a core.
+- Mechanism: the window stayed minimised for the whole measurement in 9 of 9 B Set-runs. But minimising removes little of the UI's work. Medians over 9 Set-runs, in % of one core:
+  - Live's UI thread (thread id = pid): 10.6 → 9.8;
+  - `wined3d_cs`: 2.3 → 1.6;
+  - wineserver: 1.5 → 1.0.
+  (47 of Live's threads are named `MainThread`, because unnamed threads inherit the name, but the UI thread is almost all of their CPU.)
+- Conclusion: what minimising removes does not cause dropouts, and the normal window stays. Live's log reads `GPU Renderer: Off (Platform default)`: Live draws its UI on the CPU and presents it through D3D11 on the Intel iGPU, which led to T0011.
+- Caution: this A arm had 16 errors on the configuration that gave T0009's A arm 4. Error counts vary widely between trials, so only the paired comparison counts.
+- Ledger + runs 36e4295.
+
+**Trial T0011 (user decision 2026-10-18: turn on Live's GPU renderer; pre-registered before running): Live's GPU renderer on.**
+- Setup:
+  - Both arms keep the configuration: `PIPEASIO_REALTIME=1`, with pipeasio-rt and every `AudioCalc` worker pinned to CPUs 0–11 (shared), nine workers, and Live's window normal.
+  - A: snapshot `golden`. Live logs `GPU Renderer: Off (Platform default)`.
+  - B: snapshot `golden-gpu`. This is golden with the GPU renderer switched on once in Live's settings by the user, and `state diff` must show Live's preferences as the only real change.
+  - Every run restores its arm's snapshot first; the driver restores `golden` at the end.
+  - ABAB × 3; Inbuilts, Max4Live, VSTs; 120 s.
+- Why: Live's UI thread takes ~10 % of a core during playback (T0010), and it does Live's CPU drawing. The GPU renderer moves the drawing to the GPU through wined3d. That should free the UI thread, which runs at the audio threads' realtime priority, and the CPU's shared power budget. It may also add work in wined3d's command-stream and GL driver threads.
+- PASS rule: the same as T0004 ([D] or [E], plus both guards). Unlike T0010, a PASS is kept: `golden-gpu` becomes the baseline (`state snapshot --rebaseline`).
+- Mechanism check: Live's `Log.txt` reads `GPU Renderer: On` for every B launch and `Off` for every A one. The driver aborts after B1 unless all three of its launches ran with the GPU renderer on. The per-thread CPU of the UI thread and `wined3d_cs` is reported per arm.
+- Driver: ~/.local/state/profiler/trial-T0011.sh. Scored by `plans/tools/trial-analyze.py T0011 --rule t0004`.
+
 **Wine hot-path research (2026-10-18 morning)**
 
 Diagnostic D0001: one traced run on the kept configuration (heavy Sets, 60 s each, 45,000 blocks per Set; history `diag-D0001-traced`).
@@ -284,7 +308,7 @@ Implications:
 - Reproducibility: an official workstation build of the same sources matches the laptop's installed runtime. All 288 unix-side libraries are byte-identical except `pipeasio64.dll.so`, whose log banner embeds `__DATE__ __TIME__`. The 1568 PE files differ only in their link timestamps.
 - Deploys: they go over ssh to the laptop under its session lock (`deploy_host`, 2064dba): `wine-dev.sh sync` for the dev runtime, `build-official.sh` for an installer kit. The laptop only runs trials.
 
-**Scoreboard after T0009** (heavy Sets, 120 s windows):
+**Scoreboard after T0010** (heavy Sets, 120 s windows; T0010 was a diagnostic, Live minimised, which changed nothing):
 - Kept: PipeASIO realtime (T0003), P-core audio threads (T0004) and nine audio workers (T0008). PipeWire ERR per 9 Set-runs went 204 → 4–10; Live CPU 64 → 48 % of a core; worst DSP peaks 130–225 % → 73–111 %.
 - Reverted: T0001 (idle-state cap), T0005 (E-cores for non-audio threads), T0007 (realtime wineserver), T0009 (eight workers).
 - Inconclusive: T0002 (confirmed by T0003) and T0006 (six workers: Live CPU −37 % and DSP lower, but Max4Live dropouts rose).
