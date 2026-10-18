@@ -1,1 +1,6 @@
-{}
+{
+  "d65f2ea0b816442a8d38bcb991cc7fd2": {
+    "benchmark/-": "20261017T034259Z-b4-baseline-untraced",
+    "benchmark/- [alsa_output.usb-Focusrite_Scarlett_2i4_USB-00.pro-output-0]": "aa-focusrite-1"
+  }
+}
