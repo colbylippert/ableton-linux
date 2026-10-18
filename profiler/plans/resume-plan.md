@@ -218,6 +218,14 @@ Next candidates (user to choose; none pre-registered yet):
 - Mechanism check: 8 `AudioCalc` threads in every B Set-run (9 in A), all allowed on 0–11.
 - Driver: ~/.local/state/profiler/trial-T0009.sh. Scored by `plans/tools/trial-analyze.py T0009 --rule t0004`.
 
+**Trial T0009 — REVERT (2026-10-18):** rule FAIL.
+- Dropouts: PipeWire ERR 4 → 14. B was fewer in only 1 of 9 Set-pairs, so the error guard failed.
+- DSP: the median DSP average moved by at most 0.28 pt on any Set, all within noise.
+- No efficiency gain: Live CPU 47.8 vs 47.5 % of a core. With nine workers the AudioCalc CPU wait was already only 35–77 ms per 120 s.
+- Mechanism held: 8 `AudioCalc` threads in every B Set-run (9 in A).
+- Nine workers stay, so the curve has turned between nine and eight. The nine-worker A arm had 4 PipeWire errors in 9 Set-runs, the fewest of any arm so far.
+- Ledger + runs 7e38650.
+
 **Trial T0010 (user decision 2026-10-18: "Ableton minimized before the play command is issued so the UI does not render"; pre-registered before running): Live minimised during playback.**
 - Setup:
   - Both arms keep the configuration: `PIPEASIO_REALTIME=1`, with pipeasio-rt and every `AudioCalc` worker pinned to CPUs 0–11 (shared). The worker count is whatever T0009 leaves: eight if it passes, nine otherwise.
@@ -275,9 +283,9 @@ Implications:
 - Reproducibility: an official workstation build of the same sources matches the laptop's installed runtime. All 288 unix-side libraries are byte-identical except `pipeasio64.dll.so`, whose log banner embeds `__DATE__ __TIME__`. The 1568 PE files differ only in their link timestamps.
 - Deploys: they go over ssh to the laptop under its session lock (`deploy_host`, 2064dba): `wine-dev.sh sync` for the dev runtime, `build-official.sh` for an installer kit. The laptop only runs trials.
 
-**Scoreboard after T0008** (heavy Sets, 120 s windows):
-- Kept: PipeASIO realtime (T0003), P-core audio threads (T0004) and nine audio workers (T0008). PipeWire ERR per 9 Set-runs went 204 → 10; Live CPU 64 → 49 % of a core; worst DSP peaks 130–225 % → 73–107 %.
-- Reverted: T0001 (idle-state cap), T0005 (E-cores for non-audio threads), T0007 (realtime wineserver).
+**Scoreboard after T0009** (heavy Sets, 120 s windows):
+- Kept: PipeASIO realtime (T0003), P-core audio threads (T0004) and nine audio workers (T0008). PipeWire ERR per 9 Set-runs went 204 → 4–10; Live CPU 64 → 48 % of a core; worst DSP peaks 130–225 % → 73–111 %.
+- Reverted: T0001 (idle-state cap), T0005 (E-cores for non-audio threads), T0007 (realtime wineserver), T0009 (eight workers).
 - Inconclusive: T0002 (confirmed by T0003) and T0006 (six workers: Live CPU −37 % and DSP lower, but Max4Live dropouts rose).
 **Testing plan (2026-10-17).** Every trial: ABAB × 3, golden restored per run, all 5 Sets, untraced; accept iff the median DSP average or typical peak improves by more than 2× the A/A spread on at least one heavy Set, no Set regresses beyond noise, and the dropout guards (PipeWire ERR, peaks >100 %) are not worse; ledger + history + commit/push per trial.
 1. Scheduling / configuration (no Wine code; PR-able as defaults or launcher options): PipeASIO realtime (T0002 → **kept in T0003**) → next, on top of it: tune the pipeasio-rt priority (PIPEASIO_RT_PRIORITY) vs Live's RR 10 → P-core affinity for pipeasio-rt + AudioCalc → real-time only for audio threads (today the launcher makes all 94 Live threads RR 10, UI and graphics included). Dropout trials use T0003's shape (heavy Sets, 120 s, pre-registered sign test on PipeWire ERR).

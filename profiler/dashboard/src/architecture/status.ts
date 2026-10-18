@@ -12,7 +12,7 @@ export interface PartStatus {
   note: string;
 }
 
-export const STATUS_AS_OF = '18 October 2026 (trials T0001–T0008)';
+export const STATUS_AS_OF = '18 October 2026 (trials T0001–T0009)';
 
 export const STATUS_ROWS: readonly PartStatus[] = [
   {
@@ -79,7 +79,7 @@ export const STATUS_ROWS: readonly PartStatus[] = [
     part: 'Official build',
     paths: ['profiler/dev/build-official.sh'],
     state: 'working',
-    note: "Builds run on the workstation's WSL build host in about 6 minutes; build-audit passes 189 of 189. Installing on the laptop over ssh is written, not yet run.",
+    note: "Builds run on the workstation's WSL build host in about 4 minutes; build-audit passes 189 of 189. The laptop install runs over ssh under its session lock, queued behind any trial (first used 18 October).",
   },
   {
     part: 'Wine dev loop',
@@ -91,7 +91,7 @@ export const STATUS_ROWS: readonly PartStatus[] = [
     part: 'A/B trials',
     paths: ['profiler/ledger.jsonl', 'profiler/history/runs/'],
     state: 'in progress',
-    note: 'Kept: PipeASIO realtime (T0003, PipeWire errors 204 to 30), P-core audio threads (T0004, 38 to 17) and nine audio workers (T0008, 20 to 10, Live CPU -23 %). Inconclusive: six audio workers (T0006). Reverted: T0001, T0005, T0007.',
+    note: 'Kept: PipeASIO realtime (T0003, PipeWire errors 204 to 30), P-core audio threads (T0004, 38 to 17) and nine audio workers (T0008, 20 to 10, Live CPU -23 %). Inconclusive: six audio workers (T0006). Reverted: T0001, T0005, T0007, T0009 (eight workers).',
   },
   {
     part: 'History and dashboard',
