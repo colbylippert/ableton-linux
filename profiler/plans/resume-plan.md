@@ -475,8 +475,33 @@ Next candidates (user to choose; none pre-registered yet):
   - A helper, `profiler/bin/boot-kernel normal|rt`, sets the next boot with `grub-reboot` (one-shot), reboots, waits for SSH and the session, and checks `uname -v`.
   - One-shot boots mean a failed RT boot falls back to the normal kernel on the next power cycle. `grub-set-default` makes a choice persistent.
 - Checks before any trial: R1 boot check on RT (PREEMPT_RT in `uname -v`, SSH, autologin, PipeWire + Focusrite, `/dev/ntsync`, the NVIDIA module, `trace-prereqs`, `dmesg`); R2 a Live smoke test (one Set, 60 s); R3 `cyclictest` on both kernels under load, for context (optional; needs rt-tests).
+- Done 2026-10-18 (user decision: "present skipping it is. lets move to rt bore kernel testing"):
+  - The user updated the OS first (`cachyos` update, 64 packages): the normal kernel moved from 7.2.9-2 to 7.2.11-1, and `linux-cachyos-nvidia-open` moved with it. `nvidia-utils` 615.78.08, Mesa 26.2.4, PipeWire 1.6.9, WirePlumber 0.5.18 and KWin 6.8.0 did not change.
+    - The baseline therefore moved with the kernel. Trial numbers before and after are not directly comparable; both arms of T0015 run on the new stack.
+    - The first install attempt failed: the regular mirrors no longer carried 7.2.9-2, and the main mirror's 7.2.9-2 file did not match the sync database's checksum. Nothing was installed.
+  - Installed from cachyos-v3: `linux-cachyos-rt-bore`, `-headers` and `-nvidia-open` 7.2.11-1, matching the normal kernel and `nvidia-utils` 615.78.08.
+    - Config: `PREEMPT_RT=y`, `SCHED_BORE=y`, `HZ=1000`, `NTSYNC=m`. The NVIDIA and NTSync modules are built for it.
+  - GRUB: `GRUB_DEFAULT='saved'` and `GRUB_DISABLE_SUBMENU='y'` (the old file is kept as `/etc/default/grub.profiler-<timestamp>`). The flat menu is linux-cachyos, linux-cachyos-rt-bore, linux-cachyos-lts; the saved default is the normal kernel. Every entry carries `video=eDP-1:d`.
+  - `profiler/bin/boot-kernel normal|rt|status` runs on the controlling host: it sets a one-shot `grub-reboot`, reboots, waits for a new boot ID and the desktop session, and prints a health line.
+  - R1 (RT boot): back in 39 s. PREEMPT_RT, desktop session on the NVIDIA GPU, Focusrite node, `/dev/ntsync`; 82 IRQ threads (25 on the normal kernel); 2 kernel error lines (TDX not supported, harmless).
+    - RT throttling is off (`sched_rt_runtime_us` = period = 1000000).
+    - Every IRQ thread runs FIFO 50 (`irq/123-xhci_hcd` for the Focusrite's USB controller, `irq/150-nvidia`, NVMe), above pipeasio-rt (FIFO 15) and Live (RR 10).
+  - R2 (Live smoke run on RT: official runtime, golden, OpenGL, kept configuration, Inbuilts, 60 s): exit 0, PipeWire errors 5, DSP 10.37 / 18.49.
+    - CPU was higher than the last normal-kernel run (old 7.2.9 kernel, dev runtime): Live 59.5 vs 46.5 %, UI thread 13.1 vs 8.4, AudioCalc 33.5 vs 26.8. That is typical of PREEMPT_RT's overhead, but it is one run.
 - Planned trials, ABAB × 3 on the heavy Sets with 120 s windows and the T0004 rule. Kernel arms reboot before every run, with the same boot settling as T0014:
   - **T0015, normal vs RT-BORE kernel:** everything else equal, including the switches and GPU mode T0012–T0014 keep.
+    - Pre-registered 2026-10-18, before running:
+      - A: `linux-cachyos` 7.2.11-1 (PREEMPT dynamic, full). B: `linux-cachyos-rt-bore` 7.2.11-1 (PREEMPT_RT and the BORE scheduler, which the package bundles).
+      - Both arms: `PIPEASIO_REALTIME=1`, pipeasio-rt and every `AudioCalc` pinned to CPUs 0–11, nine workers, the normal window, snapshot `golden` (OpenGL, renderer off), the official runtime with `WINE_QPC_TSC` and `WINE_APC_FASTPATH` off. Also the NVIDIA-only external display at 59.94 Hz, wired Ethernet, and the same priorities (FIFO 50 IRQ threads on B are the kernel's default).
+    - Every run starts from a fresh boot into its arm's kernel (one-shot `grub-reboot`), with T0014's boot settling: the per-boot timers are stopped for that boot, then a 120 s wait and a wait for the 1-minute load average to fall below 1.0 (at most 10 min in all).
+    - Order A1 B1 A2 B2 A3 B3. The laptop switches kernels itself, with no user steps; about 70 minutes.
+    - Inbuilts, Max4Live, VSTs; 120 s.
+    - PASS rule: the T0004 rule ([D] or [E], plus both guards), with the T0002 A/A spreads as in every trial since T0004.
+      - PASS: the RT-BORE kernel becomes the configuration, and T0016/T0017 run on it.
+      - Otherwise the normal kernel stays.
+    - Mechanism check: every run records its kernel (`uname -r`/`-v`). A run on the wrong kernel does not start; the driver stops and reports it.
+    - Secondary readouts: CPU package power (RAPL) and temperature, P-core frequency, Live's per-thread CPU, wineserver.
+    - Driver `~/.local/state/profiler/trial-T0015.sh` (one step per boot; it picks the next boot's kernel and reboots). A waiter on the controlling host starts each step after a boot. Scored by `plans/tools/trial-analyze.py T0015 --rule t0004`.
   - **T0016, audio priorities for PREEMPT_RT (RT kernel):** PREEMPT_RT runs every IRQ handler as a FIFO 50 thread, above pipeasio-rt (FIFO 15) and Live's RR 10. B raises the Focusrite's USB controller IRQ thread to 90, pipeasio-rt to 85 and AudioCalc to 80.
   - **T0017, 32-frame buffer:** on the winning kernel and configuration; is there enough headroom to halve the latency?
 - GPU mode: whatever T0014 keeps.

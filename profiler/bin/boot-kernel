@@ -1,0 +1,92 @@
+#!/usr/bin/env bash
+# profiler/bin/boot-kernel — boot the laptop once into the normal or the RT-BORE kernel and wait until its
+# desktop session is back. Runs on the controlling host and reaches the laptop over ssh.
+#
+#   profiler/bin/boot-kernel [--host HOST] [--timeout SECONDS] normal|rt
+#   profiler/bin/boot-kernel [--host HOST] status
+#
+# The choice is one-shot (grub-reboot): GRUB's saved default stays the normal kernel, so a failed RT boot
+# recovers with a plain reboot or a power cycle. GRUB needs GRUB_DEFAULT=saved and a flat menu
+# (GRUB_DISABLE_SUBMENU=y); see profiler/plans/resume-plan.md, RT-BORE kernel phase.
+# After the boot it prints one health line: kernel and preemption model, session, compositor GPU,
+# audio node, /dev/ntsync, PREEMPT_RT IRQ threads.
+# Exit: 0 booted and verified · 1 failed · 2 usage · 3 the laptop did not come back in time
+set -u
+host=ableton-laptop
+timeout=600
+usage() { sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+while [ $# -gt 0 ]; do
+    case $1 in
+        --host) host=$2; shift 2 ;;
+        --timeout) timeout=$2; shift 2 ;;
+        -h|--help) usage 0 ;;
+        -*) usage 2 ;;
+        *) break ;;
+    esac
+done
+want=${1:-}
+case $want in normal|rt|status) ;; *) usage 2 ;; esac
+
+# the laptop's login shell is fish: always run bash there, with arguments that are plain words
+remote() { ssh -o BatchMode=yes -o ConnectTimeout=8 "$host" bash -s -- "$@"; }
+
+health() {
+    remote <<'EOF'
+case $(uname -v) in
+    *PREEMPT_RT*) model=PREEMPT_RT ;;
+    *) model=preempt-$(sudo -n cat /sys/kernel/debug/sched/preempt 2>/dev/null | grep -o '([a-z]*)' | tr -d '()') ;;
+esac
+cd ~/Projects/ableton-linux 2>/dev/null || exit 1
+gpu=$(profiler/bin/with-session-env bash -c 'qdbus6 org.kde.KWin /KWin supportInformation 2>/dev/null' | sed -n 's/^OpenGL renderer string: //p' | head -1)
+node=$(sed -n 's/^audio_node=//p' ~/.config/profiler/setup.conf 2>/dev/null)
+have_node=$( [ -n "$node" ] && pw-cli ls Node 2>/dev/null | grep -q "$node" && echo yes || echo no)
+irq=$(ps -eLo comm,rtprio,cls 2>/dev/null | awk '$1 ~ /^irq\// {n++} END {print n + 0}')
+printf 'kernel %s (%s) | session %s | compositor %s | audio node %s | ntsync %s | irq threads %s\n' \
+    "$(uname -r)" "$model" "$(systemctl --user is-active graphical-session.target)" "${gpu:-none}" "$have_node" \
+    "$( [ -c /dev/ntsync ] && echo yes || echo no)" "$irq"
+EOF
+}
+
+if [ "$want" = status ]; then
+    remote <<<'printf "boot %s | %s\n" "$(cut -c1-8 /proc/sys/kernel/random/boot_id)" "$(sudo -n grub-editenv list 2>/dev/null | tr "\n" " ")"'
+    health
+    exit $?
+fi
+
+old_boot=$(remote <<<'cut -c1-8 /proc/sys/kernel/random/boot_id') || { echo "boot-kernel: cannot reach $host" >&2; exit 1; }
+remote "$want" <<'EOF' || exit 1
+case $1 in normal) pat='with Linux linux-cachyos$' ;; rt) pat='with Linux linux-cachyos-rt-bore$' ;; esac
+pgrep -f 'Live 12 Trial.exe' >/dev/null && { echo "boot-kernel: Live is running; not rebooting" >&2; exit 1; }
+flock -n ~/.local/state/profiler/live-session.lock true || { echo "boot-kernel: the session lock is held; not rebooting" >&2; exit 1; }
+title=$(sudo -n grep -oE "^menuentry '[^']*'" /boot/grub/grub.cfg | cut -d"'" -f2 | grep -E "$pat" | head -1)
+[ -n "$title" ] || { echo "boot-kernel: no GRUB entry matches /$pat/" >&2; exit 1; }
+sudo -n grub-reboot "$title" || exit 1
+echo "boot-kernel: next boot (once): $title"
+sync
+sudo -n systemctl reboot
+EOF
+
+t0=$SECONDS
+while :; do
+    sleep 5
+    boot=$(remote <<<'cut -c1-8 /proc/sys/kernel/random/boot_id' 2>/dev/null) && [ -n "$boot" ] && [ "$boot" != "$old_boot" ] && break
+    [ $((SECONDS - t0)) -lt "$timeout" ] || { echo "boot-kernel: $host did not come back within ${timeout}s" >&2; exit 3; }
+done
+remote <<'EOF'
+for i in $(seq 1 60); do
+    systemctl --user is-active -q graphical-session.target && pgrep -x plasmashell >/dev/null \
+        && systemctl --user is-active -q pipewire.service && exit 0
+    sleep 3
+done
+echo "boot-kernel: no desktop session after 3 minutes" >&2
+exit 1
+EOF
+session=$?
+echo "boot-kernel: back after $((SECONDS - t0))s"
+line=$(health)
+echo "$line"
+[ $session -eq 0 ] || exit 1
+case $want in
+    rt) [[ $line == *PREEMPT_RT* ]] ;;
+    normal) [[ $line != *PREEMPT_RT* ]] ;;
+esac || { echo "boot-kernel: the laptop did not boot the $want kernel" >&2; exit 1; }
