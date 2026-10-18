@@ -160,6 +160,17 @@ Next candidates (user to choose; none pre-registered yet):
 - PASS rule: the same as T0004 ([D] or [E], plus both guards); the DSP guard matters most here, because fewer workers mean less parallel capacity.
 - Mechanism check: B runs show 6 `AudioCalc` threads, each allowed on exactly one CPU from {0,2,4,6,8,10} and all different, and `audio_workers` = 6 in the history records (A: 15). The AudioCalc CPU wait is reported per run.
 - Driver: ~/.local/state/profiler/trial-T0006.sh. Scored by `plans/tools/trial-analyze.py T0006 --rule t0004`.
+
+**Trial T0007 (user decision 2026-10-18; pre-registered before running): wineserver at realtime priority.**
+- Setup:
+  - Both arms: the kept configuration — `PIPEASIO_REALTIME=1` and P-core audio threads.
+  - Both arms also carry T0006's arm per T0006's own rule: B's six per-core workers if T0006 passes, else A's 15 workers on 0–11.
+  - B: the 1 s watcher sets the prefix's `wineserver` to SCHED_RR 10 (`chrt -a -r -p 10`), the same class and priority as the Live threads it serves. A leaves it SCHED_OTHER.
+  - ABAB × 3; Inbuilts, Max4Live, VSTs; 120 s.
+- Why: the launcher's `chrt -r 10` covers Live but not wineserver, which ran SCHED_OTHER in every recent run. It waited 0.24–0.48 s per 120 s for a CPU while using only ~1.5 % of a core. It was woken 340–390 k times per 120 s (~4 times per audio block), so Live talks to it every block. That is the same inversion pattern as pipeasio-rt before T0003.
+- PASS rule: the same as T0004 ([D] or [E], plus both guards).
+- Mechanism check: in B, wineserver shows `policy_at_end` = RR with priority 10 in `proc-delta.json` (A: OTHER), and its CPU wait (`schedstat run_delay`) is lower.
+- Driver: ~/.local/state/profiler/trial-T0007.sh. Scored by `plans/tools/trial-analyze.py T0007 --rule t0004`.
 **Testing plan (2026-10-17).** Every trial: ABAB × 3, golden restored per run, all 5 Sets, untraced; accept iff the median DSP average or typical peak improves by more than 2× the A/A spread on at least one heavy Set, no Set regresses beyond noise, and the dropout guards (PipeWire ERR, peaks >100 %) are not worse; ledger + history + commit/push per trial.
 1. Scheduling / configuration (no Wine code; PR-able as defaults or launcher options): PipeASIO realtime (T0002 → **kept in T0003**) → next, on top of it: tune the pipeasio-rt priority (PIPEASIO_RT_PRIORITY) vs Live's RR 10 → P-core affinity for pipeasio-rt + AudioCalc → real-time only for audio threads (today the launcher makes all 94 Live threads RR 10, UI and graphics included). Dropout trials use T0003's shape (heavy Sets, 120 s, pre-registered sign test on PipeWire ERR).
 2. Existing Wine patch: WINE_APC_FASTPATH=1 (awaiting loaded-Set evidence).
