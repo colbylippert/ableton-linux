@@ -502,6 +502,13 @@ Next candidates (user to choose; none pre-registered yet):
     - Mechanism check: every run records its kernel (`uname -r`/`-v`). A run on the wrong kernel does not start; the driver stops and reports it.
     - Secondary readouts: CPU package power (RAPL) and temperature, P-core frequency, Live's per-thread CPU, wineserver.
     - Driver `~/.local/state/profiler/trial-T0015.sh` (one step per boot; it picks the next boot's kernel and reboots). A waiter on the controlling host starts each step after a boot. Scored by `plans/tools/trial-analyze.py T0015 --rule t0004`.
+  - **T0015 — REVERT (2026-10-18, 16:53–17:56, all six runs clean, every one on its arm's kernel):** rule FAIL; the DSP guard passes, the error guard fails.
+    - Dropouts: PipeWire ERR 5 → 7. B was fewer in 2 of 9 Set-pairs and more in 2 (p = 0.81). xruns 0 in both arms.
+    - DSP average: higher on RT on every Set, within the guard: +1.06 / +0.71 / +0.98 (0.90 / 0.86 / 1.14 × the spread).
+    - CPU: Live 46.9 → 60.8 % of one core (median); wineserver 1.23 → 1.83 %. CPU package 20.5 → 21.3 W, P-core median 2428 → 2361 MHz; package temperature peaks 88 → 75 °C.
+    - Context, not part of the rule: Live's worst DSP peak per Set-run was lower on RT on every Set (medians 97.7 / 105.9 / 97.7 → 90.2 / 92.4 / 88.8 %). It passed 100 % in 4 of 9 Set-runs on the normal kernel against 0 of 9 on RT, but the dropout count did not follow.
+    - Reading: PREEMPT_RT costs Live about 14 points of a core (rt_mutex locks, threaded IRQs) without reducing dropouts at the stock priorities. Every IRQ thread runs FIFO 50, above pipeasio-rt (FIFO 15) and Live (RR 10), which is what T0016 changes.
+    - The normal kernel stays the configuration. The RT kernel stays installed for T0016.
   - **T0016, audio priorities for PREEMPT_RT (RT kernel):** PREEMPT_RT runs every IRQ handler as a FIFO 50 thread, above pipeasio-rt (FIFO 15) and Live's RR 10. B raises the Focusrite's USB controller IRQ thread to 90, pipeasio-rt to 85 and AudioCalc to 80.
   - **T0017, 32-frame buffer:** on the winning kernel and configuration; is there enough headroom to halve the latency?
 - GPU mode: whatever T0014 keeps.
