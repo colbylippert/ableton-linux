@@ -12,26 +12,26 @@ export interface PartStatus {
   note: string;
 }
 
-export const STATUS_AS_OF = '17 October 2026 (block B5b in progress)';
+export const STATUS_AS_OF = '17 October 2026 (trial T0003 running)';
 
 export const STATUS_ROWS: readonly PartStatus[] = [
   {
     part: 'Trace points in Wine and PipeASIO',
     paths: ['patches/0108-ntdll-add-static-trace-points.patch', 'patches/pipeasio/0017-usdt-block-markers.patch'],
     state: 'working',
-    note: 'Built and audited: 8 Wine and 6 PipeASIO probes in the installed runtime.',
+    note: "8 Wine and 6 PipeASIO probes on the 10-byte nop that kernel 7.2 turns into its fast uprobe path; build-audit checks every site.",
   },
   {
     part: 'bpftrace tracer',
     paths: ['profiler/tracer/wine-trace.bt', 'profiler/bin/wine-trace'],
     state: 'working',
-    note: 'Traced suite runs work end to end; callers stop at the ntdll entry point.',
+    note: 'The first backend; libbpf replaced it as the default in block B5b.',
   },
   {
     part: 'libbpf tracer and real callers',
     paths: ['profiler/tracer/wine-trace.bpf.c', 'profiler/tracer/symbolize.py'],
-    state: 'in progress',
-    note: 'Block B5b: every program under 64 bytes of stack, JIT self-check, stack windows.',
+    state: 'working',
+    note: 'Callers from stack windows and .pdata unwinding. Block B5c cut the cost to about 0.26 ms per block (201 ns per probe hit on a P-core).',
   },
   {
     part: 'Validation probe',
@@ -73,24 +73,36 @@ export const STATUS_ROWS: readonly PartStatus[] = [
     part: 'Golden snapshots',
     paths: ['profiler/bin/state'],
     state: 'working',
-    note: 'Re-baselined with the Focusrite configuration.',
+    note: 'Re-baselined on the block B5c runtime; restored before every trial run.',
+  },
+  {
+    part: 'Official build',
+    paths: ['profiler/dev/build-official.sh'],
+    state: 'working',
+    note: 'Built and installed the block B5c runtime; build-audit passes 189 of 189.',
   },
   {
     part: 'Wine dev loop',
-    paths: ['profiler/dev/wine-dev.sh', 'profiler/dev/build-official.sh'],
+    paths: ['profiler/dev/wine-dev.sh'],
     state: 'written, not run',
-    note: 'First real use comes with the first optimisation trial.',
+    note: 'First real use comes with the first Wine hot-path trial.',
+  },
+  {
+    part: 'A/B trials',
+    paths: ['profiler/ledger.jsonl', 'profiler/history/runs/'],
+    state: 'in progress',
+    note: 'T0001 idle-state cap: reverted. T0002 PipeASIO realtime: inconclusive, dropouts halved. T0003 confirmation running.',
   },
   {
     part: 'History and dashboard',
     paths: ['profiler/history/', 'profiler/dashboard/'],
     state: 'working',
-    note: "Review pending (block B6); the audio device is not yet part of a run's identity.",
+    note: "The audio device is part of a run's identity; review pending (block B6).",
   },
   {
     part: 'Agent loop',
     paths: ['.claude/commands/profiler-loop.md', 'profiler/AGENT-PROMPT.md'],
     state: 'planned',
-    note: 'Block B7, after the real baselines on the Focusrite.',
+    note: 'Block B7 hands repeatable trials to /profiler-loop.',
   },
 ];
