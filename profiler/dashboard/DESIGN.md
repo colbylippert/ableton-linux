@@ -252,6 +252,14 @@ Emphasis form on purpose: call sites are a second categorical dimension and must
 the Set hues; the Set's hue marks "this Set's data", the gray lines are context, the legend
 list + table carry identity.
 
+Layout (2026-10-18):
+- One Set per full-width row (`.cs-sets`).
+- Inside a row, `CallSiteTrend` is a container-query grid. At 720 px or wider, the stacked share bars
+  take 3/5 and the legend 2/5 beside them; narrower cards put the legend below.
+- The legend lists one call site per line: swatch, name, then the `kind · caller chain` in monospace,
+  wrapping anywhere inside its own column. A three-across grid let unbreakable chains like
+  `kernelbase.dll!WaitForSingleObject+0x49` spill into the neighbouring card.
+
 ### 4.5 Scenarios — "what do the diagnostic scenarios show over time?"
 
 | Component | Props | Data |

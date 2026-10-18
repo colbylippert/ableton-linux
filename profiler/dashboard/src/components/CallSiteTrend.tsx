@@ -310,8 +310,9 @@ export function CallSiteTrend({ runs, set, slots, targeted, emphasis = null, onE
   const isolated = (s: CallSiteSeries): boolean => emphasis !== null && (s.key ?? OTHER_ID) !== emphasis;
 
   return (
-    <div ref={ref} className="cst">
-      <div className="cst-plot">
+    <div className="cst">
+      <div className="cst-layout">
+      <div ref={ref} className="cst-plot">
         <BarChart layout="vertical" width={w} height={height} data={rows} margin={{ top: 4, right: 16, bottom: 4, left: 4 }} barCategoryGap={10}>
           <CartesianGrid horizontal={false} vertical stroke={pal.grid} strokeDasharray="" />
           <XAxis
@@ -351,6 +352,7 @@ export function CallSiteTrend({ runs, set, slots, targeted, emphasis = null, onE
         </BarChart>
       </div>
       <CallSiteLegend series={series} mode={mode} targeted={targeted} emphasis={emphasis} onEmphasis={onEmphasis} />
+      </div>
     </div>
   );
 }

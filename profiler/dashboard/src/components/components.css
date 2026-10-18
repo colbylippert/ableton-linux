@@ -267,6 +267,13 @@
   margin-bottom: 8px;
 }
 
+/* ---------- call sites: one Set per full-width row ---------- */
+
+.cs-sets {
+  display: grid;
+  gap: 16px;
+}
+
 /* ---------- filter bar ---------- */
 
 .filterbar {

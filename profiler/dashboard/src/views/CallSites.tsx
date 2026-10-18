@@ -76,7 +76,7 @@ export default function CallSitesView({ data, filter, onFilterChange }: ViewProp
               {sets.length === 0 ? (
                 <p className="empty">The traced runs of this identity list no call sites.</p>
               ) : (
-                <div className="grid">
+                <div className="cs-sets">
                   {sets.map((set) => (
                     <ChartFrame
                       key={set}

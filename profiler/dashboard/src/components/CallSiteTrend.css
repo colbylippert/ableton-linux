@@ -2,6 +2,25 @@
 
 .cst {
   min-width: 0;
+  container-type: inline-size;
+}
+
+/* Wide cards (a full-width row): bars on the left, the legend beside them. Narrow: legend below. */
+.cst-layout {
+  display: grid;
+  gap: 8px;
+}
+
+@container (min-width: 720px) {
+  .cst-layout {
+    grid-template-columns: minmax(0, 3fr) minmax(0, 2fr);
+    gap: 20px;
+    align-items: start;
+  }
+
+  .cst-legend {
+    margin-top: 0;
+  }
 }
 
 .cst-plot {
@@ -18,15 +37,45 @@
   font-variant-numeric: tabular-nums;
 }
 
+/* One call site per line: swatch, then the name over its caller chain; long chains wrap inside the column. */
 .cst-legend {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 2px;
   margin-top: 8px;
+  min-width: 0;
 }
 
 .cst-legend li {
-  display: inline-flex;
+  display: flex;
   flex-wrap: wrap;
   align-items: center;
   gap: 4px 6px;
+  min-width: 0;
+}
+
+.cst-legend button {
+  display: grid;
+  grid-template-columns: 12px minmax(0, 1fr);
+  column-gap: 8px;
+  row-gap: 1px;
+  align-items: start;
+  width: 100%;
+  min-width: 0;
+}
+
+.cst-legend button .cst-swatch {
+  margin-top: 3px;
+}
+
+.cst-legend .cst-name,
+.cst-legend .cst-detail {
+  grid-column: 2;
+  min-width: 0;
+}
+
+.cst-detail {
+  overflow-wrap: anywhere;
 }
 
 .cst-swatch {
