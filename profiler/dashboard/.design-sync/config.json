@@ -4,5 +4,53 @@
   "globalName": "ProfilerDashboard",
   "shape": "package",
   "buildCmd": "npm run build:lib",
-  "cssEntry": "dist-lib/style.css"
+  "cssEntry": "dist-lib/style.css",
+  "readmeHeader": ".design-sync/conventions.md",
+  "overrides": {
+    "CallSiteTrend": {
+      "cardMode": "column"
+    },
+    "DeltaBars": {
+      "cardMode": "column",
+      "primaryStory": "TracedConfirmation"
+    },
+    "PairedDots": {
+      "cardMode": "column"
+    },
+    "ChartFrame": {
+      "cardMode": "column"
+    },
+    "DataTable": {
+      "cardMode": "column"
+    },
+    "RunTable": {
+      "cardMode": "column",
+      "viewport": "1280x700"
+    },
+    "FilterBar": {
+      "cardMode": "column"
+    },
+    "CompareDrawer": {
+      "cardMode": "column"
+    },
+    "TrialCard": {
+      "cardMode": "column",
+      "viewport": "1200x1900"
+    },
+    "CallSiteTrendTable": {
+      "cardMode": "column"
+    },
+    "DeltaBarsTable": {
+      "cardMode": "column"
+    },
+    "PairedDotsTable": {
+      "cardMode": "column"
+    },
+    "Sparkline": {
+      "cardMode": "column"
+    },
+    "TrendChart": {
+      "cardMode": "column"
+    }
+  }
 }
