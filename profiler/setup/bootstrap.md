@@ -21,7 +21,7 @@ same as the retired VM's, so name resolution must not decide which machine you r
 
 ```
 Host ableton-laptop abletonlinux
-    HostName 10.0.0.86
+    HostName <laptop-ip>
     User colby
     IdentityFile ~/.ssh/id_ed25519
     IdentitiesOnly yes
@@ -136,5 +136,5 @@ ssh -t ableton-laptop 'bash -lc "~/Projects/ableton-linux/profiler/setup/verify.
 `verify.sh` is read-only. It exits 0 only when every hard check passes. The laptop checks
 are: on AC power, the lid drop-in, Wi-Fi power save off, autologin configured, the
 speaker sink recorded as `audio_node=` and muted, and PipeASIO pointed at it. The
-dashboard runs at `http://10.0.0.86:5173/`. `abletonlinux` resolves only if you add it to
+dashboard runs at `http://<laptop-ip>:5173/`. `abletonlinux` resolves only if you add it to
 `C:\Windows\System32\drivers\etc\hosts`.

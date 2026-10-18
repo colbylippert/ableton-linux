@@ -27,7 +27,7 @@
   <text class="ts" x="64" y="417">Live 12.4.6 Trial installer</text>
   <rect class="box" x="52" y="598" width="252" height="46" rx="5"/>
   <text class="tt" x="64" y="618">browser</text>
-  <text class="tm" x="64" y="635">http://10.0.0.86:5173</text>
+  <text class="tm" x="64" y="635">http://ableton-laptop:5173</text>
   <line class="e" x1="178" y1="269" x2="178" y2="286" marker-end="url(#f3a)"/>
   <text class="ts" x="188" y="282">launches</text>
   <path class="e" d="M51 317 H40 V85 H50" marker-end="url(#f3a)"/>
