@@ -199,6 +199,25 @@ Next candidates (user to choose; none pre-registered yet):
 - Mechanism check: 9 `AudioCalc` threads in every B Set-run (15 in A), all allowed on 0–11.
 - Driver: ~/.local/state/profiler/trial-T0008.sh. Scored by `plans/tools/trial-analyze.py T0008 --rule t0004`. If it passes or is inconclusive, eight workers is the follow-up.
 
+**Trial T0008 — KEEP (2026-10-18):** PASS via [E], with both guards.
+- Dropouts: PipeWire ERR 20 → 10 (−50 %). B was fewer in 6 of 9 Set-pairs (one-sided p = 0.049), so the evidence clears the bar only just.
+- DSP: the median DSP average was lower on every Set (Inbuilts −0.61, Max4Live −1.06, VSTs −0.84 pt), but within 2× the A/A spread, so [D] was not met.
+- Efficiency: Live CPU 64.2 → 49.4 % of one core (−23 %). The AudioCalc CPU wait fell from 3.9–5.7 s to 38–93 ms per 120 s. Worst DSP peaks fell from 112 to 82 % (Inbuilts) and from 111 to 84 % (Max4Live); VSTs stayed at 107–111 %.
+- Mechanism held: 9 `AudioCalc` threads in every B Set-run (15 in A), all on CPUs 0–11.
+- Kept: nine workers (`ABLETON_MAX_AUDIO_THREADS=9`) join the configuration, and later trials run both arms on it.
+- Ledger + runs 79cfd52.
+
+**Trial T0009 (the follow-up T0008 pre-registered; registered before running): eight audio workers.**
+- Setup:
+  - Both arms keep the configuration: `PIPEASIO_REALTIME=1`, with pipeasio-rt and every `AudioCalc` worker pinned to CPUs 0–11 (shared).
+  - A: `ABLETON_MAX_AUDIO_THREADS=9`, T0008's kept count.
+  - B: `ABLETON_MAX_AUDIO_THREADS=8`.
+  - ABAB × 3; Inbuilts, Max4Live, VSTs; 120 s.
+- Why: going from 15 to 9 workers halved the dropouts and cut Live's CPU by 23 %. Six workers (T0006) cut CPU further but raised Max4Live dropouts. Eight workers plus the callback leave three P-core CPUs for Live's other threads, while keeping more parallel capacity than six. The trial shows whether the curve still improves below nine or has turned.
+- PASS rule: the same as T0004 ([D] or [E], plus both guards). If it fails, nine workers stay.
+- Mechanism check: 8 `AudioCalc` threads in every B Set-run (9 in A), all allowed on 0–11.
+- Driver: ~/.local/state/profiler/trial-T0009.sh. Scored by `plans/tools/trial-analyze.py T0009 --rule t0004`.
+
 **Wine hot-path research (2026-10-18 morning)**
 
 Diagnostic D0001: one traced run on the kept configuration (heavy Sets, 60 s each, 45,000 blocks per Set; history `diag-D0001-traced`).
@@ -235,8 +254,14 @@ Implications:
 - First Wine patch: `0109` user-mode QPC behind an opt-in switch, measured with syncbench + a traced run + ABAB.
 - Dev loop: `wine-dev` container initialised at 08:04 (`~/wine-dev/work/wine-src`, HEAD 10d4ce9).
 
-**Scoreboard after T0007** (heavy Sets, 120 s windows):
-- Kept: PipeASIO realtime (T0003) and P-core audio threads (T0004). PipeWire ERR per 9 Set-runs went 204 → 9–17; worst DSP peaks 130–225 % → 65–110 %.
+**Build host (2026-10-18):** Wine builds moved off the laptop, so they no longer perturb trials or wait for them.
+- Where: the workstation's WSL distro `ableton-build` (i9-12900K, 24 threads; rootless podman, the same image).
+- Speed: `wine-dev.sh init` took ~10 min, including a 5.5 min cold build; an official build plus audit ~6 min (the laptop takes ~10 min warm).
+- Reproducibility: an official workstation build of the same sources matches the laptop's installed runtime. All 288 unix-side libraries are byte-identical except `pipeasio64.dll.so`, whose log banner embeds `__DATE__ __TIME__`. The 1568 PE files differ only in their link timestamps.
+- Deploys: they go over ssh to the laptop under its session lock (`deploy_host`, 2064dba): `wine-dev.sh sync` for the dev runtime, `build-official.sh` for an installer kit. The laptop only runs trials.
+
+**Scoreboard after T0008** (heavy Sets, 120 s windows):
+- Kept: PipeASIO realtime (T0003), P-core audio threads (T0004) and nine audio workers (T0008). PipeWire ERR per 9 Set-runs went 204 → 10; Live CPU 64 → 49 % of a core; worst DSP peaks 130–225 % → 73–107 %.
 - Reverted: T0001 (idle-state cap), T0005 (E-cores for non-audio threads), T0007 (realtime wineserver).
 - Inconclusive: T0002 (confirmed by T0003) and T0006 (six workers: Live CPU −37 % and DSP lower, but Max4Live dropouts rose).
 **Testing plan (2026-10-17).** Every trial: ABAB × 3, golden restored per run, all 5 Sets, untraced; accept iff the median DSP average or typical peak improves by more than 2× the A/A spread on at least one heavy Set, no Set regresses beyond noise, and the dropout guards (PipeWire ERR, peaks >100 %) are not worse; ledger + history + commit/push per trial.
