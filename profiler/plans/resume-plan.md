@@ -288,6 +288,14 @@ Next candidates (user to choose; none pre-registered yet):
 - Mechanism check: wineserver's voluntary context switches and CPU fall in every B Set-run (`proc-delta.json`), and `WINE_APC_FASTPATH=1` is recorded as a switch on B.
 - Driver: ~/.local/state/profiler/trial-T0012.sh, started by `queue-T0012.sh` after T0011. Scored by `plans/tools/trial-analyze.py T0012 --rule t0004`.
 
+**Trial T0012 — REVERT (2026-10-18):** rule FAIL; both guards pass; the mechanism did not show.
+- Dropouts: PipeWire ERR 12 → 6, with B fewer in 5 of 9 Set-pairs (one-sided p = 0.12): noise.
+- DSP: the median DSP average was within 0.41 pt on every Set. Live CPU was 47.4 vs 48.6 %.
+- Mechanism: `WINE_APC_FASTPATH=1` was recorded as a switch on every B run. But wineserver's voluntary context switches did not fall: 3,063–3,069 per second in A against 3,049–3,066 in B, and its CPU did not change either.
+- So either the fast path did not engage on these Sets, or Live's alertable zero-handle sleeps are not where wineserver's ~3,000 wakeups per second come from on the heavy Sets. The patch's own figure (3,650 per second) came from an empty Set.
+- The trial says nothing about the fast path itself. The switch stays off.
+- Open question: what wakes wineserver ~3,000 times per second during playback? A traced run with server requests by type, or `strace -c` on wineserver, would name it.
+
 **Trial T0013 (user decision 2026-10-18: "Lets queue T0013 now"; pre-registered before running): user-mode QueryPerformanceCounter (patch 0109).**
 - Runtime: the official build with 0109 (cf2fe55). It was built on the workstation and installs on the laptop when T0012 releases the session lock; the queue starts T0013 only once that runtime is in place.
 - Setup:
@@ -323,7 +331,11 @@ Next candidates (user to choose; none pre-registered yet):
   - **T0014, normal vs RT-BORE kernel:** everything else equal, including the switches T0012/T0013 keep.
   - **T0015, audio priorities for PREEMPT_RT (RT kernel):** PREEMPT_RT runs every IRQ handler as a FIFO 50 thread, above pipeasio-rt (FIFO 15) and Live's RR 10. B raises the Focusrite's USB controller IRQ thread to 90, pipeasio-rt to 85 and AudioCalc to 80.
   - **T0016, 32-frame buffer:** on the winning kernel and configuration; is there enough headroom to halve the latency?
-  - **T0017, Live on the NVIDIA GPU:** `prime-run`-style render offload (`__NV_PRIME_RENDER_OFFLOAD=1`, `__GLX_VENDOR_LIBRARY_NAME=nvidia`) vs the Intel iGPU. On the laptop the iGPU shares the CPU's power budget. Pre-check: Live's log should name the NVIDIA adapter and the UI must render.
+  - ~~T0017, Live on the NVIDIA GPU~~: dropped (user decision 2026-10-18: "As we will not use GPU rendering lets stay on the intel driver").
+    - The built-in screen stays on the Intel iGPU (`i915`, hybrid mode), and Live renders there.
+    - The laptop (MSI Katana 15 B13VFK) has a MUX: the NVIDIA card has its own built-in-panel output (`eDP-2`), switchable only in firmware. It is not used.
+    - The NVIDIA driver stays installed on both kernels, so the kernel A/B loads the same drivers.
+    - Open option: the idle dGPU stays awake in P0 because the compositor holds its DRM device. Letting it power down (runtime D3) could cut heat in the cooling the CPU shares.
 
 **Wine hot-path research (2026-10-18 morning)**
 
