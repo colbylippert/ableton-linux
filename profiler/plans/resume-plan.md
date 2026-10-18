@@ -531,6 +531,18 @@ Next candidates (user to choose; none pre-registered yet):
       - Otherwise the normal kernel stays.
     - Mechanism check: for every Live process the driver records how many AudioCalc threads run FIFO 80, whether pipeasio-rt runs FIFO 85 and whether the xhci thread runs FIFO 90. A B run whose processes do not all show 9, 1 and FIFO 90 is reported.
     - Driver `~/.local/state/profiler/trial-T0016.sh`, with the T0015 waiter.
+    - **T0016 — REVERT (2026-10-18, 18:34–19:37, all six runs clean, each on its arm's kernel):** rule FAIL ([D] no, [E] no); both guards pass.
+      - Dropouts: PipeWire ERR 20 → 12 (40 % fewer on RT with the priorities; B fewer in 5 of 9 Set-pairs). One-sided p = 0.11, so [E]'s p < 0.05 is not met.
+      - DSP average: higher on RT on every Set, within the guard (+0.74 / +1.06 / +0.92).
+      - CPU: Live 44.9 → 58.4 % of one core; package 20.7 → 22.0 W.
+      - Context: Live's worst DSP peak per Set-run was lower on RT again (medians 100.0 / 104.0 / 99.1 → 90.7 / 89.0 / 81.2 %).
+      - Mechanism held in every B run: the USB controller IRQ thread at FIFO 90. The watcher raised AudioCalc to FIFO 80 54 times per run (Live builds its nine workers twice per launch) and pipeasio-rt to FIFO 85 three times per run, once per launch.
+        - The driver's per-process record was fixed after B1 (deployed by rename, so the running step was untouched). It had counted the moment the nine workers appeared, before the watcher's next pass raised them. B1's priorities were confirmed directly with `ps` during the run.
+        - pipeasio-rt starts with playback, after the record, so the record's pipeasio count stays 0 and the pin log is the evidence.
+      - Concern: T0016's normal-kernel arm had 20 errors (1/6/4, 1/1/0, 1/5/1, spread over all three runs, mostly Max4Live and VSTs), against 5 in T0015's normal-kernel arm two hours earlier.
+        - The arms differ in the display setup adopted in between (Vulkan back end, GPU renderer, present skipping; its feasibility runs covered Inbuilts only) and in the RT throttling safety net.
+        - A controlled display trial is due: the old display setup vs the new one on the normal kernel, all three Sets.
+      - The normal kernel stays; T0017 runs on it.
   - **T0017, a 32-frame buffer (pre-registered before running; it runs after T0016, on its winner):**
     - A: PipeASIO's 64-frame buffer (`~/.config/pipeasio/config.ini`). B: 32 frames, through `PIPEASIO_PREFERRED_BUFFERSIZE=32`, the launcher's per-launch override. That halves the buffer period from 1.33 to 0.67 ms.
     - Both arms: T0016's winning kernel and priorities, plus the configuration above. The runs go back to back on one boot (ABAB × 3), since the kernel does not change.
