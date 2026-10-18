@@ -161,6 +161,14 @@ Next candidates (user to choose; none pre-registered yet):
 - Mechanism check: B runs show 6 `AudioCalc` threads, each allowed on exactly one CPU from {0,2,4,6,8,10} and all different, and `audio_workers` = 6 in the history records (A: 15). The AudioCalc CPU wait is reported per run.
 - Driver: ~/.local/state/profiler/trial-T0006.sh. Scored by `plans/tools/trial-analyze.py T0006 --rule t0004`.
 
+**Trial T0006 — INCONCLUSIVE (2026-10-18):** rule FAIL on the error guard.
+- [D] PASS: VSTs median DSP average −1.75 pt (2.03× spread); Inbuilts −1.30, Max4Live −0.51 (all lower). DSP guard PASS.
+- Error guard failed: PipeWire ERR 13 → 17, concentrated in Max4Live (2, 1, 1 → 0, 5, 5).
+- Largest efficiency gain so far: Live CPU median 64.0 % → 40.1 % of one core (−37 %), and the AudioCalc CPU wait went from 3.6–5.4 s to 21–705 ms per 120 s.
+- The default stays at Live's 15 workers; T0007 runs on that base, as pre-registered.
+- Open question: is the Max4Live rise real (six workers lengthen its critical path) or noise? A confirmation with longer windows, or a middle count (8–9 workers), would decide.
+- Ledger + runs d44375b.
+
 **Trial T0007 (user decision 2026-10-18; pre-registered before running): wineserver at realtime priority.**
 - Setup:
   - Both arms: the kept configuration — `PIPEASIO_REALTIME=1` and P-core audio threads.
