@@ -188,6 +188,42 @@ Next candidates (user to choose; none pre-registered yet):
 - Ledger + runs 7477ea9.
 - Next: a traced diagnostic run on the kept configuration, to name the ~4 per-block wineserver requests and count the Wine crossings per block. That leads into the first Wine hot-path patch (the event fast path for the worker fan-out).
 
+**Wine hot-path research (2026-10-18 morning)**
+
+Diagnostic D0001: one traced run on the kept configuration (heavy Sets, 60 s each, 45,000 blocks per Set; history `diag-D0001-traced`).
+- Per 1.33 ms block, Live makes 320–360 Wine syscalls:
+  - `NtSetEvent` at `Live.exe+0x33f587e`: 105–118;
+  - `NtWaitForSingleObject` at `Live.exe+0x4f8c119`: 70–78;
+  - `NtResetEvent` at `Live.exe+0x33f41d2`: 68–77 (manual-reset events re-armed by each worker);
+  - `NtQueryPerformanceCounter` (two Live sites): ~65.
+  - The fan-out alone is ~245 per block.
+- The callback's elapsed time is p50 150–196 µs, p99 256–289 µs, max ~1.45 ms. Late blocks: 1–4 per 45,000.
+- In every late block the callback, not PipeASIO, is slow (`live_ns` 1.28–1.47 ms; PipeASIO pre ~10 µs, post 1–2 µs, wake 29–55 µs).
+- In late blocks the callback makes ~3× the usual rounds (30–47 `NtSetEvent` against 15) and 10–36 `NtFlushInstructionCache` (normally 0–1), i.e. Live generates code on the audio thread. There is no `NtAllocateVirtualMemory` or `NtProtectVirtualMemory`, so Wine's VM lock is not involved.
+- The late blocks land at the same offsets in each Set's run (~8.1, 23.7 and 25.3 s): song-position events, not scheduling.
+
+Microbenchmarks (`tools/syncbench.c` under Wine, `tools/syncbench_native.c` with raw `/dev/ntsync` and futexes; threads SCHED_RR 10, pinned identically):
+
+| | Wine | raw ntsync | futex |
+|---|---|---|---|
+| QPC | 76 ns (Windows TSC path ~10 ns) | — | — |
+| SetEvent / ResetEvent | 190 ns | 105–108 ns | — |
+| Wait, already signaled | 350 ns | 314–336 ns | — |
+| Ping-pong, same core | 1.9 µs | 1.77 µs | 1.37 µs |
+| Ping-pong, cross core | 3.0 µs | 2.63 µs | 1.87 µs |
+| Fan-out, 6 workers (own CPUs) | 6.1 µs | 4.57 µs | 4.35 µs |
+| Fan-out, 15 workers (CPUs 0–11) | 11.1 µs | 8.71 µs | 8.71 µs |
+
+- Wine's own share is ~80 ns per call (the syscall dispatcher's register and xsavec save and restore), i.e. ~1.5–2.4 µs per fan-out round (20–25 %).
+- NTSync already runs the fan-out at the kernel's sleep/wake floor.
+- With ~5 rounds per block, 15 workers cost ~54 µs per block and 6 workers ~31 µs. That matches T0006's DSP drop.
+
+Implications:
+- Wine-side patches can save roughly 5–25 µs of CPU per block: a user-mode QPC (TSC bypass, which Wine's own tests list as missing) and a lighter dispatcher path for the hot event calls.
+- The dropouts come from Live's own work spikes. Next evidence: scheduler and page-fault tracing of the callback in late blocks.
+- First Wine patch: `0109` user-mode QPC behind an opt-in switch, measured with syncbench + a traced run + ABAB.
+- Dev loop: `wine-dev` container initialised at 08:04 (`~/wine-dev/work/wine-src`, HEAD 10d4ce9).
+
 **Scoreboard after T0007** (heavy Sets, 120 s windows):
 - Kept: PipeASIO realtime (T0003) and P-core audio threads (T0004). PipeWire ERR per 9 Set-runs went 204 → 9–17; worst DSP peaks 130–225 % → 65–110 %.
 - Reverted: T0001 (idle-state cap), T0005 (E-cores for non-audio threads), T0007 (realtime wineserver).
