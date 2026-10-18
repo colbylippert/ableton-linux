@@ -85,8 +85,12 @@ static void ev_wait( struct ev *e )
     if (!g_impl)
     {
         __u32 obj = e->fd;
-        struct ntsync_wait_args args = { .timeout = UINT64_MAX, .objs = (uintptr_t)&obj, .count = 1 };
-        while (ioctl( g_dev, NTSYNC_IOC_WAIT_ANY, &args ) < 0 && errno == EINTR) ;
+        struct ntsync_wait_args args = { .timeout = UINT64_MAX, .objs = (uintptr_t)&obj, .count = 1,
+                                         .owner = (__u32)gettid(), .index = ~0u };
+        int ret;
+        while ((ret = ioctl( g_dev, NTSYNC_IOC_WAIT_ANY, &args )) < 0 && errno == EINTR) ;
+        if (ret < 0) { fprintf( stderr, "NTSYNC_IOC_WAIT_ANY failed: %s
+", strerror( errno ) ); exit( 1 ); }
         return;
     }
     for (;;)
