@@ -527,7 +527,8 @@ elif [ -n "$DEPLOY_HOST" ]; then
     # minus dist/) + what install.sh reads from dist/ — the scripts that shipped
     # with this build install it, whatever the host's own checkout holds
     kitlist="$(mktemp "${TMPDIR:-/tmp}/build-official-kit.XXXXXX")"
-    { git ls-files -z --cached --others --exclude-standard -- . ':(exclude)dist'
+    { git ls-files -z --cached --others --exclude-standard -- . ':(exclude)dist' \
+          | while IFS= read -r -d '' p; do if [ -e "$p" ] || [ -L "$p" ]; then printf '%s\0' "$p"; fi; done   # as build.sh: skip deleted tracked files
       printf '%s\0' "$RUNTIME_TARBALL" "$RUNTIME_TARBALL.sha256" "dist/BUILD-INFO-$VERSION.txt" dist/BUILD-INFO.txt \
           dist/pipewire-version-probe dist/ableton-linkd dist/cabextract-static; } > "$kitlist"
     step "installer kit → $DEPLOY_HOST:$KIT ($(tr -cd '\0' < "$kitlist" | wc -c) files)"
