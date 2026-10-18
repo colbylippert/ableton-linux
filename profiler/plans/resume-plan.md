@@ -413,6 +413,7 @@ Next candidates (user to choose; none pre-registered yet):
   |---|---|---|---|---|---|---|---|
   | none (60 fps) | — | 8.9 | 1.7 | 3.9 | 14.5 | 10.23 / 18.15 | 0 |
   | 30 fps | up to 33 ms | 7.4–7.8 | 1.3 | 2.9–3.0 | 11.6–12.1 | 9.27–9.51 / 20.5–21.8 | 3, 5 |
+  | 20 fps | up to 50 ms | 6.0 | 1.0 | 2.3 | 9.3 | 9.62 / 34.24 | 5 |
   | 15 fps | up to 67 ms | 5.0 | 0.8 | 2.0 | 7.8 | 8.07 / 24.19 | 19 |
   | 10 fps | up to 100 ms | 3.8 | 0.6 | 1.5 | 5.9 | 5.58 / 36.30 | 20 |
   | 5 fps | up to 200 ms | — | — | — | — | — | Live hung at startup and was killed |
