@@ -21,6 +21,16 @@
   .cst-legend {
     margin-top: 0;
   }
+
+  /* a fixed chart width (tests, static exports, preview cards) keeps the legend below the bars */
+  .cst.cst-fixed .cst-layout {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 8px;
+  }
+
+  .cst.cst-fixed .cst-legend {
+    margin-top: 8px;
+  }
 }
 
 .cst-plot {

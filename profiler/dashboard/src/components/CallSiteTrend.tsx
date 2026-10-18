@@ -310,7 +310,7 @@ export function CallSiteTrend({ runs, set, slots, targeted, emphasis = null, onE
   const isolated = (s: CallSiteSeries): boolean => emphasis !== null && (s.key ?? OTHER_ID) !== emphasis;
 
   return (
-    <div className="cst">
+    <div className={width === undefined ? 'cst' : 'cst cst-fixed'}>
       <div className="cst-layout">
       <div ref={ref} className="cst-plot">
         <BarChart layout="vertical" width={w} height={height} data={rows} margin={{ top: 4, right: 16, bottom: 4, left: 4 }} barCategoryGap={10}>
