@@ -305,6 +305,10 @@ SUMMARY_ON_EXIT=0
 _is_dry() { [ "${DRY_RUN:-0}" = 1 ]; }
 _st() { if _is_dry; then printf 'dry-run\n'; else printf 'ok\n'; fi; }
 _now() { printf '%(%s)T\n' -1; }
+# Callers use $(_scratch), a subshell, so the directory must already exist and be
+# recorded in SCRATCH: _log_open creates it in the main shell. Created inside a
+# subshell, each call would make (and leak) a new directory, and paths taken by two
+# calls (format-patch's export/ and the patch in it) would point at different ones.
 _scratch() {
     if [ -z "$SCRATCH" ] || [ ! -d "$SCRATCH" ]; then
         SCRATCH="$(mktemp -d "${TMPDIR:-/tmp}/wine-dev.XXXXXX")" || die "cannot create a temporary directory"
@@ -331,6 +335,7 @@ _log_open() {   # _log_open CMD — per-invocation log under ~/.local/state/prof
     rm -f -- "$DEV_STATE/setup-latest.log" 2>/dev/null || true
     [ -z "$LOGFILE" ] || ln -sfn -- "$(basename -- "$LOGFILE")" "$DEV_STATE/wine-dev-latest.log" 2>/dev/null || true
     SUMMARY_ON_EXIT=1
+    _scratch >/dev/null     # main shell: every later $(_scratch) returns this one directory
 }
 
 _banner() {
