@@ -96,6 +96,21 @@ Later, if still needed: the in-process recorder (per-thread shared-memory buffer
 - Recorded in ledger + runs 918d06a; scored by `plans/tools/trial-analyze.py T0003` (run on the laptop: `ssh ableton-laptop python3 - T0003 < plans/tools/trial-analyze.py`). The ledger's `xruns` field for T0001/T0002 holds their PipeWire ERR totals; T0003 records `xruns` and `pipewire_errors` separately.
 - From T0004 on, both arms export `PIPEASIO_REALTIME=1` (the kept change); aa-focusrite-1..3 stays the reference for cumulative gains.
 - Upstream candidate (patch pipeasio/0009 left the flip to "the scheduling A/B"): ship `realtime=true`, or have the launcher export the switch. PR timing is the user's call.
+
+**Trial T0004 (pre-registered before running): P-core affinity for the audio threads.**
+- Setup:
+  - Both arms export `PIPEASIO_REALTIME=1` (kept in T0003).
+  - B pins `pipeasio-rt` and Live's 15 `AudioCalc` workers to the P-core CPUs 0–11 (`/sys/devices/cpu_core/cpus`) with `taskset`, from a 1 s watcher.
+  - A runs the same watcher without pinning, so both arms carry the same overhead.
+  - ABAB × 3; Sets Inbuilts, Max4Live, VSTs; `--duration 120`.
+- Why: in T0003-B the workers waited 0.40–0.60 s per 120 s for a CPU, and 1–4 of the 15 ended on an E-core (CPUs 12–15). Live sets no affinity of its own (all audio threads are allowed on 0-15).
+- PASS iff [D] or [E] holds, and both guards hold:
+  - [D] median DSP average lower in B by more than 2× the A/A spread (aa-focusrite: Inbuilts 1.18, Max4Live 0.82, VSTs 0.86) on at least one heavy Set;
+  - [E] total PipeWire ERR in B ≤ 0.6 × A, with a one-sided binomial test of B given A + B at p < 0.05;
+  - guard: no Set's median DSP average worse in B by more than 2× its spread;
+  - guard: total PipeWire ERR not higher in B.
+- Mechanism check: `proc-delta.json` shows `cpus_allowed_list` 0-11 for the audio threads in every B Set-run, and 0-15 in A.
+- Driver: ~/.local/state/profiler/trial-T0004.sh. Scored by `plans/tools/trial-analyze.py --rule t0004`.
 **Testing plan (2026-10-17).** Every trial: ABAB × 3, golden restored per run, all 5 Sets, untraced; accept iff the median DSP average or typical peak improves by more than 2× the A/A spread on at least one heavy Set, no Set regresses beyond noise, and the dropout guards (PipeWire ERR, peaks >100 %) are not worse; ledger + history + commit/push per trial.
 1. Scheduling / configuration (no Wine code; PR-able as defaults or launcher options): PipeASIO realtime (T0002 → **kept in T0003**) → next, on top of it: tune the pipeasio-rt priority (PIPEASIO_RT_PRIORITY) vs Live's RR 10 → P-core affinity for pipeasio-rt + AudioCalc → real-time only for audio threads (today the launcher makes all 94 Live threads RR 10, UI and graphics included). Dropout trials use T0003's shape (heavy Sets, 120 s, pre-registered sign test on PipeWire ERR).
 2. Existing Wine patch: WINE_APC_FASTPATH=1 (awaiting loaded-Set evidence).
