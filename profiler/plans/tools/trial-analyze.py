@@ -115,16 +115,17 @@ for a, b in pairs:
         for f in sorted(glob.glob(f'{src}/sets/*/raw/proc-delta.json')):
             d = json.loads(pathlib.Path(f).read_text())
             set_name = f.split('/sets/')[1].split('/')[0].split('-', 1)[1].replace('Benchmark_', '')
-            aff, wait, on_e = set(), 0.0, 0
+            aff, wait, on_e, workers = set(), 0.0, 0, 0
             for proc in d['processes']:
                 for t in proc.get('threads', []):
                     c = t.get('comm', '')
                     if c.startswith('AudioCalc') or c == 'pipeasio-rt':
                         aff.add(t.get('cpus_allowed_list'))
                         if c.startswith('AudioCalc'):
+                            workers += 1
                             wait += (t.get('schedstat') or {}).get('run_delay_ns', 0) / 1e6
                             on_e += (t.get('processor_at_end') or 0) >= 12
-            cells.append(f"{set_name}: cpus {','.join(sorted(x for x in aff if x))} wait {wait:.0f} ms E@end {on_e}")
+            cells.append(f"{set_name}: {workers} workers, cpus {' '.join(sorted((x for x in aff if x), key=lambda x: (len(x), x)))} wait {wait:.0f} ms E@end {on_e}")
         if cells:
             print(f'  {rid:16} ' + ' | '.join(cells))
 
