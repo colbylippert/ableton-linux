@@ -266,6 +266,7 @@ Implications:
 - Wine-side patches can save roughly 5–25 µs of CPU per block: a user-mode QPC (TSC bypass, which Wine's own tests list as missing) and a lighter dispatcher path for the hot event calls.
 - The dropouts come from Live's own work spikes. Next evidence: scheduler and page-fault tracing of the callback in late blocks.
 - First Wine patch: `0109` user-mode QPC behind an opt-in switch, measured with syncbench + a traced run + ABAB.
+- `0109` keeps QPC in 100 ns ticks at 10 MHz (design correction, 2026-10-18). Wine's own code calls `NtQueryPerformanceCounter(&now, NULL)` and treats the result as 100 ns ticks: the threadpool timers, the wait timeouts in `unix/sync.c` and `unix/server.c`, win32u input, nsiproxy and the OSS/CoreAudio drivers. So the Windows layout (`QpcBypassEnabled` with a TSC-derived `QpcFrequency`) would break them. Instead, the TSC is scaled to 100 ns ticks, and `NtQueryPerformanceCounter` uses the same formula, so both paths agree. The parameters live in the shared user data, so every process in the prefix gets the same values. Open point: QPC is `CLOCK_BOOTTIME` today, so a TSC base drifts from it by the NTP correction (ppm).
 - Dev loop: `wine-dev` container initialised at 08:04 (`~/wine-dev/work/wine-src`, HEAD 10d4ce9).
 
 **Build host (2026-10-18):** Wine builds moved off the laptop, so they no longer perturb trials or wait for them.
