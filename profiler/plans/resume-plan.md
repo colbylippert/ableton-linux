@@ -111,6 +111,28 @@ Later, if still needed: the in-process recorder (per-thread shared-memory buffer
   - guard: total PipeWire ERR not higher in B.
 - Mechanism check: `proc-delta.json` shows `cpus_allowed_list` 0-11 for the audio threads in every B Set-run, and 0-15 in A.
 - Driver: ~/.local/state/profiler/trial-T0004.sh. Scored by `plans/tools/trial-analyze.py --rule t0004`.
+
+**Trial T0004 — KEEP (2026-10-17):** PASS via [E], with both guards.
+- PipeWire ERR 38 → 17 (−55 %, one-sided binomial p = 0.003); B fewer in 7 of 9 Set-pairs.
+- [D] not met: the median DSP average fell on every Set (−0.68 / −0.92 / −0.37 pt), but within 2× the spread.
+- Mechanism: B had the audio threads on 0-11 and none on an E-core at the end, against 3–5 of 15 on E-cores in A.
+- Pinning raised the workers' total CPU wait ~9× (0.5 → 3.9–5.9 s per 120 s: 16 audio threads on 12 logical CPUs). Even so, dropouts halved and the worst peaks tightened (Max4Live 75–136 % → 81–88 %).
+- Ledger + runs 7095b3f. From T0005 on, both arms pin the audio threads.
+- Upstream candidate: on hybrid Intel CPUs the launcher could pin the audio threads to the P-cores by thread name.
+
+**Trial T0005 (pre-registered before running): reserve the P-cores for audio.**
+- Setup:
+  - Both arms keep `PIPEASIO_REALTIME=1` and pin `pipeasio-rt` + `AudioCalc*` to the P-core CPUs 0–11 (T0003, T0004).
+  - B also pins every other thread of Live's process (main/UI, graphics, Wine service threads: ~78 threads at the same SCHED_RR 10) to the E-core CPUs 12–15 (`/sys/devices/cpu_atom/cpus`), from the same 1 s watcher.
+  - ABAB × 3; Inbuilts, Max4Live, VSTs; 120 s.
+- Why: in T0004-B the audio workers queued 3.9–5.9 s per 120 s for the 12 P-core CPUs, which they share with Live's own non-audio threads.
+- PASS rule: the same as T0004. PASS iff [D] or [E] holds, and both guards hold:
+  - [D] median DSP average lower in B by more than 2× the A/A spread on at least one heavy Set;
+  - [E] total PipeWire ERR in B ≤ 0.6 × A, one-sided binomial p < 0.05;
+  - guard: no Set's median DSP average worse in B by more than 2× its spread;
+  - guard: total PipeWire ERR not higher in B.
+- Mechanism check: in B, the non-audio Live threads show `cpus_allowed_list` 12-15 and the audio threads 0-11, and the AudioCalc CPU wait is reported per run.
+- Driver: ~/.local/state/profiler/trial-T0005.sh. Scored by `plans/tools/trial-analyze.py T0005 --rule t0004`.
 **Testing plan (2026-10-17).** Every trial: ABAB × 3, golden restored per run, all 5 Sets, untraced; accept iff the median DSP average or typical peak improves by more than 2× the A/A spread on at least one heavy Set, no Set regresses beyond noise, and the dropout guards (PipeWire ERR, peaks >100 %) are not worse; ledger + history + commit/push per trial.
 1. Scheduling / configuration (no Wine code; PR-able as defaults or launcher options): PipeASIO realtime (T0002 → **kept in T0003**) → next, on top of it: tune the pipeasio-rt priority (PIPEASIO_RT_PRIORITY) vs Live's RR 10 → P-core affinity for pipeasio-rt + AudioCalc → real-time only for audio threads (today the launcher makes all 94 Live threads RR 10, UI and graphics included). Dropout trials use T0003's shape (heavy Sets, 120 s, pre-registered sign test on PipeWire ERR).
 2. Existing Wine patch: WINE_APC_FASTPATH=1 (awaiting loaded-Set evidence).
