@@ -80,12 +80,19 @@ _lock() {   # _lock WAIT — hold the session lock on fd 9 until this script exi
         || die "the session lock $SESSION_LOCK on $(uname -n) is held (a trial, bench run or Live session is in progress); retry when it is free, or pass --lock-wait SECONDS" 3
 }
 
+# Called with the session lock held, so no new session can start: whatever still
+# runs is the tail of one that just ended (wineserver lingers a few seconds after
+# its last client), so give it up to 30 s before refusing.
 _refuse_if_busy() {
-    local busy
-    busy="$(_runtime_pids "$OFFICIAL_ROOT" "$DEV_ROOT")"
-    [ -n "$busy" ] || return 0
+    local busy i
+    for i in $(seq 1 30); do
+        busy="$(_runtime_pids "$OFFICIAL_ROOT" "$DEV_ROOT")"
+        [ -n "$busy" ] || return 0
+        [ "$i" -gt 1 ] || printf 'waiting up to 30 s for processes from the runtime(s) to exit\n'
+        sleep 1
+    done
     printf '%s\n' "$busy" | sed 's/^/   pid /' >&2
-    die "processes run from the runtime(s) on $(uname -n); quit Live (File > Quit) and wait for wineserver" 4
+    die "processes still run from the runtime(s) on $(uname -n) after 30 s; quit Live (File > Quit) and wait for wineserver" 4
 }
 
 cmd_probe() {
