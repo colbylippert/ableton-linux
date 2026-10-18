@@ -264,6 +264,21 @@ Next candidates (user to choose; none pre-registered yet):
 - Mechanism check: Live's `Log.txt` reads `GPU Renderer: On` for every B launch and `Off` for every A one. The driver aborts after B1 unless all three of its launches ran with the GPU renderer on. The per-thread CPU of the UI thread and `wined3d_cs` is reported per arm.
 - Driver: ~/.local/state/profiler/trial-T0011.sh. Scored by `plans/tools/trial-analyze.py T0011 --rule t0004`.
 
+**Trial T0012 (user decision 2026-10-18: "q t0012"; pre-registered before running): the APC fast path.**
+- Setup:
+  - Both arms keep the configuration: `PIPEASIO_REALTIME=1`, with pipeasio-rt and every `AudioCalc` worker pinned to CPUs 0–11 (shared), nine workers, the normal window, and snapshot `golden`. If T0011 passes, its snapshot becomes the baseline first, and the queue holds for that.
+  - A: Wine's regular wait route, the runtime's default.
+  - B: `WINE_APC_FASTPATH=1`, the runtime's `performance/0001` patch. Alertable zero-handle sleeps (`NtDelayExecution`) then wait on the NTSync alert event instead of a wineserver select; APC routing itself stays in wineserver.
+  - ABAB × 3; Inbuilts, Max4Live, VSTs; 120 s.
+- Why:
+  - The patch's own measurement: an empty Live Set caused about 3,650 wineserver context switches per second, one per alertable delay.
+  - D0001 counted about 370 wineserver requests per second on the heavy Sets.
+  - wineserver runs SCHED_OTHER, unpinned (T0007), so its wakeups land on the CPUs the audio threads use. Removing them changes nothing on the audio path itself.
+  - This is also the first trial of a Wine patch, and it is already in the runtime.
+- PASS rule: the same as T0004 ([D] or [E], plus both guards). A PASS keeps the switch for later trials; making it a default stays the user's call.
+- Mechanism check: wineserver's voluntary context switches and CPU fall in every B Set-run (`proc-delta.json`), and `WINE_APC_FASTPATH=1` is recorded as a switch on B.
+- Driver: ~/.local/state/profiler/trial-T0012.sh, started by `queue-T0012.sh` after T0011. Scored by `plans/tools/trial-analyze.py T0012 --rule t0004`.
+
 **Wine hot-path research (2026-10-18 morning)**
 
 Diagnostic D0001: one traced run on the kept configuration (heavy Sets, 60 s each, 45,000 blocks per Set; history `diag-D0001-traced`).
