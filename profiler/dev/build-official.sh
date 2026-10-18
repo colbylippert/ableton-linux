@@ -258,7 +258,8 @@ _remote_rt() {   # _remote_rt HOST SUBCOMMAND [ARG…] — run remote-runtime.sh
         [[ "$a" =~ ^[A-Za-z0-9._/@:+=-]+$ ]] || { fail "refusing to pass '$a' to the remote shell (allowed: A-Z a-z 0-9 . _ / @ : + = -)"; return 2; }
     done
     b64="$(base64 -w0 < "$DEV_DIR/remote-runtime.sh")" || { fail "cannot read $DEV_DIR/remote-runtime.sh"; return 1; }
-    ssh -o BatchMode=yes -o ConnectTimeout=10 -- "$host" "printf %s $b64 | base64 -d | bash -s -- $*"
+    # -n: ssh must not drain our stdin (a terminal, or the script a caller pipes to bash -s)
+    ssh -n -o BatchMode=yes -o ConnectTimeout=10 -- "$host" "printf %s $b64 | base64 -d | bash -s -- $*"
 }
 declare -A RF=()
 _remote_probe() {   # _remote_probe HOST → RF[key]=value (remote-runtime.sh probe)
