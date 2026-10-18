@@ -1,0 +1,365 @@
+From 443d0f7a92336b49f753d2e58449b69681a5da7b Mon Sep 17 00:00:00 2001
+From: dist <build@localhost>
+Date: Sun, 18 Oct 2026 12:58:17 -0400
+Subject: [PATCH] ntdll: read QueryPerformanceCounter from the TSC in user mode
+ (WINE_QPC_TSC=1)
+
+Result
+
+RtlQueryPerformanceCounter always made the NtQueryPerformanceCounter
+syscall: 76 ns per call on the test laptop, and Ableton Live calls it
+about 65 times per 1.33 ms audio block. With WINE_QPC_TSC=1 it reads the
+counter in user mode in 14 ns.
+
+Scope
+
+With WINE_QPC_TSC=1 in its environment, an invariant TSC and the kernel's
+clocksource tsc, wineserver publishes a TSC-to-QPC mapping in the unused
+tail of the shared user data page (offset 0xf00). "force" skips the
+clocksource check and "debug" also logs the tracking every 5 s. QPC keeps
+its 100 ns units and 10 MHz: Wine's own code treats NtQueryPerformanceCounter
+values as 100 ns ticks. wineserver calibrates the rate over one second, then
+re-anchors the mapping on every refresh of the page (at least every 16 ms).
+It measures CLOCK_BOOTTIME's rate against the TSC every second and slews the
+remaining phase error (at most 1 %, never back), so QPC keeps the kernel
+clock's rate, which PipeASIO's CLOCK_MONOTONIC stamps share. Two copies of
+the mapping form a latch, so a reader never waits for wineserver.
+NtQueryPerformanceCounter reads the same mapping, so both routes agree.
+Without the switch, or without an invariant TSC on the tsc clocksource, QPC
+takes its regular route. Only x86_64 code reads the mapping in user mode.
+
+Verification
+
+tools/qpcprobe.exe on the laptop (i7-13620H, clocksource tsc): frequency
+10 MHz; 2,000,000 alternating QueryPerformanceCounter and
+NtQueryPerformanceCounter values never went backwards; the routes agree
+(mean gap 0.49 ticks); QPC 76 -> 14 ns per call (syncbench qpc median
+76.5 -> 15.0 ns). WINE_QPC_TSC=debug: QPC within 62-106 ns of
+CLOCK_BOOTTIME after settling, rate within 1 ppm. Without the switch every
+check passes on the regular route.
+---
+ dlls/ntdll/time.c      |   9 +++
+ dlls/ntdll/unix/sync.c |   7 +-
+ include/ddk/wdm.h      |  71 ++++++++++++++++++++
+ server/fd.c            | 174 ++++++++++++++++++++++++++++++++++++++++++++++++-
+ 4 files changed, 259 insertions(+), 2 deletions(-)
+
+diff --git a/dlls/ntdll/time.c b/dlls/ntdll/time.c
+index 5a96a1e..f151780 100644
+--- a/dlls/ntdll/time.c
++++ b/dlls/ntdll/time.c
+@@ -381,6 +381,15 @@ LONGLONG WINAPI RtlGetSystemTimePrecise( void )
+  */
+ BOOL WINAPI DECLSPEC_HOTPATCH RtlQueryPerformanceCounter( LARGE_INTEGER *counter )
+ {
++    ULONGLONG value;
++
++    /* WINE_QPC_TSC=1: read the TSC mapping wineserver publishes (ddk/wdm.h) without a
++     * syscall; NtQueryPerformanceCounter reads the same mapping */
++    if (wine_qpc_tsc_read( wine_qpc_tsc_from_usd( user_shared_data ), &value ))
++    {
++        counter->QuadPart = value;
++        return TRUE;
++    }
+     NtQueryPerformanceCounter( counter, NULL );
+     return TRUE;
+ }
+diff --git a/dlls/ntdll/unix/sync.c b/dlls/ntdll/unix/sync.c
+index b3aee8e..4ad4cbc 100644
+--- a/dlls/ntdll/unix/sync.c
++++ b/dlls/ntdll/unix/sync.c
+@@ -2567,7 +2567,12 @@ NTSTATUS WINAPI NtDelayExecution( BOOLEAN alertable, const LARGE_INTEGER *timeou
+  */
+ NTSTATUS WINAPI NtQueryPerformanceCounter( LARGE_INTEGER *counter, LARGE_INTEGER *frequency )
+ {
+-    counter->QuadPart = monotonic_counter();
++    ULONGLONG value;
++
++    /* WINE_QPC_TSC=1: the TSC mapping wineserver publishes (ddk/wdm.h), which
++     * RtlQueryPerformanceCounter reads in user mode; both routes must agree */
++    if (wine_qpc_tsc_read( wine_qpc_tsc_from_usd( user_shared_data ), &value )) counter->QuadPart = value;
++    else counter->QuadPart = monotonic_counter();
+     if (frequency) frequency->QuadPart = TICKSPERSEC;
+     return STATUS_SUCCESS;
+ }
+diff --git a/include/ddk/wdm.h b/include/ddk/wdm.h
+index 406870d..cb06c49 100644
+--- a/include/ddk/wdm.h
++++ b/include/ddk/wdm.h
+@@ -1364,6 +1364,77 @@ C_ASSERT( sizeof(KUSER_SHARED_DATA) == 0x738 );
+ #define SHARED_GLOBAL_FLAGS_QPC_BYPASS_USE_MFENCE 0x10
+ #define SHARED_GLOBAL_FLAGS_QPC_BYPASS_USE_LFENCE 0x20
+ #define SHARED_GLOBAL_FLAGS_QPC_BYPASS_A73_ERRATA 0x40
++
++#ifdef __WINESRC__
++/* Wine extension: with WINE_QPC_TSC=1, wineserver publishes a mapping from the TSC to
++ * QueryPerformanceCounter ticks in the otherwise unused tail of the shared user data
++ * page, so RtlQueryPerformanceCounter reads the counter in user mode, without a
++ * syscall. QPC keeps its 100 ns units: Wine's own code treats NtQueryPerformanceCounter
++ * values as 100 ns ticks, so the frequency must not change. wineserver re-anchors the
++ * mapping against CLOCK_BOOTTIME on every refresh of the page (at least every 16 ms) and
++ * slews its rate, so QPC follows the kernel clock instead of drifting from it.
++ *
++ * counter = base_qpc + ((tsc - base_tsc) * mult + base_frac) / 2^32
++ *
++ * Two copies form a latch: wineserver writes the inactive copy, then advances index, so
++ * a reader never waits for wineserver and always finds one complete copy. */
++struct wine_qpc_tsc_params
++{
++    ULONGLONG base_tsc;   /* TSC at the anchor */
++    ULONGLONG base_qpc;   /* QPC ticks (100 ns) at the anchor */
++    ULONGLONG mult;       /* QPC ticks per TSC tick, 32.32 fixed point */
++    ULONG     base_frac;  /* fraction of a tick at the anchor, in 1/2^32 */
++    ULONG     pad;
++};
++
++struct wine_qpc_tsc
++{
++    volatile LONG index;     /* params[index & 1] is the current copy */
++    volatile LONG enabled;   /* nonzero once wineserver has calibrated the mapping */
++    struct wine_qpc_tsc_params params[2];
++};
++
++#define WINE_QPC_TSC_OFFSET 0xf00
++C_ASSERT( WINE_QPC_TSC_OFFSET >= sizeof(KUSER_SHARED_DATA) );
++C_ASSERT( WINE_QPC_TSC_OFFSET + sizeof(struct wine_qpc_tsc) <= 0x1000 );
++
++static inline const struct wine_qpc_tsc *wine_qpc_tsc_from_usd( const void *usd )
++{
++    return (const struct wine_qpc_tsc *)((const char *)usd + WINE_QPC_TSC_OFFSET);
++}
++
++/* Returns FALSE when the mapping is not published (QPC then takes its regular route). */
++static inline BOOL wine_qpc_tsc_read( const struct wine_qpc_tsc *qpc, ULONGLONG *counter )
++{
++#ifdef __x86_64__
++    const volatile struct wine_qpc_tsc_params *p;
++    ULONGLONG base_tsc, base_qpc, mult, tsc, delta;
++    ULONG base_frac, lo, hi;
++    LONG index;
++
++    if (!qpc->enabled) return FALSE;
++    do
++    {
++        index = qpc->index;
++        __asm__ __volatile__( "" ::: "memory" );
++        p = &qpc->params[index & 1];
++        base_tsc = p->base_tsc;
++        base_qpc = p->base_qpc;
++        mult = p->mult;
++        base_frac = p->base_frac;
++        /* lfence: the TSC is read after the copy, not speculatively before it */
++        __asm__ __volatile__( "lfence; rdtsc" : "=a" (lo), "=d" (hi) :: "memory" );
++        tsc = ((ULONGLONG)hi << 32) | lo;
++    } while (index != qpc->index);
++    /* the cores' TSCs agree to a few cycles: this core may read just before base_tsc */
++    delta = (LONGLONG)(tsc - base_tsc) > 0 ? tsc - base_tsc : 0;
++    *counter = base_qpc + (ULONGLONG)(((unsigned __int128)delta * mult + base_frac) >> 32);
++    return TRUE;
++#else
++    return FALSE;
++#endif
++}
++#endif /* __WINESRC__ */
+ #define SHARED_GLOBAL_FLAGS_QPC_BYPASS_USE_RDTSCP 0x80
+ 
+ typedef enum _MEMORY_CACHING_TYPE {
+diff --git a/server/fd.c b/server/fd.c
+index b601216..0a02eac 100644
+--- a/server/fd.c
++++ b/server/fd.c
+@@ -33,6 +33,9 @@
+ #include <stdlib.h>
+ #include <stdint.h>
+ #include <poll.h>
++#ifdef __x86_64__
++#include <cpuid.h>
++#endif
+ #ifdef HAVE_LINUX_MAJOR_H
+ #include <linux/major.h>
+ #endif
+@@ -427,14 +430,183 @@ static void set_user_shared_data_time(void)
+     atomic_store_ulong(&user_shared_data->TickCountLowDeprecated, tick_count);
+ }
+ 
++
++/* user-mode QueryPerformanceCounter (WINE_QPC_TSC=1): wineserver keeps a TSC-to-QPC
++ * mapping in the shared user data, see struct wine_qpc_tsc in ddk/wdm.h */
++#ifdef __x86_64__
++static int qpc_tsc_state;           /* 0 undecided, 1 calibrating, 2 published, -1 off */
++static ULONGLONG qpc_cal_tsc;       /* calibration start */
++static timeout_t qpc_cal_time;
++static ULONGLONG qpc_mult;          /* the kernel clock's rate: QPC ticks per TSC tick, 32.32 */
++static ULONGLONG qpc_ref_tsc;       /* rate reference, a sample about one second old */
++static timeout_t qpc_ref_time;
++static int qpc_tsc_debug;           /* WINE_QPC_TSC=debug: log the tracking every 5 s */
++static ULONGLONG qpc_mult_first;    /* the rate at calibration (debug output) */
++static timeout_t qpc_last_log;
++static unsigned int qpc_rejected;   /* samples a preemption made too wide (debug output) */
++
++static inline ULONGLONG qpc_rdtsc(void)
++{
++    unsigned int lo, hi;
++    __asm__ __volatile__( "lfence; rdtsc" : "=a" (lo), "=d" (hi) :: "memory" );
++    return ((ULONGLONG)hi << 32) | lo;
++}
++
++static int qpc_tsc_usable(void)
++{
++    const char *env = getenv( "WINE_QPC_TSC" );
++    unsigned int eax, ebx, ecx, edx;
++    char source[32] = "";
++    FILE *f;
++
++    if (!env || (strcmp( env, "1" ) && strcmp( env, "force" ) && strcmp( env, "debug" ))) return 0;
++    qpc_tsc_debug = !strcmp( env, "debug" );
++    /* an invariant TSC runs at one rate in every P-, C- and T-state */
++    if (!__get_cpuid( 0x80000007, &eax, &ebx, &ecx, &edx ) || !(edx & (1u << 8)))
++    {
++        fprintf( stderr, "wineserver: WINE_QPC_TSC: the TSC is not invariant; QPC keeps its regular route\n" );
++        return 0;
++    }
++    /* the kernel keeps time on the TSC only when it trusts it (synchronised, stable);
++     * "force" skips this check for testing in virtual machines */
++    if (strcmp( env, "force" ))
++    {
++        if ((f = fopen( "/sys/devices/system/clocksource/clocksource0/current_clocksource", "r" )))
++        {
++            if (!fgets( source, sizeof(source), f )) source[0] = 0;
++            fclose( f );
++        }
++        if (strcmp( source, "tsc\n" ) && strcmp( source, "tsc" ))
++        {
++            fprintf( stderr, "wineserver: WINE_QPC_TSC: the kernel clocksource is not tsc; QPC keeps its regular route\n" );
++            return 0;
++        }
++    }
++    return 1;
++}
++
++static void qpc_tsc_publish( ULONGLONG tsc, ULONGLONG qpc, ULONG frac, ULONGLONG mult )
++{
++    struct wine_qpc_tsc *shared = (struct wine_qpc_tsc *)((char *)user_shared_data + WINE_QPC_TSC_OFFSET);
++    LONG next = shared->index + 1;
++    struct wine_qpc_tsc_params *p = &shared->params[next & 1];
++
++    /* write the inactive copy, then switch readers to it: x86 keeps the stores in
++     * order, the barrier keeps the compiler from reordering them */
++    p->base_tsc = tsc;
++    p->base_qpc = qpc;
++    p->base_frac = frac;
++    p->mult = mult;
++    __asm__ __volatile__( "" ::: "memory" );
++    shared->index = next;
++}
++
++/* one sample: the TSC read around the monotonic_counter() call that produced now */
++static void update_qpc_tsc( ULONGLONG tsc, timeout_t now )
++{
++    struct wine_qpc_tsc *shared = (struct wine_qpc_tsc *)((char *)user_shared_data + WINE_QPC_TSC_OFFSET);
++    const struct wine_qpc_tsc_params *p;
++    unsigned __int128 pred;
++    ULONGLONG delta, pred_int;
++    ULONG pred_frac;
++    LONGLONG err_int, limit;
++    __int128 err, adjust;
++
++    switch (qpc_tsc_state)
++    {
++    case 0:
++        qpc_tsc_state = qpc_tsc_usable() ? 1 : -1;
++        qpc_cal_tsc = tsc;
++        qpc_cal_time = now;
++        return;
++    case 1:
++        /* measure the rate over one second before anyone may use it */
++        if (now - qpc_cal_time < TICKS_PER_SEC || tsc <= qpc_cal_tsc) return;
++        qpc_mult = qpc_mult_first = (ULONGLONG)(((unsigned __int128)(now - qpc_cal_time) << 32) / (tsc - qpc_cal_tsc));
++        qpc_last_log = now;
++        qpc_ref_tsc = tsc;
++        qpc_ref_time = now;
++        qpc_tsc_publish( tsc, now, 0, qpc_mult );
++        shared->enabled = 1;
++        qpc_tsc_state = 2;
++        fprintf( stderr, "wineserver: WINE_QPC_TSC: QueryPerformanceCounter reads the TSC in user mode (%llu kHz)\n",
++                 (unsigned long long)(((unsigned __int128)TICKS_PER_SEC << 32) / qpc_mult / 1000) );
++        return;
++    case 2:
++        break;
++    default:
++        return;
++    }
++
++    /* rate: measure the kernel clock against the TSC again every second. NTP and
++     * timesyncd slew CLOCK_BOOTTIME (by percents after a suspend), and QPC must keep its
++     * rate, which PipeASIO's CLOCK_MONOTONIC stamps share */
++    if (now - qpc_ref_time >= TICKS_PER_SEC && tsc > qpc_ref_tsc)
++    {
++        qpc_mult = (ULONGLONG)(((unsigned __int128)(now - qpc_ref_time) << 32) / (tsc - qpc_ref_tsc));
++        qpc_ref_tsc = tsc;
++        qpc_ref_time = now;
++    }
++
++    /* where the published mapping puts this TSC value, in ticks and 1/2^32 fractions */
++    p = &shared->params[shared->index & 1];
++    delta = (LONGLONG)(tsc - p->base_tsc) > 0 ? tsc - p->base_tsc : 0;
++    pred = (unsigned __int128)delta * p->mult + p->base_frac;
++    pred_int = p->base_qpc + (ULONGLONG)(pred >> 32);
++    pred_frac = (ULONG)pred;
++    err_int = (LONGLONG)(now - pred_int);
++    if (qpc_tsc_debug && now - qpc_last_log >= 5 * TICKS_PER_SEC)
++    {
++        fprintf( stderr, "wineserver: WINE_QPC_TSC: QPC %+lld ns from CLOCK_BOOTTIME, rate %+lld ppm from calibration, %u sample(s) rejected\n",
++                 (long long)(-(err_int * 100 - (LONGLONG)(((ULONGLONG)pred_frac * 100) >> 32))),
++                 (long long)(((LONGLONG)qpc_mult - (LONGLONG)qpc_mult_first) * 1000000 / (LONGLONG)qpc_mult_first),
++                 qpc_rejected );
++        qpc_last_log = now;
++    }
++
++    if (err_int > 100000)
++    {
++        /* more than 10 ms behind the kernel clock (a suspend, a TSC reset): step forward */
++        qpc_tsc_publish( tsc, now, 0, qpc_mult );
++        return;
++    }
++    /* phase: remove the remaining error over about one second on top of the measured
++     * rate, never stepping, so QPC stays monotonic (at most 1 % off the kernel clock's
++     * rate while it catches up) */
++    err = ((__int128)err_int << 32) - pred_frac;
++    adjust = err * (__int128)qpc_mult / ((__int128)TICKS_PER_SEC << 32);
++    limit = (LONGLONG)(qpc_mult / 100);
++    if (adjust > limit) adjust = limit;
++    if (adjust < -limit) adjust = -limit;
++    qpc_tsc_publish( tsc, pred_int, pred_frac, qpc_mult + (LONGLONG)adjust );
++}
++#endif
++
+ void set_current_time(void)
+ {
+     static const timeout_t ticks_1601_to_1970 = (timeout_t)86400 * (369 * 365 + 89) * TICKS_PER_SEC;
+     struct timeval now;
++#ifdef __x86_64__
++    ULONGLONG tsc0 = 0, tsc1 = 0;
++#endif
+     gettimeofday( &now, NULL );
+     current_time = (timeout_t)now.tv_sec * TICKS_PER_SEC + now.tv_usec * 10 + ticks_1601_to_1970;
++#ifdef __x86_64__
++    if (qpc_tsc_state >= 0) tsc0 = qpc_rdtsc();
++#endif
+     monotonic_time = monotonic_counter();
+-    if (user_shared_data) set_user_shared_data_time();
++#ifdef __x86_64__
++    if (qpc_tsc_state >= 0) tsc1 = qpc_rdtsc();
++#endif
++    if (user_shared_data)
++    {
++        set_user_shared_data_time();
++#ifdef __x86_64__
++        /* a sample is good when nothing preempted the clock read (under ~4 us) */
++        if (qpc_tsc_state >= 0 && tsc1 - tsc0 < 10000) update_qpc_tsc( tsc0 + (tsc1 - tsc0) / 2, monotonic_time );
++        else if (qpc_tsc_state > 0) qpc_rejected++;
++#endif
++    }
+ }
+ 
+ /* add a timeout user */

@@ -104,6 +104,7 @@ INTERFACE_METRIC_SPECS = (
 # Paths and other WINE_* values stay outside the report.
 BENCHMARK_WINE_ENV_KEYS = (
     "WINE_APC_FASTPATH",
+    "WINE_QPC_TSC",
     "WINE_MSG_FASTPATH",
     "WINE_USER_APC_FASTPATH",
     "WINE_HOOK_FASTPATH",

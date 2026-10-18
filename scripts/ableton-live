@@ -125,6 +125,11 @@ RUNTIME VARIABLES:
         run one NTSync alert-wait trial;
         Wine's regular wait route remains the launch default
 
+    WINE_QPC_TSC=1
+        read QueryPerformanceCounter from the TSC in user mode (patch
+        0109; needs an invariant TSC on the tsc clocksource); unset keeps
+        the regular syscall route
+
     The pointer variables below override the saved pointer setting
     for one launch; the launcher exports none of them, and registry
     values hold the persistent settings. Values ignore letter case;

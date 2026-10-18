@@ -11,11 +11,12 @@ point-version gap with upstream's actively-maintained branch and with ENCORE
 The rebase involved five merge conflicts and uncovered three additional build
 breaks, plus a `build.sh`/`pipefail` tooling issue.
 
-The Wine series contains 96 patch files and ends at 0108. The absent numbers
+The Wine series contains 97 patch files and ends at 0109. The absent numbers
 are 0027, 0044, 0072, 0074, 0090 through 0095, 0097, and 0098; their reasons
 are declared in `SERIES_GAPS` in `scripts/build-audit.sh`. Patch 0073 keeps
 the wheel coordinate fix separate. Patch 0100 combines 10 pointer patches.
 Patch 0108 adds the static trace points of the interface profiler.
+Patch 0109 adds the user-mode QueryPerformanceCounter switch (`WINE_QPC_TSC`).
 
 A separate performance series contains one reviewed patch under
 `patches/performance/`. Patch 0001 provides the NTSync alertable wait trial.
@@ -469,6 +470,21 @@ Apply them in sequence with the rest of the series.
   nop); the audit also counts the eight probe names in `ntdll.so` and
   checks that every site is that nop and stays inside one page. See
   `profiler/tracer/README.md`.
+- `0109` lets `QueryPerformanceCounter` read the counter in user mode with
+  `WINE_QPC_TSC=1` (76 to 14 ns per call on the profiling laptop). wineserver
+  publishes a TSC-to-QPC mapping at offset `0xf00` of the shared user data page
+  (`struct wine_qpc_tsc` in `include/ddk/wdm.h`, Wine sources only), as a
+  two-copy latch so readers never wait for it, and only with an invariant TSC on
+  the kernel clocksource `tsc` (`force` skips that check, `debug` logs the
+  tracking). QPC keeps 100 ns units because Wine's own code assumes them.
+  wineserver re-anchors the mapping on every refresh of the page: it measures
+  `CLOCK_BOOTTIME`'s rate against the TSC every second and slews the remaining
+  phase error, never stepping back, so QPC keeps the kernel clock's rate
+  (`server/fd.c`). `RtlQueryPerformanceCounter` (`dlls/ntdll/time.c`) and
+  `NtQueryPerformanceCounter` (`dlls/ntdll/unix/sync.c`) read the same mapping,
+  so both routes agree. Unset, QPC takes its regular route. The fingerprint
+  literal is `WINE_QPC_TSC` in `wineserver`. See
+  `notes/ABLETON-WINE-USERMODE-QPC.md` and `tools/qpcprobe.c`.
 - `pipeasio/0017` adds six USDT probes (provider `pipeasio`) to the PipeASIO
   driver: `cycle_start` and `cycle_end` around the PipeWire cycle in
   `audio_on_process`, and `block_start`, `block_before_live`,
