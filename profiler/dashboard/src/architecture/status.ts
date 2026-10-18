@@ -12,7 +12,7 @@ export interface PartStatus {
   note: string;
 }
 
-export const STATUS_AS_OF = '17 October 2026 (trial T0003 running)';
+export const STATUS_AS_OF = '17 October 2026 (trial T0003 kept)';
 
 export const STATUS_ROWS: readonly PartStatus[] = [
   {
@@ -91,7 +91,7 @@ export const STATUS_ROWS: readonly PartStatus[] = [
     part: 'A/B trials',
     paths: ['profiler/ledger.jsonl', 'profiler/history/runs/'],
     state: 'in progress',
-    note: 'T0001 idle-state cap: reverted. T0002 PipeASIO realtime: inconclusive, dropouts halved. T0003 confirmation running.',
+    note: 'T0003 kept PipeASIO realtime, the first proven gain: PipeWire errors 204 to 30 on the heavy Sets. T0001 (idle-state cap) was reverted.',
   },
   {
     part: 'History and dashboard',

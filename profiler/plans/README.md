@@ -17,3 +17,4 @@ documents describe lives in the rest of `profiler/` and in `patches/0108-…` / 
 | `findings/wf*.json` | Review findings from the first implementation workflows |
 | `workflows/*.js` | The multi-agent workflow scripts that implemented each block (Claude Code workflows) |
 | `tools/workflow-status.py` | Shows the progress of a running workflow (Windows side) |
+| `tools/trial-analyze.py` | Scores an ABAB trial against its pre-registered rule (PipeWire errors per Set-pair, DSP average vs the A/A spread) |
