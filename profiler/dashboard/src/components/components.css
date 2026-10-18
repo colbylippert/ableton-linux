@@ -108,6 +108,165 @@
   box-shadow: 0 0 0 2px var(--surface-1);
 }
 
+/* ---------- overview (Claude Design "Spectrum overview" layout) ---------- */
+
+.overview-head {
+  justify-content: space-between;
+  align-items: flex-end;
+}
+
+.overview-head-text {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.overview-head-text .view-title,
+.overview-head-text .note {
+  margin: 0;
+}
+
+.set-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 0 0 16px;
+}
+
+.set-chip {
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.set-chip:hover {
+  border-color: var(--axis);
+}
+
+.set-chip[aria-pressed='true'] {
+  border-color: var(--focus);
+  box-shadow: inset 0 0 0 1px var(--focus);
+  font-weight: 600;
+}
+
+.overview-top {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 360px), 1fr));
+  gap: 16px;
+  align-items: stretch;
+  margin: 0 0 24px;
+}
+
+/* the hero card's top rule carries the status of the cumulative gain */
+.overview-hero {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  border-top: 5px solid var(--border);
+}
+
+.overview-hero.tone-good {
+  border-top-color: var(--status-good);
+}
+
+.overview-hero.tone-warning {
+  border-top-color: var(--status-warning);
+}
+
+.overview-hero.tone-critical {
+  border-top-color: var(--status-critical);
+}
+
+.overview-hero-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+/* DSP load by Set: one row per Set, tinted with the Set's hue, bars on one shared scale */
+.set-load {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.set-load-row {
+  display: grid;
+  grid-template-columns: minmax(0, 150px) minmax(0, 1fr) 56px;
+  align-items: center;
+  gap: 12px;
+  padding: 6px 8px;
+  border-radius: var(--radius-sm);
+  background: color-mix(in oklch, var(--row-hue) var(--set-tint), var(--surface-1));
+}
+
+.set-load-name {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  overflow: hidden;
+  font-size: 13px;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.set-load-dot {
+  flex: none;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--row-hue);
+}
+
+.set-load-track {
+  display: block;
+  height: 12px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: var(--surface-2);
+}
+
+.set-load-bar {
+  display: block;
+  height: 100%;
+  border-radius: 999px;
+  background: var(--row-hue);
+}
+
+.set-load-value {
+  font-family: var(--mono);
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+.set-load-scale {
+  margin: 4px 0 0;
+  font-size: 12px;
+}
+
+.overview-tiles {
+  margin: 0 0 24px;
+}
+
+.overview-charts {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 520px), 1fr));
+  gap: 16px;
+  align-items: start;
+  margin: 0 0 24px;
+}
+
+.overview-chart {
+  min-width: 0;
+}
+
+.overview-trials .card-subtitle {
+  margin-bottom: 8px;
+}
+
 /* ---------- filter bar ---------- */
 
 .filterbar {

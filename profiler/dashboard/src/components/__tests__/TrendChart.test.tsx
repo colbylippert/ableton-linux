@@ -170,9 +170,9 @@ describe('TrendChart', () => {
     expect(all(c, '.trend-end-label').map(text)).toEqual(['3.00/min', '1.00/min']);
     const buttons = all<HTMLButtonElement>(c, '.legend button');
     expect(buttons.map(text)).toEqual(['Zero', 'Empty']);
-    // jsdom (like browsers) normalises an inline hex background to rgb(): #eb6834 → rgb(235, 104, 52)
-    expect((buttons[1]?.querySelector('.legend-key') as HTMLElement | null)?.style.background).toBe('rgb(235, 104, 52)');
-    expect(PALETTE.light.series[1]).toBe('#eb6834');
+    // jsdom (like browsers) normalises an inline hex background to rgb(): #ff6b35 → rgb(255, 107, 53)
+    expect((buttons[1]?.querySelector('.legend-key') as HTMLElement | null)?.style.background).toBe('rgb(255, 107, 53)');
+    expect(PALETTE.light.series[1]).toBe('#ff6b35');
     click(buttons[0]);
     expect(buttons[0]?.getAttribute('aria-pressed')).toBe('true');
     expect(all(c, '.recharts-line-curve')).toHaveLength(1);

@@ -18,8 +18,16 @@
   `system-ui, -apple-system, 'Segoe UI', sans-serif` and
   `ui-monospace, 'Cascadia Mono', 'Consolas', 'DejaVu Sans Mono', monospace`; no webfont ships,
   exactly like the real site. `[FONT_MISSING] "Cascadia Mono"` is expected and accepted.
-- Chart colours come from the validated dataviz palette in `src/theme.css` (DESIGN.md §7);
-  restyling may change layout, type and chrome, but series/status colours keep their rules.
+- Palettes (user decision, 2026-10-17, made in Claude Design): light = **Spectrum** (template
+  `templates/bright-theme`, tokens `spectrum-tokens.css`), dark = **Abyss** (`templates/dark-abyss`,
+  `abyss-tokens.css`). The Overview layout and the app bar come from `templates/spectrum-overview`.
+  All of this is synced back into `src/theme.css`, `src/palette.ts`, `src/App.tsx` and
+  `src/views/Overview.tsx`. Token names are unchanged. Series and status colours keep their rules
+  (fixed Set slots, status on dots only). The dataviz validator fails these palettes on some checks
+  (DESIGN.md §7.4). The one that matters: in dark mode, Inbuilts lime and Max4Live amber are hard to
+  tell apart. That is an open design question for the user.
+- `templates/**` in the Claude Design project is the user's design work. It is not produced by
+  this build. Never delete it (the plan's delete globs exclude it), and never overwrite it.
 
 ## Card layout (cfg.overrides, first sync 2026-10-17)
 - **Column mode for wide components.** The capture viewport is 900 px, and a product grid cell has only

@@ -5,7 +5,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { DEFAULT_FILTER, type FilterState } from '../../data/types';
-import OverviewView from '../../views/Overview';
+import OverviewView, { heroStatus, niceCeil, quarterDomain } from '../../views/Overview';
 import TrendsView from '../../views/Trends';
 import { EMPTY_DATA, FIXTURE_DATA } from './fixtures';
 import { all, byText, choose, click, mount, text, type Mounted } from './harness';
@@ -59,7 +59,43 @@ describe('Overview view', () => {
 
     click(byText(c, '.chart-frame-toggle button', 'Table'));
     expect(all(c, 'tbody tr').length).toBeGreaterThanOrEqual(8);
-    expect(all(c, 'th').map(text)).toEqual(['Set', 'Metric', 'Baseline', 'Latest', 'Best', 'Δ', 'Significance', 'Runs']);
+    expect(all(c, '.overview-tiles th').map(text)).toEqual(['Set', 'Metric', 'Baseline', 'Latest', 'Best', 'Δ', 'Significance', 'Runs']);
+  });
+
+  it('shows the Set chips, DSP load by Set, the latest-trial dropouts and the recent trials', () => {
+    const onFilterChange = vi.fn<(next: FilterState) => void>();
+    mounted = mount(<OverviewView data={FIXTURE_DATA} filter={DEFAULT_FILTER} onFilterChange={onFilterChange} />);
+    const c = mounted.container;
+    // Set chips name every Set of the slice and narrow the shared filter
+    expect(all(c, '.set-chip').map(text)).toEqual(['Zero', 'VSTs']);
+    click(byText(c, '.set-chip', 'VSTs'));
+    expect(onFilterChange).toHaveBeenLastCalledWith({ ...DEFAULT_FILTER, set: 'Benchmark_VSTs' });
+    // DSP load by Set: one tinted row per Set with a DSP meter, from the latest untraced run
+    const loadRows = all(c, '.set-load-row');
+    expect(loadRows.length).toBeGreaterThan(0);
+    expect(loadRows.every((r) => ['Benchmark_Zero', 'Benchmark_VSTs'].includes(r.getAttribute('data-set') ?? ''))).toBe(true);
+    // the hero card carries a tone and the kept trial's switch
+    expect(c.querySelector('.overview-hero')?.className).toMatch(/tone-(good|warning|critical|dim)/);
+    expect(text(c.querySelector('.overview-hero-chips'))).toContain('WINE_FOO=1');
+    // dropouts come from the latest trial whose ABAB runs are in history (T0007; T0008 has none)
+    expect(text(c.querySelector('.overview-charts'))).toContain('Dropouts, latest trial');
+    expect(text(c.querySelector('.overview-charts'))).toContain('T0007');
+    // recent trials, newest first
+    expect(all(c, '.overview-trials tbody tr').map((r) => text(r.querySelector('td')))).toEqual(['T0008', 'T0007']);
+  });
+
+  it('maps the cumulative gain to the hero tone and rounds bar scales up', () => {
+    expect(heroStatus('beyond', 'better')).toBe('good');
+    expect(heroStatus('beyond', 'worse')).toBe('critical');
+    expect(heroStatus('within', 'better')).toBe('warning');
+    expect(heroStatus('unknown', 'flat')).toBe('dim');
+    expect(niceCeil(31.2)).toBe(35);
+    expect(niceCeil(0)).toBe(5);
+    expect(niceCeil(204, 10, 1.1)).toBe(230);
+    expect(quarterDomain(38)).toEqual([0, 40]);
+    expect(quarterDomain(204)).toEqual([0, 400]);
+    expect(quarterDomain(17)).toEqual([0, 20]);
+    expect(quarterDomain(0)).toEqual([0, 4]);
   });
 
   it('narrows to the chosen machine and shows the no-timing ribbon on a virtualised host', () => {

@@ -1,6 +1,6 @@
 # Profiler dashboard — building with these components
 
-The dashboard of the Wine interface profiler for Ableton Live on Linux. It shows benchmark runs, A/B trials and Wine call sites. It is data-dense and calm: system fonts, light and dark themes, and colour only where it carries meaning.
+The dashboard of the Wine interface profiler for Ableton Live on Linux. It shows benchmark runs, A/B trials and Wine call sites. It is data-dense and calm: system fonts, colour only where it carries meaning, and two palettes: **Spectrum** (light: cool indigo base, rainbow Set hues) and **Abyss** (dark: deep teal, cyan accents).
 
 ## Setup
 - **No provider or root wrapper.** All styling comes from `styles.css`, which imports `_ds_bundle.css`. That file holds the tokens, the `body` base (page background, ink, 14 px system font) and every component class. Without it, components render as bare HTML.
@@ -27,7 +27,9 @@ The dashboard of the Wine interface profiler for Ableton Live on Linux. It shows
 - **Status:** `--status-good`, `--status-warning`, `--status-serious`, `--status-critical`.
   - Status colours go on dots, marks and borders only; text stays in ink.
   - Positive deltas written as text use `--delta-good-text`.
-- **Shape and type:** `--radius`, `--radius-sm`, `--gutter`, `--font`, `--mono`.
+- **Shape and type:** `--radius` (12 px), `--radius-sm`, `--gutter`, `--font`, `--mono`.
+- **App bar and links:** `--appbar-bg`, `--appbar-ink`, `--appbar-accent` (the active pill and brand dot), `--appbar-accent-ink`, `--appbar-border`; `--link`, `--link-hover`.
+- **Set rows:** `--set-tint` (12 % light, 22 % dark) tints a row with its Set's hue: `color-mix(in oklch, var(--set-vsts) var(--set-tint), var(--surface-1))`.
 - **Shipped classes for your own layout:**
   - Cards: `.card`, `.card-title`, `.card-subtitle`.
   - Grids: `.grid` (auto-fit, 280 px columns) and `.grid-kpi` (180 px).
@@ -35,6 +37,8 @@ The dashboard of the Wine interface profiler for Ableton Live on Linux. It shows
   - Chips: `.chip` with `.dot` and the `.chip-good` / `-warning` / `-serious` / `-critical` / `-dim` variants.
   - Other: `.empty` (empty state) and `.sr-only`.
   - View composition: `.view-title` (page `h2`), `.view-head`, `.section-head`, `.note` (lead text), `.muted` and `.mono` (ids, hashes and call sites).
+  - App shell: `.appbar` > `.appbar-inner` with `.appbar-brand` (`.appbar-dot`, `.app-title`) and `.appbar-nav` (`.tablist` of `.tab` pills, `.theme-toggle`).
+  - Set legend: `.set-chips` of `.chip.set-chip` buttons (`aria-pressed` = filtered). Per-Set bars: `.set-load` > `.set-load-row` with `--row-hue` set to the Set token.
 
   Don't invent class names; for other glue, use inline styles built from the tokens.
 

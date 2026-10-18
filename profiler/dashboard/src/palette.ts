@@ -2,9 +2,9 @@
  * Hex mirror of `src/theme.css` for Recharts.
  *
  * SVG presentation attributes (`stroke`, `fill`) need concrete colours, so charts read
- * them from here while everything HTML reads the CSS tokens. Both columns are the dataviz
- * reference palette (DESIGN.md §7; validator output for light and dark in §7.4). Change a
- * value here only together with `theme.css` and re-run the validator.
+ * them from here while everything HTML reads the CSS tokens. The columns are the palettes
+ * chosen in Claude Design: Spectrum (light) and Abyss (dark) (DESIGN.md §7, validator output
+ * in §7.4). Change a value here only together with `theme.css`, and re-run the validator.
  *
  * `useThemeMode()` follows the viewer's toggle (`<html data-theme>`) and the OS preference
  * so a theme switch re-renders every chart with the matching column.
@@ -30,7 +30,7 @@ export interface PaletteTokens {
   border: string;
   deltaGoodText: string;
   focus: string;
-  /** Slots 1..8 in theme order: blue, orange, aqua, yellow, magenta, green, violet, red. */
+  /** Slots 1..8 in theme order (Spectrum: indigo, tangerine, teal, amber, pink, sky, violet, red). */
   series: readonly [string, string, string, string, string, string, string, string];
   seriesDim: string;
   /** Blue sequential ramp, steps 100..700. */
@@ -59,52 +59,52 @@ const SEQ = {
   700: '#0d366b',
 } as const;
 
-const STATUS = { good: '#0ca30c', warning: '#fab219', serious: '#ec835a', critical: '#d03b3b' } as const;
-
 export const PALETTE: Readonly<Record<ThemeMode, PaletteTokens>> = {
+  // Spectrum (Claude Design, 2026-10-17): cool indigo base, full-rainbow Set hues.
   light: {
-    page: '#f9f9f7',
-    surface1: '#fcfcfb',
-    surface2: '#f0efec',
-    textPrimary: '#0b0b0b',
-    textSecondary: '#52514e',
-    textMuted: '#898781',
-    grid: '#e1e0d9',
-    axis: '#c3c2b7',
-    border: 'rgba(11, 11, 11, 0.1)',
-    deltaGoodText: '#006300',
-    focus: '#2a78d6',
-    series: ['#2a78d6', '#eb6834', '#1baf7a', '#eda100', '#e87ba4', '#008300', '#4a3aa7', '#e34948'],
-    seriesDim: '#898781',
+    page: '#f3f5ff',
+    surface1: '#ffffff',
+    surface2: '#e8edff',
+    textPrimary: '#0b1033',
+    textSecondary: '#434a75',
+    textMuted: '#666c94',
+    grid: '#e1e6fa',
+    axis: '#c3c9ea',
+    border: 'rgba(11, 16, 51, 0.1)',
+    deltaGoodText: '#047857',
+    focus: '#4f46e5',
+    series: ['#4f46e5', '#ff6b35', '#00c2a8', '#ffc233', '#ff4fa3', '#22a6f2', '#9b5de5', '#f2545b'],
+    seriesDim: '#8a8fb0',
     seq: SEQ,
-    divNeg: '#e34948',
-    divMid: '#f0efec',
-    divPos: '#2a78d6',
-    ordBefore: '#86b6ef',
-    ordAfter: '#1c5cab',
-    status: STATUS,
+    divNeg: '#f2545b',
+    divMid: '#e8edff',
+    divPos: '#4f46e5',
+    ordBefore: '#a5a1f5',
+    ordAfter: '#3730a3',
+    status: { good: '#00b37e', warning: '#ffc233', serious: '#ff8a3d', critical: '#ef4444' },
   },
+  // Abyss (Claude Design, 2026-10-17): deep ocean teal, cyan accents.
   dark: {
-    page: '#0d0d0d',
-    surface1: '#1a1a19',
-    surface2: '#262624',
-    textPrimary: '#ffffff',
-    textSecondary: '#c3c2b7',
-    textMuted: '#898781',
-    grid: '#2c2c2a',
-    axis: '#383835',
-    border: 'rgba(255, 255, 255, 0.1)',
-    deltaGoodText: '#0ca30c',
-    focus: '#3987e5',
-    series: ['#3987e5', '#d95926', '#199e70', '#c98500', '#d55181', '#008300', '#9085e9', '#e66767'],
-    seriesDim: '#898781',
+    page: '#061419',
+    surface1: '#0c2129',
+    surface2: '#133039',
+    textPrimary: '#eafcff',
+    textSecondary: '#aed3db',
+    textMuted: '#7fa5ae',
+    grid: '#1a3a44',
+    axis: '#255059',
+    border: 'rgba(255, 255, 255, 0.12)',
+    deltaGoodText: '#4be3a0',
+    focus: '#3fe0e6',
+    series: ['#3fe0e6', '#ff8a5c', '#a6e85a', '#ffd257', '#ff74b8', '#7aa8ff', '#c79bff', '#ff6b72'],
+    seriesDim: '#5f7f87',
     seq: SEQ,
-    divNeg: '#e66767',
-    divMid: '#383835',
-    divPos: '#3987e5',
-    ordBefore: '#9ec5f4',
-    ordAfter: '#3987e5',
-    status: STATUS,
+    divNeg: '#ff6b72',
+    divMid: '#1a3a44',
+    divPos: '#3fe0e6',
+    ordBefore: '#1f7f86',
+    ordAfter: '#8ff2f5',
+    status: { good: '#2ed398', warning: '#ffd257', serious: '#ffa05c', critical: '#ff5c5c' },
   },
 };
 

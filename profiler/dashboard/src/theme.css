@@ -1,11 +1,11 @@
 /*
  * Profiler gains — design tokens and base layout.
  *
- * Tokens come from the dataviz reference palette (references/palette.md): the chart
- * chrome, the eight categorical slots (dark column = the same hues re-stepped for the
- * dark surface, validated as a set), the blue sequential ramp, the blue<->red diverging
- * pair, the fixed status scale and the ordinal before/after pair. Validator output for
- * both modes is recorded in DESIGN.md. Nothing below is eyeballed.
+ * Palettes chosen in Claude Design (2026-10-17, project "Profiler Dashboard Design System"):
+ * light = Spectrum (cool indigo base, full-rainbow Set hues), dark = Abyss (deep ocean teal,
+ * cyan accents). Token names are unchanged, so every component keeps its rules: each
+ * benchmark Set owns one categorical slot, status colours sit on dots, marks and borders,
+ * text stays in ink. palette.ts mirrors these values for the charts; DESIGN.md §7 lists them.
  *
  * Dark mode is declared twice on purpose: once under the OS preference (guarded so an
  * explicit light stamp wins) and once under the viewer's toggle (data-theme="dark").
@@ -15,30 +15,32 @@
   color-scheme: light;
 
   /* chart chrome & ink */
-  --page: #f9f9f7;
-  --surface-1: #fcfcfb;
-  --surface-2: #f0efec; /* raised rows, chips, neutral diverging midpoint */
-  --text-primary: #0b0b0b;
-  --text-secondary: #52514e;
-  --text-muted: #898781; /* axis ticks, captions >= 12px; never body text */
-  --grid: #e1e0d9;
-  --axis: #c3c2b7;
-  --border: rgba(11, 11, 11, 0.1);
-  --delta-good-text: #006300;
-  --focus: #2a78d6;
+  --page: #f3f5ff;
+  --surface-1: #ffffff;
+  --surface-2: #e8edff; /* raised rows, chips, neutral diverging midpoint */
+  --text-primary: #0b1033;
+  --text-secondary: #434a75;
+  --text-muted: #666c94; /* axis ticks, captions >= 12px; never body text */
+  --grid: #e1e6fa;
+  --axis: #c3c9ea;
+  --border: rgba(11, 16, 51, 0.1);
+  --delta-good-text: #047857;
+  --focus: #4f46e5;
+  --link: #4f46e5;
+  --link-hover: #3730a3;
 
   /* categorical slots, fixed order, never cycled */
-  --series-1: #2a78d6; /* blue */
-  --series-2: #eb6834; /* orange */
-  --series-3: #1baf7a; /* aqua */
-  --series-4: #eda100; /* yellow */
-  --series-5: #e87ba4; /* magenta */
-  --series-6: #008300; /* green */
-  --series-7: #4a3aa7; /* violet */
-  --series-8: #e34948; /* red */
-  --series-dim: #898781; /* de-emphasis: context series in the emphasis form */
+  --series-1: #4f46e5; /* indigo */
+  --series-2: #ff6b35; /* tangerine */
+  --series-3: #00c2a8; /* teal */
+  --series-4: #ffc233; /* amber */
+  --series-5: #ff4fa3; /* pink */
+  --series-6: #22a6f2; /* sky */
+  --series-7: #9b5de5; /* violet */
+  --series-8: #f2545b; /* red */
+  --series-dim: #8a8fb0; /* de-emphasis: context series in the emphasis form */
 
-  /* Set -> slot (suite order). A non-canonical Set wears --set-other. */
+  /* Set -> slot (DESIGN.md §7.1); a Set keeps its slot in every view */
   --set-zero: var(--series-1);
   --set-empty: var(--series-2);
   --set-inbuilts: var(--series-3);
@@ -61,28 +63,38 @@
   --seq-650: #104281;
   --seq-700: #0d366b;
 
-  /* diverging: blue (improvement) <-> neutral <-> red (regression) */
-  --div-neg: #e34948;
-  --div-mid: #f0efec;
-  --div-pos: #2a78d6;
+  /* diverging: improvement <-> neutral <-> regression */
+  --div-neg: #f2545b;
+  --div-mid: #e8edff;
+  --div-pos: #4f46e5;
 
   /* ordinal before/after pair (dumbbells, before/after bars): one hue, two shades */
-  --ord-before: #86b6ef; /* step 250 */
-  --ord-after: #1c5cab; /* step 550 */
+  --ord-before: #a5a1f5;
+  --ord-after: #3730a3;
 
-  /* status: fixed, reserved, always paired with an icon + label */
-  --status-good: #0ca30c;
-  --status-warning: #fab219;
-  --status-serious: #ec835a;
-  --status-critical: #d03b3b;
+  /* status: reserved, always paired with an icon + label */
+  --status-good: #00b37e;
+  --status-warning: #ffc233;
+  --status-serious: #ff8a3d;
+  --status-critical: #ef4444;
+
+  /* app bar: the full-width band that carries the brand, the view tabs and the theme toggle */
+  --appbar-bg: #1a1f5c;
+  --appbar-ink: #ffffff;
+  --appbar-accent: #00c2a8;
+  --appbar-accent-ink: #06201c;
+  --appbar-border: transparent;
+
+  /* Set rows tint their background with the Set's hue (color-mix percentage) */
+  --set-tint: 12%;
 
   /* mark specs */
   --line-width: 2px;
   --marker-r: 4px;
   --bar-max: 24px;
   --surface-gap: 2px;
-  --radius: 8px;
-  --radius-sm: 4px;
+  --radius: 12px;
+  --radius-sm: 6px;
   --gutter: 16px;
 
   --font: system-ui, -apple-system, 'Segoe UI', sans-serif;
@@ -92,70 +104,96 @@
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme='light']) {
     color-scheme: dark;
-    --page: #0d0d0d;
-    --surface-1: #1a1a19;
-    --surface-2: #262624;
-    --text-primary: #ffffff;
-    --text-secondary: #c3c2b7;
-    --text-muted: #898781;
-    --grid: #2c2c2a;
-    --axis: #383835;
-    --border: rgba(255, 255, 255, 0.1);
-    --delta-good-text: #0ca30c;
-    --focus: #3987e5;
+    --page: #061419;
+    --surface-1: #0c2129;
+    --surface-2: #133039;
+    --text-primary: #eafcff;
+    --text-secondary: #aed3db;
+    --text-muted: #7fa5ae;
+    --grid: #1a3a44;
+    --axis: #255059;
+    --border: rgba(255, 255, 255, 0.12);
+    --delta-good-text: #4be3a0;
+    --focus: #3fe0e6;
+    --link: #3fe0e6;
+    --link-hover: #8ff2f5;
 
-    --series-1: #3987e5;
-    --series-2: #d95926;
-    --series-3: #199e70;
-    --series-4: #c98500;
-    --series-5: #d55181;
-    --series-6: #008300;
-    --series-7: #9085e9;
-    --series-8: #e66767;
-    --series-dim: #898781;
+    --series-1: #3fe0e6;
+    --series-2: #ff8a5c;
+    --series-3: #a6e85a;
+    --series-4: #ffd257;
+    --series-5: #ff74b8;
+    --series-6: #7aa8ff;
+    --series-7: #c79bff;
+    --series-8: #ff6b72;
+    --series-dim: #5f7f87;
 
-    --div-neg: #e66767;
-    --div-mid: #383835;
-    --div-pos: #3987e5;
+    --div-neg: #ff6b72;
+    --div-mid: #1a3a44;
+    --div-pos: #3fe0e6;
 
-    --ord-before: #9ec5f4; /* step 200 */
-    --ord-after: #3987e5; /* step 400 */
+    --ord-before: #1f7f86;
+    --ord-after: #8ff2f5;
+
+    --status-good: #2ed398;
+    --status-warning: #ffd257;
+    --status-serious: #ffa05c;
+    --status-critical: #ff5c5c;
+
+    --appbar-bg: #030d10;
+    --appbar-ink: #ffffff;
+    --appbar-accent: #3fe0e6;
+    --appbar-accent-ink: #022225;
+    --appbar-border: #1a3a44;
+    --set-tint: 22%;
   }
 }
 
 :root[data-theme='dark'] {
   color-scheme: dark;
-  --page: #0d0d0d;
-  --surface-1: #1a1a19;
-  --surface-2: #262624;
-  --text-primary: #ffffff;
-  --text-secondary: #c3c2b7;
-  --text-muted: #898781;
-  --grid: #2c2c2a;
-  --axis: #383835;
-  --border: rgba(255, 255, 255, 0.1);
-  --delta-good-text: #0ca30c;
-  --focus: #3987e5;
+  --page: #061419;
+  --surface-1: #0c2129;
+  --surface-2: #133039;
+  --text-primary: #eafcff;
+  --text-secondary: #aed3db;
+  --text-muted: #7fa5ae;
+  --grid: #1a3a44;
+  --axis: #255059;
+  --border: rgba(255, 255, 255, 0.12);
+  --delta-good-text: #4be3a0;
+  --focus: #3fe0e6;
+  --link: #3fe0e6;
+  --link-hover: #8ff2f5;
 
-  --series-1: #3987e5;
-  --series-2: #d95926;
-  --series-3: #199e70;
-  --series-4: #c98500;
-  --series-5: #d55181;
-  --series-6: #008300;
-  --series-7: #9085e9;
-  --series-8: #e66767;
-  --series-dim: #898781;
+  --series-1: #3fe0e6;
+  --series-2: #ff8a5c;
+  --series-3: #a6e85a;
+  --series-4: #ffd257;
+  --series-5: #ff74b8;
+  --series-6: #7aa8ff;
+  --series-7: #c79bff;
+  --series-8: #ff6b72;
+  --series-dim: #5f7f87;
 
-  --div-neg: #e66767;
-  --div-mid: #383835;
-  --div-pos: #3987e5;
+  --div-neg: #ff6b72;
+  --div-mid: #1a3a44;
+  --div-pos: #3fe0e6;
 
-  --ord-before: #9ec5f4;
-  --ord-after: #3987e5;
+  --ord-before: #1f7f86;
+  --ord-after: #8ff2f5;
+
+  --status-good: #2ed398;
+  --status-warning: #ffd257;
+  --status-serious: #ffa05c;
+  --status-critical: #ff5c5c;
+
+  --appbar-bg: #030d10;
+  --appbar-ink: #ffffff;
+  --appbar-accent: #3fe0e6;
+  --appbar-accent-ink: #022225;
+  --appbar-border: #1a3a44;
+  --set-tint: 22%;
 }
-
-/* ---------- base ---------- */
 
 *,
 *::before,
@@ -178,7 +216,11 @@ body {
 }
 
 a {
-  color: inherit;
+  color: var(--link);
+}
+
+a:hover {
+  color: var(--link-hover);
 }
 
 button,
@@ -222,19 +264,49 @@ select {
   padding: 0 var(--gutter) 48px;
 }
 
-.app-header {
+.app > .load-warnings {
+  margin-top: 12px;
+}
+
+/* app bar: full-width band with the brand, the view tabs (pills) and the theme toggle */
+.appbar {
+  background: var(--appbar-bg);
+  color: var(--appbar-ink);
+  border-bottom: 1px solid var(--appbar-border);
+}
+
+.appbar-inner {
+  max-width: 1280px;
+  margin: 0 auto;
+  padding: 12px var(--gutter);
   display: flex;
   flex-wrap: wrap;
-  align-items: baseline;
-  gap: 8px 16px;
-  padding: 20px 0 12px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px 16px;
+}
+
+.appbar-brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.appbar-dot {
+  flex: none;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--appbar-accent);
 }
 
 .app-title {
   margin: 0;
-  font-size: 20px;
+  font-size: 16px;
   font-weight: 600;
   letter-spacing: -0.01em;
+  white-space: nowrap;
 }
 
 .app-meta {
@@ -242,71 +314,91 @@ select {
   font-size: 13px;
 }
 
-.app-header .spacer {
-  flex: 1 1 auto;
+.appbar .app-meta {
+  color: inherit;
+  opacity: 0.75;
+}
+
+.appbar-nav {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.appbar :focus-visible {
+  outline-color: var(--appbar-ink);
 }
 
 .theme-toggle {
   display: inline-flex;
   gap: 2px;
   padding: 2px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  background: var(--surface-1);
+  border: 1px solid rgba(255, 255, 255, 0.22);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.06);
 }
 
 .theme-toggle button {
   border: 0;
   background: transparent;
   padding: 4px 10px;
-  border-radius: var(--radius-sm);
-  color: var(--text-secondary);
+  border-radius: 999px;
+  color: var(--appbar-ink);
+  opacity: 0.8;
+  font-size: 13px;
   cursor: pointer;
 }
 
+.theme-toggle button:hover {
+  opacity: 1;
+}
+
 .theme-toggle button[aria-pressed='true'] {
-  background: var(--surface-2);
-  color: var(--text-primary);
+  background: rgba(255, 255, 255, 0.16);
+  opacity: 1;
   font-weight: 600;
 }
 
-/* tabs: one row, scrolls horizontally on phones, never the page */
+/* tabs: pills in the app bar; one row that scrolls horizontally on phones, never the page */
 .tablist {
   display: flex;
-  gap: 4px;
+  gap: 6px;
   overflow-x: auto;
   scrollbar-width: thin;
-  border-bottom: 1px solid var(--border);
-  margin: 0 calc(-1 * var(--gutter));
-  padding: 0 var(--gutter);
+  max-width: 100%;
+  padding: 2px;
 }
 
 .tab {
   flex: 0 0 auto;
   border: 0;
   background: transparent;
-  padding: 10px 12px;
-  margin-bottom: -1px;
-  border-bottom: 2px solid transparent;
-  color: var(--text-secondary);
+  padding: 6px 14px;
+  border-radius: 999px;
+  color: var(--appbar-ink);
+  opacity: 0.85;
+  font-size: 14px;
   cursor: pointer;
   white-space: nowrap;
 }
 
 .tab:hover {
-  color: var(--text-primary);
-  background: var(--surface-2);
-  border-radius: var(--radius-sm) var(--radius-sm) 0 0;
+  opacity: 1;
+  background: rgba(255, 255, 255, 0.1);
 }
 
 .tab[aria-selected='true'] {
-  color: var(--text-primary);
+  background: var(--appbar-accent);
+  color: var(--appbar-accent-ink);
+  opacity: 1;
   font-weight: 600;
-  border-bottom-color: var(--text-primary);
 }
 
 .filterbar-slot {
-  padding: 12px 0 4px;
+  padding: 16px 0 4px;
 }
 
 .tabpanel {

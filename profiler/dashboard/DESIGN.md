@@ -194,6 +194,20 @@ view). Views never own filter state; they may narrow it (clicking a Set name set
 | `HeroFigure` | `{ label: 'Cumulative gain', value: '▲ 18.4%', sub: 'late blocks / min, median of 5 Sets vs baseline 2026-10-16', chip: Badge(significance), kept: 3 }` | §3 cumulative gain |
 | `KpiTile` × 4 per Set (one `grid-kpi` row per Set, Set name as the row heading with its colour dot) | late blocks / min · PipeWire errors + xruns (guard tile, `value: '0 / 0'`) · Live CPU / core · slack p01 | `computeGains` rows for the Set |
 | `DataTable` (tile twin) | columns: Set, metric, baseline, latest, best, delta, significance, runs | same rows |
+| Set chips (`.set-chips`) | one `.chip.set-chip` button per Set (`aria-pressed` = filtered) | the slice's Sets; click narrows the shared filter |
+| DSP load by Set (`.set-load`) | one row per Set, tinted with `color-mix(in oklch, <Set hue> var(--set-tint), var(--surface-1))`, bars on one shared scale | latest untraced run's `dsp_avg` |
+| `TrendChart` | DSP load average per Set over the identity's untraced runs, trial markers | `trendSeries` + `trialMarkers` |
+| `ChartFrame` + `DeltaBars` / `DeltaBarsTable` | dropouts of the latest trial: PipeWire errors summed over its ABAB runs, arm A vs arm B | `joinTrials` |
+| `DataTable` (recent trials) | trial, change, verdict, primary metric, per-Set ratio-to-spread chips | ledger, newest first, max 5 |
+
+Layout (Claude Design "Spectrum overview" template, 2026-10-17), top to bottom:
+1. The view head: title and slice note on the left, environment badge on the right.
+2. The Set chips.
+3. The hero card beside "DSP load by Set". The hero card's top rule takes the status colour of
+   the cumulative gain, and its chips are the significance badge plus each kept trial's switch.
+4. "Headline metrics": the tile rows with their table twin.
+5. The DSP trend beside the latest trial's dropouts.
+6. Recent trials.
 
 Each tile: baseline → latest, best since baseline, delta (`▲`/`▼` glyph in status colour,
 number in ink), a 12-point sparkline (`--series-dim` line, current point in the Set's hue),
@@ -401,159 +415,143 @@ loaders, which is what gives HMR on `history-add` and ledger appends.
 
 ## 7. Palette and tokens
 
-Design system = the dataviz reference instance (`references/palette.md`), unchanged. Tokens
-live in `src/theme.css` on `:root`, with the dark set declared under
+Palettes chosen in Claude Design on 2026-10-17 (project "Profiler Dashboard Design System",
+templates `bright-theme` → **Spectrum** for light and `dark-abyss` → **Abyss** for dark). They
+replace the original dataviz reference instance; token names and every rule below are
+unchanged. Tokens live in `src/theme.css` on `:root`, with the dark set declared under
 `@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) }` and again under
 `:root[data-theme="dark"]` (viewer toggle wins both ways). `src/palette.ts` mirrors the same
 hex values for Recharts.
 
 ### 7.1 Categorical order per Set (fixed, never cycled)
 
-| Slot | Hue | Light | Dark | Set (suite order) | token |
+| Slot | Hue | Light (Spectrum) | Dark (Abyss) | Set (suite order) | token |
 |---|---|---|---|---|---|
-| 1 | blue | `#2a78d6` | `#3987e5` | Benchmark_Zero | `--set-zero` |
-| 2 | orange | `#eb6834` | `#d95926` | Benchmark_Empty | `--set-empty` |
-| 3 | aqua | `#1baf7a` | `#199e70` | Benchmark_Inbuilts | `--set-inbuilts` |
-| 4 | yellow | `#eda100` | `#c98500` | Benchmark_Max4Live | `--set-max4live` |
-| 5 | magenta | `#e87ba4` | `#d55181` | Benchmark_VSTs | `--set-vsts` |
-| 6 | green | `#008300` | `#008300` | other (any non-canonical Set) | `--set-other` |
-| 7 | violet | `#4a3aa7` | `#9085e9` | reserved (unused) | `--series-7` |
-| 8 | red | `#e34948` | `#e66767` | reserved (unused) | `--series-8` |
-| — | de-emphasis | `#898781` | `#898781` | context series in the emphasis form, sparkline body | `--series-dim` |
+| 1 | indigo / cyan | `#4f46e5` | `#3fe0e6` | Benchmark_Zero | `--set-zero` |
+| 2 | tangerine / coral | `#ff6b35` | `#ff8a5c` | Benchmark_Empty | `--set-empty` |
+| 3 | teal / lime | `#00c2a8` | `#a6e85a` | Benchmark_Inbuilts | `--set-inbuilts` |
+| 4 | amber | `#ffc233` | `#ffd257` | Benchmark_Max4Live | `--set-max4live` |
+| 5 | pink | `#ff4fa3` | `#ff74b8` | Benchmark_VSTs | `--set-vsts` |
+| 6 | sky / periwinkle | `#22a6f2` | `#7aa8ff` | other (any non-canonical Set) | `--set-other` |
+| 7 | violet | `#9b5de5` | `#c79bff` | reserved (unused) | `--series-7` |
+| 8 | red | `#f2545b` | `#ff6b72` | reserved (unused) | `--series-8` |
+| — | de-emphasis | `#8a8fb0` | `#5f7f87` | context series in the emphasis form, sparkline body | `--series-dim` |
 
 A Set keeps its slot in every view and whatever the filter removes. Several non-canonical
 Sets in one overlay would share slot 6, so the overlay excludes them (they keep their own
-small-multiple card, where one series needs no hue distinction). Light-mode slots 3, 4 and 5
-sit below 3:1 on the surface (validator WARN): the relief is the table twin on every chart
-plus the end-value direct label — both mandatory here, never optional.
+small-multiple card, where one series needs no hue distinction).
+
+The table twin on every chart and the end-value direct label are both mandatory, never
+optional, for two reasons (§7.4):
+- in light mode, slots 2, 3, 4 and 6 sit below 3:1 on the surface;
+- in dark mode, slots 3 and 4 (Inbuilts and Max4Live) are close in hue.
 
 ### 7.2 Sequential, diverging, ordinal, status
 
 | Job | Assignment | Where |
 |---|---|---|
-| Sequential (blue 100→700) | `--seq-100 … --seq-700` | share-intensity cell wash in `CallSiteTable`, meter tracks |
-| Ordinal before/after pair | light `--ord-before #86b6ef` (250) → `--ord-after #1c5cab` (550); dark `#9ec5f4` (200) → `#3987e5` (400) | `PairedDots` (A → B), `BeforeAfterBars` |
-| Diverging | `--div-neg #e34948` (regression) · `--div-mid #f0efec` · `--div-pos #2a78d6` (improvement); dark `#e66767` · `#383835` · `#3987e5` | delta cell bars in `RunDelta` and the Overview table (bar only; the number stays in ink) |
-| Status good | `#0ca30c` | keep ✓, beyond-noise improvement ▲ |
-| Status warning | `#fab219` | within noise ≈, inconclusive |
-| Status serious | `#ec835a` | `NoTimingRibbon` ⚠ |
-| Status critical | `#d03b3b` | revert ✗, beyond-noise regression ▼, guard reject |
+| Sequential (blue 100→700) | `--seq-100 … --seq-700` (unchanged) | reserved; no view uses it today |
+| Ordinal before/after pair | light `--ord-before #a5a1f5` → `--ord-after #3730a3`; dark `#1f7f86` → `#8ff2f5` | `PairedDots` (A → B), `DeltaBars`, architecture "busy" marks |
+| Diverging | `--div-neg #f2545b` (regression) · `--div-mid #e8edff` · `--div-pos #4f46e5` (improvement); dark `#ff6b72` · `#1a3a44` · `#3fe0e6` | delta cell bars in `CompareDrawer` (bar only; the number stays in ink) |
+| Status good | light `#00b37e` · dark `#2ed398` | keep ✓, beyond-noise improvement ▲ |
+| Status warning | light `#ffc233` · dark `#ffd257` | within noise ≈, inconclusive |
+| Status serious | light `#ff8a3d` · dark `#ffa05c` | `NoTimingRibbon` ⚠ |
+| Status critical | light `#ef4444` · dark `#ff5c5c` | revert ✗, beyond-noise regression ▼, guard reject |
 
-Status colours never touch text: they sit on the chip dot, the glyph, the marker line or the
-ribbon border; the label text is always ink (warning and serious are sub-3:1 on light by
-design, the icon + label is the mitigation). `--delta-good-text` (`#006300` / `#0ca30c`,
-7.35:1 / 5.19:1) is the one coloured text token and is used only for the hero figure's
-positive delta line.
+Status colours never touch text. They sit on the chip dot, the glyph, the marker line, the
+ribbon border or the hero card's top rule, and the label text is always ink. In light mode,
+warning and serious are below 3:1 by design; the icon and label carry the meaning.
+`--delta-good-text` (`#047857` / `#4be3a0`) is the one coloured text token, used only for
+positive deltas.
 
 ### 7.3 Token tables
 
+Contrast is WCAG 2.x against the chart surface (`--surface-1`: `#ffffff` / `#0c2129`).
+
 | Role | token | Light | Dark | contrast light / dark |
 |---|---|---|---|---|
-| Page plane | `--page` | `#f9f9f7` | `#0d0d0d` | — |
-| Chart surface / cards | `--surface-1` | `#fcfcfb` | `#1a1a19` | — |
-| Raised rows, chips, diverging midpoint | `--surface-2` | `#f0efec` | `#262624` | — |
-| Primary ink | `--text-primary` | `#0b0b0b` | `#ffffff` | 19.2 / 17.4 |
-| Secondary ink | `--text-secondary` | `#52514e` | `#c3c2b7` | 7.7 / 9.7 |
-| Muted (axis ticks, captions ≥ 12 px) | `--text-muted` | `#898781` | `#898781` | 3.5 / 4.9 — never body text |
-| Gridline (hairline) | `--grid` | `#e1e0d9` | `#2c2c2a` | recessive by design |
-| Baseline / axis | `--axis` | `#c3c2b7` | `#383835` | recessive by design |
-| Border ring | `--border` | `rgba(11,11,11,.10)` | `rgba(255,255,255,.10)` | — |
-| Delta up good (text) | `--delta-good-text` | `#006300` | `#0ca30c` | 7.35 / 5.19 |
-| Focus ring | `--focus` | `#2a78d6` | `#3987e5` | — |
-| Series 1–8 | `--series-N` | §7.1 | §7.1 | all ≥ 3:1 dark; light WARN on 3/4/5 |
-| De-emphasis | `--series-dim` | `#898781` | `#898781` | 3.5 / 4.9 |
-| Sequential 100–700 | `--seq-*` | `#cde2fb … #0d366b` | same steps, anchor flipped | — |
-| Ordinal pair | `--ord-before/after` | `#86b6ef` / `#1c5cab` | `#9ec5f4` / `#3987e5` | 2.06 / 6.46 — 9.74 / 4.79 |
-| Diverging | `--div-neg/mid/pos` | `#e34948` / `#f0efec` / `#2a78d6` | `#e66767` / `#383835` / `#3987e5` | — |
-| Status | `--status-*` | good `#0ca30c` · warning `#fab219` · serious `#ec835a` · critical `#d03b3b` | same | 3.27 · 1.79 · 2.57 · 4.68 / 5.19 · 9.49 · 6.60 · 3.62 |
+| Page plane | `--page` | `#f3f5ff` | `#061419` | — |
+| Chart surface / cards | `--surface-1` | `#ffffff` | `#0c2129` | — |
+| Raised rows, chips, diverging midpoint | `--surface-2` | `#e8edff` | `#133039` | — |
+| Primary ink | `--text-primary` | `#0b1033` | `#eafcff` | 18.5 / 15.7 |
+| Secondary ink | `--text-secondary` | `#434a75` | `#aed3db` | 8.5 / 10.4 |
+| Muted (axis ticks, captions ≥ 12 px) | `--text-muted` | `#666c94` | `#7fa5ae` | 5.1 / 6.2 |
+| Gridline (hairline) | `--grid` | `#e1e6fa` | `#1a3a44` | recessive by design |
+| Baseline / axis | `--axis` | `#c3c9ea` | `#255059` | recessive by design |
+| Border ring | `--border` | `rgba(11,16,51,.10)` | `rgba(255,255,255,.12)` | — |
+| Delta up good (text) | `--delta-good-text` | `#047857` | `#4be3a0` | 5.5 / 10.1 |
+| Focus ring | `--focus` | `#4f46e5` | `#3fe0e6` | 6.3 / 10.3 |
+| Links | `--link` / `--link-hover` | `#4f46e5` / `#3730a3` | `#3fe0e6` / `#8ff2f5` | 6.3 / 10.3 |
+| Series 1–8 | `--series-N` | §7.1 | §7.1 | light 6.3 · 2.8 · 2.3 · 1.6 · 3.0 · 2.7 · 4.1 · 3.4; dark all ≥ 6.0 |
+| De-emphasis | `--series-dim` | `#8a8fb0` | `#5f7f87` | 3.2 / 3.9 |
+| Ordinal pair | `--ord-before/after` | `#a5a1f5` / `#3730a3` | `#1f7f86` / `#8ff2f5` | 2.33 / 9.93 — 3.51 / 12.79 |
+| Diverging | `--div-neg/mid/pos` | `#f2545b` / `#e8edff` / `#4f46e5` | `#ff6b72` / `#1a3a44` / `#3fe0e6` | — |
+| Status | `--status-*` | good `#00b37e` · warning `#ffc233` · serious `#ff8a3d` · critical `#ef4444` | `#2ed398` · `#ffd257` · `#ffa05c` · `#ff5c5c` | 2.7 · 1.6 · 2.3 · 3.8 / 8.6 · 11.5 · 8.2 · 5.5 |
+| App bar | `--appbar-bg` / `-ink` / `-accent` / `-accent-ink` / `-border` | `#1a1f5c` / `#ffffff` / `#00c2a8` / `#06201c` / transparent | `#030d10` / `#ffffff` / `#3fe0e6` / `#022225` / `#1a3a44` | ink 15.1 / 19.6; accent pill text 7.5 / 10.3 |
+| Set-row tint | `--set-tint` | 12 % | 22 % | `color-mix(in oklch, <Set hue> var(--set-tint), var(--surface-1))` |
+| Radius | `--radius` / `--radius-sm` | 12 px / 6 px | same | — |
 | Typeface | `--font` | `system-ui, -apple-system, "Segoe UI", sans-serif` | same | proportional figures; `tabular-nums` only in table columns and axis ticks |
 
-Contrast figures were computed with the validator's exported `contrast()` against the chart
-surfaces (`#fcfcfb` / `#1a1a19`).
-
-### 7.4 Validator output (recorded verbatim; all runs exit 0)
+### 7.4 Validator output (recorded verbatim, 2026-10-17)
 
 Script: `node C:/Users/colby/AppData/Local/Temp/claude/bundled-skills/2.1.292/89eebd4548465f2d7df474971b3b3dd1/dataviz/scripts/validate_palette.js`
 
 ```
-$ validate_palette.js "#2a78d6,#eb6834,#1baf7a,#eda100,#e87ba4,#008300,#4a3aa7,#e34948" --mode light
-
-Palette (light, surface #fcfcfb, categorical): 8 slots
-  [PASS] Lightness band         all 8 inside L 0.43–0.77
+$ validate_palette.js "#4f46e5,#ff6b35,#00c2a8,#ffc233,#ff4fa3,#22a6f2,#9b5de5,#f2545b" --mode light --surface "#ffffff"
+  [FAIL] Lightness band         outside band: [["#ffc233",0.847]]
   [PASS] Chroma floor           all 8 >= 0.1
-  [PASS] CVD separation         worst adjacent #eda100↔#1baf7a ΔE 9.1 (protan) · tritan 5.8
-  [PASS] Normal-vision floor    worst adjacent #e87ba4↔#eda100 ΔE 19.6 (normal)
-  [WARN] Contrast vs surface    below 3:1 — relief required (visible labels or table view): [["#1baf7a",2.74],["#eda100",2.11],["#e87ba4",2.62]]
-  → ALL CHECKS PASS  (CVD in the 6–8 floor band is legal ONLY with secondary encoding: direct labels, gaps, or texture)
-exit=0
+  [PASS] CVD separation         worst adjacent #9b5de5↔#22a6f2 ΔE 8.7 (deutan) · tritan 18.4
+  [PASS] Normal-vision floor    worst adjacent #9b5de5↔#22a6f2 ΔE 20.0 (normal)
+  [WARN] Contrast vs surface    below 3:1 — relief required (visible labels or table view): [["#ff6b35",2.84],["#00c2a8",2.26],["#ffc233",1.61],["#22a6f2",2.69]]
+exit=1
 
-$ validate_palette.js "#3987e5,#d95926,#199e70,#c98500,#d55181,#008300,#9085e9,#e66767" --mode dark --surface "#1a1a19"
-
-Palette (dark, surface #1a1a19, categorical): 8 slots
-  [PASS] Lightness band         all 8 inside L 0.48–0.67
+$ validate_palette.js "#3fe0e6,#ff8a5c,#a6e85a,#ffd257,#ff74b8,#7aa8ff,#c79bff,#ff6b72" --mode dark --surface "#0c2129"
+  [FAIL] Lightness band         outside band: [["#3fe0e6",0.829],["#ff8a5c",0.753],["#a6e85a",0.859],["#ffd257",0.881],["#ff74b8",0.743],["#7aa8ff",0.735],["#c79bff",0.768],["#ff6b72",0.713]]
   [PASS] Chroma floor           all 8 >= 0.1
-  [PASS] CVD separation         worst adjacent #c98500↔#199e70 ΔE 8.4 (protan) · tritan 8.7
-  [PASS] Normal-vision floor    worst adjacent #d55181↔#c98500 ΔE 19.3 (normal)
+  [FAIL] CVD separation         worst adjacent #c79bff↔#7aa8ff ΔE 0.5 (protan) · tritan 12.7
+  [FAIL] Normal-vision floor    worst adjacent #c79bff↔#7aa8ff ΔE 10.4 (normal) — below 15, hard to tell apart even with full color vision
   [PASS] Contrast vs surface    all 8 >= 3:1
-  → ALL CHECKS PASS
-exit=0
+exit=1
 
-$ validate_palette.js "#2a78d6,#eb6834,#1baf7a,#eda100,#e87ba4,#008300" --mode light          # the 6 slots actually assigned (5 Sets + other)
-
-Palette (light, surface #fcfcfb, categorical): 6 slots
-  [PASS] Lightness band         all 6 inside L 0.43–0.77
+$ validate_palette.js "#4f46e5,#ff6b35,#00c2a8,#ffc233,#ff4fa3,#22a6f2" --mode light --surface "#ffffff"      # the 6 slots actually assigned
+  [FAIL] Lightness band         outside band: [["#ffc233",0.847]]
   [PASS] Chroma floor           all 6 >= 0.1
-  [PASS] CVD separation         worst adjacent #eda100↔#1baf7a ΔE 9.1 (protan) · tritan 5.8
-  [PASS] Normal-vision floor    worst adjacent #e87ba4↔#eda100 ΔE 19.6 (normal)
-  [WARN] Contrast vs surface    below 3:1 — relief required (visible labels or table view): [["#1baf7a",2.74],["#eda100",2.11],["#e87ba4",2.62]]
-  → ALL CHECKS PASS
-exit=0
+  [PASS] CVD separation         worst adjacent #00c2a8↔#ff6b35 ΔE 14.0 (deutan) · tritan 21.2
+  [PASS] Normal-vision floor    worst adjacent #ffc233↔#00c2a8 ΔE 24.8 (normal)
+  [WARN] Contrast vs surface    below 3:1 — relief required (visible labels or table view): [["#ff6b35",2.84],["#00c2a8",2.26],["#ffc233",1.61],["#22a6f2",2.69]]
+exit=1
 
-$ validate_palette.js "#3987e5,#d95926,#199e70,#c98500,#d55181,#008300" --mode dark --surface "#1a1a19"
-
-Palette (dark, surface #1a1a19, categorical): 6 slots
-  [PASS] Lightness band         all 6 inside L 0.48–0.67
+$ validate_palette.js "#3fe0e6,#ff8a5c,#a6e85a,#ffd257,#ff74b8,#7aa8ff" --mode dark --surface "#0c2129"
+  [FAIL] Lightness band         outside band: [["#3fe0e6",0.829],["#ff8a5c",0.753],["#a6e85a",0.859],["#ffd257",0.881],["#ff74b8",0.743],["#7aa8ff",0.735]]
   [PASS] Chroma floor           all 6 >= 0.1
-  [PASS] CVD separation         worst adjacent #c98500↔#199e70 ΔE 8.4 (protan) · tritan 8.7
-  [PASS] Normal-vision floor    worst adjacent #d55181↔#c98500 ΔE 19.3 (normal)
+  [FAIL] CVD separation         worst adjacent #ffd257↔#a6e85a ΔE 2.6 (protan) · tritan 12.7
+  [FAIL] Normal-vision floor    worst adjacent #ffd257↔#a6e85a ΔE 12.6 (normal) — below 15, hard to tell apart even with full color vision
   [PASS] Contrast vs surface    all 6 >= 3:1
-  → ALL CHECKS PASS
+exit=1
+
+$ validate_palette.js "#4f46e5,#ff6b35,#00c2a8" --mode light --surface "#ffffff" --pairs all
+  [PASS] Lightness band · [PASS] Chroma floor · [PASS] CVD separation (ΔE 14.0 deutan) · [PASS] Normal-vision floor (ΔE 30.7)
+  [WARN] Contrast vs surface    below 3:1: [["#ff6b35",2.84],["#00c2a8",2.26]]
 exit=0
-
-$ validate_palette.js "#2a78d6,#eb6834,#1baf7a" --mode light --pairs all                      # all-pairs cap: forms where any two marks touch (PairedDots)
-
-Palette (light, surface #fcfcfb, categorical): 3 slots
-  [PASS] Lightness band         all 3 inside L 0.43–0.77
-  [PASS] Chroma floor           all 3 >= 0.1
-  [PASS] CVD separation         worst all-pairs #1baf7a↔#eb6834 ΔE 9.2 (deutan) · tritan 9.6
-  [PASS] Normal-vision floor    worst all-pairs #1baf7a↔#2a78d6 ΔE 24.0 (normal)
-  [WARN] Contrast vs surface    below 3:1 — relief required (visible labels or table view): [["#1baf7a",2.74]]
-  → ALL CHECKS PASS
-exit=0
-
-$ validate_palette.js "#3987e5,#d95926,#199e70" --mode dark --surface "#1a1a19" --pairs all
-
-Palette (dark, surface #1a1a19, categorical): 3 slots
-  [PASS] Lightness band         all 3 inside L 0.48–0.67
-  [PASS] Chroma floor           all 3 >= 0.1
-  [PASS] CVD separation         worst all-pairs #199e70↔#d95926 ΔE 9.4 (deutan) · tritan 4.0
-  [PASS] Normal-vision floor    worst all-pairs #199e70↔#3987e5 ΔE 20.9 (normal)
-  [PASS] Contrast vs surface    all 3 >= 3:1
-  → ALL CHECKS PASS
-exit=0
-
-$ validate_palette.js "#86b6ef,#1c5cab" --ordinal --mode light                                 # before/after pair
-  [PASS] Lightness monotone · [PASS] Adjacent ΔL (>= 0.06) · [PASS] Light-end contrast #86b6ef at 2.06:1 · [PASS] Single hue (3°)   exit=0
-$ validate_palette.js "#9ec5f4,#3987e5" --ordinal --mode dark --surface "#1a1a19"
-  [PASS] Lightness monotone · [PASS] Adjacent ΔL (>= 0.06) · [PASS] Light-end contrast #3987e5 at 4.79:1 · [PASS] Single hue (2°)   exit=0
+$ validate_palette.js "#3fe0e6,#ff8a5c,#a6e85a" --mode dark --surface "#0c2129" --pairs all
+  [FAIL] Lightness band (all 3 above L 0.67) · [PASS] CVD separation (ΔE 10.0 deutan) · [PASS] Normal-vision floor (ΔE 18.4) · [PASS] Contrast
+exit=1
+$ validate_palette.js "#a5a1f5,#3730a3" --ordinal --mode light --surface "#ffffff"
+  [PASS] Lightness monotone · [PASS] Adjacent ΔL · [PASS] Light-end contrast #a5a1f5 at 2.33:1 · [PASS] Single hue (8°)   exit=0
+$ validate_palette.js "#1f7f86,#8ff2f5" --ordinal --mode dark --surface "#0c2129"
+  [PASS] Lightness monotone · [PASS] Adjacent ΔL · [PASS] Light-end contrast #1f7f86 at 3.51:1 · [PASS] Single hue (4°)   exit=0
 ```
 
-No step had to be snapped: every hard gate passes in both modes. Consequences carried into
-the design: (a) the light WARN on slots 3/4/5 → table twin + end labels on every chart;
-(b) the all-pairs cap of three → any chart where arbitrary marks can touch (`PairedDots`
-across Sets, scatter-like forms) uses the ordinal pair or small multiples, never more than
-three categorical slots side by side; (c) no 9th hue, ever — a 6th+ non-canonical Set folds
-into slot 6 and is separated by labels and its own card.
+These are the designer's palettes, shipped as chosen. What the failures mean:
+- **Dark lightness band.** Abyss's neon series are brighter than the validator's dark band
+  (L 0.48–0.67). That is a deliberate look; contrast on the surface is ≥ 6:1 for every slot.
+- **Inbuilts vs Max4Live in dark.** Lime `#a6e85a` vs amber `#ffd257` are hard to tell apart:
+  ΔE 12.6 for normal vision and 2.6 for protan. This is the one failure that bites, because the
+  heavy-Set overlay draws them together. The end labels and the table twin carry the
+  distinction until the hue is moved (an open design question).
+- **Slots 6/7 in dark.** Near-identical for protan, but slot 7 is reserved and unused, so the
+  pair never meets.
+- **Light amber.** `#ffc233` is too light (1.6:1). Max4Live marks rely on their labels.
 
 ---
 

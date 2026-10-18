@@ -175,69 +175,76 @@ export default function App({ data }: AppProps) {
   const warnings = data.loadErrors.length;
 
   return (
-    <div className="app">
-      <header className="app-header">
-        <h1 className="app-title">Profiler gains</h1>
-        <span className="app-meta" aria-live="polite">
-          {runs} run{runs === 1 ? '' : 's'} · {trials} trial{trials === 1 ? '' : 's'}
-          {warnings > 0 ? ` · ${warnings} load warning${warnings === 1 ? '' : 's'}` : ''}
-        </span>
-        <span className="spacer" />
-        <div className="theme-toggle" role="group" aria-label="Theme">
-          {(['system', 'light', 'dark'] as const).map((choice) => (
-            <button key={choice} type="button" aria-pressed={theme === choice} onClick={() => setTheme(choice)}>
-              {choice[0]!.toUpperCase() + choice.slice(1)}
-            </button>
-          ))}
+    <div className="app-shell">
+      <header className="appbar">
+        <div className="appbar-inner">
+          <div className="appbar-brand">
+            <span className="appbar-dot" aria-hidden="true" />
+            <h1 className="app-title">Wine profiler</h1>
+            <span className="app-meta" aria-live="polite">
+              Ableton Live · Linux · {runs} run{runs === 1 ? '' : 's'} · {trials} trial{trials === 1 ? '' : 's'}
+              {warnings > 0 ? ` · ${warnings} load warning${warnings === 1 ? '' : 's'}` : ''}
+            </span>
+          </div>
+          <nav className="appbar-nav" aria-label="Dashboard">
+            <div className="tablist" role="tablist" aria-label="Dashboard views" onKeyDown={onTabKeyDown}>
+              {TABS.map((t) => (
+                <button
+                  key={t.id}
+                  id={`tab-${t.id}`}
+                  className="tab"
+                  role="tab"
+                  type="button"
+                  aria-selected={t.id === tab}
+                  aria-controls={`panel-${t.id}`}
+                  tabIndex={t.id === tab ? 0 : -1}
+                  onClick={() => selectTab(t.id)}
+                >
+                  {t.label}
+                </button>
+              ))}
+            </div>
+            <div className="theme-toggle" role="group" aria-label="Theme">
+              {(['system', 'light', 'dark'] as const).map((choice) => (
+                <button key={choice} type="button" aria-pressed={theme === choice} onClick={() => setTheme(choice)}>
+                  {choice[0]!.toUpperCase() + choice.slice(1)}
+                </button>
+              ))}
+            </div>
+          </nav>
         </div>
       </header>
 
-      {warnings > 0 ? (
-        <details className="load-warnings">
-          <summary>
-            <span className="icon" aria-hidden="true">
-              ⚠
-            </span>{' '}
-            {warnings} load warning{warnings === 1 ? '' : 's'}: history files or ledger lines that were skipped or given defaults
-          </summary>
-          <ul>
-            {data.loadErrors.map((message, i) => (
-              <li key={`${i}-${message}`}>
-                <code>{message}</code>
-              </li>
-            ))}
-          </ul>
-        </details>
-      ) : null}
+      <div className="app">
+        {warnings > 0 ? (
+          <details className="load-warnings">
+            <summary>
+              <span className="icon" aria-hidden="true">
+                ⚠
+              </span>{' '}
+              {warnings} load warning{warnings === 1 ? '' : 's'}: history files or ledger lines that were skipped or given defaults
+            </summary>
+            <ul>
+              {data.loadErrors.map((message, i) => (
+                <li key={`${i}-${message}`}>
+                  <code>{message}</code>
+                </li>
+              ))}
+            </ul>
+          </details>
+        ) : null}
 
-      <div className="tablist" role="tablist" aria-label="Dashboard views" onKeyDown={onTabKeyDown}>
-        {TABS.map((t) => (
-          <button
-            key={t.id}
-            id={`tab-${t.id}`}
-            className="tab"
-            role="tab"
-            type="button"
-            aria-selected={t.id === tab}
-            aria-controls={`panel-${t.id}`}
-            tabIndex={t.id === tab ? 0 : -1}
-            onClick={() => selectTab(t.id)}
-          >
-            {t.label}
-          </button>
-        ))}
+        {/* One row above the panel; it scopes every view that reads runs. */}
+        {active.filtered !== false ? (
+          <div className="filterbar-slot">
+            <FilterBar filter={filter} options={options} onChange={setFilter} runsInSlice={slice.length} />
+          </div>
+        ) : null}
+
+        <main id={`panel-${active.id}`} className="tabpanel" role="tabpanel" aria-labelledby={`tab-${active.id}`}>
+          <View data={data} filter={filter} onFilterChange={setFilter} />
+        </main>
       </div>
-
-      {/* One row above the panel; it scopes every view that reads runs. */}
-      {active.filtered !== false ? (
-        <div className="filterbar-slot">
-          <FilterBar filter={filter} options={options} onChange={setFilter} runsInSlice={slice.length} />
-        </div>
-      ) : null}
-
-      <main id={`panel-${active.id}`} className="tabpanel" role="tabpanel" aria-labelledby={`tab-${active.id}`}>
-        <View data={data} filter={filter} onFilterChange={setFilter} />
-      </main>
     </div>
   );
 }
