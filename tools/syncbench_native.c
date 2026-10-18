@@ -89,8 +89,7 @@ static void ev_wait( struct ev *e )
                                          .owner = (__u32)gettid(), .index = ~0u };
         int ret;
         while ((ret = ioctl( g_dev, NTSYNC_IOC_WAIT_ANY, &args )) < 0 && errno == EINTR) ;
-        if (ret < 0) { fprintf( stderr, "NTSYNC_IOC_WAIT_ANY failed: %s
-", strerror( errno ) ); exit( 1 ); }
+        if (ret < 0) { perror( "NTSYNC_IOC_WAIT_ANY" ); exit( 1 ); }
         return;
     }
     for (;;)
