@@ -212,6 +212,31 @@ fi
 grep -q 'unknown crackle set: Benchmark_VSTs' "$base/crackle.err" || fail "crackle set refusal was not precise"
 ok "--sets plans the chosen sets in order and marks a non-canonical run diagnostic"
 
+grep -q '^live-window=normal$' "$base/default.out" || fail "the default plan does not keep Live's window normal"
+touch -- "$bin/livewin.exe"
+"${fixture_env[@]}" "ABLETON_BENCH_WINDOW_TOOL=$bin/livewin.exe" "$here/bench-suite.sh" --dry-run \
+    --live-window minimized --sets Inbuilts --tag fixture --output "$base/minimized-report" \
+    > "$base/minimized.out" 2> "$base/minimized.err" \
+    || fail "minimised-window dry-run failed: $(cat "$base/minimized.err")"
+grep -q '^live-window=minimized$' "$base/minimized.out" || fail "--live-window minimized is not in the plan"
+"${fixture_env[@]}" "ABLETON_BENCH_WINDOW_TOOL=$bin/livewin.exe" ABLETON_BENCH_LIVE_WINDOW=minimized \
+    "$here/bench-suite.sh" --dry-run --sets Inbuilts --tag fixture --output "$base/minimized-env-report" \
+    > "$base/minimized-env.out" 2> "$base/minimized-env.err" \
+    || fail "ABLETON_BENCH_LIVE_WINDOW=minimized dry-run failed: $(cat "$base/minimized-env.err")"
+grep -q '^live-window=minimized$' "$base/minimized-env.out" || fail "ABLETON_BENCH_LIVE_WINDOW=minimized is not in the plan"
+if "${fixture_env[@]}" "ABLETON_BENCH_WINDOW_TOOL=$bin/missing.exe" "$here/bench-suite.sh" --dry-run \
+    --live-window minimized --sets Inbuilts --tag fixture --output "$base/no-tool-report" \
+    > "$base/no-tool.out" 2> "$base/no-tool.err"; then
+    fail "a minimised-window run without tools/livewin.exe was accepted"
+fi
+grep -q 'build it with tools/build_livewin.sh' "$base/no-tool.err" || fail "missing livewin.exe refusal was not precise"
+if "${fixture_env[@]}" "$here/bench-suite.sh" --dry-run --live-window hidden --tag fixture \
+    --output "$base/bad-window-report" > "$base/bad-window.out" 2> "$base/bad-window.err"; then
+    fail "an unknown --live-window mode was accepted"
+fi
+grep -q -- '--live-window must be normal or minimized' "$base/bad-window.err" || fail "--live-window refusal was not precise"
+ok "--live-window minimized is planned only with tools/livewin.exe present; unknown modes are refused"
+
 "${fixture_env[@]}" "$here/bench-suite.sh" --dry-run --scenario clip-launch-storm --tag fixture \
     --output "$base/scenario-report" > "$base/scenario.out" 2> "$base/scenario.err" \
     || fail "scenario dry-run failed: $(cat "$base/scenario.err")"

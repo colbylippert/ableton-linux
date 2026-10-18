@@ -27,6 +27,8 @@ scenario_tool="${ABLETON_BENCH_SCENARIO_TOOL:-$root/profiler/control/scenario-ru
 quit_tool="${ABLETON_BENCH_QUIT_TOOL:-$root/profiler/bin/live-trial-dialog}"
 session_env_tool="${ABLETON_BENCH_SESSION_ENV:-$root/profiler/bin/with-session-env}"
 state_tool="${ABLETON_BENCH_STATE_TOOL:-$root/profiler/bin/state}"
+live_window="${ABLETON_BENCH_LIVE_WINDOW:-normal}"
+window_tool="${ABLETON_BENCH_WINDOW_TOOL:-$root/tools/livewin.exe}"
 privilege=none
 dry_run=0
 skip_vst_check=0
@@ -51,6 +53,10 @@ usage: scripts/bench-suite.sh [options]
   --sets A,B,C                sets to run, in this order (default the five
                               standard sets; names may omit Benchmark_)
   --skip-vst-check            accept a VST set prepared for plug-in tests
+  --live-window MODE          normal, or minimized: minimise Live's main window
+                              before playback starts and restore it after the
+                              measurement, so the UI does not render (default
+                              normal; ABLETON_BENCH_LIVE_WINDOW)
   --dry-run                   check the run and print its plan; Live stays closed
 
 The suite runs Zero, Empty, Inbuilts, Max4Live, and VSTs in that order. Zero
@@ -138,6 +144,7 @@ while [ "$#" -gt 0 ]; do
             [ "${#sets[@]}" -gt 0 ] || fail "--sets wants a comma-separated list of set names"
             ;;
         --skip-vst-check) skip_vst_check=1 ;;
+        --live-window) shift; live_window="${1:-}" ;;
         --dry-run) dry_run=1 ;;
         -h|--help) usage; exit 0 ;;
         *) fail "unknown argument: $1" ;;
@@ -150,6 +157,14 @@ whole_seconds "$launch_timeout" launch-timeout 3600
 whole_seconds "$settle" settle 120
 case "$trace" in off|interface|drilldown) ;; *) fail "--trace must be off, interface, or drilldown" ;; esac
 case "$scenario" in *[!A-Za-z0-9_.-]*) fail "scenario name may use letters, digits, '_', '.', and '-' only: $scenario" ;; esac
+# A minimised window is a setting that changes the results: exported, the
+# report records it with the benchmark gates and history-add as a switch. The
+# normal window stays unrecorded, so normal runs keep their identity.
+case "$live_window" in
+    normal) unset ABLETON_BENCH_LIVE_WINDOW ;;
+    minimized) export ABLETON_BENCH_LIVE_WINDOW=minimized ;;
+    *) fail "--live-window must be normal or minimized" ;;
+esac
 # A crackle report must name a set of this run. The list is final here.
 for observation_set in "${!crackle[@]}"; do
     case " ${sets[*]} " in *" $observation_set "*) ;;
@@ -283,6 +298,9 @@ preflight()
         [ -f "$scenario_tool" ] || fail "scenario tool is missing: $scenario_tool"
         python3 "$scenario_tool" --validate "$scenario" || fail "unknown or invalid scenario: $scenario"
     fi
+    if [ "$live_window" = minimized ]; then
+        [ -f "$window_tool" ] || fail "--live-window minimized needs $window_tool (build it with tools/build_livewin.sh)"
+    fi
     [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] || fail "a desktop session is required (DISPLAY and WAYLAND_DISPLAY are unset)"
     case "$output" in
         "$ABLETON_WINE_ROOT"|"$ABLETON_WINE_ROOT"/*|"$ABLETON_WINEPREFIX"|"$ABLETON_WINEPREFIX"/*|\
@@ -297,6 +315,7 @@ preflight
 if [ "$dry_run" -eq 1 ]; then
     printf 'benchmark plan: duration=%ss output=%s\n' "$duration" "$output"
     printf 'trace=%s privilege=%s structure=%s scenario=%s\n' "$trace" "$privilege" "$structure" "${scenario:-none}"
+    printf 'live-window=%s\n' "$live_window"
     printf 'osc send=%s recv=%s control=%s\n' "$ABL_BENCH_OSC_SEND" "$ABL_BENCH_OSC_RECV" "$control"
     for index in "${!sets[@]}"; do
         set_name="${sets[index]}"
@@ -387,6 +406,33 @@ wait_log_quiet()
         sleep 0.5
     done
     return 1
+}
+
+# --live-window minimized: tools/livewin.exe runs in Live's prefix with Live's runtime and
+# minimises Live's main window before playback starts (ShowWindow through winex11, the path of
+# the title bar's minimise button), so the UI does not render during the measurement. After the
+# measurement it records the state (still minimised?) and restores the window, so the quit
+# through the UI reaches it. Every step's output lands in raw/live-window.txt.
+live_window_do()
+{
+    printf '[%s] livewin %s\n' "$(date -u +%H:%M:%S)" "$1" >> "$set_dir/raw/live-window.txt"
+    WINEPREFIX="$ABLETON_WINEPREFIX" WINEDEBUG=-all timeout 30 \
+        "$session_env_tool" "$ABLETON_WINE_ROOT/bin/wine" "$window_tool" "$1" \
+        >> "$set_dir/raw/live-window.txt" 2>&1
+}
+
+minimize_live_window()
+{
+    [ "$live_window" = minimized ] || return 0
+    live_window_do minimize || fail "could not minimise Live's window for $set_name (see $set_dir/raw/live-window.txt)"
+}
+
+restore_live_window()
+{
+    [ "$live_window" = minimized ] || return 0
+    live_window_do state || true
+    live_window_do restore \
+        || printf "bench-suite: could not restore Live's window for %s (see %s)\n" "$set_name" "$set_dir/raw/live-window.txt" >&2
 }
 
 # Live quits through its own UI first: live-trial-dialog quit-live (Ctrl+Q, the quit-time trial
@@ -587,6 +633,7 @@ for index in "${!sets[@]}"; do
             > "$set_dir/raw/osc-probe.txt" 2> "$set_dir/raw/osc-probe.stderr.txt" \
             || fail "$set_name control device did not answer (no /abl/bench/pong on UDP $ABL_BENCH_OSC_RECV within ${launch_timeout}s; $control_hint)"
         wait_log_quiet || fail "$set_name log did not settle within ${launch_timeout}s"
+        minimize_live_window
         if [ "$mode" = scenario ]; then
             python3 "$scenario_tool" setup --scenario "$scenario" \
                 || fail "$set_name scenario setup failed: $scenario"
@@ -598,6 +645,7 @@ for index in "${!sets[@]}"; do
         sleep "$settle"
     else
         wait_log_quiet || fail "$set_name log did not settle within ${launch_timeout}s"
+        minimize_live_window
         if [ "$trace" != off ]; then trace_start; sleep "$settle"; fi
     fi
 
@@ -627,6 +675,7 @@ for index in "${!sets[@]}"; do
         [ "$interface_rc" -eq 0 ] || [ "$interface_rc" -eq 2 ] \
             || fail "interface post-processing failed for $set_name"
     fi
+    restore_live_window
     [ "$osc" = off ] || python3 "$here/bench-osc.py" send /abl/bench/stop || true
     stop_owned_session || fail "could not end only the runner-owned $set_name session"
 

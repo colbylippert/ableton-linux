@@ -813,12 +813,14 @@ ERR:          5
             "WINE_APC_FASTPATH": "1", "WINEFSYNC": "1", "STAGING_RT_PRIORITY_SERVER": "90",
             "WINE_UNRELATED_SECRET": "omit", "PIPEASIO_REALTIME": "1", "ABLETON_RT": "1",
             "ABLETON_DCOMP": "off", "ABLETON_POWER": "performance",
+            "ABLETON_BENCH_LIVE_WINDOW": "minimized",
         }
         selected = report.benchmark_environment(environment)
         self.assertEqual(selected["WINE_APC_FASTPATH"], "1")
         self.assertNotIn("WINE_UNRELATED_SECRET", selected)
         self.assertEqual(report.benchmark_gate_environment(environment)["PIPEASIO_REALTIME"], "1")
         self.assertEqual(report.benchmark_gate_environment(environment)["ABLETON_POWER"], "performance")
+        self.assertEqual(report.benchmark_gate_environment(environment)["ABLETON_BENCH_LIVE_WINDOW"], "minimized")
 
     def test_audio_kernel_and_cpu_policy_snapshots_are_explicit(self):
         with tempfile.TemporaryDirectory() as temporary:
