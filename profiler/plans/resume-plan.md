@@ -509,8 +509,30 @@ Next candidates (user to choose; none pre-registered yet):
     - Context, not part of the rule: Live's worst DSP peak per Set-run was lower on RT on every Set (medians 97.7 / 105.9 / 97.7 → 90.2 / 92.4 / 88.8 %). It passed 100 % in 4 of 9 Set-runs on the normal kernel against 0 of 9 on RT, but the dropout count did not follow.
     - Reading: PREEMPT_RT costs Live about 14 points of a core (rt_mutex locks, threaded IRQs) without reducing dropouts at the stock priorities. Every IRQ thread runs FIFO 50, above pipeasio-rt (FIFO 15) and Live (RR 10), which is what T0016 changes.
     - The normal kernel stays the configuration. The RT kernel stays installed for T0016.
-  - **T0016, audio priorities for PREEMPT_RT (RT kernel):** PREEMPT_RT runs every IRQ handler as a FIFO 50 thread, above pipeasio-rt (FIFO 15) and Live's RR 10. B raises the Focusrite's USB controller IRQ thread to 90, pipeasio-rt to 85 and AudioCalc to 80.
-  - **T0017, 32-frame buffer:** on the winning kernel and configuration; is there enough headroom to halve the latency?
+  - **Configuration from 2026-10-18 (user decision: "make 3 permanent, then run 16 and 17"):**
+    - Patch 0110 (`WINED3D_PRESENT_SKIP`) is in the series and in the official runtime.
+    - Live runs on wined3d's Vulkan back end (`WINE_D3D_CONFIG=csmt=0x1,renderer=vulkan`), with its GPU renderer on, showing every 6th frame (`WINED3D_PRESENT_SKIP=6`, 10 fps at 60 Hz).
+      - golden is rebaselined from golden-gpu; the previous golden is kept as `golden.<UTC>`.
+      - Desktop launches get the two variables from `~/.config/environment.d/90-profiler-ableton-display.conf`. `with-session-env` copies only display and D-Bus variables, so trials stay unaffected and set their switches explicitly.
+    - Not trial-verified: adopted on the G0 and G0d feasibility data. Trials from T0016 on run with it in both arms.
+  - **T0016, the RT-BORE kernel with raised audio priorities vs the normal kernel.** As first registered, both arms ran the RT kernel with B adding the priorities. After T0015 the useful question is the normal kernel against RT with the priorities fixed, so it was redesigned before running (user: "run 16 and 17"):
+    - A: `linux-cachyos` 7.2.11-1 with stock priorities (pipeasio-rt FIFO 15, Live RR 10; IRQs are not threaded).
+    - B: `linux-cachyos-rt-bore` 7.2.11-1 with raised priorities: the Focusrite's USB controller IRQ thread (`irq/N-xhci_hcd`) at FIFO 90, pipeasio-rt at FIFO 85 and every AudioCalc at FIFO 80. The driver's watcher sets them for every Live process. Other Live threads keep RR 10; other IRQ threads keep FIFO 50.
+    - Both arms: the configuration above, plus `PIPEASIO_REALTIME=1`, pinning, nine workers and the normal window. RT throttling is set to 950000/1000000 µs at every boot, a safety net for audio threads running above the IRQ threads: a runaway thread then leaves 5 % of each second to the rest.
+    - Every run starts from a fresh boot, with T0014's settling. Order A1 B1 A2 B2 A3 B3, about 70 minutes; Inbuilts, Max4Live, VSTs, 120 s.
+    - PASS rule: the T0004 rule.
+      - PASS: the RT-BORE kernel with these priorities becomes the configuration, and T0017 runs on it.
+      - Otherwise the normal kernel stays.
+    - Mechanism check: for every Live process the driver records how many AudioCalc threads run FIFO 80, whether pipeasio-rt runs FIFO 85 and whether the xhci thread runs FIFO 90. A B run whose processes do not all show 9, 1 and FIFO 90 is reported.
+    - Driver `~/.local/state/profiler/trial-T0016.sh`, with the T0015 waiter.
+  - **T0017, a 32-frame buffer (pre-registered before running; it runs after T0016, on its winner):**
+    - A: PipeASIO's 64-frame buffer (`~/.config/pipeasio/config.ini`). B: 32 frames, through `PIPEASIO_PREFERRED_BUFFERSIZE=32`, the launcher's per-launch override. That halves the buffer period from 1.33 to 0.67 ms.
+    - Both arms: T0016's winning kernel and priorities, plus the configuration above. The runs go back to back on one boot (ABAB × 3), since the kernel does not change.
+    - Rule: dropouts only. The DSP meter is load per buffer period, so it rises at a shorter period by construction and is reported, not ruled on. Keep 32 frames iff:
+      - B has no xruns;
+      - B's PipeWire errors are not significantly higher than A's (a one-sided binomial test of B's share of all errors, p ≥ 0.05);
+      - the bench measured a 32-frame quantum in every B Set-run.
+    - Otherwise 64 frames stays.
 - GPU mode: whatever T0014 keeps.
   - The earlier "T0017, Live on the NVIDIA GPU" was dropped ("As we will not use GPU rendering lets stay on the intel driver"). The user then moved the discrete-mode test ahead of this phase, as T0014.
   - The laptop (MSI Katana 15 B13VFK) has a MUX: the NVIDIA card has its own built-in-screen output (`eDP-2`), switchable only in the firmware.
