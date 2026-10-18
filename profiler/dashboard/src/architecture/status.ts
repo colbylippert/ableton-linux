@@ -12,7 +12,7 @@ export interface PartStatus {
   note: string;
 }
 
-export const STATUS_AS_OF = '18 October 2026 (trials T0001–T0007)';
+export const STATUS_AS_OF = '18 October 2026 (trials T0001–T0008)';
 
 export const STATUS_ROWS: readonly PartStatus[] = [
   {
@@ -79,19 +79,19 @@ export const STATUS_ROWS: readonly PartStatus[] = [
     part: 'Official build',
     paths: ['profiler/dev/build-official.sh'],
     state: 'working',
-    note: 'Built and installed the block B5c runtime; build-audit passes 189 of 189.',
+    note: "Builds run on the workstation's WSL build host in about 6 minutes; build-audit passes 189 of 189. Installing on the laptop over ssh is written, not yet run.",
   },
   {
     part: 'Wine dev loop',
-    paths: ['profiler/dev/wine-dev.sh'],
-    state: 'written, not run',
-    note: 'First real use comes with the first Wine hot-path trial.',
+    paths: ['profiler/dev/wine-dev.sh', 'profiler/dev/remote-runtime.sh'],
+    state: 'in progress',
+    note: "Runs on the workstation's WSL build host: about 10 minutes to set up once, then rebuilds in seconds. Syncing to the laptop's dev runtime is written, not yet run.",
   },
   {
     part: 'A/B trials',
     paths: ['profiler/ledger.jsonl', 'profiler/history/runs/'],
     state: 'in progress',
-    note: 'Kept: PipeASIO realtime (T0003, PipeWire errors 204 to 30) and P-core audio threads (T0004, 38 to 17). Inconclusive: six audio workers (T0006, Live CPU -37 %). Reverted: T0001, T0005, T0007.',
+    note: 'Kept: PipeASIO realtime (T0003, PipeWire errors 204 to 30), P-core audio threads (T0004, 38 to 17) and nine audio workers (T0008, 20 to 10, Live CPU -23 %). Inconclusive: six audio workers (T0006). Reverted: T0001, T0005, T0007.',
   },
   {
     part: 'History and dashboard',
