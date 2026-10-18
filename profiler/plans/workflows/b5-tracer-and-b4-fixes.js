@@ -1,0 +1,83 @@
+export const meta = {
+  name: 'b5-tracer-and-b4-fixes',
+  description: 'Block B5: bpftrace prototype fixes + validation probe, libbpf production loader, B4 fixes (power hold, report buffer, DSP peak, quit-live); one review; fix; verify with a traced run on the laptop',
+  phases: [
+    { title: 'Author', detail: 'prototype+validation, libbpf loader, B4 fixes (3 agents, disjoint files, Live serialized by a lock)' },
+    { title: 'Review', detail: 'one combined adversarial review' },
+    { title: 'Fix', detail: 'apply confirmed findings' },
+    { title: 'Verify', detail: 'traceprobe validation + traced bench run on the laptop' },
+  ],
+}
+const REPO = args.repo, PLANS = args.plans, HOST = args.host
+
+const COMMON = `
+# Context (read before anything)
+Project "Wine Interface Profiler for Ableton Live on Linux". Repo: ${REPO} (Windows checkout, Git Bash, branch "profiler", core.autocrlf=false — keep LF, no BOM). Plans: ${PLANS}/wine-interface-profiler-plan.md (§6-7), ${PLANS}/design-B-tracer-and-probes.md (tracer spec), ${PLANS}/design-C-control-suite-agent-loop.md (suite/report), ${PLANS}/resume-plan.md (B4/B5 status), review findings ${PLANS}/findings/wf3-tracer.json. Read ${REPO}/CLAUDE.md and ${REPO}/profiler/tracer/README.md.
+TARGET: a native CachyOS laptop, "ssh -o BatchMode=yes ${HOST} bash -s <<'EOF' … EOF" (login shell fish — always run bash explicitly). It is fully set up: Wine runtime with the USDT trace points at ~/.local/opt/wine-d2d1-nspa-11.13 (ntdll.so: 8 "wine" probes; pipeasio64.dll.so: 6 "pipeasio" probes; list them with "sudo -n bpftrace -l usdt:<path>:*"), prefix ~/.wine-ableton with Live 12.4.6 Trial in DEMO mode, launcher ~/.local/bin/ableton-live, AbletonOSC control surface on UDP 11000/11001, bench Sets in ~/Projects/ableton-linux/bench, PASSWORDLESS SUDO (sudo -n works), bpftrace 0.27, libbpf 1.7, bpftool 7.2, clang 23, gcc 16, perf, mingw-w64-gcc 16 (for PE probes), python 3.14, kernel 7.2.9-cachyos with BTF incl. /sys/kernel/btf/ntsync. Hardware: i7-13620H (P-cores CPU 0-11, E-cores 12-15), 16 GB. The laptop's working repo ~/Projects/ableton-linux is at the latest commit of the Windows checkout; NEVER edit it — test from a scratch copy: "rm -rf /tmp/profiler-b5/<you> && git clone -q ~/Projects/ableton-linux /tmp/profiler-b5/<you>" then copy your changed files from the Windows checkout over it (scp), and run from there. History/runs output goes under ~/.local/share/profiler/runs/b5-* only.
+LIVE ON THE LAPTOP (shared, one instance at a time): every action that launches Live, traces it, or runs the bench suite MUST hold the shared lock: run it inside "flock -w 3600 ~/.local/state/profiler/live-session.lock bash -c '…'" (or flock in the remote script). Start Live: "profiler/bin/state clean-crash; setsid -f profiler/bin/with-session-env ~/.local/bin/ableton-live [SET.als] >/tmp/…log 2>&1 </dev/null; profiler/bin/live-trial-dialog continue --wait 120" (demo-mode dialog), wait for UDP 11000 (ss -ulnp) or Log.txt "Open: finished". Stop Live: "profiler/bin/live-trial-dialog quit-live --timeout 60" and, if it fails, "WINEPREFIX=$HOME/.wine-ableton ~/.local/opt/wine-d2d1-nspa-11.13/bin/wineserver -k" followed by "profiler/bin/state clean-crash". Always leave Live stopped and the prefix idle when you release the lock. Never modify, hook or disassemble Live; never edit Live's Preferences by hand.
+KNOWN FACTS FROM B4 (verified): (1) the bpftrace prototype (profiler/bin/wine-trace --proto, profiler/tracer/wine-trace.bt) attached all 19 probes and produced events, but bpftrace aborted after a few seconds with "terminate called after throwing an instance of 'std::bad_alloc'" (bpftrace.stderr, after "9 warnings generated."), and the recorded times mix clocks: tracer.json started_monotonic_ns 19799095275094 vs stopped_monotonic_ns 9881485990562 — bpftrace "nsecs" counts suspended time (boot clock) on this laptop that has suspended, while the suite/PipeWire use CLOCK_MONOTONIC: use nsecs(monotonic) (verify bpftrace 0.27 syntax) everywhere. A reproduction run dir is ~/.local/share/profiler/runs/b4-trace-smoke on the laptop. (2) Live 12.4.6 runs 15 AudioCalc workers; PipeASIO runs at 64 frames/48 kHz (pw-top QUANT 64) on the built-in SOF speaker sink, which xruns heavily at 64 (expected; real measurements later use a USB Focusrite). (3) The untraced baseline run is ~/.local/share/profiler/runs/20261017T034259Z-b4-baseline-untraced/bench (report.md there).
+Hard rules: bash "set -euo pipefail" and bash -n after edits; python stdlib only (3.9+ syntax); C compiled with -Wall -Wextra clean; only write the files you own; no state-changing git commands in ${REPO} (the orchestrator commits); report precisely what you verified on the laptop vs only locally. Final message = report: files changed (paths), what each change does, test evidence (command + key output), "VERIFY:" items.
+`
+
+phase('Author')
+const authors = await parallel([
+  () => agent(`${COMMON}
+# Your task (owner T-proto): make the bpftrace prototype path reliable and validated end to end
+Own: ${REPO}/profiler/tracer/wine-trace.bt, ${REPO}/profiler/bin/wine-trace, ${REPO}/profiler/tracer/reduce.py, ${REPO}/profiler/tracer/symbolize.py, ${REPO}/profiler/tracer/validate.py, ${REPO}/profiler/tracer/tests/*, ${REPO}/tools/traceprobe.c, ${REPO}/tools/build_traceprobe.sh, ${REPO}/profiler/tracer/README.md.
+1. Clock: all bpftrace timestamps on CLOCK_MONOTONIC (nsecs(monotonic) or the bpftrace 0.27 equivalent); the wrapper's started/stopped_monotonic_ns and the header record must be in the same domain as python time.monotonic_ns() and PipeWire clock.nsec. Prove it on the laptop (values ~= /proc/uptime minus suspend, and stopped > started).
+2. Crash: reproduce the std::bad_alloc (attach to a running Live playing Benchmark_Inbuilts via AbletonOSC /abl/bench/play for 60 s), find the cause (bpftrace map growth, printf volume, async output buffer, string args, per-event printf at ~100k events/s, -B none, too many attachments ...) and fix it: e.g. move from per-event printf to aggregation where the reducer allows, use ringbuf/print limits, lower volume with filters (only traced pids / roles), or split the probe set. Requirement: a 60 s traced run of Benchmark_Inbuilts at 64 frames completes with bpftrace exiting cleanly, lost/dropped events reported (not silently zero), and reduce.py producing blocks with plausible slack (most blocks NOT late), block counts ≈ 750/s × 60 s.
+3. Validation probe: build tools/traceprobe.exe on the laptop with tools/build_traceprobe.sh (mingw-w64-gcc is installed), run it in the prefix (tools/run_in_prefix.sh or the runtime's wine with WINEPREFIX=~/.wine-ableton) while "wine-trace start --pid <probe pid>"/"stop" records (Live need not run, but take the lock anyway since it uses the prefix's wineserver), and make profiler/tracer/validate.py PASS the EXPECT lines (fix the probe, reducer or validator as needed; report any expectation that is wrong about Wine 11.13 behaviour rather than forcing it).
+4. Keep all tracer unit tests passing (python -I -m unittest discover -s profiler/tracer/tests) and add tests for the fixes.`, { label: 'author:prototype+validation', phase: 'Author' }),
+  () => agent(`${COMMON}
+# Your task (owner T-libbpf): the production tracer loader
+Own: ${REPO}/profiler/tracer/wine-trace.c (new), ${REPO}/profiler/tracer/wine-trace.bpf.c, ${REPO}/profiler/tracer/wine-trace.h, ${REPO}/profiler/tracer/Makefile, ${REPO}/profiler/tracer/BUILD.md (new). Do NOT edit profiler/bin/wine-trace (another agent owns it); it already prefers the binary profiler/tracer/build/wine-trace when present and passes the CLI described in design B §3b — implement exactly that CLI (read profiler/bin/wine-trace to see which options it passes to the binary backend) and write the same output files as the prototype path + reduce.py would (tracer.json fields, blocks.jsonl with header record, threads.jsonl, summary.json, events.jsonl in drilldown, maps snapshot for symbolize.py) so bench-report.py's "interface" subcommand works unchanged (read scripts/bench-report.py interface code and profiler/tracer/README.md for the exact contract). Timestamps: bpf_ktime_get_ns() is CLOCK_MONOTONIC — keep everything on it.
+Also fix the wf3 review:bpf findings in ${PLANS}/findings/wf3-tracer.json (the major: crossing_entry() evaluates want_stack() for every kind so server_req/server_wait entries emit junk stack samples — restrict stack sampling to syscall/unixcall entries; and the cheap minors).
+Build on the laptop from a scratch copy: "make -C profiler/tracer" (vmlinux.h via bpftool btf dump; skeleton via bpftool gen skeleton), zero warnings. Then a real attach test under the Live lock: start Live with Benchmark_Inbuilts playing, run "sudo -n profiler/tracer/build/wine-trace --pid … --out ~/.local/share/profiler/runs/b5-libbpf-test --mode summary --duration 30" (or the exact CLI you implement), check the outputs (blocks ≈ 750/s, plausible slack, ntsync waits and server requests attributed to roles, lost events counted) and that the verifier accepted every program. Report probe hit rates and the tracer's own CPU cost (from its counters or /proc).`, { label: 'author:libbpf-loader', phase: 'Author' }),
+  () => agent(`${COMMON}
+# Your task (owner F): the B4 fixes outside the tracer
+Own: ${REPO}/scripts/bench-report.py, ${REPO}/scripts/test-bench-report.py, ${REPO}/profiler/bin/live-trial-dialog, ${REPO}/profiler/bin/bench, ${REPO}/profiler/bin/history-add, ${REPO}/profiler/bin/tests/*, ${REPO}/profiler/control/overlay/abletonosc/bench.py, ${REPO}/profiler/control/tests/*.
+Fix and verify on the laptop:
+1. Power profile not held during runs: the launcher (scripts/ableton-live, lines ~1706-1742) wraps Live in "powerprofilesctl launch -p performance …" only under some condition — find why the B4 suite run stayed "balanced" with no holds (prefs file ~/.config/ableton-wine/preferences has power=performance; check how the launcher reads ABLETON_POWER / preferences and whether bench-suite.sh sanitises the environment), then make profiler/bin/bench ensure the performance hold for the run (prefer exporting ABLETON_POWER=performance for the suite, or a powerprofilesctl hold held by the wrapper for the whole run — choose the approach that makes the suite's recorded power profile read "performance"), without editing scripts/ableton-live unless unavoidable (if you must, keep it minimal and say why). Verify with a short dry check: run one Set with "profiler/bin/bench --tag b5-power --sets Zero --duration 10" under the Live lock and show report.md's Power profile column.
+2. Report buffer column: scripts/bench-report.py shows "Sample rate and buffer size" from pw-metadata clock.quantum (256) while the driver actually ran at 64 (pw-top QUANT for the Live/PipeASIO node and the driver node). Make the column report the effective quantum seen by pw-top for the driving node (keep the metadata value available, e.g. "48000/64 (graph default 256)"), with a unit test; keep the 18-pipe table shape.
+3. DSP peak: B4 reported DSP average 27-48 but peak 571-797. Determine whether Live's Application.peak_process_usage has a different unit/meaning than average_process_usage (e.g. per-core sum, per-mille, or a max over an interval) using the smoke data and AbletonOSC (/live/application/get/average_process_usage) against the bench handler's reports; fix CPU_SCALE/peak handling in the bench handler or the report's interpretation, document the finding, and add a test.
+4. quit-live reliability: "live-trial-dialog quit-live" failed once (Ctrl+Q via liveinject did not quit Live, no dialog appeared). Make it robust: retry Ctrl+Q after activating Live's main window via liveinject "fg"/"fgw", fall back to "liveinject close" (WM_CLOSE to the main window), handle the quit-time trial dialog (click Exit Live) and any "save changes?" prompt in demo mode (inspect with "import -window <id>" screenshots copied back and viewed; never click Save), and only then report failure. Verify 5 consecutive launch→quit cycles leave no crash-recovery files.
+5. history-add warned "the baseline run has switches, a trial or an arm recorded" for a plain baseline: find which field triggered it (probably benchmark_gates env entries) and fix the classification (unset/empty switches must not count), with a test.
+Run the affected unit tests locally (python -I scripts/test-bench-report.py; profiler/control/tests; profiler/bin/tests) — on Windows some report tests fail for Windows-only reasons (os.geteuid, symlinks): run them on the laptop scratch copy instead.`, { label: 'author:b4-fixes', phase: 'Author' }),
+])
+const authorReports = authors.map((r, i) => `--- ${['prototype+validation', 'libbpf-loader', 'b4-fixes'][i]} ---\n${r || '(agent failed — no report)'}`).join('\n')
+
+phase('Review')
+const FINDINGS = { type: 'object', properties: { findings: { type: 'array', items: { type: 'object', properties: { file: { type: 'string' }, line: { type: 'integer' }, severity: { type: 'string', enum: ['blocker', 'major', 'minor'] }, summary: { type: 'string' }, evidence: { type: 'string' }, fix: { type: 'string' } }, required: ['file', 'severity', 'summary', 'fix'] } }, notes: { type: 'string' } }, required: ['findings'] }
+const review = await agent(`${COMMON}
+# You are the single adversarial REVIEWER for block B5. Do not edit repo files.
+Author reports:\n${authorReports}
+Review every file the authors changed ("git -C ${REPO} status --porcelain" and "git -C ${REPO} diff"). Lenses in one pass: (1) correctness — clock domains end to end (bpftrace/BPF ktime vs python monotonic vs PipeWire clock.nsec vs the suite window), block association, entry/exit pairing, lost-event accounting, verifier-safety of BPF code, CLI contract between profiler/bin/wine-trace and the libbpf binary, output schema vs scripts/bench-report.py's interface reader; (2) robustness on the laptop — re-run the key commands yourself on a scratch copy under the Live lock where cheap (e.g. "make -C profiler/tracer", the unit tests, a 20 s prototype trace, quit-live cycle) and confirm the authors' claims; (3) scope/safety — no edits to Live or its preferences, sudo only for tracing, nothing written outside allowed dirs, Live left stopped.
+Report confirmed defects with evidence and concrete fixes.`, { label: 'review:b5', phase: 'Review', schema: FINDINGS })
+const findings = (review && review.findings) || []
+log(`Review: ${findings.length} findings (${findings.filter(f => f.severity === 'blocker').length} blockers, ${findings.filter(f => f.severity === 'major').length} majors)`)
+
+phase('Fix')
+let fixReport = '(no findings)'
+if (findings.length) {
+  fixReport = await agent(`${COMMON}
+# FIXER for block B5 — you own every file the authors changed.
+Apply these findings (confirm each first; skip with reason if not real; minimal fixes; re-run the relevant tests/builds):\n${JSON.stringify(findings, null, 2)}
+Report each finding → fixed / skipped: reason.`, { label: 'fix:b5', phase: 'Fix' })
+}
+
+phase('Verify')
+let verify = null
+for (let round = 1; round <= 2; round++) {
+  verify = await agent(`${COMMON}
+# VERIFIER for block B5 — you own every file the authors changed (minimal fixes only).
+Fix report:\n${fixReport}
+On a fresh laptop scratch clone with all changed files copied in, under the Live lock:
+1. Unit tests: python -I -m unittest discover -s profiler/tracer/tests -t .; python -I scripts/test-bench-report.py; profiler/control/tests and profiler/bin/tests; bash scripts/test-bench-suite.sh.
+2. make -C profiler/tracer (zero warnings).
+3. Validation: tools/build_traceprobe.sh + run traceprobe.exe under "profiler/bin/wine-trace" (prototype and libbpf backends both if the libbpf one exists) and profiler/tracer/validate.py → PASS.
+4. Traced suite run: "profiler/bin/bench --tag b5-traced --trace interface --sets Inbuilts,VSTs" from the scratch clone (run it with ABLETON_BENCH_TRACER pointing at the scratch clone's profiler/bin/wine-trace if needed), then show report.md's Interface section (blocks, late/near-late, top call sites with real callers, not 'unsampled'), the tracer's lost events, and confirm Live ended stopped with no crash files. Also show that "scripts/bench-report.py compare" refuses traced vs the untraced baseline (~/.local/share/profiler/runs/20261017T034259Z-b4-baseline-untraced/bench) with a clear trace-mode message.
+5. Clean up scratch dirs; leave runs under ~/.local/share/profiler/runs/b5-*.
+Report exact outputs; end with "remaining problems: none" only if everything passed.`, { label: `verify:b5-${round}`, phase: 'Verify' })
+  if (verify && /remaining problems:\s*none/i.test(verify)) break
+}
+return { authorReports, findings, fixReport, verify }

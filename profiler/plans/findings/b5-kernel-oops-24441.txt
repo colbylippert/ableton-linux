@@ -1,0 +1,47 @@
+[24441.880343] BUG: unable to handle page fault for address: 00000d32a9f8c924
+[24441.880348] #PF: supervisor read access in kernel mode
+[24441.880349] #PF: error_code(0x0000) - not-present page
+[24441.880350] PGD 0 P4D 0 
+[24441.880353] Oops: Oops: 0000 [#1] SMP NOPTI
+[24441.880356] CPU: 6 UID: 1000 PID: 623623 Comm: pipeasio-rt Tainted: G           O        7.2.9-2-cachyos #1 PREEMPT(full)  73865583327a74ff18b44e6b864a636566f79bf7
+[24441.880359] Tainted: [O]=OOT_MODULE
+[24441.880360] Hardware name: Micro-Star International Co., Ltd. Katana 15 B13VFK/MS-1585, BIOS E1585IMS.11C 08/26/2025
+[24441.880362] RIP: 0010:bpf_prog_73315ea51a874990_wine_syscall_exit+0x8d5/0xf42
+[24441.880366] Code: 39 f7 72 07 8b 78 2c 41 89 79 80 41 8b 51 88 89 d7 83 f7 ff 49 8b 71 90 4c 0f b6 b6 c0 00 00 00 41 01 fe 49 8b b9 78 ff ff ff <4c> 0f b7 47 28 48 0f b7 4f 26 41 89 89 50 ff ff ff 48 0f b7 4f 24
+[24441.880368] RSP: 0000:ffffcce20e32fce8 EFLAGS: 00010213
+[24441.880370] RAX: 0000000000000000 RBX: ffff88c2c73a7930 RCX: 0000000004cb56fe
+[24441.880371] RDX: 0000000000000002 RSI: ffffcce23211a738 RDI: 00000d32a9f8c8fc
+[24441.880372] RBP: ffffcce20e32fd08 R08: 0000000000000001 R09: ffffece1ffba8740
+[24441.880373] R10: 000000000000000f R11: ffffffffc033f6f0 R12: ffff88c2cf339c00
+[24441.880374] R13: 0000000000000000 R14: 0000000000000001 R15: 0000000000000000
+[24441.880375] FS:  000000010233f6c0(0000) GS:ffff88c5fd7d3000(0000) knlGS:000000001c0a8000
+[24441.880376] CS:  0010 DS: 002b ES: 002b CR0: 0000000080050033
+[24441.880377] CR2: 00000d32a9f8c924 CR3: 00000003dd9c6005 CR4: 0000000000f72ef0
+[24441.880378] PKRU: 55555554
+[24441.880379] Call Trace:
+[24441.880380]  <TASK>
+[24441.880381]  uprobe_prog_run+0x232/0x260
+[24441.880385]  uprobe_multi_link_handler+0x20/0x40
+[24441.880387]  handler_chain+0xeb/0x6a0
+[24441.880389]  ? find_active_uprobe_rcu+0x121/0x4c0
+[24441.880391]  ? preempt_schedule_irq+0x47/0x70
+[24441.880394]  ? schedule+0x55/0x140
+[24441.880399]  ? ntsync_lock_obj+0x1d/0xa0 [ntsync 865aed4f760895c9ec3dfda7871c32cdbfac740b]
+[24441.880402]  uprobe_notify_resume+0x19a/0x640
+[24441.880405]  exit_to_user_mode_loop.cold+0x143/0x5e3
+[24441.880407]  exc_int3+0xde/0x190
+[24441.880409]  asm_exc_int3+0x39/0x40
+[24441.880410] RIP: 0033:0x7fd7d557b946
+[24441.880427] Code: 03 00 00 01 00 00 00 0f 85 8c 01 00 00 4c 89 d7 4c 89 de 4c 89 c2 4c 89 c9 4d 8b 07 4d 8b 4f 08 41 ff d4 48 8d 8d 68 ff ff ff <cc> 1f 44 00 00 48 8d 61 70 41 c6 85 40 03 00 00 01 66 41 8b 95 38
+[24441.880428] RSP: 002b:000000010233e940 EFLAGS: 00000202
+[24441.880429] RAX: 0000000000000000 RBX: 00007fd7d55d4280 RCX: 000000010233e940
+[24441.880430] RDX: 0000000000000000 RSI: 0000000080044e89 RDI: 000000000000010c
+[24441.880431] RBP: 000000010233e9d8 R08: 0000000000000000 R09: 00000001433f44c0
+[24441.880432] R10: 00000000000001a0 R11: 0000000000000246 R12: 00007fd7d5589d00
+[24441.880433] R13: 000000001c0a8000 R14: 000000000000000f R15: 000000001c9aee90
+[24441.880435]  </TASK>
+[24441.880436] Modules linked in: udp_diag inet_diag tun overlay rfcomm snd_seq_dummy snd_hrtimer snd_seq snd_seq_device ccm algif_hash algif_skcipher af_alg bnep vfat fat snd_ctl_led snd_soc_skl_hda_dsp snd_soc_intel_sof_board_helpers snd_sof_probes snd_soc_intel_hda_dsp_common snd_hda_codec_intelhdmi snd_hda_codec_alc269 snd_hda_codec_realtek_lib snd_hda_scodec_component snd_hda_codec_generic snd_soc_dmic snd_sof_pci_intel_tgl snd_sof_pci_intel_cnl snd_sof_intel_hda_generic soundwire_intel snd_sof_intel_hda_sdw_bpt snd_sof_intel_hda_common snd_soc_hdac_hda intel_rapl_msr snd_sof_intel_hda intel_uncore_frequency snd_sof_intel_hda_mlink intel_uncore_frequency_common soundwire_cadence snd_sof_pci snd_sof_xtensa_dsp snd_sof snd_sof_utils snd_soc_acpi_intel_match iwlmvm snd_soc_acpi_intel_sdca_quirks soundwire_generic_allocation x86_pkg_temp_thermal snd_soc_sdw_utils intel_powerclamp snd_soc_acpi soundwire_bus coretemp mac80211 snd_soc_sdca crc8 kvm_intel snd_soc_avs snd_hda_codec_nvhdmi snd_hda_codec_hdmi snd_soc_hda_codec
+[24441.880466]  uvcvideo ptp joydev kvm snd_hda_intel snd_hda_ext_core pps_core processor_thermal_device_pci uvc videobuf2_vmalloc processor_thermal_device libarc4 r8169 snd_hda_codec btusb mousedev processor_thermal_power_floor videobuf2_memops snd_soc_core irqbypass btmtk realtek processor_thermal_wt_hint spd5118 aesni_intel videobuf2_v4l2 processor_thermal_wt_req snd_hda_core phy_package ac97_bus btbcm videobuf2_common gf128mul processor_thermal_rfim snd_intel_dspcfg mdio_devres mei_hdcp snd_pcm_dmaengine btintel processor_thermal_mbox videodev rapl iwlwifi i2c_i801 mei_pxp hid_multitouch snd_intel_sdw_acpi spi_nor libphy intel_pmc_core btrtl snd_compress platform_temperature_control i2c_smbus intel_cstate snd_hwdep gpio_keys bluetooth mc intel_uncore psmouse mtd pcspkr wmi_bmof msi_wmi msi_wmi_platform snd_pcm intel_pmc_ssram_telemetry i2c_mux mdio_bus cfg80211 processor_thermal_rapl intel_pmc_pwrm_telemetry snd_timer i2c_hid_acpi intel_rapl_common int3400_thermal mei_me i2c_hid pmt_telemetry int3403_thermal snd
+[24441.880499]  processor_thermal_soc_slider pmt_discovery intel_hid acpi_thermal_rel mei soundcore rfkill soc_button_array int340x_thermal_zone pmt_class sparse_keymap acpi_pad pinctrl_tigerlake acpi_tad mac_hid dm_mod pkcs8_key_parser i2c_dev crypto_user ntsync zram 842_decompress 842_compress lz4hc_compress nvidia_drm(O) xe intel_vsec nvidia_uvm(O) nvme gpu_sched nvidia_modeset(O) drm_gpuvm nvme_core drm_exec nvme_keyring drm_gpusvm_helper nvme_auth drm_suballoc_helper i915 intel_lpss_pci drm_buddy spi_intel_pci intel_gtt intel_lpss spi_intel vmd i2c_algo_bit idma64 serio_raw nvidia(O) drm_ttm_helper ttm drm_display_helper video cec wmi aead
+[24441.880524] CR2: 00000d32a9f8c924
+[24441.880526] ---[ end trace 0000000000000000 ]---

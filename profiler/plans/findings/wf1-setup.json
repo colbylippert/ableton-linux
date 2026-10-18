@@ -1,0 +1,299 @@
+[
+  {
+    "file": "profiler/setup/phases/",
+    "line": 0,
+    "severity": "blocker",
+    "owner": "p1",
+    "summary": "Phases 01-08 (sudo, packages, podman, limits, session, audio, repo, media) do not exist, so setup-machine.sh cannot run: phase_select dies on the unknown dependency names that phases 09-18 declare, with or without --force.",
+    "evidence": "find lists only 00-preflight.sh and 09..18 under profiler/setup/phases. Run in an isolated HOME: `setup-machine.sh --profile vm --dry-run` -> \"✗ phase 'build' depends on unknown phase 'podman'\" exit 2; identical with --force (lib/phase.sh:351 dies on an unknown dep name before the --force relaxation at :357). 09-build.sh registers deps podman,repo,media; 10-install.sh build,session,audio; 15 packages,install; 17 packages. Only --list-phases, --only preflight, --only claude and --only summary work today.",
+    "fix": "Deliver profiler/setup/phases/01-sudo.sh … 08-media.sh with phase_register names exactly sudo, packages, podman, limits, session, audio, repo, media (design A §2.1 table), each with the read-only _check / run-only _apply contract documented in lib/phase.sh.",
+    "review": "review:contract"
+  },
+  {
+    "file": "profiler/setup/verify.sh",
+    "line": 0,
+    "severity": "major",
+    "owner": "p3",
+    "summary": "verify.sh (and setup/bootstrap.md, profiler/README.md) are not delivered; the summary phase already advertises verify.sh as the first next step and the lens item 'verify.sh never mutates' cannot be checked.",
+    "evidence": "find shows no profiler/setup/verify.sh, bootstrap.md or profiler/README.md; 18-summary.sh:52 prints `kv \"verify\" \"$SETUP_ROOT/verify.sh\"`; plan §4 / design A §2.6 require it (every phase check + helper/podman/groups/kernel/display/PipeWire/repo/dist/runtime/check-ntsync/VST3/AbletonOSC/state diff/trace-prereqs/claude/dashboard, exit 0 only when all hard checks pass).",
+    "fix": "Deliver verify.sh (source lib/log.sh + lib/phase.sh + phases/*.sh, run every phase_<name>_check with DRY_RUN=1 so nothing mutates, add the extra probes, same summary table, exit non-zero on any hard failure), plus bootstrap.md and README.md.",
+    "review": "review:contract"
+  },
+  {
+    "file": "profiler/setup/phases/16-claude.sh",
+    "line": 88,
+    "severity": "major",
+    "owner": "p2",
+    "summary": "On a host without ~/.bash_profile the phase creates one from the snippet and then never adds the '. ~/.bashrc' line, because the grep for 'bashrc' matches the snippet's own comment; login shells then stop reading ~/.bashrc and ~/.profile.",
+    "evidence": "Ran phase_claude_apply for real in an isolated HOME (no ~/.bash_profile): the file ends up containing only the template (templates/profiler.bashrc line 3 has '~/.bashrc' in a comment), and `grep -nE '\\. ~/.bashrc|source ~/.bashrc'` prints 'NO sourcing line'. Order at 16-claude.sh:87-91 is append-to-.bash_profile first, then `grep -q bashrc ~/.bash_profile || ensure_line …`, so the guard is always true after the append. bash reads only the first of ~/.bash_profile/~/.bash_login/~/.profile, so creating the file also shadows ~/.profile. The VM is unaffected (skel's ~/.bash_profile already sources ~/.bashrc); bare metal / non-Arch skels are.",
+    "fix": "Move the `grep … || ensure_line \"$HOME/.bash_profile\" '[[ -f ~/.bashrc ]] && . ~/.bashrc'` step before `_claude_append_snippet \"$HOME/.bash_profile\"`, and test for an actual sourcing statement (e.g. `grep -qE '^[^#]*(\\.|source)[[:space:]]+~/\\.bashrc' ~/.bash_profile`) rather than the substring 'bashrc'.",
+    "review": "review:contract"
+  },
+  {
+    "file": "profiler/setup/phases/14-golden.sh",
+    "line": 72,
+    "severity": "major",
+    "owner": "p2",
+    "summary": "A re-run with --force (notably the unattended `--force --yes`) silently replaces the existing golden snapshot with the current, possibly drifted, prefix/runtime, losing the reference state every trial restores to.",
+    "evidence": "lib/phase.sh:404 calls apply whenever FORCE=1 even though check passes; phase_golden_apply then runs `state snapshot --name golden` (14-golden.sh:72) and bin/state:229-230 `rm -rf`s the existing snapshot directory before `mv -T`. With --yes the human phase is deferred (13-human.sh:124-130) while `_human_evidence` is still true from the old Log.txt, so no human step precedes the overwrite and no prompt or warning is printed.",
+    "fix": "When a golden snapshot already exists, do not re-snapshot under --force unless `state diff --name golden` is clean or ask_continue confirms (never implicitly under --yes); otherwise skip with a warning that names the explicit command `profiler/bin/state snapshot --name golden`.",
+    "review": "review:contract"
+  },
+  {
+    "file": "profiler/setup/lib/phase.sh",
+    "line": 229,
+    "severity": "minor",
+    "owner": "core",
+    "summary": "_tmpdir is only ever called inside a command substitution, so PROFILER_TMPDIR never reaches the parent shell and every write_template call leaks an empty /tmp/profiler-setup.XXXXXX that the EXIT trap cannot remove.",
+    "evidence": "Test sourcing log.sh+phase.sh with TMPDIR set: after write_template, PROFILER_TMPDIR is '' in the parent; two calls leave two profiler-setup.* dirs and both survive the EXIT trap (_phase_on_exit:462 sees an empty variable). The `--only claude --dry-run` run of the driver left /tmp/profiler-setup.wbwM9E behind; the p2 author reported the same on the VM.",
+    "fix": "Create the scratch dir in the parent once (e.g. `_tmpdir >/dev/null` in setup-machine.sh after log_init, or at the top of write_template) and then use \"$PROFILER_TMPDIR\" in the mktemp call instead of \"$(_tmpdir)\".",
+    "review": "review:contract"
+  },
+  {
+    "file": "profiler/bin/state",
+    "line": 194,
+    "severity": "minor",
+    "owner": "p2",
+    "summary": "A failed snapshot leaves its partially filled .<name>.tmp.<pid> directory under ~/.local/share/profiler/golden/; failures accumulate because only the current pid's tmp is ever removed.",
+    "evidence": "cmd_snapshot exits with `copy_tree … || exit 1` (state:194) and has no EXIT trap; after a copy failure the directory golden/.golden.tmp.15310 remained (observed in a fake-tree run). On the rsync path each leftover can hold a full prefix+runtime copy; `state list` hides them (no MANIFEST.json).",
+    "fix": "Install a trap in cmd_snapshot that removes \"$tmp\" unless the final `mv -T` succeeded, and/or delete stale `$SNAP_ROOT/.*.tmp.*` directories at the start of a snapshot.",
+    "review": "review:contract"
+  },
+  {
+    "file": "profiler/dev/build-official.sh",
+    "line": 458,
+    "severity": "minor",
+    "owner": "p4",
+    "summary": "build-official.sh never writes ~/.local/state/profiler/build-audit.env, so after an official build every setup-machine.sh (and verify.sh) run re-unpacks the ~1.3 GB tarball and re-runs build-audit.sh in phase build's check, also under --dry-run.",
+    "evidence": "09-build.sh:158 passes the check cheaply only when build-audit.env records result=ok for the tarball's sha256; only phase_build_apply (09-build.sh:239-247) writes it, and check is read-only by contract. build-official.sh audits the new tarball (:458) but records only dev/last-official-build (:468-474); the new tarball sha never matches the old record, so _build_audit_direct runs on every invocation (unpack into ~/.cache/profiler/tmp).",
+    "fix": "After a passing audit in build-official.sh, write the same record (ts, version, tarball, tarball_sha256, build_log, build_seconds, jobs, result=ok) to $PROFILER_STATE_DIR/build-audit.env, or factor the writer into a shared helper both scripts call.",
+    "review": "review:contract"
+  },
+  {
+    "file": "profiler/setup/setup-machine.sh",
+    "line": 192,
+    "severity": "minor",
+    "owner": "core",
+    "summary": "The derived default Live installer path is persisted as live_installer on the first run, so a later --media-dir change is silently ignored for the installer path.",
+    "evidence": "LIVE_INSTALLER=\"${opt_installer:-$(cfg_get live_installer \"$MEDIA_DIR/Ableton Live 12 Trial Installer.exe\")}\" (line 192) and cfg_set live_installer \"$LIVE_INSTALLER\" (line 236): on run 2 with --media-dir /new, media_dir is updated but cfg_get live_installer returns the old absolute path, so phases 08/10 keep the stale file.",
+    "fix": "Persist live_installer only when --live-installer was given (or when it differs from the derived default), otherwise derive it from MEDIA_DIR on every run.",
+    "review": "review:contract"
+  },
+  {
+    "file": "profiler/setup/phases/",
+    "severity": "blocker",
+    "owner": "p1",
+    "summary": "Phases 01-08 (sudo, packages, podman, limits, session, audio, repo, media) do not exist, so setup-machine.sh cannot run any selection that includes a later phase: phase_select dies with exit 2 on 'unknown phase' even with --force.",
+    "evidence": "find profiler/setup/phases lists only 00-preflight.sh and 09..18; the phases-00-08 author report is null. Run on the VM from a /tmp copy (HOME under /tmp): `setup-machine.sh --profile vm --dry-run` -> '✗ phase build depends on unknown phase podman' rc=2; `--only build --force` -> same rc=2 because lib/phase.sh:351 dies on an unknown dependency name regardless of --force. The templates for 01-08 (sudoers-*, limits-profiler.conf, sysctl-profiler.conf, sddm-autologin.conf, profiler-inhibit.service, pw-9?-*.conf) exist but nothing consumes them. Only `--only preflight` and `--only claude,dashboard,summary --force` work today.",
+    "fix": "Deliver phases/01-sudo.sh .. 08-media.sh registering exactly the names the later phases depend on (sudo packages podman limits session audio repo media). Optionally (core) downgrade the unknown-dependency die at phase.sh:351 to a warning under --force so partial trees can be exercised.",
+    "review": "review:vm-facts"
+  },
+  {
+    "file": "profiler/setup/templates/sddm-autologin.conf",
+    "severity": "major",
+    "owner": "p1",
+    "summary": "The VM's display manager is Plasma Login Manager (plasmalogin), not SDDM: the design's phase 05 target /etc/sddm.conf.d/zz-profiler-autologin.conf is never read, so autologin would silently not happen and install/human have no desktop after a reboot.",
+    "line": 9,
+    "evidence": "VM: /etc/systemd/system/display-manager.service -> plasmalogin.service (plasma-login-manager 6.8.0-1; `pacman -Q sddm` not found); /etc/sddm.conf and /etc/sddm.conf.d/ do not exist; `strings -el /usr/bin/plasmalogin` lists exactly /etc/plasmalogin.conf, /etc/plasmalogin.conf.d, /usr/lib/plasmalogin/plasmalogin.conf.d (no sddm.conf.d); the KCM auth helper writes /etc/plasmalogin.conf. /etc/plasmalogin.conf is root 0644 (readable without sudo) and today contains '[Autologin]\\nSession=plasma' with no User=; the daemon logs 'is configured to autologin but names no User; it will be greeted'. /usr/lib/sddm/sddm.conf.d/* belongs to cachyos-kde-settings, not to the DM. Session name 'plasma' is correct (/usr/share/wayland-sessions/plasma.desktop; DESKTOP_SESSION in the user session is that file).",
+    "fix": "In phase 05 detect the DM via `readlink -f /etc/systemd/system/display-manager.service`; for plasmalogin install the same template to /etc/plasmalogin.conf.d/zz-profiler-autologin.conf (create the dir with `run --sudo -- install -d -m 0755`), User=colby Session=plasma Relogin=true, and inspect /etc/plasmalogin.conf (readable) for a conflicting User=; keep the sddm path only when sddm.service is the DM. The template header already mentions plasmalogin, so only the phase logic needs this.",
+    "review": "review:vm-facts"
+  },
+  {
+    "file": "profiler/bin/state",
+    "severity": "major",
+    "owner": "p2",
+    "summary": "`state restore` replaces the official runtime with the snapshot's copy, and nothing refreshes the golden snapshot after build-official.sh installs a new runtime: the first 'restore golden before the trial' after a kept trial silently rolls the runtime back to the pre-keep build.",
+    "line": 264,
+    "evidence": "items_define adds the runtime (state:77); cmd_restore does `rm -rf -- \"$src\"` + copy_tree for every item including runtime (state:260-271) and only warns when the recorded path differs (state:243), never when the installed BUILD-INFO differs from MANIFEST.json's runtime_build_info_sha256. profiler/dev/build-official.sh ends at :475-479 with hints about the dev runtime and the A/B but no `state snapshot`/action to re-take golden. The plan (§10) runs `state restore` before every trial and uses build-official.sh as the keep gate, so the stale runtime copy is restored on the very next trial; bench-report only flags it later as a runtime-identity change.",
+    "fix": "In cmd_restore compare sha256 of $rt/ABLETON-WINE-BUILD-INFO.txt with the manifest's runtime_build_info_sha256 and skip the runtime item (or refuse unless --force/--runtime) when they differ, printing why; in build-official.sh, after a successful install either run `profiler/bin/state snapshot --name golden` (prefix unchanged) or print an ACTION 'retake the golden snapshot' and record it in dev/last-official-build.",
+    "review": "review:vm-facts"
+  },
+  {
+    "file": "profiler/setup/lib/phase.sh",
+    "severity": "minor",
+    "owner": "core",
+    "summary": "_tmpdir is only ever called in a command substitution, so PROFILER_TMPDIR is never set in the parent shell and every write_template call leaks an empty /tmp/profiler-setup.XXXXXX directory that the EXIT trap never removes (on the VM /tmp is the 3.9 GB tmpfs build.sh depends on).",
+    "line": 229,
+    "evidence": "phase.sh:129-135 exports PROFILER_TMPDIR inside `$(_tmpdir)` (subshell); phase.sh:229 `tmp=\"$(mktemp \"$(_tmpdir)/tpl.XXXXXX\")\"`; trap at :462 removes $PROFILER_TMPDIR which stays empty in the parent. Observed on the VM: after one `--only claude,... --dry-run` run with TMPDIR redirected, `profiler-setup.WYxZtx` remained; p2's report observed the same on both hosts.",
+    "fix": "Create the scratch dir eagerly (e.g. in the driver after log_init: `PROFILER_TMPDIR=$(mktemp -d ...); export`) or call `_tmpdir >/dev/null` for its side effect and then use \"$PROFILER_TMPDIR\" directly in write_template.",
+    "review": "review:vm-facts"
+  },
+  {
+    "file": "profiler/setup/lib/phase.sh",
+    "severity": "minor",
+    "owner": "core",
+    "summary": "write_template/ensure_line with --sudo test existence as the unprivileged user, so files inside root-only directories (e.g. /etc/sudoers.d, 0750 on the VM) are never seen: ensure_line --sudo would append its line on every run and write_template re-installs and reports 'wrote' instead of 'already up to date'.",
+    "line": 222,
+    "evidence": "phase.sh:222/225 `[ -e \"$dst\" ]` and :260 `[ -e \"$file\" ]` run without sudo; VM: `ls /etc/sudoers.d/` -> Permission denied (directory not searchable), so -e is false for /etc/sudoers.d/90-profiler-colby even when it exists. No current phase calls ensure_line --sudo there, but the design's phase 01 writes two sudoers files through write_template.",
+    "fix": "When --sudo is given (and not dry-run) probe with `sudo -n test -e -- \"$dst\"` and read with `sudo -n cat`; keep the unprivileged path otherwise.",
+    "review": "review:vm-facts"
+  },
+  {
+    "file": "profiler/setup/lib/phase.sh",
+    "severity": "minor",
+    "owner": "core",
+    "summary": "sudo_keepalive_start runs before the first non-preflight phase regardless of whether the selection needs sudo, so `--only claude` (or any sudo-less selection) prompts for a password on a tty, or warns 'sudo commands will fail' without one, on a host where NOPASSWD is not yet in force (the VM today: `sudo -n true` fails).",
+    "line": 444,
+    "evidence": "phase.sh:443-446 starts the keepalive for any selection whose first phase is not preflight; sudo_keepalive_start (:272-283) prompts via /dev/tty or warns when there is no tty. VM: `sudo -n -v` -> 'a password is required'.",
+    "fix": "Start the keepalive lazily from `run --sudo` (first use) or only when the selected phases declare a needs-sudo flag in phase_register.",
+    "review": "review:vm-facts"
+  },
+  {
+    "file": "profiler/setup/phases/00-preflight.sh",
+    "severity": "minor",
+    "owner": "core",
+    "summary": "GiB values are floored, so the 8 GiB VM is reported as 'RAM is 7 GiB' and the 7.7 GiB zram swap as 7 GiB; the thresholds are still evaluated on kB/bytes and are correct.",
+    "line": 153,
+    "evidence": "VM MemTotal 8084712 kB -> 8084712/1048576 = 7; preflight dry-run on the VM printed 'memory 7 GiB total, 6 GiB available' and 'RAM is 7 GiB (< 12 GiB) ... JOBS is clamped to 3'. All other arithmetic verified on the VM: home 520481128448 B -> 484 GiB >= 60 ok; /tmp 4082397184 B -> >= 2 GiB ok (tmpfs warned); JOBS = (6544916 kB -> 6 GiB - 2)*10/12 = 3 = design's floor((6.24-2)/1.2).",
+    "fix": "Round for display: `mem_gib=$(( (mem_kb + 524288) / 1048576 ))` (same for swap/avail), keep the comparisons on raw kB.",
+    "review": "review:vm-facts"
+  },
+  {
+    "file": "profiler/setup/phases/09-build.sh",
+    "severity": "minor",
+    "owner": "p2",
+    "summary": "phase_build_check runs the full scripts/build-audit.sh (unpacks the ~1.3 GB tarball under ~/.cache/profiler/tmp, minutes) whenever build-audit.env has no record for the tarball, including under --dry-run; build-official.sh never writes that record, so after every official build each later setup-machine.sh run (even a dry run) re-audits.",
+    "line": 161,
+    "evidence": "09-build.sh:155-166 calls _build_audit_direct from check; :123-128 creates $PROFILER_CACHE_DIR/tmp with mkdir (a write during a read-only check/dry run); dev/build-official.sh records only dev/last-official-build (:468-474), not build-audit.env. The design states check functions are read-only and --dry-run writes nothing.",
+    "fix": "Share one record: have build-official.sh write ~/.local/state/profiler/build-audit.env in the same format after its audit; in check, treat 'artifacts verify but no record' as 'audit pending' and let apply run only the audit (not the build) in that case.",
+    "review": "review:vm-facts"
+  },
+  {
+    "file": "profiler/setup/phases/13-human.sh",
+    "severity": "minor",
+    "owner": "p2",
+    "summary": "Under --yes the human phase (and golden, via _GOLDEN_DEFERRED) returns 0 from check without doing the work, so the runner writes 13-human.done / 14-golden.done markers: --list-phases shows them 'done', dependency validation treats them as satisfied, and anything trusting markers (verify.sh) is misled.",
+    "line": 113,
+    "evidence": "13-human.sh:125 sets _HUMAN_DEFERRED=1 in apply and :113 makes check return 0; 14-golden.sh:40/68 same pattern; lib/phase.sh:419-420 writes the marker whenever the post-apply check passes. Markers are advisory for the runner, but phase_list and phase_is_done read only the marker.",
+    "fix": "Return 0 from apply but 1 from the deferred check path so no marker is written (the runner then reports 'failed'), or add a `phase_defer` helper that records status=deferred in the summary/marker (ts=... deferred=1) and have phase_is_done ignore deferred markers.",
+    "review": "review:vm-facts"
+  },
+  {
+    "file": "profiler/setup/phases/15-tracecheck.sh",
+    "severity": "minor",
+    "owner": "p2",
+    "summary": "Phase 15 runs scripts/check-ntsync.sh, which starts a wineserver for the real prefix and runs ntsyncprobe.exe in it, after phase 14 took the golden snapshot, so the first `state diff --name golden` (verify.sh) can report prefix drift before any trial ran.",
+    "line": 71,
+    "evidence": "check-ntsync.sh:9 `export WINEPREFIX=${ABLETON_WINEPREFIX:-~/.wine-ableton}`, :88-90 `mkdir -p $WINEPREFIX; wineserver -p`, :101 `wine $PROBE` (cleanup trap kills the server, :40-54); phase order golden(14) -> tracecheck(15). VERIFY: whether Wine rewrites user.reg/system.reg or drive_c/users/*/Temp on this probe run.",
+    "fix": "Run tracecheck before golden (make golden depend on tracecheck, or renumber), or run `state diff` after phase 15 during setup and re-snapshot when only probe artefacts differ.",
+    "review": "review:vm-facts"
+  },
+  {
+    "file": "profiler/setup/phases/17-dashboard.sh",
+    "severity": "minor",
+    "owner": "p2",
+    "summary": "_dash_responds blocks up to ~40 s (10 x curl -m 3 + sleep 1) and is called from check on every setup run while the unit is down, slowing every later invocation of the driver.",
+    "line": 21,
+    "evidence": "17-dashboard.sh:19-26; check calls it at the end of phase_dashboard_check whenever node_modules and the unit are present but the server is not answering.",
+    "fix": "Use a single short probe in check (1 attempt, -m 2) and keep the 10-attempt wait only in apply right after `systemctl --user enable --now`.",
+    "review": "review:vm-facts"
+  },
+  {
+    "file": "profiler/setup/phases/",
+    "severity": "blocker",
+    "owner": "p1",
+    "summary": "Phases 01-08 (sudo, packages, podman, limits, session, audio, repo, media) do not exist, so setup-machine.sh dies at phase_select on every run: `phase 'build' depends on unknown phase 'podman'` (exit 2). Only 00-preflight.sh and 09-18 are present; the p1 templates exist but no phase uses them.",
+    "evidence": "`find profiler/setup/phases -type f` lists 00,09,10,...,18 only. Run in a scratch HOME: `bash profiler/setup/setup-machine.sh --profile vm --dry-run --no-color` prints the banner, then `[..] ✗ phase 'build' depends on unknown phase 'podman'` and exits 2 (lib/phase.sh:351 `die \"phase '$n' depends on unknown phase '$d'\" 2`). `--list-phases` shows no 01-08 rows. Every reviewed phase (09-18) therefore cannot be reached, with or without --only.",
+    "fix": "Deliver profiler/setup/phases/01-sudo.sh .. 08-media.sh registering exactly the names the later phases depend on (sudo, packages, podman, limits, session, audio, repo, media; see design-A §2.1 and phase_register deps in 09-build.sh:27, 10-install.sh:22, 13-human.sh:19, 15-tracecheck.sh:14, 17-dashboard.sh:11).",
+    "review": "review:bash"
+  },
+  {
+    "file": "profiler/setup/phases/09-build.sh",
+    "line": 74,
+    "severity": "major",
+    "owner": "p2",
+    "summary": "_lp_live_pids (09-build.sh:70-77) and state's live_pids (profiler/bin/state:116-123) treat ANY process whose cmdline contains `Ableton Live…​.exe` as Live - including the setup driver itself when started with `--live-installer …/Ableton Live 12 Trial Installer.exe` (or the `bash -lc \"…\"` wrapper used over SSH). _lp_prefix_busy is then always true, so phases build/install/human/golden/tracecheck fail with 'Live or Wine processes are using the prefix', and `state snapshot|restore|clean-crash` (called by phases 13/14) die with 'refusing to … while processes use the prefix'.",
+    "evidence": "Pattern `case \"$cmd\" in *\"Ableton Live\"*.exe*)` matched against the driver's own cmdline `bash …/setup-machine.sh --profile vm --live-installer /home/colby/Proprietary/ableton/Ableton Live 12 Trial Installer.exe ` -> MATCH (tested). --live-installer PATH is a documented option (design-A §2.1, setup-machine.sh:116) and the default file name contains the string. scripts/lib/lifecycle.sh:1-3 deliberately forbids this: 'No process is selected by a global image-name match: both /proc/PID/exe and WINEPREFIX must match'.",
+    "fix": "Mirror lifecycle.sh: only count a pid as Live when /proc/PID/exe resolves to a Wine binary (basename wine|wine64|wine-preloader|wine64-preloader|wineserver, or exe under a */bin/ or */lib/wine/ of a runtime root) AND/OR its environ carries WINEPREFIX=<prefix>; at minimum skip $$, $PPID and pids whose exe is a shell/ssh/editor. Apply the same change to live_pids in profiler/bin/state:120.",
+    "review": "review:bash"
+  },
+  {
+    "file": "profiler/bin/wine-trace",
+    "line": 623,
+    "severity": "major",
+    "owner": "p2",
+    "summary": "NOT in p2's ownership list (tracer workstream file, routed to p2 only because it lives in profiler/bin). `wine-trace stop` aborts with exit 1 in the normal, lossless case: `lost_extra=\"$(grep -oE 'Lost [0-9]+ events?' \"$out/bpftrace.stderr\" | awk …)\"` runs under `set -euo pipefail`; when bpftrace.stderr (always created by daemonise) contains no 'Lost N events' line, grep exits 1, pipefail makes the substitution fail, errexit kills the script right after `rm -f wine-trace.pid` (line 619) and before reduce.py, maps.json and chown_out run.",
+    "evidence": "Reproduced: `bash -c 'set -euo pipefail; lost_extra=\"$(grep -oE \"Lost [0-9]+ events?\" empty.stderr | awk \"{s+=\\$2} END {print s+0}\")\"; echo survived'` prints nothing and exits 1; with a 'Lost 3 events' line it prints `survived lost_extra=3`. cmd_stop is invoked from main's case (line 719), not a condition, so errexit is live.",
+    "fix": "`lost_extra=\"$( { grep -oE 'Lost [0-9]+ events?' \"$out/bpftrace.stderr\" || true; } | awk '{s+=$2} END {print s+0}')\"` (same for any future `grep | awk` under errexit).",
+    "review": "review:bash"
+  },
+  {
+    "file": "profiler/setup/lib/phase.sh",
+    "line": 229,
+    "severity": "minor",
+    "owner": "core",
+    "summary": "_tmpdir is only ever called inside a command substitution (`mktemp \"$(_tmpdir)/tpl.XXXXXX\"`), so PROFILER_TMPDIR is set in a subshell and stays empty in the driver: every write_template that renders creates a fresh /tmp/profiler-setup.XXXXXX that the EXIT trap (line 462) never removes, and every phase's `${PROFILER_TMPDIR:-${TMPDIR:-/tmp}}` falls back to /tmp (a 3.9 GB tmpfs on the VM). A mktemp failure inside _tmpdir also cannot `die` (subshell) and surfaces as a confusing second error.",
+    "evidence": "Test: sourced log.sh+phase.sh, called write_template three times (two real writes, one skipped) -> `PROFILER_TMPDIR in parent after 3 calls: []`, two `profiler-setup.*` directories left in TMPDIR after the EXIT trap ran. The p2 author observed the same leak on the VM.",
+    "fix": "Create the scratch dir once in the parent, e.g. in write_template: `[ -n \"$PROFILER_TMPDIR\" ] && [ -d \"$PROFILER_TMPDIR\" ] || _tmpdir >/dev/null; tmp=\"$(mktemp \"$PROFILER_TMPDIR/tpl.XXXXXX\")\"` (and/or have setup-machine.sh call `_tmpdir >/dev/null` right after log_init so all phases inherit it).",
+    "review": "review:bash"
+  },
+  {
+    "file": "profiler/setup/phases/16-claude.sh",
+    "line": 89,
+    "severity": "minor",
+    "owner": "p2",
+    "summary": "The guard that adds `[[ -f ~/.bashrc ]] && . ~/.bashrc` to ~/.bash_profile is defeated by the snippet appended one line earlier: templates/profiler.bashrc line 3 contains the word 'bashrc' ('This block sits in ~/.bashrc …'), so `grep -q bashrc ~/.bash_profile` always matches after _claude_append_snippet and the sourcing line is never added on a machine whose .bash_profile did not already source .bashrc.",
+    "evidence": "Order in phase_claude_apply: line 88 appends templates/profiler.bashrc to $HOME/.bash_profile (its line 3: '# This block sits in ~/.bashrc (interactive shells) and ~/.bash_profile (bash -lc …)'), line 89 then tests `grep -q bashrc \"$HOME/.bash_profile\"` -> true -> ensure_line skipped. Low impact because the PATH snippet itself is in .bash_profile and the VM's .bash_profile already exists.",
+    "fix": "Evaluate the guard before appending the snippet, or make it specific: `grep -qE '^[^#]*\\. +~/\\.bashrc|^[^#]*source +~/\\.bashrc' \"$HOME/.bash_profile\"`.",
+    "review": "review:bash"
+  },
+  {
+    "file": "profiler/setup/verify.sh",
+    "severity": "minor",
+    "owner": "p3",
+    "summary": "p3's verify.sh, bootstrap.md and profiler/README.md are absent (author report is null); 18-summary.sh:52 prints `$SETUP_ROOT/verify.sh` as the first 'next' command and the design (§2.6) makes verify.sh the post-setup gate.",
+    "evidence": "`find profiler/setup -type f` shows only root-helper/profiler-root-helper, templates/sudoers-helper and plugins.lock from the p3 list; no verify.sh, bootstrap.md or profiler/README.md anywhere under profiler/.",
+    "fix": "Deliver profiler/setup/verify.sh (design-A §2.6), profiler/setup/bootstrap.md and profiler/README.md.",
+    "review": "review:bash"
+  },
+  {
+    "file": "profiler/dev/wine-dev.sh",
+    "line": 838,
+    "severity": "major",
+    "owner": "p4",
+    "summary": "`sync --artifacts --dir dlls/<mod>` never copies the unix half (`<mod>.so`): Wine builds it at `dlls/<mod>/<mod>.so`, not under a `*-unix/` build subdirectory, so the glob at this line finds only the `*-windows/` PE dirs. The command then reports success with the PE dlls alone and the dev runtime keeps a stale `ntdll.so` (where the ntsync/USDT work lives), making every A/B on the dev runtime silently wrong. The documented 'typical loop' in the usage text (`build --dir dlls/ntdll && sync --artifacts --dir dlls/ntdll`) hits this on every iteration.",
+    "evidence": "Verified against the vendored Wine 11.13 `tools/makedep.c` (extracted on the VM to /tmp): `arch_dirs[0] = \"\"` (line 5156) and the unix-library rule target is `obj_dir_path( make, make->unixlib )` (line 4069), i.e. `dlls/ntdll/ntdll.so`; only PE archs get `\"%s-windows/\"` (line 5165). `arch_install_dirs[0] = \"$(libdir)/wine/%s-unix\"` (line 5157) is the INSTALL dir, which the script confused with the build layout. `_artifacts_to_stage` loops `for arch in \"$BUILD_DIR/$d\"/*-windows \"$BUILD_DIR/$d\"/*-unix` and only installs files found inside those dirs; `n` is >0 from the PE files, so the 'no built modules found' guard does not fire. Also: line 944 defaults `dirs=(dlls/ntdll)` when `--artifacts` is given without `--dir`, which is undocumented; and makedep installs the unix lib via `install_program` (mode 755, line 4068) while the script uses `install -m 0644`.",
+    "fix": "In `_artifacts_to_stage`, add a third source: `for f in \"$BUILD_DIR/$d\"/*.so; do install -m 0755 -- \"$f\" \"$STAGE_ROOT/lib/wine/<host>-unix/$(basename \"$f\")\"; done`, deriving `<host>-unix` from the existing `$STAGE_ROOT/lib/wine/*-unix` directory (x86_64-unix here). Fail (not just warn) when a requested DIR yields no `.so` and no PE module. Document the `dlls/ntdll` default or require `--dir` with `--artifacts`.",
+    "review": "review:devloop"
+  },
+  {
+    "file": "profiler/dev/wine-dev.sh",
+    "line": 528,
+    "severity": "major",
+    "owner": "p4",
+    "summary": "`drift=\"$(_series_drift)\"` aborts the whole script under `set -euo pipefail` whenever `patches/` differs from the init-time snapshot, because `_series_drift`'s pipeline returns `diff`'s exit status 1. That state is exactly what `format-patch` creates (a new NNNN patch in `patches/`), after which `wine-dev.sh build`, `sync` (line 923) and `status` (line 1160) all exit 1 with no message instead of printing the intended drift warning. The same assignment pattern in `_write_dev_info` (line 869 `dirty=\"$(_wine_dirty)\"` -> exit 128 when wine-src is not a git repo; line 872 `official_version=\"$(sed … | head -n1)\"` -> exit 2 when `$OFFICIAL_ROOT/ABLETON-WINE-BUILD-INFO.txt` is absent) kills `--dry-run sync` on a machine that has no official runtime yet (the VM's state today).",
+    "evidence": "Reproduced in Git Bash with a 10-line script using the identical constructs: the drift case exits 1 before the line after the assignment, the sed case exits 2, the git case exits 128 (`bash -c 'set -euo pipefail; x=$(false)'` semantics: errexit is unset inside `$(...)` but the failed assignment status still triggers errexit in the parent). `_series_drift` (lines 520-525) ends with `diff … | awk … | sort -u | tr`, and pipefail propagates diff's 1. The author's tests never exercised a drifted `patches/` (their isolated HOME had no `series.sha256`, so `[ -r … ] || return 0` short-circuited).",
+    "fix": "Make the helpers never return non-zero for 'differences': in `_series_drift` use `{ diff … || true; } | awk …` (or `diff …; [ ${PIPESTATUS[0]} -le 1 ]`), and in `_write_dev_info` write `dirty=\"$(_wine_dirty || true)\"` / guard the sed with `[ -r \"$f\" ] && sed … | head -n1 || true`. Grep the file for every `var=\"$(…)\"` whose substitution can fail (pipefail counts) and append `|| true` or `|| echo default`.",
+    "review": "review:devloop"
+  },
+  {
+    "file": "profiler/dev/wine-dev.sh",
+    "line": 1072,
+    "severity": "minor",
+    "owner": "p4",
+    "summary": "`format-patch` exports a commit that sits ON TOP of `performance/0001` in the dev tree, but the official pipeline applies every `NNNN-*.patch` (including the new one) BEFORE `patches/performance/*.patch`. A dev-verified patch that touches `dlls/ntdll/unix/sync.c` (the only file performance/0001 changes) can apply cleanly in the dev tree yet fail `git am --3way` or merge differently in `./build.sh`; nothing in the dev loop checks the official order.",
+    "evidence": "container-build.sh:156 loops `\"$SRC\"/patches/[0-9][0-9][0-9][0-9]-*.patch \"${performance_patches[@]}\"` (numbered first, performance last); init.sh:103 replays the same order and tags `series-aceb236` after performance/0001 (init.sh:112), so any dev commit is after it. `patches/performance/0001-*.patch` diffs only `dlls/ntdll/unix/sync.c`. The plan sidesteps this for 0108 by stating 'sync.c untouched so performance/0001 keeps applying' (wine-interface-profiler-plan.md:126), i.e. the hazard is real and currently handled by convention only.",
+    "fix": "Have init.sh tag the commit after the numbered series and before the performance loop (e.g. `series-wine`), and make `cmd_format_patch` replay the official order in a throwaway worktree: `git worktree add <scratch> series-wine && git am --3way <exported patch> && git am --3way patches/performance/*.patch`; warn (or refuse without --force) on conflict and print the official application position in the checklist.",
+    "review": "review:devloop"
+  },
+  {
+    "file": "profiler/dev/wine-dev.sh",
+    "line": 1072,
+    "severity": "minor",
+    "owner": "p4",
+    "summary": "Host git configuration leaks into the exported patch and into `apply`: `git format-patch` and `git am` run on the host with the user's `~/.gitconfig`, while the official build applies with the container's clean config (`HOME=/work`). Settings such as `diff.noprefix`, `diff.mnemonicPrefix`, `format.signOff`, `format.subjectPrefix`, `diff.renames`/`diff.algorithm` or `commit.gpgsign` can produce a patch that the container's `git am --3way` or `patch -p1` (pipeasio series) cannot apply, or that differs from what the dev tree built.",
+    "evidence": "Line 1072: `git -C \"$src\" format-patch -1 --no-numbered --no-signature --stat=80 --stdout HEAD` with no `-c` overrides and no `GIT_CONFIG_GLOBAL`; line 664: host `git … am --3way` likewise. The container side (init.sh:46-47, pipeasio-init.sh:52-53) deliberately uses `HOME=/work` so only `safe.directory` applies there; the host side has no equivalent isolation. The pipeasio series is applied with `patch -p1` (container-build.sh:260), which cannot consume a `diff.noprefix=true` diff.",
+    "fix": "Run both with an isolated config: `GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null git -c diff.noprefix=false -c diff.mnemonicPrefix=false -c diff.renames=true -c format.signOff=false -c format.subjectPrefix=PATCH -c commit.gpgsign=false -C \"$src\" format-patch …` (git >= 2.32), and the same env for the `git am` in `cmd_apply`.",
+    "review": "review:devloop"
+  },
+  {
+    "file": "profiler/setup/phases/09-build.sh",
+    "line": 212,
+    "severity": "minor",
+    "owner": "p2",
+    "summary": "Phase 09 runs `./build.sh` without taking `~/.local/state/profiler/build.lock` and without checking `wine-dev.lock`, so the refusal conditions on the dev-loop side are one-directional: `build-official.sh`'s 'another official build is running' check and `wine-dev.sh`'s `_official_build_running` never see a setup-driven build, and a setup build does not refuse while `wine-dev.sh` or `build-official.sh` is building. Two concurrent `build.sh` runs then share the image tag, `.ccache` and `dist/` promotion.",
+    "evidence": "`grep -n -E 'flock|build\\.lock|wine-dev\\.lock|wine-dev\\.building' profiler/setup/phases/09-build.sh profiler/setup/lib/phase.sh profiler/setup/setup-machine.sh` returns nothing; the phase launches build.sh via `run -- bash -o pipefail -c 'cd … && JOBS=… ./build.sh 2>&1 | tee …'` (see the RULE message at line 212 and the author report). build-official.sh:305-317 and wine-dev.sh:357-361 rely solely on `flock -n` of `build.lock` / `wine-dev.lock`.",
+    "fix": "In phase 09's apply, acquire the same lock before launching build.sh (`exec 9>>\"$STATE/build.lock\"; flock -n 9 || fail 'another official build is running'`) and refuse while `wine-dev.lock` is held (same subshell `flock -n` probe as build-official.sh `_dev_loop_running`), so all three entry points share one mutual-exclusion contract.",
+    "review": "review:devloop"
+  }
+]

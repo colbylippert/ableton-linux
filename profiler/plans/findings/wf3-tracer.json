@@ -1,0 +1,152 @@
+[
+  {
+    "file": "profiler/tracer/gen_tables.py",
+    "line": 227,
+    "severity": "major",
+    "owner": "t4",
+    "summary": "The `_count`/`_COUNT` suffix filter meant for the `unix_funcs_count` sentinel also drops real unix-call codes, so the committed tables/wine-11.13.json cannot name dwrite code 5 (unix_get_glyph_count) or winegstreamer code 7 (unix_wg_parser_get_stream_count); the tracer will label them `dwrite.so#5` / `winegstreamer.so#7` and `EXPECT unixcall dwrite.so:* ...` globs miss them.",
+    "evidence": "parse_all_unixlibs(): `if enumerator.endswith(\"_count\") or enumerator.endswith(\"_COUNT\"): continue` is applied to every enumerator, not only the last. Scratch tree W3/wine-src dlls/dwrite/unixlib.h enum font_backend_funcs has unix_get_glyph_count at position 5 (PE caller dlls/dwrite/font.c:1058 `UNIX_CALL(get_glyph_count, &params)`); dlls/winegstreamer/unixlib.h enum unix_funcs has unix_wg_parser_get_stream_count at 7 (PE caller dlls/winegstreamer/main.c:249). Committed table: dwrite has codes 0-4,6-9 (count 9 of 10 real codes), winegstreamer 0-6,8-36 (missing 7) -- verified by loading the JSON; test_gen_tables.py only asserts get_glyph_outline is present, so the regression passed unnoticed. Live's text rendering goes through dwrite (patches 0081-0103), so this id appears in real traces.",
+    "fix": "Only strip the sentinel: skip an enumerator when it is the LAST item of the enum and its name matches the sentinel shape (e.g. `re.search(r\"funcs?_count$|_COUNT$\", name)` on items[-1] only, or compare against `<enum>_count`/`unix_funcs_count` explicitly). Add `self.assertEqual(unix[\"dwrite\"][\"5\"], \"get_glyph_count\")` and `unix[\"winegstreamer\"][\"7\"] == \"wg_parser_get_stream_count\"` to CommittedTableTest, regenerate tables/wine-11.13.json with `--label \"wine-src (vendor/wine-base-5c23dd1c + patches, tag series-aceb236)\"` from W3/wine-src (HEAD 46ba4ec2) and re-run the tests.",
+    "review": "review:python"
+  },
+  {
+    "file": "profiler/tracer/reduce.py",
+    "line": 1097,
+    "severity": "minor",
+    "owner": "t4",
+    "summary": "update_tracer_json writes the raw collections.Counter into tracer.json `counters`, so in a healthy run (no unmatched/abandoned pairings) the keys `unmatched_exits` and `abandoned_entries` are absent and validate.py's pairing checks report SKIP instead of PASS; the design-B section 7 acceptance `abandoned_entries == 0` can never be certified from tracer.json.",
+    "evidence": "Reproduced: a 2-syscall events.txt reduced with `--mode drilldown` yields tracer.json `\"counters\": {\"ntsync_wait_without_exit\": 0}` only (Counter keys exist only after `+=`), and `validate.py --expect ... --events ... --threads ... --tracer tracer.json` prints `SKIP pairing-unmatched_exits: no counter in tracer.json` and `SKIP pairing-abandoned_entries: no counter in tracer.json` (validate.py tracer_counter(), line 672-695, looks for the key in tracer/counters/stats). summary.json itself is fine because summary() uses counters.get(name, 0); only the tracer.json copy (line 1097 `data[\"counters\"] = summary[\"counters\"][\"all\"]`) lacks the defaults. test_reduce.py's fixture has one abandoned entry, so the key was always present in the tests.",
+    "fix": "In update_tracer_json write the zero-defaulted counters, e.g. `data[\"counters\"] = dict(summary[\"counters\"][\"all\"], unmatched_exits=summary[\"counters\"][\"unmatched_exits\"], unmatched_exits_first_on_tid=summary[\"counters\"][\"unmatched_exits_first_on_tid\"], abandoned_entries=summary[\"counters\"][\"abandoned_entries\"])` (keeps test_tracer_json_updated passing), and add a test that reduces a trace with no abandoned entries and asserts `tracer[\"counters\"][\"abandoned_entries\"] == 0`.",
+    "review": "review:python"
+  },
+  {
+    "file": "profiler/tracer/roles.toml",
+    "line": 72,
+    "severity": "minor",
+    "owner": "t5",
+    "summary": "The shared classifier and reduce.py's built-in fallback disagree for unnamed Live threads: roles.toml gives `live:Ableton Live 12`, the built-in gives `unknown:Ableton Live 12`, although the symbolizer report (deviation 5) claims the two were aligned; design B section 5 reserves `live:<comm>` for named threads.",
+    "evidence": "Ran both classifiers on tid 4201 (comm \"Ableton Live 12\" == process comm, image \"Ableton Live 12 Trial.exe\"): RoleTable.classify -> `live:Ableton Live 12` (rule at roles.toml:71-73 has no `named` field), Reducer.builtin_role -> `unknown:Ableton Live 12` because reduce.py:433 requires `comm != self.pid_comm.get(pid)`. All other fixture cases agree. test_reduce.test_builtin_roles_match_shared_classifier never includes an unnamed Live thread (the fixture names every Live thread), so the mismatch is untested. summary.json `roles` keys therefore differ between the roles.toml and `--no-roles` paths on a real trace.",
+    "fix": "Pick one rule and test it: add `named = true` to the `live:{comm}` rule (restores design B's 'named Live thread' and matches the built-in), and in reduce.py:433 require a known process comm (`pcomm = self.pid_comm.get(pid); ... and pcomm is not None and comm != pcomm`) so the two agree when the main thread was never seen; extend test_builtin_roles_match_shared_classifier with an unnamed Live thread (comm == process comm) and assert both classifiers return the same string.",
+    "review": "review:python"
+  },
+  {
+    "file": "profiler/tracer/reduce.py",
+    "line": 606,
+    "severity": "minor",
+    "owner": "t4",
+    "summary": "Children discovered through `P` lines (exec'd after `start`) get `pid_image`/`pid_comm` from the comm at sched_process_exec time, which for a Wine child is the loader binary's basename, not the Windows exe; the later task_rename (`N` line with tid == pid) only updates `names[tid]`, so the `webview`/`max`/`push2`/`main` rules (which match `.exe` image names) never fire for late-spawned Max.exe / msedgewebview2.exe / Push2DisplayProcess.exe processes and every thread of them is `unknown:<comm>`.",
+    "evidence": "wine-trace.bt:232-237 prints `P ... comm=%s` from the sched_process_exec probe, where the kernel has already set comm to the basename of the exec'd file (begin_new_exec runs before trace_sched_process_exec); Wine starts children by exec'ing its loader and only afterwards renames the main thread via prctl(PR_SET_NAME, exe name), which arrives as an `N` line. reduce.py:603-606 does `self.pid_comm.setdefault(pid, comm)` / `self.pid_image.setdefault(pid, comm)` with that loader comm and reduce.py:599-602 (`N`) never touches pid_comm/pid_image. roles.toml:51-66 and reduce.py:425-431 need `msedgewebview2.exe`/`Max.exe`/`Push2DisplayProcess.exe`/`\\.exe$` images; even a correctly renamed comm is 15 chars (`msedgewebview2.`, `Push2DisplayPro`), so the exe regexes would still fail. Only pids present at `start` (image from /proc/PID/cmdline, wine-trace:257-259) classify correctly.",
+    "fix": "On an `N` line with tid == pid, set `self.pid_comm[pid] = comm` and, when the image came from a `P` line (track a `self.pid_image_from_exec` set), `self.pid_image[pid] = comm`; make the exe rules tolerate the 15-char comm (e.g. `exe = \"^msedgewebview2\\\\.\"`, `\"^Push2DisplayPro\"`, and treat `main` as tid == pid of any traced process), or have `wine-trace stop` write `/proc/PID/cmdline` basenames for `P`-discovered pids into tracer.json so reduce.py keeps using real image names. Add a fixture with `P ... comm=wine64-preloade` + `N <pid> comm=Max` and assert role `max`.",
+    "review": "review:python"
+  },
+  {
+    "file": "profiler/tracer/tests/test_validate.py",
+    "line": 4,
+    "severity": "minor",
+    "owner": "t5",
+    "summary": "The documented test invocation `python -I -m unittest discover -s profiler/tracer/tests -t profiler/tracer` fails with `ImportError: Start directory is not importable` because tests/ has no __init__.py (the same happens with `-t <repo root>`); only the README form without `-t` and the Makefile's per-file runs work.",
+    "evidence": "Ran the docstring command from the repo root on Python 3.13: `ImportError: Start directory is not importable: '...\\\\profiler\\\\tracer\\\\tests'`. `python -I -m unittest discover -s profiler/tracer/tests -v` (README) runs 79 tests OK, and `python -I ./profiler/tracer/tests/test_validate.py` (Makefile test-profiler target) runs 14 OK.",
+    "fix": "Change the docstring to the working command (`python3 -I -m unittest discover -s profiler/tracer/tests -v` from the repo root, as README.md and the other three test modules say), or add an empty profiler/tracer/tests/__init__.py if the `-t` form is wanted (then keep the sys.path/importlib loading, which does not depend on the package).",
+    "review": "review:python"
+  },
+  {
+    "file": "patches/pipeasio/0017-usdt-block-markers.patch",
+    "line": 74,
+    "severity": "minor",
+    "owner": "t2",
+    "summary": "README hunk claims both ELF halves (pipeasio64.dll.so and pipeasio32.so) carry the trace points and then tabulates all six, but pipeasio32.so is built from src/wow64/audio_unix.c, handle_table.c, src/audio.c, hotplug.c, config.c (scratch pipeasio CMakeLists.txt:163-164, BUILD_WOW64_32, default OFF) and never compiles src/asio.c, so it carries only cycle_start/cycle_end; block_start/block_before_live/block_after_live/block_end exist only in pipeasio64.dll.so (and are no-ops in the mingw PE stub).",
+    "evidence": "patch lines 74-76: 'The ELF driver halves (`pipeasio64.dll.so`, and `pipeasio32.so` for WoW64) carry static USDT trace points under the provider `pipeasio`' followed by the six-row table; CMakeLists.txt:163-164 'add_library(pipeasio32_unix_objs OBJECT src/wow64/audio_unix.c src/wow64/handle_table.c src/audio.c src/hotplug.c src/config.c)' (no asio.c); the PE front end is compiled with -DPIPEASIO_WOW64_PE (CMakeLists.txt:143) where PIPEASIO_PROBE is ((void)0).",
+    "fix": "Reword the README paragraph: 'pipeasio64.dll.so carries all six probes; the optional WoW64 unixlib pipeasio32.so (BUILD_WOW64_32, off by default) carries only cycle_start and cycle_end, because the block markers live in src/asio.c, which the WoW64 build compiles only into the mingw PE front end where PIPEASIO_PROBE is a no-op.' Regenerate the patch (git format-patch -1 as before) and re-run scripts/build-audit.sh --freeze since the file hash changes.",
+    "review": "review:patch-hygiene"
+  },
+  {
+    "file": "patches/pipeasio/0017-usdt-block-markers.patch",
+    "line": 443,
+    "severity": "minor",
+    "owner": "t2",
+    "summary": "The vendored include/sdt.h keeps upstream's one trailing-whitespace line ('+  ' = pristine sdt.h line 138); it is the only trailing-whitespace line in either patch, and 0108 blanked the same line (declared as local change 3 in its provenance block), so the two copies design B calls 'the same vendored header' now differ in whitespace. No functional effect: GNU patch 2.7.6 applies it silently.",
+    "evidence": "LC_ALL=C grep -n -E '^\\+.*[[:space:]]$' patches/pipeasio/0017-usdt-block-markers.patch -> only line 443 ('+  '); same scan of 0108 -> 0 lines; diff of pristine sdt.h (sha256 1e31c26a...) against the applied 0017 include/sdt.h shows the line retained, against the applied 0108 dlls/ntdll/unix/sdt.h shows it blanked.",
+    "fix": "Either blank the line and add a numbered entry to the provenance comment exactly as 0108 does (then re-run --freeze), or, if byte-exactness against upstream is preferred, add 'patches/pipeasio/0017-usdt-block-markers.patch whitespace=-blank-at-eol' to .gitattributes next to the existing entries for 0105/0106/pipeasio/0012.",
+    "review": "review:patch-hygiene"
+  },
+  {
+    "file": "profiler/tracer/Makefile",
+    "line": 52,
+    "severity": "blocker",
+    "owner": "t7",
+    "summary": "The libbpf loader profiler/tracer/wine-trace.c and BUILD.md do not exist, so the stage's deliverable (build/wine-trace) cannot be built and every loader-side item of this review (CLI, per-pid USDT attach, fork follow, agg drain, ring-buffer consumer, JSON writers, SIGINT flush, chown) is unverifiable; make all and make check both stop at the link rule.",
+    "evidence": "git status shows only wine-trace.bpf.c, wine-trace.h, Makefile under profiler/tracer (no wine-trace.c, no BUILD.md; `find . -name 'wine-trace*'` lists only the .bpf.c/.bt/.h and bin/wine-trace). On the VM (/tmp/profiler-w3/review-bpf/src, kernel 7.2.9-2-cachyos, clang 23.1.1, libbpf 1.7.0, bpftool 7.8.0): `make BUILD=... all` -> \"make: *** No rule to make target 'wine-trace.c', needed by '/tmp/profiler-w3/review-bpf/build/wine-trace'.  Stop.\" (exit 2); `make check` fails identically. The BPF object alone builds: `make .../wine-trace.skel.h` compiles wine-trace.bpf.c with the Makefile's exact flags (only warning in the file: line 300 -Wsign-compare; 9 -Wmissing-declarations come from the generated vmlinux.h) and `bpftool gen skeleton` succeeds (32 programs, 17 map VARs incl. agg0..3/agg/rb/stats/unixlibs/trigger_ids and the two __bpf_usdt_* maps). The wrapper profiler/bin/wine-trace:510-523 switches to this backend as soon as build/wine-trace is executable and, unlike the bpftrace path, runs no reduce.py at stop (lines 636-637 only warn if blocks.jsonl is missing), so the missing loader must itself write blocks.jsonl/threads.jsonl/summary.json.",
+    "fix": "Write profiler/tracer/wine-trace.c against build/wine-trace.skel.h: parse `--out DIR --mode summary|drilldown|sample --pid P... [--ntsync fentry|kprobe|tracepoint|off] --sched on|off [--run-id T] [--sample 1/N] [--stack-bytes N] [--roles audio|all] [--no-exit] [--slack-threshold PCT] [--ringbuf-mb N] [--duration S] [--trigger-ids ...] --version` (the wrapper passes exactly `--out --mode --pid... [--ntsync off] --sched on|off [--run-id]` and reads one line from `--version`); after skeleton open: bpf_map__set_max_entries(rb, mb<<20), set cfg (mode, sample_n 64/4, stack_bytes 1536, roles, slack 15, no_exit, offcpu_min_ns 50000), bpf_program__set_autoload(false) on the unused ntsync variant programs, on one of the two tp_btf/sched_waking programs (pick on_sched_waking_irq only if `__preempt_count` is in vmlinux BTF), on sched programs when --sched off, and on on_perf_sample unless --mode sample (otherwise load fails when the ntsync module/BTF is absent); then load, fill `pids`, attach the 8 wine probes (ntdll.so path from /proc/PID/maps) and 6 pipeasio probes (pipeasio64.dll.so) with bpf_program__attach_usdt(prog, pid, path, provider, name, NULL) per pid, attach sched/ntsync programs, and on REC_FORK records re-run the per-pid USDT attach for the child (retry after exec; a non-Wine child will simply never hit). Consume the ring buffer at >= 20 Hz (records are self-describing via rec_hdr.type/len; rec_stack's data length is nbytes, the ring slot is sizeof+class), drain all four agg slots with bpf_map_lookup_and_delete_batch on a timer (not only on epoch progress: window buckets share the slots and g->epoch never advances without blocks) and again at stop, merging late keys (long waits complete after their epoch was drained) by their own seq. On SIGINT/SIGTERM flush and write blocks.jsonl, threads.jsonl, summary.json, events.jsonl/stacks.jsonl (symbolize.py shape: {type:'stack',ref,t,tid,pid,seq,kind,id,frame,rip,rsp,regs:[20],stack_hex}) and update tracer.json with stopped_monotonic_ns, lost_events (ST_RINGBUF_DROP), probe_hits, counters.unmatched_exits/abandoned_entries/ringbuf_drops, overhead_estimate_ns_per_block; chown outputs to SUDO_UID:SUDO_GID. Add BUILD.md (host prerequisites, make targets, vmlinux.h regeneration after kernel updates).",
+    "review": "review:bpf"
+  },
+  {
+    "file": "profiler/tracer/wine-trace.bpf.c",
+    "line": 542,
+    "severity": "major",
+    "owner": "t7",
+    "summary": "crossing_entry() evaluates want_stack() for every kind, so server_req_start/server_wait_start entries emit junk rec_stack records (frame = req type or 0, rsp = 0), consume the 1/N sampling counter meant for syscalls/unix calls, and set e->sampled = 1 so complete_event() attaches the junk sample instead of inheriting the enclosing syscall's real stack, contrary to design B section 3c.",
+    "evidence": "wine_server_req_start (line 670-674) calls crossing_entry(KIND_SERVER_REQ, req_type, req_type, 0, 0) and wine_server_wait_start (683-688) crossing_entry(KIND_SERVER_WAIT, flags, 0, 0, 0); crossing_entry line 542 `if (want_stack(c, g, now, id))` has no kind test, and want_stack returns true on every sample_n-th call of ST_SAMPLE_CTR (line 393-402) or on a trigger id. stack_fill then does bpf_probe_read_user(r->regs, 160, (void*)req_type) which faults -> regs zeroed, rsp = regs[17] = 0 -> no bytes, ST_STACK_READ_FAIL++, yet emit_stack still submits the sizeof(rec_stack)+class (512..4096) reservation and crossing_entry sets e->sampled = 1 (line 548-549); complete_event line 363 `stack_ts = e.sampled ? e.ts : 0` then skips the enclosing-entry search (line 366-370). In drill-down (SAMPLE_N_DRILLDOWN 4) one in four server requests/waits produces a 0.7-4.3 KB empty record and a stack_ts that symbolize.py resolves to frames: [].",
+    "fix": "Only sample at syscall/unix-call entries: `if ((kind == KIND_SYSCALL || kind == KIND_UNIXCALL) && want_stack(c, g, now, id)) { ... }` (kind is a compile-time constant after inlining, so the whole emit_stack body drops out of the server_* programs). Optionally make emit_stack discard (bpf_ringbuf_discard) when got == 0 and regs could not be read, so ST_STACK_READ_FAIL never comes with a useless record.",
+    "review": "review:bpf"
+  },
+  {
+    "file": "profiler/tracer/wine-trace.bpf.c",
+    "line": 607,
+    "severity": "minor",
+    "owner": "t7",
+    "summary": "A syscall_exit fired by the unix-call slow path (restore_flags has RESTORE_FLAGS_INCOMPLETE_FRAME_CONTEXT) can never match a KIND_SYSCALL entry, because the unix-call entry is KIND_UNIXCALL and was already popped by unixcall_exit, so each such exit is counted in ST_UNMATCHED_EXIT, the counter validate.py gates at <= 1 per tid.",
+    "evidence": "Wine 11.13 scratch tree dlls/ntdll/unix/signal_x86_64.c:3318 sets `movl $0x20000,0xb4(%rcx)` on every unix-call frame and 3399-3400 jump to __wine_syscall_dispatcher_return when `testl $0xffff,0xb4(%rcx)` is non-zero, after the unixcall_exit probe site (3386, `movq %rsp,%rcx`); wine_syscall_exit (line 599-608) sets AGGF_INCOMPLETE from the 0x20000 bit but still calls crossing_exit(KIND_SYSCALL, frame, true, ...), whose inflight_find(KIND_SYSCALL, frame) fails and increments ST_UNMATCHED_EXIT (line 574-577). Design B section 1b says the flag \"tells the tracer that an exit belongs to a unix call whose frame was modified\"; the current code turns that into a spurious unmatched exit.",
+    "fix": "In wine_syscall_exit, when `(__u32)restore_flags & WT_RESTORE_FLAGS_INCOMPLETE_FRAME_CONTEXT` is set, call crossing_exit with a flag that treats a miss as expected (e.g. count ST_UNIXCALL_SLOW_EXIT instead of ST_UNMATCHED_EXIT, or return 0 before inflight_find when no KIND_SYSCALL entry with that frame exists).",
+    "review": "review:bpf"
+  },
+  {
+    "file": "profiler/tracer/wine-trace.bpf.c",
+    "line": 1256,
+    "severity": "minor",
+    "owner": "t7",
+    "summary": "on_sched_waking_irq tests preempt_count against 0x001fff00, which is neither the mask named in the comment nor the kernel's in_task() test: it classifies bh-disabled process context (SOFTIRQ_DISABLE_OFFSET bits 9-15) as interrupt context, dropping the waker tid, and misses NMI nesting bits 21-23.",
+    "evidence": "Linux preempt.h: SOFTIRQ_MASK 0x0000ff00 (SOFTIRQ_OFFSET = bit 8 is 'serving softirq', bits 9-15 count local_bh_disable), HARDIRQ_MASK 0x000f0000, NMI_MASK 0x00f00000; in_task() = !(NMI_MASK|HARDIRQ_MASK|SOFTIRQ_OFFSET) = 0x00ff0100. The comment on lines 1242-1243 says `HARDIRQ_MASK | SOFTIRQ_MASK | NMI_MASK` (= 0x00ffff00) but the code uses 0x001fff00. __preempt_count is present in vmlinux BTF on the VM ([72865] VAR, .data..percpu offset 98352), so this program is the one the loader is meant to pick.",
+    "fix": "Use `(*pc & 0x00ff0100)` (NMI_MASK | HARDIRQ_MASK | SOFTIRQ_OFFSET, the in_task() complement) and fix the comment; a spin_lock_bh/local_bh_disable waker is process context and its tid should be kept.",
+    "review": "review:bpf"
+  },
+  {
+    "file": "profiler/tracer/wine-trace.bpf.c",
+    "line": 929,
+    "severity": "minor",
+    "owner": "t7",
+    "summary": "In the kprobe and tracepoint fallbacks every ioctl return is offered to ntsync_wait_exit, so ST_NTSYNC_UNMATCHED is incremented for every non-wait ntsync command (CREATE_SEM/MUTEX/EVENT, SEM_RELEASE on the char device) and, in tracepoint mode, for every ioctl of any fd (ALSA, DRM, PipeWire) on traced threads, making the counter meaningless outside fentry mode.",
+    "evidence": "kr_ntsync_char_ioctl (line 1033-1037) and tp_sys_exit_ioctl (1060-1064) call ntsync_wait_exit(ret) unconditionally; ntsync_wait_exit (909-932) does inflight_find(KIND_NTSYNC_WAIT) and on -1 executes stat_inc(ST_NTSYNC_UNMATCHED) (line 929-931). Only fx_ntsync_char_ioctl (1004-1012) filters on cmd first. The comment at 1022-1023 acknowledges the kretprobe limitation but the counter is still charged.",
+    "fix": "Record the wait in progress per tid at enter (e.g. a `__u8` in sched_ent or a small per-tid map set in ntsync_wait_enter and cleared in ntsync_wait_exit) and have the kretprobe/tracepoint exit handlers return silently when it is not set; keep ST_NTSYNC_UNMATCHED for the fentry/fexit pair only.",
+    "review": "review:bpf"
+  },
+  {
+    "file": "profiler/tracer/wine-trace.bpf.c",
+    "line": 819,
+    "severity": "minor",
+    "owner": "t7",
+    "summary": "pipeasio_cycle_start pushes a KIND_CYCLE in-flight entry regardless of cfg.no_exit, unlike crossing_entry and ntsync_wait_enter which aggregate at entry in that mode; if the loader does not attach cycle_end under --no-exit (exit probes are documented as not attached), the data-loop thread's 4-deep stack fills with cycle entries and every later push reports ST_INFLIGHT_OVERFLOW.",
+    "evidence": "crossing_entry line 534-540 and ntsync_wait_enter line 899-902 branch on c->no_exit; pipeasio_cycle_start line 818-821 does inflight_get(tid, true) + inflight_push(KIND_CYCLE) unconditionally and never consults cfg (it does not even call cfg_get). wine-trace.h:170 documents no_exit as \"count at entry, exit probes not attached\". Entries are only ever popped by pipeasio_cycle_end (846-858) or process exit.",
+    "fix": "In pipeasio_cycle_start fetch cfg and, when c->no_exit, call agg_add(seq, tid, KIND_CYCLE, fl, 0, 0, 0, 0, 0) instead of pushing; alternatively document in the loader that cycle_end is always attached and keep the push only when !c->no_exit.",
+    "review": "review:bpf"
+  },
+  {
+    "file": "profiler/tracer/Makefile",
+    "line": 22,
+    "severity": "minor",
+    "owner": "t7",
+    "summary": "BPF_CFLAGS passes -Wall -Wextra with the generated vmlinux.h on the ordinary include path, so every build prints nine -Wmissing-declarations warnings from vmlinux.h on kernel 7.2.9 and buries the one real warning in the file (line 300, int vs __u32 comparison).",
+    "evidence": "VM build output: `vmlinux.h:32818:3: warning: declaration does not declare anything [-Wmissing-declarations]` (and 8 more at 40069, 59633, 81280, 82920, 119228, 119470, 132450, 133097), then `wine-trace.bpf.c:300:9: warning: comparison of integers of different signs: 'int' and '__u32' [-Wsign-compare]` -> \"10 warnings generated\".",
+    "fix": "Include the generated header as a system header (`-isystem $(BUILD)` instead of `-I$(BUILD)` in BPF_CFLAGS) or add -Wno-missing-declarations; in inflight_find declare `__u32 i` (or compare `i < (int)d`) so the file builds warning-free.",
+    "review": "review:bpf"
+  },
+  {
+    "file": "patches/0108-ntdll-add-static-trace-points.patch",
+    "line": 723,
+    "severity": "minor",
+    "owner": "t1",
+    "summary": "Latent build fragility: the four STAP_PROBE_ASM raw-template probes only compile through sdt.h's C99 variadic branch (sdt.h hunk line 623, `__STDC_VERSION__ >= 199901L`); under any pre-C99 -std the non-variadic branch pastes the template unquoted and signal_x86_64.c fails with cryptic errors. The jammy gcc 11 default (gnu17) is fine and neither configure.ac nor container-build.sh passes -std= to the unix side (the -std=gnu99 loop at configure.ac:527 is for the PE cross compiler), so nothing is broken today; the patch just has no guard.",
+    "evidence": "VM /tmp/profiler-w3/review-asm/run2.log section 1b: gcc 16.2.1 -std=gnu89 on the verbatim patched dispatcher blocks -> 16 error lines ('stray @ in program', 'expected : or ) before ( token' at sdt.h:512 via _SDT_ASM_BODY / STAP_PROBE_ASM); the same TU with the default standard assembles with 4 notes. gcc -E (section 0) shows the C99 path stringifies the template correctly: .ascii \"-4@176(%rcx) 8@%rcx 8@136(%rcx) 8@112(%rcx)\".",
+    "fix": "In the signal_x86_64.c hunk, right after `#include \"sdt.h\"` (patch line 723) add: `#if !defined(__STDC_VERSION__) || __STDC_VERSION__ < 199901L` / `#error \"STAP_PROBE_ASM raw templates need sdt.h's C99 variadic form\"` / `#endif`, so a future CFLAGS=-std=gnu89 fails with one clear message instead of 16 macro-expansion errors. Keep sdt.h itself pristine. Re-run `git am --3way` on a fresh series-aceb236 checkout and refresh SERIES.sha256 (t3) if the patch bytes change.",
+    "review": "review:asm"
+  }
+]

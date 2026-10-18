@@ -1,0 +1,142 @@
+[
+  {
+    "file": "scripts/bench-report.py",
+    "line": 2610,
+    "severity": "major",
+    "owner": "q3b",
+    "summary": "`block_sites()` ignores the `caller` the tracer puts on every crossing and derives call sites only from `block[\"stacks\"]`, which reduce.py never fills (it always writes `\"stacks\": []`, reduce.py:670, and puts `caller` on each crossing, reduce.py:773, README.md:124). On real tracer output every call-site key collapses to `kind|id|unsampled`, so the measurement's `call_sites`, `compare`'s key join, `history-add`'s `call_sites_top`, the ledger's `evidence.call_site` and `ledger-report`'s open hotspots all lose the call-site identity the whole loop pivots on, and no longer match the tracer's own `summary.json` keys.",
+    "evidence": "Executed: fed reduce.py's own fixture (profiler/tracer/tests/test_reduce.py build_fixture + run_reduce) through `report.interface()` with a window covering the blocks. Tracer summary.json call_site keys: ['syscall|NtWaitForSingleObject|ntdll.dll!NtWaitForSingleObject+0x14', 'ntsync_wait|WAIT_ANY|ntdll.dll!NtWaitForSingleObject+0x14', 'syscall|NtCreateEvent|ntdll.dll!NtCreateEvent+0x14', 'server_req|create_event|ntdll.dll!NtCreateEvent+0x14', 'ntsync_wake|EVENT_SET|none']. measurement['interface']['call_sites'] keys from the same files: ['syscall|NtWaitForSingleObject|unsampled', 'ntsync_wait|WAIT_ANY|unsampled', 'syscall|NtCreateEvent|unsampled', 'server_req|create_event|unsampled', 'ntsync_wake|EVENT_SET|unsampled', 'syscall|NtReleaseSemaphore|unsampled']; every `caller` is 'unsampled'; `hotspots_non_audio` callers are 'unsampled' too. Block totals, lost_slack (353334/326667/26667) and late/near-late counts agree with the tracer, so only the caller dimension is lost. The unit tests pass only because their fixture (test-bench-report.py:266-282) puts `stacks` with `frames` on blocks and omits `caller` on crossings, the opposite of what the tracer writes.",
+    "fix": "In `block_sites()` use the crossing's own caller when present: `caller = crossing.get(\"caller\"); if isinstance(caller, str) and caller: sites.append({\"key\": f\"{kind}|{name}|{caller}\", \"caller\": caller, \"n\": count, \"total_ns\": total_ns, ...}); continue` and keep the sampled-stack split / \"unsampled\" only as the fallback when no caller is recorded. Optionally prefer `blocks.symbolized.jsonl` over `blocks.jsonl` when wine-trace wrote it (symbolized module+offset callers). Add a test to test-bench-report.py with `interface_crossing(..., caller=\"ntdll.dll!NtWaitForSingleObject+0x14\")` asserting the key `ntsync_wait|NtWaitForSingleObject|ntdll.dll!NtWaitForSingleObject+0x14` and that a block without `stacks` keeps the tracer's caller.",
+    "review": "review:execute"
+  },
+  {
+    "file": "scripts/bench-report.py",
+    "line": 2681,
+    "severity": "minor",
+    "owner": "q3b",
+    "summary": "`hotspots_non_audio` is built only from crossings recorded inside audio blocks (`interface_call_sites` -> `block_sites`), while the tracer attributes seq-0 events of main/loader/UI threads to 100 ms window buckets (threads.jsonl, no caller) and computes its whole-trace `summary.json[\"hotspots_non_audio\"]` (reduce.py `hotspots()`, line 1034). The report's whole-app list therefore misses every non-audio crossing that fell between blocks and differs from the tracer's list, which the agent prompt (section 1, whole-app view) relies on.",
+    "evidence": "Same executed run as the previous finding: tracer summary hotspots_non_audio = [{'role': 'main', 'kind': 'syscall', 'name': 'NtUserMsgWaitForMultipleObjectsEx', 'caller': 'win32u.dll!NtUserMsgWaitForMultipleObjectsEx+0x14', 'n': 1, 'total_ns': 25000000}, {'role': 'live:MIDI', 'kind': 'syscall', 'name': 'NtDelayExecution', ...}, ...]; measurement['interface']['hotspots_non_audio'] = [{'caller': 'unsampled', 'kind': 'syscall', 'n': 1, 'role': 'live:MIDI', 'total_ns': 11000}, {'caller': 'unsampled', 'kind': 'server_req', 'n': 1, 'role': 'live:MIDI', 'total_ns': 8000}, {'caller': 'unsampled', 'kind': 'ntsync_wake', 'n': 1, 'role': 'wineserver', 'total_ns': 0}]: the 25 ms main-thread message wait (seq 0) is absent and the entries carry no `name`.",
+    "fix": "In `interface_section()` use `summary.get(\"hotspots_non_audio\")` from the tracer's summary.json when it is a list (whole-trace, documented as such in the section), falling back to the block-derived list only when summary.json is absent; include `name` in the block-derived entries so both shapes match `{role, kind, name, caller, n, total_ns}` (history-add already keys on role/kind/caller/n/total_ns).",
+    "review": "review:execute"
+  },
+  {
+    "file": "scripts/bench-report.py",
+    "line": 2999,
+    "severity": "minor",
+    "owner": "q3b",
+    "summary": "`interface-drilldown` reads `raw/interface/stacks.jsonl` for the per-block stacks and `interface_section` lists `evidence.stacks = raw/interface/stacks.jsonl`, but neither wine-trace nor reduce.py ever writes a `stacks.jsonl` (reduce.py writes `events.jsonl` in drilldown mode and wine-trace writes `blocks.symbolized.jsonl`; `grep stacks.jsonl profiler/bin/wine-trace profiler/tracer/wine-trace.bpf.c` finds nothing). The drilldown's extra-stacks branch is dead and the evidence entry points at a file that never exists.",
+    "evidence": "profiler/tracer/reduce.py:18 ('events.jsonl -- every completed crossing (--mode drilldown only)') and write_outputs() at reduce.py:1052-1062 write blocks.jsonl, threads.jsonl, summary.json and events.jsonl only; profiler/bin/wine-trace:640-648 writes blocks.symbolized.jsonl; bench-report.py:2831 and :2999 reference stacks.jsonl.",
+    "fix": "In drilldown mode read `events.jsonl` (records `{t, tid, role, kind, id, caller, dur_ns, status, seq, woken_by?}`) and group them by `seq` for the per-block crossing timeline; drop the `stacks` evidence entry or point it at `events.jsonl` only when that file exists.",
+    "review": "review:execute"
+  },
+  {
+    "file": "Makefile",
+    "line": 52,
+    "severity": "minor",
+    "owner": "q3b",
+    "summary": "`test-profiler` depends on `test-bench` and `test` ends with `$(MAKE) test-profiler`, so `make test` (the CI gate) runs `scripts/test-bench-report.py` and `scripts/test-bench-suite.sh` twice.",
+    "evidence": "VM: `make -n test` lists ./scripts/test-bench-report.py and ./scripts/test-bench-suite.sh in the `test` recipe and again inside the recursive `make test-profiler`; the author's report acknowledges the duplication (~2 s per run, more once the suite test grows).",
+    "fix": "Drop the `test-bench` prerequisite from `test-profiler` (the design's 'plus test-bench' is already satisfied because `test` runs both bench scripts before recursing), or keep the prerequisite and list the profiler commands directly in `test` instead of recursing.",
+    "review": "review:execute"
+  },
+  {
+    "file": "CLAUDE.md",
+    "line": 21,
+    "severity": "minor",
+    "owner": "q4",
+    "summary": "CLAUDE.md's exact-commands block and project map name `profiler/setup/verify.sh --profile vm` (line 21) and `profiler/bin/profile-app` (line 13), neither of which exists in the tree; an agent or human following the file hits 'No such file' on the documented health check.",
+    "evidence": "`ls profiler/setup/verify.sh profiler/bin/profile-app` -> both MISSING while every other path cited in CLAUDE.md exists (setup-machine.sh, state, bench, wine-trace, trace-prereqs, history-add, ledger-report, wine-dev.sh, build-official.sh, install.sh, smoke-test.sh all present). The author lists this under VERIFY but left the lines as commands.",
+    "fix": "Remove the two references or mark them '(pending, workstream A/D)' until the files land, and point the health check at an existing command (`profiler/bin/trace-prereqs`, `profiler/control/smoke-test.sh`) in the meantime.",
+    "review": "review:execute"
+  },
+  {
+    "file": "scripts/bench-suite.sh",
+    "line": 489,
+    "severity": "major",
+    "owner": "q3a",
+    "summary": "A `--scenario` run started without `profiler/bin/bench` (env ABL_BENCH_OSC_SEND/RECV unset) talks to two different control endpoints: bench-osc.py (probe, dump, the final /abl/bench/stop) defaults to 19001/19002 = the M4L device still embedded in the canonical sets, while scenario-run.py/liveosc.py default to 11000/11001 = AbletonOSC. The probe is then satisfied by the M4L device, `setup` and the timeline drive AbletonOSC, and every Live-side `/abl/bench/scenario-marker` echo goes to 11001 where nothing listens, so raw/osc.tsv carries the M4L cpu lines but no markers and the run looks healthy.",
+    "evidence": "scripts/bench-osc.py:27-28 `SEND_PORT = int(os.environ.get(\"ABL_BENCH_OSC_SEND\", 19001))` / `RECV_PORT ... 19002`; profiler/control/liveosc.py:45-46 `SEND_PORT = ... 11000` / `RECV_PORT = ... 11001` (deliberately different defaults per design C §port decision). scripts/bench-suite.sh only reads the variables (`${ABL_BENCH_OSC_RECV:-19002}` at 229, 231, 486) and never exports them; line 489 runs `python3 \"$scenario_tool\" setup --scenario` with the inherited env and line 528 sends /abl/bench/stop through bench-osc.py. scripts/bench-report.py:1888-1901 starts `bench-osc.py dump` (binds RECV=19002) and `scenario-run.py run` (sends to 11000, AbletonOSC replies to 11001 per vendor/AbletonOSC/abletonosc/osc_server.py:81-83,165) from the same env. Only profiler/bin/bench:37-38 exports 11000/11001, and the suite's own `--scenario` option/usage text (46-60) does not require the wrapper.",
+    "fix": "In scripts/bench-suite.sh, right after option parsing (near line 134), make AbletonOSC the default endpoint whenever a scenario is requested, since only the bench handler serves /abl/bench/scenario-marker: `if [ -n \"$scenario\" ]; then export ABL_BENCH_OSC_SEND=\"${ABL_BENCH_OSC_SEND:-11000}\" ABL_BENCH_OSC_RECV=\"${ABL_BENCH_OSC_RECV:-11001}\"; fi` (or `fail` when they are unset), drop the 'M4L device' alternative from the 486 message in scenario mode, and add a dry-run assertion in scripts/test-bench-suite.sh (`--scenario` + env unset prints the 11000/11001 ports). Alternative owned by q2: have liveosc.py refuse to run when bench-osc.py's resolved SEND_PORT/RECV_PORT differ from its own, which turns the silent mismatch into an error.",
+    "review": "review:live-api"
+  },
+  {
+    "file": "profiler/control/overlay/abletonosc/bench.py",
+    "line": 249,
+    "severity": "minor",
+    "owner": "q1",
+    "summary": "The first /abl/bench/load-device for a KIND walks the entire browser root (every preset folder below every device node, `item.children` on every node) on Live's main thread before loading anything, and the load-devices scenario issues that first call at at_s 0.0 inside the measurement window; pre-order DFS also lets a same-named preset inside an earlier sibling's subtree shadow a top-level device.",
+    "evidence": "bench.py:251-259: `stack = [getattr(browser, kind)]; while stack: item = stack.pop(); ... stack.extend(reversed(list(item.children)))` has no early exit and descends below loadable device nodes (whose children are the Core Library preset trees: Drum Rack kits, Instrument Rack / Operator / Wavetable presets, every plugin folder under `plugins`), caching the whole tree in `self.browser_index[kind]` before `index.get(name)` runs. profiler/scenarios/load-devices.json timeline step 0 (`at_s 0.0, instruments, Operator`) is the first call, so the full walk lands inside the window and is attributed to the first device; UPSTREAM-API.md §9 notes that a slow handler delays the tick, the UI and every queued message. Index order: `if item.is_loadable and item.name not in index` keeps the first pre-order hit, so e.g. an Audio Effect Rack preset named exactly like a later top-level device would win.",
+    "fix": "Stop at the first hit and keep the partial walk for later lookups: keep `stack` and `index` per KIND in `self.browser_index[kind] = (index, stack)` and continue the DFS only until `name` is found; additionally do not descend below a node whose `is_loadable` (or `is_device`) is true unless the name was not found at that level (BFS over root children first, then the subtrees). With that, `Operator` costs one level of `browser.instruments.children`. Optionally warm the index in the scenario's setup (a `load_device` is allowed there for diagnostic scenarios) and say so in SCHEMA.md.",
+    "review": "review:live-api"
+  },
+  {
+    "file": "profiler/control/overlay/abletonosc/bench.py",
+    "line": 67,
+    "severity": "minor",
+    "owner": "q1",
+    "summary": "The is_playing listener (and the queued cpu tick) are only removed in clear_api(), which Manager calls on /live/api/reload but never on disconnect(); when Live disconnects the surface (Set closed, surface deselected, Live quitting) the closure stays registered on the Song and each later play/stop transition calls send() on the closed OSC socket, logging an error through a logger whose handlers stop_logging() already removed.",
+    "evidence": "bench.py:67-78 `clear_api()` is the only place `remove_is_playing_listener` runs; overlay/manager.py:145-150 `disconnect()` calls `stop_logging()`, `osc_server.shutdown()` and `super().disconnect()` and never `clear_api()`; ControlSurface.disconnect() disconnects every registered Component, and BenchHandler does not override `Component.disconnect`. `playing_changed` (bench.py:126-130) captures `song` and `self` and reports via `self.osc_server.send` -> OSError on the closed socket -> `logger.error(\"bench: playing report failed\")` with no file/relay handler left. tests/fake_live.py:280-281 models `ControlSurface.disconnect` as a no-op, so test_bench_handler.py cannot observe it. Same hygiene gap as upstream's beat listener (song.py:295-300), so parity, not a regression.",
+    "fix": "Add to BenchHandler: `def disconnect(self):\\n        self.clear_api()\\n        super().disconnect()` (clear_api is idempotent: generation bump, period 0, listener removed, `super().clear_api()` tolerates an empty listener map), and extend test_clear_api_removes_listener_and_cancels_period with a `handler.disconnect()` case plus a `disconnect()` that records the call in fake_live.Component/ControlSurface.",
+    "review": "review:live-api"
+  },
+  {
+    "file": "profiler/.gitignore",
+    "line": 4,
+    "severity": "blocker",
+    "owner": "q4",
+    "summary": "The unanchored pattern `runs/` in profiler/.gitignore ignores profiler/history/runs/, so history-add records (and the committed .gitkeep) can never be added; the agent loop's record commit and the dashboard's history glob both read that directory.",
+    "evidence": "`git check-ignore -v profiler/history/runs/.gitkeep` -> `profiler/.gitignore:4:runs/`; `git ls-tree -r HEAD -- profiler/history` lists only README.md and baselines.json (the .gitkeep written by q4 is missing from commit 70c262a); `git add --dry-run profiler/history/runs/.gitkeep` -> \"The following paths are ignored by one of your .gitignore files\" (exit 1 without -f), which is exactly the command AGENT-PROMPT.md:176 runs for every record commit (`git add profiler/ledger.jsonl profiler/history/runs/<run id>.json ...`); profiler/dashboard/src/data/load.ts:43 globs `../../../history/runs/*.json`. The root .gitignore already anchors its own entry as `profiler/runs/`.",
+    "fix": "Anchor the nested pattern: change line 4 of profiler/.gitignore from `runs/` to `/runs/` (profiler/runs/ stays ignored, profiler/history/runs/ does not), then `git add profiler/history/runs/.gitkeep`. profiler/.gitignore is not in this review's owner list (setup workstream); assigned to q4 because it blocks the history/ledger deliverable.",
+    "review": "review:design"
+  },
+  {
+    "file": "Makefile",
+    "line": 53,
+    "severity": "blocker",
+    "owner": "q3b",
+    "summary": "Every new executable (profiler/bin/*, profiler/control/{vendor.sh,install.sh,smoke-test.sh,liveosc.py,scenario-run.py}, profiler/setup/..., profiler/dev/*.sh, tools/build_traceprobe.sh; 36 shebang files) is committed as mode 100644, so on a Linux checkout `make test`/`make test-profiler` die at `./profiler/control/vendor.sh --check` and every documented command (`profiler/bin/bench`, `history-add`, `install.sh`, the `--trace` preflight `[ -x \"$tracer\" ]`) fails with Permission denied.",
+    "evidence": "`git config core.filemode` = false on this checkout; `git ls-tree -r HEAD` shows 100644 for all 36 shebang files added since aceb236 and no 100755 under profiler/. Demonstrated on the VM clone with the committed modes: `make -o test-bench test-profiler` -> `make: ./profiler/control/vendor.sh: Permission denied ... [Makefile:53: test-profiler] Error 127`; `./profiler/bin/bench --dry-run` -> `Permission denied`. profiler/bin/bench:72 execs `\"$here/with-session-env\"`, scripts/bench-suite.sh preflight refuses `--trace` when `$tracer` is not executable, and profiler/control/install.sh:67 runs `\"$here/vendor.sh\" --check` and would report the misleading \"vendor/AbletonOSC does not match VENDOR.txt\".",
+    "fix": "Before the next commit, on the Windows checkout: `git ls-tree -r HEAD --name-only -- profiler tools/build_traceprobe.sh | xargs grep -l '^#!' | xargs git update-index --chmod=+x` (then commit); additionally make the two in-repo callers mode-independent the way the Python tests already are: Makefile line 53 `bash ./profiler/control/vendor.sh --check` and install.sh:67 `bash \"$here/vendor.sh\" --check`.",
+    "review": "review:design"
+  },
+  {
+    "file": "scripts/bench-report.py",
+    "line": 2595,
+    "severity": "major",
+    "owner": "q3b",
+    "summary": "`interface` derives call-site callers only from an embedded `block[\"stacks\"][{tid,kind,id,frames}]` list that the tracer never produces and ignores the `caller` field reduce.py writes on every crossing, so every call site in measurement[\"interface\"] (and every hotspot) collapses to `kind|id|unsampled` and the symbolized callers are never used.",
+    "evidence": "bench-report.py:2589-2612: `stack_caller()` returns \"unsampled\" without frames and `block_sites()` keys on `block.get(\"stacks\")` samples, never reading `crossing.get(\"caller\")`; profiler/tracer/reduce.py:773 writes `\"caller\": caller` into each crossing (placeholders documented in profiler/tracer/README.md:107-110) and reduce.py:670 emits `\"stacks\": []` with nothing ever appended; profiler/tracer/symbolize.py:46-56 documents stacks as a separate stacks.jsonl referenced by `stack_ref`, with `frames`/`caller` added by the symbolizer; profiler/bin/wine-trace:644-647 writes the symbolized copy to blocks.symbolized.jsonl while bench-report.py:2895 reads only blocks.jsonl. Design C §B specifies `key: \"ntsync_wait|NtWaitForSingleObject|ntdll+0x7f3a1\"` and a `caller` chain per site; the AGENT-PROMPT picks trial targets by that key.",
+    "fix": "In `block_sites()` use `crossing.get(\"caller\")` as the caller (falling back to \"unsampled\" only when it is absent) and keep the stack-sample split as a refinement when samples match; in `interface()`/`interface_drilldown()` load `raw/interface/blocks.symbolized.jsonl` when it exists and fall back to blocks.jsonl; add a test fixture whose crossings carry `caller` and no stacks and assert the key is `kind|id|<caller>`.",
+    "review": "review:design"
+  },
+  {
+    "file": "scripts/bench-report.py",
+    "line": 2999,
+    "severity": "minor",
+    "owner": "q3b",
+    "summary": "`interface-drilldown` looks for per-block stacks in raw/interface/stacks.jsonl and prints their `frames`, but the tracer's stacks.jsonl holds raw frame/rip/regs records without `frames` and drilldown mode writes events.jsonl; the `evidence.stacks` path advertised in measurement[\"interface\"] likewise never exists.",
+    "evidence": "bench-report.py:2999-3002 reads `stacks.jsonl` by `seq` and drilldown_markdown prints `stack.get(\"frames\")`; profiler/tracer/symbolize.py:46-52 shows stacks.jsonl records as `{type:\"stack\", ref, seq, kind, id, frame, rip, rsp, regs, stack_hex}` (frames only in the symbolized output); profiler/tracer/reduce.py:1061 writes events.jsonl in drilldown mode and wine-trace:13 lists blocks/threads/summary (+events.jsonl) as the outputs; interface_section() always records `evidence.stacks: raw/interface/stacks.jsonl`.",
+    "fix": "Take symbolized `stacks[].frames` from blocks.symbolized.jsonl when present, list the block's events.jsonl records (by `seq`) as the crossing timeline in drilldown mode, and record `evidence.stacks`/`events` only for files that exist.",
+    "review": "review:design"
+  },
+  {
+    "file": "scripts/bench-report.py",
+    "line": 61,
+    "severity": "minor",
+    "owner": "q3b",
+    "summary": "`AUDIO_ROLES` omits the tracer's `pipeasio_worker` and `plugin:*` audio roles, so PipeASIO worker and plug-in audio threads are reported as `hotspots_non_audio`.",
+    "evidence": "bench-report.py:61 `AUDIO_ROLES = frozenset({\"pipeasio_callback\", \"audio_worker\", \"pipeasio_rt\"})` and :2680 `role not in AUDIO_ROLES`; profiler/tracer/roles.toml:24 `audio_roles = [\"pipeasio_callback\", \"audio_worker\", \"pipeasio_rt\", \"pipeasio_worker\", \"plugin:*\"]` (the set `wine-trace --roles audio` keeps).",
+    "fix": "Add `pipeasio_worker` to AUDIO_ROLES and treat `role.startswith(\"plugin:\")` as audio (or read `audio_roles` from the tracer header/summary.json), with a test case for a `plugin:Dexed.vst3` crossing.",
+    "review": "review:design"
+  },
+  {
+    "file": "CLAUDE.md",
+    "line": 21,
+    "severity": "minor",
+    "owner": "q4",
+    "summary": "CLAUDE.md documents `profiler/setup/verify.sh --profile vm` (line 21) and lists `profiler/bin/profile-app` (line 13), neither of which exists in the tree; an agent following the Commands block hits a missing file on its first health check.",
+    "evidence": "`ls profiler/setup/verify.sh profiler/bin/profile-app` -> both missing in commit 70c262a (profiler/setup/ has setup-machine.sh, lib/, phases/, templates/, root-helper/; profiler/bin/ has bench, history-add, ledger-report, state, trace-prereqs, wine-trace, with-session-env). q4's own report lists this under VERIFY.",
+    "fix": "Remove the two references (or mark them \"pending, setup workstream\") until the scripts land; keep the Commands block limited to files that exist.",
+    "review": "review:design"
+  }
+]
