@@ -407,6 +407,20 @@ Next candidates (user to choose; none pre-registered yet):
 - No effect on the audio side is visible in single runs. The DSP averages and the errors stay within run-to-run noise: Live's total CPU swings by about 4 points between identical runs because the audio workers' CPU varies.
 - Correction to G0: on the same runtime, the Vulkan back end with the renderer on is not clearly cheaper than OpenGL with the renderer off (14.5 vs 15.4). The earlier 42.1 % was a favourable run.
 - The DSP peak median was higher in both capped Vulkan runs (20.5 and 21.8 vs 18.2). A trial should check that.
+- Lower caps (user: "lets try one run at 5 fps", then 10 fps, then 15 fps; Vulkan, renderer on, dev runtime):
+
+  | Cap | Present wait | UI thread | wined3d_cs | Compositor | Sum | DSP avg / peak | Errors |
+  |---|---|---|---|---|---|---|---|
+  | none (60 fps) | — | 8.9 | 1.7 | 3.9 | 14.5 | 10.23 / 18.15 | 0 |
+  | 30 fps | up to 33 ms | 7.4–7.8 | 1.3 | 2.9–3.0 | 11.6–12.1 | 9.27–9.51 / 20.5–21.8 | 3, 5 |
+  | 15 fps | up to 67 ms | 5.0 | 0.8 | 2.0 | 7.8 | 8.07 / 24.19 | 19 |
+  | 10 fps | up to 100 ms | 3.8 | 0.6 | 1.5 | 5.9 | 5.58 / 36.30 | 20 |
+  | 5 fps | up to 200 ms | — | — | — | — | — | Live hung at startup and was killed |
+
+- The cap holds the rate exactly at every setting, but it does so by making Live's UI thread sleep inside each present. The longer that sleep, the worse the audio: the DSP peak climbs from 18 to 36, and the PipeWire errors jump to 19–20 at 15 and 10 fps.
+  - Likely cause: Live's main thread does work the audio engine depends on, or does its work in bursts after each long sleep.
+  - 30 fps is the only cap that looks harmless in single runs, and even there the peaks rise.
+- A cap that blocks presents is therefore the wrong mechanism below 30 fps. Lowering the frame rate safely needs Live itself to draw less often, with its UI thread free. One candidate: report a lower display refresh rate to Live (Wine's display frequency, which `DwmFlush` and the composition timing follow) instead of sleeping in `Present`.
 
 **RT-BORE kernel phase (user decision 2026-10-18: after T0013, stop and try the RT-BORE kernel with the NVIDIA driver; the same day the user moved it after T0014; pre-research only so far)**
 - What the laptop has:
