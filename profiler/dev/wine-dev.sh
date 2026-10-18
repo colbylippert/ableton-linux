@@ -1162,7 +1162,9 @@ cmd_sync() {
         errf="$(_scratch)/rsync-compare.err"
         changes="$(rsync "${rsync_opts[@]}" --dry-run -- "$STAGE_ROOT/" "$dest/" 2>"$errf")" \
             || { fail "comparing with $dest failed: $(head -c 400 -- "$errf")"; return 1; }
-        changes="$(printf '%s\n' "$changes" | grep -E '^[>ch*]' || true)"
+        # itemize: '>' a file received (local copy), '<' a file sent (to the deploy host),
+        # 'c' created, 'h' hard link, '*' a message such as *deleting
+        changes="$(printf '%s\n' "$changes" | grep -E '^[<>ch*]' || true)"
         n="$(printf '%s' "$changes" | grep -c . || true)"
         if [ "$n" -eq 0 ]; then
             ok "dev runtime already matches the stage"
