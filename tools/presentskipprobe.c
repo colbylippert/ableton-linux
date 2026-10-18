@@ -138,6 +138,7 @@ int main( void )
     HWND hwnd;
     HRESULT hr;
 
+    setvbuf( stdout, NULL, _IONBF, 0 );  /* each line as it happens, also through a pipe */
     printf( "INFO switch    WINED3D_PRESENT_SKIP=%s\n", env ? env : "(unset)" );
     wc.lpfnWndProc = DefWindowProcA;
     wc.hInstance = GetModuleHandleA( NULL );
