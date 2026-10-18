@@ -130,6 +130,11 @@ RUNTIME VARIABLES:
         0109; needs an invariant TSC on the tsc clocksource); unset keeps
         the regular syscall route
 
+    WINED3D_PRESENT_SKIP=N
+        show only every Nth Direct3D present of each window (patch 0110;
+        2-60): Live keeps drawing at the display rate and the screen
+        updates at 1/N of it; unset shows every present
+
     The pointer variables below override the saved pointer setting
     for one launch; the launcher exports none of them, and registry
     values hold the persistent settings. Values ignore letter case;

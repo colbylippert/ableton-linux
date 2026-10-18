@@ -11,7 +11,7 @@ point-version gap with upstream's actively-maintained branch and with ENCORE
 The rebase involved five merge conflicts and uncovered three additional build
 breaks, plus a `build.sh`/`pipefail` tooling issue.
 
-The Wine series contains 97 patch files and ends at 0109. The absent numbers
+The Wine series contains 98 patch files and ends at 0110. The absent numbers
 are 0027, 0044, 0072, 0074, 0090 through 0095, 0097, and 0098; their reasons
 are declared in `SERIES_GAPS` in `scripts/build-audit.sh`. Patch 0073 keeps
 the wheel coordinate fix separate. Patch 0100 combines 10 pointer patches.
@@ -485,6 +485,18 @@ Apply them in sequence with the rest of the series.
   so both routes agree. Unset, QPC takes its regular route. The fingerprint
   literal is `WINE_QPC_TSC` in `wineserver`. See
   `notes/ABLETON-WINE-USERMODE-QPC.md` and `tools/qpcprobe.c`.
+Patch 0110 adds present skipping (`WINED3D_PRESENT_SKIP`).
+  `WINED3D_PRESENT_SKIP=N` (2 to 60) shows only every Nth present of each
+  swap chain; `wined3d_swapchain_present` (`dlls/wined3d/swapchain.c`) returns
+  at once for the others, before it takes the wined3d lock. Live keeps its UI
+  loop at the display rate, which its audio engine depends on (slowing the loop
+  raised dropouts on the profiling laptop), while the present path and the
+  compositor run at 1/N of it. Buffers rotate only on a real present, so the
+  frames drawn in between land in the same back buffer and every frame shown
+  is complete. With a frame-latency waitable object a skipped present releases
+  the semaphore the worker thread would have released. Unset, every present is
+  shown. The fingerprint literal is `WINED3D_PRESENT_SKIP` in `wined3d.dll`. See
+  `notes/ABLETON-WINE-PRESENT-SKIP.md` and `tools/presentskipprobe.c`.
 - `pipeasio/0017` adds six USDT probes (provider `pipeasio`) to the PipeASIO
   driver: `cycle_start` and `cycle_end` around the PipeWire cycle in
   `audio_on_process`, and `block_start`, `block_before_live`,

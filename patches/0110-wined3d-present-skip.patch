@@ -1,0 +1,81 @@
+From 048f3787fae4acfa7193133322d47abe7223e944 Mon Sep 17 00:00:00 2001
+From: dist <build@localhost>
+Date: Sun, 18 Oct 2026 18:05:29 -0400
+Subject: [PATCH] wined3d: Show only every Nth present with
+ WINED3D_PRESENT_SKIP.
+
+---
+ dlls/wined3d/swapchain.c       | 40 ++++++++++++++++++++++++++++++++++++++++
+ dlls/wined3d/wined3d_private.h |  1 +
+ 2 files changed, 41 insertions(+)
+
+diff --git a/dlls/wined3d/swapchain.c b/dlls/wined3d/swapchain.c
+index 869fe45..e5824c4 100644
+--- a/dlls/wined3d/swapchain.c
++++ b/dlls/wined3d/swapchain.c
+@@ -323,6 +323,43 @@ void CDECL wined3d_swapchain_set_dirty_rects(struct wined3d_swapchain *swapchain
+     swapchain->present_dirty_rect_count = count;
+ }
+ 
++/* WINED3D_PRESENT_SKIP=N (2-60) shows only every Nth present of each
++ * swapchain; the others return at once without presenting. The application
++ * keeps its frame loop and its pace: Live keeps running its UI loop at the
++ * display rate, which its audio engine depends on, while the compositor and
++ * the present path run at 1/N of it. Buffers only rotate on a real present,
++ * so the frames drawn in between land in the same back buffer and each frame
++ * shown is complete. Unset: unchanged. */
++static unsigned int present_skip_interval(void)
++{
++    static int interval = -1;
++    const char *env;
++    int value;
++
++    if (interval >= 0)
++        return interval;
++    value = (env = getenv("WINED3D_PRESENT_SKIP")) ? atoi(env) : 0;
++    interval = value >= 2 && value <= 60 ? value : 0;
++    if (interval)
++        ERR_(winediag)("Showing every %d. present per swapchain (WINED3D_PRESENT_SKIP).\n", interval);
++    return interval;
++}
++
++/* TRUE when this present is skipped. A skipped present still balances the
++ * frame-latency handshake: with a waitable object the application waited on
++ * the semaphore for this frame, and the worker thread would have released it
++ * after the present; without one, the present path neither waits nor releases. */
++static BOOL present_skip(struct wined3d_swapchain *swapchain)
++{
++    unsigned int interval = present_skip_interval();
++
++    if (!interval || !(++swapchain->present_skip_count % interval))
++        return FALSE;
++    if (swapchain->state.desc.flags & WINED3D_SWAPCHAIN_FRAME_LATENCY_WAITABLE_OBJECT)
++        ReleaseSemaphore(swapchain->frame_latency_semaphore, 1, NULL);
++    return TRUE;
++}
++
+ HRESULT CDECL wined3d_swapchain_present(struct wined3d_swapchain *swapchain,
+         const RECT *src_rect, const RECT *dst_rect, HWND dst_window_override,
+         unsigned int swap_interval, uint32_t flags)
+@@ -337,6 +374,9 @@ HRESULT CDECL wined3d_swapchain_present(struct wined3d_swapchain *swapchain,
+     if (flags)
+         FIXME("Ignoring flags %#x.\n", flags);
+ 
++    if (present_skip(swapchain))
++        return WINED3D_OK;
++
+     wined3d_mutex_lock();
+ 
+     if (!swapchain->back_buffers)
+diff --git a/dlls/wined3d/wined3d_private.h b/dlls/wined3d/wined3d_private.h
+index 6f22e53..08777bf 100644
+--- a/dlls/wined3d/wined3d_private.h
++++ b/dlls/wined3d/wined3d_private.h
+@@ -4233,6 +4233,7 @@ struct wined3d_swapchain
+     /* Performance tracking */
+     LARGE_INTEGER last_present_time;
+     LONG prev_time, frames;
++    unsigned int present_skip_count; /* WINED3D_PRESENT_SKIP: presents seen */
+ 
+     /* Telemetry for the 0058 present-size gate.  Written only on the CS
+      * thread, in swapchain_gl_present_size_agrees(); zeroed by the calloc in
