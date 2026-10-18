@@ -28,8 +28,10 @@ Comparison rules (from the plan; the dashboard never bends them):
 2. **No timing claims under virtualisation.** Runs with `virtualization !== 'none'` carry the
    `NoTimingRibbon` wherever they are shown and are never compared with bare-metal runs
    (`virtualization` is part of the identity).
-3. **Identity** = `(machine_id, virtualization, structure/scenario, trace_mode)`. Every
-   baseline, delta, spread and trend is computed inside one identity.
+3. **Identity** = `(machine_id, virtualization, audio_device, structure/scenario, trace_mode)`.
+   Every baseline, delta, spread and trend is computed inside one identity. `audio_device`
+   (the PipeWire default sink's node.name) keeps runs on different interfaces apart, e.g. the
+   built-in speaker and the USB Focusrite; absent and `null` both mean unknown (older records).
 4. **Positive delta = improvement**, whatever the metric's direction. The sign flip is done
    once, in `signedDelta()`; the UI never re-derives it.
 5. **Noise before claims.** Significance is `|deltaAbs| > 2 × A/A spread` → "beyond noise",
@@ -113,8 +115,8 @@ traced runs, else the outcome primary (plan priority: 0 guards → 1 late/near-l
 ## 3. Gains model (`src/data/gains.ts`)
 
 ```
-identityOf(run)      = { machine_id, virtualization, structure, scenario, trace_mode }
-identityKeyOf(id)    = `${machine_id}|${virtualization}|${structure}/${scenario ?? '-'}|${trace_mode}`
+identityOf(run)      = { machine_id, virtualization, audio_device, structure, scenario, trace_mode }
+identityKeyOf(id)    = `${machine_id}|${virtualization}|${structure}/${scenario ?? '-'}|${trace_mode}|${audio_device ?? '-'}`
 baselineKeyOf(run)   = `${structure}/${scenario ?? '-'}`          // baselines.json inner key
 ```
 

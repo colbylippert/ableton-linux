@@ -30,7 +30,7 @@ describe('<RunTable>', () => {
   it('lists the identity columns, newest first, with a checkbox per run', () => {
     const onSelect = vi.fn();
     m = mount(<RunTable runs={runs} selected={[]} onSelect={onSelect} />);
-    expect(runTableColumns().map((c) => c.key)).toEqual(['started', 'run_id', 'tag', 'machine', 'environment', 'structure', 'trace', 'switches', 'trial', 'commit', 'duration', 'sets']);
+    expect(runTableColumns().map((c) => c.key)).toEqual(['started', 'run_id', 'tag', 'machine', 'environment', 'audio', 'structure', 'trace', 'switches', 'trial', 'commit', 'duration', 'sets']);
     const rows = m.$$('tbody tr');
     expect(rows).toHaveLength(3);
     expect(rows[0]?.textContent).toContain(RUN.b1);

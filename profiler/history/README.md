@@ -8,7 +8,7 @@ JSON file per run plus the baselines map.
 | File | Written by | Content |
 |---|---|---|
 | `runs/<run_id>.json` | `profiler/bin/history-add RUN_DIR [--trial T0007 --arm A\|B\|AA]` | one `ableton-linux-profiler-history/v1` record |
-| `baselines.json` | `profiler/bin/history-add RUN_DIR --baseline` | `{machine_id: {"<structure>/<scenario or ->": run_id}}`; a traced run is keyed `"<structure>/<scenario or ->@<trace_mode>"` (`benchmark/-@interface`) so the untraced and the traced baseline coexist |
+| `baselines.json` | `profiler/bin/history-add RUN_DIR --baseline` | `{machine_id: {"<structure>/<scenario or ->": run_id}}`; a traced run is keyed `"<structure>/<scenario or ->@<trace_mode>"` (`benchmark/-@interface`) so the untraced and the traced baseline coexist; a run with a known audio device appends `" [<node.name>]"` so each interface keeps its own baseline |
 
 `RUN_DIR` is the suite output directory (`run.json`, `report.json`, `profile/profile.json`,
 `sets/NN-<Set>/measurement.json`) or its parent when the output lives in `RUN_DIR/bench`.
@@ -28,6 +28,7 @@ missing field.
 | `machine_id` | `run.json` `machine.id`, else `profile.json` `machine.id` | 32 hex characters, stable per user |
 | `hostname` | `profile.json` `system.hostname`, else the second word of `system.uname` | |
 | `virtualization` | `profile.json` `system.virtualization.value` | `none` = bare metal; `null` = detector absent, treat as unknown (no timing claims) |
+| `audio_device` | first Set's `measurement.json` `endpoint_identity.audio.before.default_sink` (`node.name`) | the PipeWire default sink, e.g. `alsa_output.usb-Focusrite_Scarlett_2i4_USB-00.pro-output-0`; part of the identity; `null` = unknown (records written before the field existed) |
 | `structure` | `run.json` `structure`; else `benchmark` when `set_order` is the canonical five and there is no scenario, otherwise `diagnostic` | |
 | `scenario` | `run.json` `scenario` (its `name` when an object) | |
 | `trace_mode` | `run.json` `trace.mode`; `off` when the run has no trace record | `off`, `interface`, `drilldown` |

@@ -84,20 +84,26 @@ export function identityOf(run: Run): Identity {
   return {
     machine_id: run.machine_id,
     virtualization: run.virtualization,
+    audio_device: run.audio_device ?? null,
     structure: run.structure,
     scenario: run.scenario,
     trace_mode: run.trace_mode,
   };
 }
 
-/** `"<structure>/<scenario or ->"` — the inner key of baselines.json. */
+/** `"<structure>/<scenario or ->"` — the inner key of baselines.json (before the trace and device suffixes). */
 export function baselineKeyOf(x: Pick<Identity, 'structure' | 'scenario'>): string {
   return `${x.structure}/${x.scenario ?? '-'}`;
 }
 
-/** `"<machine>|<virtualization>|<structure>/<scenario or ->|<trace_mode>"` — stable grouping key. */
+/** `" [<node.name>]"` for a known audio device, else `""` — history-add's baseline-key suffix. */
+export function deviceSuffix(x: Pick<Identity, 'audio_device'>): string {
+  return x.audio_device ? ` [${x.audio_device}]` : '';
+}
+
+/** `"<machine>|<virtualization>|<structure>/<scenario or ->|<trace_mode>|<audio device or ->"` — stable grouping key. */
 export function identityKeyOf(id: Identity): string {
-  return `${id.machine_id}|${id.virtualization}|${baselineKeyOf(id)}|${id.trace_mode}`;
+  return `${id.machine_id}|${id.virtualization}|${baselineKeyOf(id)}|${id.trace_mode}|${id.audio_device ?? '-'}`;
 }
 
 /** A `Run` satisfies `Identity` structurally, so runs and identities mix freely here. */
@@ -105,6 +111,7 @@ export function sameIdentity(a: Identity, b: Identity): boolean {
   return (
     a.machine_id === b.machine_id &&
     a.virtualization === b.virtualization &&
+    (a.audio_device ?? null) === (b.audio_device ?? null) &&
     a.structure === b.structure &&
     (a.scenario ?? null) === (b.scenario ?? null) &&
     a.trace_mode === b.trace_mode
@@ -255,7 +262,9 @@ export function resolveBaseline(runs: readonly Run[], baselines: Baselines, iden
   const byMachine = hasOwn(baselines, identity.machine_id) ? baselines[identity.machine_id] : undefined;
   if (byMachine) {
     const key = baselineKeyOf(identity);
-    for (const candidate of [`${key}@${identity.trace_mode}`, key]) {
+    const device = deviceSuffix(identity);
+    const keys = [`${key}@${identity.trace_mode}`, key];
+    for (const candidate of device ? [...keys.map((k) => `${k}${device}`), ...keys] : keys) {
       const runId = hasOwn(byMachine, candidate) ? byMachine[candidate] : undefined;
       if (typeof runId !== 'string') continue;
       const run = idRuns.find((r) => r.run_id === runId);

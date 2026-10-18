@@ -51,6 +51,17 @@ export function runTableColumns(): Column<Run>[] {
     },
     { key: 'environment', header: 'Environment', render: (r) => <Badge {...environmentBadge(r.virtualization)} />, sortValue: (r) => r.virtualization },
     {
+      key: 'audio',
+      header: 'Audio device',
+      title: 'PipeWire default sink when the run started; runs on different devices never compare',
+      render: (r) => (
+        <span className="cell-mono" title={r.audio_device ?? 'unknown (recorded before the audio device was part of a run)'}>
+          {r.audio_device ? r.audio_device.replace(/^alsa_output\./, '') : '—'}
+        </span>
+      ),
+      sortValue: (r) => r.audio_device ?? null,
+    },
+    {
       key: 'structure',
       header: 'Structure',
       render: (r) => <Badge kind="structure" value={r.scenario ? `${r.structure} · ${r.scenario}` : r.structure} status="none" icon="" />,

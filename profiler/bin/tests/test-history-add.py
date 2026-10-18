@@ -33,8 +33,8 @@ bench_tests = load("bench_report_tests", REPOSITORY / "scripts/test-bench-report
 report = bench_tests.report
 
 TOP_LEVEL_KEYS = (
-    "schema", "run_id", "tag", "started_at", "machine_id", "hostname", "virtualization", "structure",
-    "scenario", "trace_mode", "duration_s", "runtime", "switches", "harness_sha", "commit", "trial", "arm",
+    "schema", "run_id", "tag", "started_at", "machine_id", "hostname", "virtualization", "audio_device",
+    "structure", "scenario", "trace_mode", "duration_s", "runtime", "switches", "harness_sha", "commit", "trial", "arm",
     "source_dir", "sets",
 )
 SET_KEYS = (
@@ -330,6 +330,22 @@ class HelperTests(unittest.TestCase):
         self.assertIsNone(history_add.number("3"))
         self.assertEqual(history_add.number(3.5), 3.5)
         self.assertEqual(history_add.run_identifier({"id": "a b/c"}, Path("/tmp/x")), "a-b-c")
+
+    def test_audio_device_from_the_default_sink_and_in_the_baseline_key(self):
+        sink = ['* media.class = "Audio/Sink"', '* node.name = "alsa_output.usb-Focusrite_Scarlett_2i4_USB-00.pro-output-0"']
+        measurement = {"endpoint_identity": {"audio": {"before": {"default_sink": sink}}}}
+        device = "alsa_output.usb-Focusrite_Scarlett_2i4_USB-00.pro-output-0"
+        self.assertEqual(history_add.audio_device([{}, measurement]), device)
+        self.assertIsNone(history_add.audio_device([{"endpoint_identity": {"audio": {"before": {"default_sink": "n/a"}}}}]))
+        self.assertIsNone(history_add.audio_device([]))
+        self.assertEqual(
+            history_add.baseline_key({"structure": "benchmark", "scenario": None, "trace_mode": "off", "audio_device": device}),
+            f"benchmark/- [{device}]",
+        )
+        self.assertEqual(
+            history_add.baseline_key({"structure": "benchmark", "scenario": None, "trace_mode": "interface", "audio_device": device}),
+            f"benchmark/-@interface [{device}]",
+        )
 
     def test_baseline_key_adds_the_trace_mode_of_traced_runs(self):
         self.assertEqual(history_add.baseline_key({"structure": "benchmark", "scenario": None, "trace_mode": "off"}), "benchmark/-")

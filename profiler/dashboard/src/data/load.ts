@@ -218,6 +218,7 @@ export function parseHistoryRecord(value: unknown, file: string): { run: Run | n
     machine_id,
     hostname: str(r.hostname) ?? '',
     virtualization,
+    audio_device: str(r.audio_device),
     structure,
     scenario,
     trace_mode,

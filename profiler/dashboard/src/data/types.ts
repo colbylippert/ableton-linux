@@ -96,6 +96,12 @@ export interface Run {
   machine_id: string;
   hostname: string;
   virtualization: Virtualization;
+  /**
+   * PipeWire node.name of the default sink when the run started (history-add, from
+   * bench-report's endpoint identity). Part of the identity: runs on different interfaces
+   * never compare. `null`/absent = unknown (records written before the field existed).
+   */
+  audio_device?: string | null;
   structure: Structure;
   scenario: string | null;
   trace_mode: TraceMode;
@@ -257,6 +263,8 @@ export interface MetricDef {
 export interface Identity {
   machine_id: string;
   virtualization: Virtualization;
+  /** Audio interface (see `Run.audio_device`); absent and `null` both mean unknown. */
+  audio_device?: string | null;
   structure: Structure;
   scenario: string | null;
   trace_mode: TraceMode;

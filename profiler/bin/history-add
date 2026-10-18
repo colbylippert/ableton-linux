@@ -64,6 +64,27 @@ def scalar(value: Any) -> Any:
     return value if isinstance(value, str) else number(value)
 
 
+NODE_NAME_RE = re.compile(r'node\.name = "([^"]+)"')
+
+
+def audio_device(measurements: list[dict[str, Any]]) -> Any:
+    """The PipeWire node.name of the default sink at the start of the first measured Set.
+
+    bench-report records `wpctl inspect @DEFAULT_AUDIO_SINK@` lines under
+    endpoint_identity.audio.before.default_sink; the device is part of a run's identity,
+    because runs on different interfaces (built-in speaker vs USB) never compare.
+    """
+    for measurement in measurements:
+        lines = nested(measurement, "endpoint_identity", "audio", "before", "default_sink")
+        if not isinstance(lines, list):
+            continue
+        for line in lines:
+            match = NODE_NAME_RE.search(str(line))
+            if match:
+                return match.group(1)
+    return None
+
+
 def load_json(path: Path) -> Any:
     try:
         with path.open(encoding="utf-8") as handle:
@@ -297,6 +318,7 @@ def history_record(
         "machine_id": text(nested(run, "machine", "id")) or text(nested(profile, "machine", "id")),
         "hostname": profile_hostname(profile),
         "virtualization": profile_virtualization(profile),
+        "audio_device": audio_device(measurements),
         "structure": run_structure(run, scenario),
         "scenario": scenario,
         "trace_mode": run_trace_mode(run),
@@ -348,10 +370,13 @@ def write_json(path: Path, value: Any) -> bool:
 
 
 def baseline_key(record: dict[str, Any]) -> str:
-    """"<structure>/<scenario or ->"; a traced run gets "@<trace_mode>" so it never replaces the untraced baseline."""
+    """"<structure>/<scenario or ->"; a traced run gets "@<trace_mode>" so it never replaces the untraced baseline,
+    and a known audio device " [<node.name>]" so each interface keeps its own baseline."""
     key = f"{record['structure'] or '-'}/{record['scenario'] or '-'}"
     if record["trace_mode"] != "off":
         key += f"@{record['trace_mode']}"
+    if record.get("audio_device"):
+        key += f" [{record['audio_device']}]"
     return key
 
 
