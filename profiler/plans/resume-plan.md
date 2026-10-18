@@ -431,6 +431,17 @@ Next candidates (user to choose; none pre-registered yet):
   - Live's audio side evidently depends on the main loop's cadence.
   - The higher DSP peak is partly a measuring artifact: Live reports the worst buffer since its last UI update, so the window grows as the frame rate falls. The PipeWire errors are measured outside Live.
 - Implication: a frame rate below 30 fps works against the primary metric. The opposite direction is untested: a faster UI loop (the monitor's real 75 or 100 Hz modes, or a higher reported rate) might reduce dropouts, at some CPU cost.
+- 100 Hz test (user: "okay lets try 100hz"; the monitor's real 1920×1080 100 Hz mode, dev runtime, no switches; back to 59.94 Hz afterwards):
+
+  | Config | Live presents | UI thread | Graphics | Compositor | DSP avg / peak | Errors |
+  |---|---|---|---|---|---|---|
+  | OpenGL, renderer off, 60 Hz | 60 fps | 8.4 | 2.6 | 4.4 | 9.67 / 17.66 | 5 |
+  | OpenGL, renderer off, 100 Hz | — | 11.1 | 2.4 | 4.3 | 9.35 / 17.06 | 4 |
+  | Vulkan, renderer on, 60 Hz | 60 fps | 8.9 | 1.7 | 3.9 | 10.23 / 18.15 | 0 |
+  | Vulkan, renderer on, 100 Hz | 59.6–62.2 fps | 11.3 | 1.8 | 3.9 | 9.40 / 17.70 | 1 |
+
+  - Live caps its own drawing at about 60 fps, but its UI loop follows the refresh rate, costing about 2.5 more points of a core on the UI thread. No change in audio.
+- Conclusion of G0b/G0c: keep 60 Hz. Lower frame rates save display CPU but raise dropouts below 30 fps; higher refresh rates cost CPU and change nothing. Both switches (`WINED3D_PRESENT_FPS`, `WINE_REPORTED_REFRESH_RATE`) stay in the dev tree only, uncommitted. 30 fps remains the only candidate for saving CPU, and it would need a proper trial.
 
 **RT-BORE kernel phase (user decision 2026-10-18: after T0013, stop and try the RT-BORE kernel with the NVIDIA driver; the same day the user moved it after T0014; pre-research only so far)**
 - What the laptop has:
