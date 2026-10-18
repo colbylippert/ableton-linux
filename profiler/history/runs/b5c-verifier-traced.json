@@ -1,0 +1,315 @@
+{
+  "schema": "ableton-linux-profiler-history/v1",
+  "run_id": "b5c-verifier-traced",
+  "tag": "b5c-traced",
+  "started_at": "2026-10-17T20:19:51.242250Z",
+  "machine_id": "d65f2ea0b816442a8d38bcb991cc7fd2",
+  "hostname": "abletonlinux",
+  "virtualization": "none",
+  "audio_device": "alsa_output.usb-Focusrite_Scarlett_2i4_USB-00.pro-output-0",
+  "structure": "diagnostic",
+  "scenario": null,
+  "trace_mode": "interface",
+  "duration_s": 30,
+  "runtime": {
+    "dist_version": "2026.08.28.1",
+    "source_tree_sha": "218fb5a4add119a5272fd810281890be89affa6cfc1a9e84da19ec7fcb160c9c",
+    "dev_info": null
+  },
+  "switches": {},
+  "harness_sha": "3d2ca605985c5f423abcffff45340b5783f6ae7ac5f06f0d372b176247d8005d",
+  "commit": "4f5728e1450b69f512059d7a1ab756543be3d980",
+  "trial": null,
+  "arm": null,
+  "source_dir": "~/.local/share/profiler/runs/b5c-verifier-traced/bench",
+  "sets": {
+    "Benchmark_Inbuilts": {
+      "mode": "playback",
+      "host_cpu_pct": 4.7419,
+      "live_cpu_pct_per_core": 100.3856,
+      "wine_cpu_pct_per_core": 102.5172,
+      "pipewire_cpu_pct": 2.2648,
+      "irq_per_s": 19559.004922,
+      "softirq_per_s": 7572.321105,
+      "pipewire_errors": 20,
+      "xruns": 0,
+      "dsp_avg": 15.474,
+      "dsp_peak": 192.824997,
+      "audio_workers": 15,
+      "voluntary_switches_per_s": 2809.3,
+      "late_blocks": 12,
+      "near_late_blocks": 5,
+      "slack_p01_ns": 796554,
+      "slack_p50_ns": 1058248,
+      "lost_slack_total_ns": 12524325,
+      "call_sites_top": [
+        {
+          "key": "syscall|NtWaitForMultipleObjects|kernelbase.dll!WaitForMultipleObjects+0xae <- MaxPlug.dll+0x4afb5b",
+          "share": 0.0,
+          "total_ns_in_late_blocks": 499959373
+        },
+        {
+          "key": "syscall|NtWaitForSingleObject|kernelbase.dll!WaitForSingleObject+0x49 <- Ableton Live 12 Trial.exe+0x4f8c119",
+          "share": 0.9599,
+          "total_ns_in_late_blocks": 395140325
+        },
+        {
+          "key": "syscall|NtDelayExecution|dwmapi.dll!DwmFlush+0x1b3 <- Ableton Live 12 Trial.exe+0x31f0886",
+          "share": 0.0,
+          "total_ns_in_late_blocks": 60803543
+        },
+        {
+          "key": "syscall|NtWaitForAlertByThreadId|wined3d.dll!wined3d_device_context_flush_mapped_buffer+0x66a <- kernel32.dll!BaseThreadInitThunk+0x9 <- ntdll.dll!RtlUserThreadStart+0x17",
+          "share": 0.0,
+          "total_ns_in_late_blocks": 27726255
+        },
+        {
+          "key": "syscall|NtWaitForAlertByThreadId|ntdll.dll!RtlWaitOnAddress+0x16d <- ntdll.dll!RtlSleepConditionVariableSRW+0x14b <- kernelbase.dll!SleepConditionVariableSRW+0x2c <- msvcp140.dll+0x122e8 <- MaxPlug.dll+0x64b9e9",
+          "share": 0.0,
+          "total_ns_in_late_blocks": 23614328
+        },
+        {
+          "key": "syscall|NtDelayExecution|kernelbase.dll!Sleep+0x28 <- dxgi.dll!DXGIGetDebugInterface1+0x44c4 <- MaxPlug.dll+0x89ccaf",
+          "share": 0.0,
+          "total_ns_in_late_blocks": 12008464
+        },
+        {
+          "key": "syscall|NtSetEvent|kernelbase.dll!SetEvent+0xf <- Ableton Live 12 Trial.exe+0x33f587e",
+          "share": 0.0218,
+          "total_ns_in_late_blocks": 8188438
+        },
+        {
+          "key": "syscall|NtUserGetMessage|Ableton Live 12 Trial.exe+0x313f8c2",
+          "share": 0.0,
+          "total_ns_in_late_blocks": 3870829
+        },
+        {
+          "key": "syscall|NtResetEvent|kernelbase.dll!ResetEvent+0xf <- Ableton Live 12 Trial.exe+0x33f41d2",
+          "share": 0.0061,
+          "total_ns_in_late_blocks": 2239734
+        },
+        {
+          "key": "syscall|NtWaitForAlertByThreadId|ntdll.dll!RtlWaitOnAddress+0x16d <- ntdll.dll!RtlSleepConditionVariableSRW+0x14b <- kernelbase.dll!SleepConditionVariableSRW+0x2c <- SpliceAbletonLive.vst3+0x559c60",
+          "share": 0.0,
+          "total_ns_in_late_blocks": 1281652
+        }
+      ],
+      "hotspots_non_audio_top": [
+        {
+          "role": "unknown:MainThread",
+          "kind": "syscall",
+          "caller": "ntdll.dll!RtlWaitOnAddress+0x16d <- ntdll.dll!RtlSleepConditionVariableSRW+0x14b <- kernelbase.dll!SleepConditionVariableSRW+0x2c <- SpliceAbletonLive.vst3+0x559c60",
+          "n": 6187,
+          "total_ns": 887819895607
+        },
+        {
+          "role": "unknown:MainThread",
+          "kind": "syscall",
+          "caller": "unsampled",
+          "n": 574,
+          "total_ns": 314004690405
+        },
+        {
+          "role": "unknown:MainThread",
+          "kind": "syscall",
+          "caller": "ntdll.dll!RtlWaitOnAddress+0x16d <- ntdll.dll!RtlSleepConditionVariableSRW+0x14b <- kernelbase.dll!SleepConditionVariableSRW+0x2c <- msvcp140.dll+0x122e8 <- MaxPlug.dll+0x64b9e9",
+          "n": 4385,
+          "total_ns": 35791076898
+        },
+        {
+          "role": "unknown:MainThread",
+          "kind": "syscall",
+          "caller": "kernelbase.dll!Sleep+0x28 <- dxgi.dll!DXGIGetDebugInterface1+0x44c4 <- MaxPlug.dll+0x89ccaf",
+          "n": 5939,
+          "total_ns": 35704100470
+        },
+        {
+          "role": "main",
+          "kind": "syscall",
+          "caller": "Ableton Live 12 Trial.exe+0x313f8c2",
+          "n": 10435,
+          "total_ns": 35587981024
+        },
+        {
+          "role": "live:IPC Channel Rea",
+          "kind": "syscall",
+          "caller": "kernelbase.dll!WaitForSingleObjectEx+0x4d <- ws2_32.dll!select+0x421 <- Ableton Live 12 Trial.exe+0x4ad6d9b",
+          "n": 71,
+          "total_ns": 35509237687
+        },
+        {
+          "role": "live:IPC Channel Rea",
+          "kind": "ntsync_wait",
+          "caller": "kernelbase.dll!WaitForSingleObjectEx+0x4d <- ws2_32.dll!select+0x421 <- Ableton Live 12 Trial.exe+0x4ad6d9b",
+          "n": 142,
+          "total_ns": 35505090076
+        },
+        {
+          "role": "unknown:MainThread",
+          "kind": "syscall",
+          "caller": "kernelbase.dll!WaitForMultipleObjects+0xae <- MaxPlug.dll+0x4afb5b",
+          "n": 71,
+          "total_ns": 35498321166
+        },
+        {
+          "role": "unknown:MainThread",
+          "kind": "ntsync_wait",
+          "caller": "kernelbase.dll!WaitForMultipleObjects+0xae <- MaxPlug.dll+0x4afb5b",
+          "n": 71,
+          "total_ns": 35498134808
+        },
+        {
+          "role": "live:DWM-Sync",
+          "kind": "syscall",
+          "caller": "dwmapi.dll!DwmFlush+0x1b3 <- Ableton Live 12 Trial.exe+0x31f0886",
+          "n": 5179,
+          "total_ns": 35428815712
+        }
+      ]
+    },
+    "Benchmark_VSTs": {
+      "mode": "playback",
+      "host_cpu_pct": 19.2615,
+      "live_cpu_pct_per_core": 102.6457,
+      "wine_cpu_pct_per_core": 104.9104,
+      "pipewire_cpu_pct": 2.0649,
+      "irq_per_s": 22284.755019,
+      "softirq_per_s": 8750.544547,
+      "pipewire_errors": 10,
+      "xruns": 0,
+      "dsp_avg": 15.453,
+      "dsp_peak": 98.699997,
+      "audio_workers": 15,
+      "voluntary_switches_per_s": 2846.1,
+      "late_blocks": 10,
+      "near_late_blocks": 5,
+      "slack_p01_ns": 804566,
+      "slack_p50_ns": 1081386,
+      "lost_slack_total_ns": 6046617,
+      "call_sites_top": [
+        {
+          "key": "syscall|NtWaitForSingleObject|kernelbase.dll!WaitForSingleObject+0x49 <- Ableton Live 12 Trial.exe+0x4f8c119",
+          "share": 0.9573,
+          "total_ns_in_late_blocks": 277648285
+        },
+        {
+          "key": "syscall|NtDelayExecution|dwmapi.dll!DwmFlush+0x1b3 <- Ableton Live 12 Trial.exe+0x31f0886",
+          "share": 0.0,
+          "total_ns_in_late_blocks": 68181828
+        },
+        {
+          "key": "syscall|NtDelayExecution|kernelbase.dll!Sleep+0x28 <- dxgi.dll!DXGIGetDebugInterface1+0x44c4 <- MaxPlug.dll+0x89ccaf",
+          "share": 0.0,
+          "total_ns_in_late_blocks": 18008655
+        },
+        {
+          "key": "syscall|NtWaitForAlertByThreadId|ntdll.dll!RtlWaitOnAddress+0x16d <- ntdll.dll!RtlSleepConditionVariableSRW+0x14b <- kernelbase.dll!SleepConditionVariableSRW+0x2c <- SpliceAbletonLive.vst3+0x559c60",
+          "share": 0.0,
+          "total_ns_in_late_blocks": 16313691
+        },
+        {
+          "key": "syscall|NtUserGetMessage|Ableton Live 12 Trial.exe+0x313f8c2",
+          "share": 0.0,
+          "total_ns_in_late_blocks": 15120177
+        },
+        {
+          "key": "syscall|NtSetEvent|kernelbase.dll!SetEvent+0xf <- Ableton Live 12 Trial.exe+0x33f587e",
+          "share": 0.019,
+          "total_ns_in_late_blocks": 3929759
+        },
+        {
+          "key": "syscall|NtResetEvent|kernelbase.dll!ResetEvent+0xf <- Ableton Live 12 Trial.exe+0x33f41d2",
+          "share": 0.0095,
+          "total_ns_in_late_blocks": 1799018
+        },
+        {
+          "key": "syscall|NtQueryPerformanceCounter|ntdll.dll!RtlQueryPerformanceCounter+0xb <- Ableton Live 12 Trial.exe+0x3403253",
+          "share": 0.0065,
+          "total_ns_in_late_blocks": 596659
+        },
+        {
+          "key": "syscall|NtUserMessageCall|user32.dll!SendMessageW+0x3b <- Ableton Live 12 Trial.exe+0x31f0910",
+          "share": 0.0,
+          "total_ns_in_late_blocks": 581265
+        },
+        {
+          "key": "syscall|NtQueryPerformanceCounter|ntdll.dll!RtlQueryPerformanceCounter+0xb <- Ableton Live 12 Trial.exe+0x3402fbb",
+          "share": 0.0023,
+          "total_ns_in_late_blocks": 526207
+        }
+      ],
+      "hotspots_non_audio_top": [
+        {
+          "role": "unknown:MainThread",
+          "kind": "syscall",
+          "caller": "ntdll.dll!RtlWaitOnAddress+0x16d <- ntdll.dll!RtlSleepConditionVariableSRW+0x14b <- kernelbase.dll!SleepConditionVariableSRW+0x2c <- SpliceAbletonLive.vst3+0x559c60",
+          "n": 5832,
+          "total_ns": 704811501272
+        },
+        {
+          "role": "unknown:MainThread",
+          "kind": "syscall",
+          "caller": "unsampled",
+          "n": 925,
+          "total_ns": 489006032042
+        },
+        {
+          "role": "unknown:MainThread",
+          "kind": "ntsync_wait",
+          "caller": "unsampled",
+          "n": 120,
+          "total_ns": 70502265801
+        },
+        {
+          "role": "unknown:MainThread",
+          "kind": "syscall",
+          "caller": "ntdll.dll!RtlWaitOnAddress+0x16d <- ntdll.dll!RtlSleepConditionVariableSRW+0x14b <- kernelbase.dll!SleepConditionVariableSRW+0x2c <- msvcp140.dll+0x122e8 <- MaxPlug.dll+0x64b9e9",
+          "n": 4392,
+          "total_ns": 35822566079
+        },
+        {
+          "role": "unknown:MainThread",
+          "kind": "syscall",
+          "caller": "kernelbase.dll!Sleep+0x28 <- dxgi.dll!DXGIGetDebugInterface1+0x44c4 <- MaxPlug.dll+0x89ccaf",
+          "n": 5947,
+          "total_ns": 35739232748
+        },
+        {
+          "role": "main",
+          "kind": "syscall",
+          "caller": "Ableton Live 12 Trial.exe+0x313f8c2",
+          "n": 10476,
+          "total_ns": 35572916182
+        },
+        {
+          "role": "live:IPC Channel Rea",
+          "kind": "syscall",
+          "caller": "kernelbase.dll!WaitForSingleObjectEx+0x4d <- ws2_32.dll!select+0x421 <- Ableton Live 12 Trial.exe+0x4ad6d9b",
+          "n": 71,
+          "total_ns": 35509571508
+        },
+        {
+          "role": "live:IPC Channel Rea",
+          "kind": "ntsync_wait",
+          "caller": "kernelbase.dll!WaitForSingleObjectEx+0x4d <- ws2_32.dll!select+0x421 <- Ableton Live 12 Trial.exe+0x4ad6d9b",
+          "n": 142,
+          "total_ns": 35505273915
+        },
+        {
+          "role": "unknown:MainThread",
+          "kind": "syscall",
+          "caller": "unsampled",
+          "n": 71,
+          "total_ns": 35494603448
+        },
+        {
+          "role": "live:DWM-Sync",
+          "kind": "syscall",
+          "caller": "dwmapi.dll!DwmFlush+0x1b3 <- Ableton Live 12 Trial.exe+0x31f0886",
+          "n": 5177,
+          "total_ns": 35454013017
+        }
+      ]
+    }
+  }
+}
