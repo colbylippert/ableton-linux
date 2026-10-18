@@ -218,6 +218,20 @@ Next candidates (user to choose; none pre-registered yet):
 - Mechanism check: 8 `AudioCalc` threads in every B Set-run (9 in A), all allowed on 0–11.
 - Driver: ~/.local/state/profiler/trial-T0009.sh. Scored by `plans/tools/trial-analyze.py T0009 --rule t0004`.
 
+**Trial T0010 (user decision 2026-10-18: "Ableton minimized before the play command is issued so the UI does not render"; pre-registered before running): Live minimised during playback.**
+- Setup:
+  - Both arms keep the configuration: `PIPEASIO_REALTIME=1`, with pipeasio-rt and every `AudioCalc` worker pinned to CPUs 0–11 (shared). The worker count is whatever T0009 leaves: eight if it passes, nine otherwise.
+  - A: Live's window stays as it is, on screen and rendering.
+  - B: `--live-window minimized` (59a5b83). The suite minimises Live's main window after the Set has loaded and before `rewind`/`play`, and restores it after the measurement. The switch is recorded as `ABLETON_BENCH_LIVE_WINDOW=minimized`.
+  - ABAB × 3; Inbuilts, Max4Live, VSTs; 120 s.
+- Why: Live's UI renders all the time (~38 % of a core earlier). All of Live's threads, the UI included, run SCHED_RR 10 through the launcher's `chrt`, the same priority as the audio workers, and the UI threads are not pinned. So the UI competes with the callback and the workers for the P-cores, memory bandwidth and the shared power budget. Minimising removes the rendering without touching the audio path.
+- PASS rule: the same as T0004 ([D] or [E], plus both guards).
+- What a verdict means: this is a diagnostic, a measurement of what the UI costs the audio path. Nobody performs with Live minimised, so later trials keep the normal window whatever the verdict. A PASS makes UI-side changes, such as a lower UI priority or cheaper rendering, the next trials. A FAIL with the mechanism confirmed rules the UI out as a cause of dropouts.
+- Mechanism check:
+  - In B, every Set's `raw/live-window.txt` shows the main window iconic after minimising and still iconic at the end of the measurement. A has no such file.
+  - Live's CPU is lower in B than in A. If it is not, minimising did not stop the rendering, and the trial says nothing about the UI.
+- Driver: ~/.local/state/profiler/trial-T0010.sh. Scored by `plans/tools/trial-analyze.py T0010 --rule t0004`.
+
 **Wine hot-path research (2026-10-18 morning)**
 
 Diagnostic D0001: one traced run on the kept configuration (heavy Sets, 60 s each, 45,000 blocks per Set; history `diag-D0001-traced`).
