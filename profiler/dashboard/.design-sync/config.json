@@ -1,0 +1,8 @@
+{
+  "projectId": "8e497577-e6b5-44fa-8ba4-11e5c7f08c41",
+  "pkg": "profiler-dashboard",
+  "globalName": "ProfilerDashboard",
+  "shape": "package",
+  "buildCmd": "npm run build:lib",
+  "cssEntry": "dist-lib/style.css"
+}

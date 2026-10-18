@@ -7,6 +7,14 @@ __pycache__/
 *.pyc
 dashboard/node_modules/
 dashboard/dist/
+dashboard/dist-lib/
+# design-sync (Claude Design): staged converter, build output, machine state; the durable
+# set (.design-sync/config.json, NOTES.md, conventions.md, previews/, overrides/) is committed
+dashboard/.ds-sync/
+dashboard/ds-bundle/
+dashboard/.design-sync/.cache/
+dashboard/.design-sync/learnings/
+dashboard/.design-sync/node_modules
 control/vendor/AbletonOSC/logs/
 tracer/build/
 tracer/*.skel.h
