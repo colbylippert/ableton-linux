@@ -352,6 +352,16 @@ Next candidates (user to choose; none pre-registered yet):
   - The built-in screen stayed on the Intel GPU (`eDP-1` on `i915`; `eDP-2` on NVIDIA disconnected). KWin composites on Mesa Intel, and GLX clients such as wined3d render on Mesa Intel. So the MUX did not switch.
   - MSI documents the GPU switch for this model in MSI Center on Windows (FAQ 8805), not in the firmware setup.
   - Also changed since T0013: the laptop is on wired Ethernet (`enp3s0`) with Wi-Fi off.
+- **Display setup from 2026-10-18 15:03 (user decision: "apply the changes to go to external monitor"):** the desktop runs on the NVIDIA GPU only, on an external monitor on the HDMI port, which is wired to the NVIDIA GPU. The lid is closed.
+  - udev rule `/etc/udev/rules.d/61-profiler-gpu-names.rules` gives the GPUs stable names without colons: `/dev/dri/nvidia-dgpu` and `/dev/dri/intel-igpu`. The card numbers change with the firmware's boot-VGA setting, and `KWIN_DRM_DEVICES` is colon-separated.
+  - `~/.config/environment.d/90-profiler-kwin-gpu.conf` sets `KWIN_DRM_DEVICES=/dev/dri/nvidia-dgpu`, so KWin opens only the NVIDIA GPU, and Xwayland's GL follows it.
+  - The kernel option `video=eDP-1:d` (in `/etc/default/grub`; the old file is kept as `grub.profiler-<timestamp>`) turns off the built-in panel's connector on the Intel GPU. Without it, the Intel GPU keeps the console on the panel. The Intel driver stays loaded, so the iGPU still idles in its low-power state.
+  - The monitor runs at 1920×1080, 59.94 Hz, to match the built-in panel's 60 Hz.
+  - Verified after a reboot: KWin and Xwayland report the RTX 4060. Live's log reads `TD3dSurface: Adapter: 'NVIDIA GeForce RTX 4060M'` (`Intel(R) Graphics` before). The NVIDIA GPU ran at 31–44 % load in P8 during playback.
+  - Smoke run (Inbuilts, 60 s, unpinned): 0 PipeWire errors, DSP 10.6 / 19.8, 64 frames.
+  - The firmware's boot graphics device stays NVIDIA, so the firmware and GRUB screens appear on the monitor.
+  - Undo: remove the environment.d file and the kernel option, run `grub-mkconfig`, and reboot.
+  - T0014 needs a new design for this setup; the one above assumed the firmware MUX.
 
 **RT-BORE kernel phase (user decision 2026-10-18: after T0013, stop and try the RT-BORE kernel with the NVIDIA driver; the same day the user moved it after T0014; pre-research only so far)**
 - What the laptop has:
