@@ -147,6 +147,19 @@ Next candidates (user to choose; none pre-registered yet):
 - (b) One audio thread per physical P-core (CPUs 0,2,4,…), with the rest on the E-cores.
 - (c) `WINE_APC_FASTPATH=1` (existing opt-in patch; no evidence yet that alertable zero-object sleeps sit on the audio path).
 - (d) The slack budget first (tracer), to find the next lever from data instead of guessing.
+
+**Trial T0006 (user decision 2026-10-18; pre-registered before running): six audio workers, one per physical P-core.**
+- Setup:
+  - Both arms keep `PIPEASIO_REALTIME=1` and pin `pipeasio-rt` to the P-core CPUs 0–11.
+  - A: Live's current 15 workers (launcher auto), pinned to 0–11 (the T0004 configuration).
+  - B: `ABLETON_MAX_AUDIO_THREADS=6` (the launcher writes Live's own `-MaxAudioThreads=6` before Live starts). The 1 s watcher pins each `AudioCalc` worker to its own physical P-core: one CPU each from 0, 2, 4, 6, 8, 10, least-used first, so no two workers share a core.
+  - ABAB × 3; Inbuilts, Max4Live, VSTs; 120 s; golden restored before every run (it brings back Live's own Options.txt).
+- Why:
+  - In T0004/T0005 the 15 workers plus the callback queued 4–5 s per 120 s for 12 logical CPUs on 6 physical cores, and moving other threads away did not change that (T0005).
+  - Fewer workers also mean fewer wake-ups: about 110 `SetEvent` + 64 waits per block today come from the fan-out.
+- PASS rule: the same as T0004 ([D] or [E], plus both guards); the DSP guard matters most here, because fewer workers mean less parallel capacity.
+- Mechanism check: B runs show 6 `AudioCalc` threads, each allowed on exactly one CPU from {0,2,4,6,8,10} and all different, and `audio_workers` = 6 in the history records (A: 15). The AudioCalc CPU wait is reported per run.
+- Driver: ~/.local/state/profiler/trial-T0006.sh. Scored by `plans/tools/trial-analyze.py T0006 --rule t0004`.
 **Testing plan (2026-10-17).** Every trial: ABAB × 3, golden restored per run, all 5 Sets, untraced; accept iff the median DSP average or typical peak improves by more than 2× the A/A spread on at least one heavy Set, no Set regresses beyond noise, and the dropout guards (PipeWire ERR, peaks >100 %) are not worse; ledger + history + commit/push per trial.
 1. Scheduling / configuration (no Wine code; PR-able as defaults or launcher options): PipeASIO realtime (T0002 → **kept in T0003**) → next, on top of it: tune the pipeasio-rt priority (PIPEASIO_RT_PRIORITY) vs Live's RR 10 → P-core affinity for pipeasio-rt + AudioCalc → real-time only for audio threads (today the launcher makes all 94 Live threads RR 10, UI and graphics included). Dropout trials use T0003's shape (heavy Sets, 120 s, pre-registered sign test on PipeWire ERR).
 2. Existing Wine patch: WINE_APC_FASTPATH=1 (awaiting loaded-Set evidence).
