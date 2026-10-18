@@ -12,7 +12,7 @@ export interface PartStatus {
   note: string;
 }
 
-export const STATUS_AS_OF = '18 October 2026 (trials T0001–T0005)';
+export const STATUS_AS_OF = '18 October 2026 (trials T0001–T0007)';
 
 export const STATUS_ROWS: readonly PartStatus[] = [
   {
@@ -91,7 +91,7 @@ export const STATUS_ROWS: readonly PartStatus[] = [
     part: 'A/B trials',
     paths: ['profiler/ledger.jsonl', 'profiler/history/runs/'],
     state: 'in progress',
-    note: 'Kept: PipeASIO realtime (T0003, PipeWire errors 204 to 30) and P-core audio threads (T0004, 38 to 17). Reverted: idle-state cap (T0001), E-cores for non-audio threads (T0005).',
+    note: 'Kept: PipeASIO realtime (T0003, PipeWire errors 204 to 30) and P-core audio threads (T0004, 38 to 17). Inconclusive: six audio workers (T0006, Live CPU -37 %). Reverted: T0001, T0005, T0007.',
   },
   {
     part: 'History and dashboard',
