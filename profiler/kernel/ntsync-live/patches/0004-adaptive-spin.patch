@@ -1,0 +1,158 @@
+ntsync-live: adaptive spin (spin_adaptive)
+
+Per gated thread, the outcomes of its last 4 waits (short: over within spin_ns) index 16 two-bit saturating
+counters; a wait spins only when its counter is at least 2, so a thread alternating one long wait with short
+ones (Live's workers between and within blocks) does not spin on the long one. The predictor learns from
+every gated wait, spun or not; stats gains skipped. Off by default.
+
+diff -ruN a/ntsync.c b/ntsync.c
+--- a/ntsync.c	2026-10-19 12:12:31.378026474 -0400
++++ b/ntsync.c	2026-10-19 12:12:31.378026474 -0400
+@@ -9,6 +9,7 @@
+ #include <linux/atomic.h>
+ #include <linux/file.h>
+ #include <linux/fs.h>
++#include <linux/hash.h>
+ #include <linux/hrtimer.h>
+ #include <linux/ktime.h>
+ #include <linux/miscdevice.h>
+@@ -41,6 +42,7 @@
+ 	u64 hits;	/* spins that ended because the wait was satisfied */
+ 	u64 misses;	/* spins that used their whole budget */
+ 	u64 aborts;	/* spins stopped early: need_resched, a signal, another runnable task */
++	u64 skipped;	/* gated waits the adaptive predictor did not spin */
+ 	u64 spin_ns;	/* time spent spinning */
+ };
+ static DEFINE_PER_CPU(struct ntsl_stats, ntsl_stats);
+@@ -57,6 +59,7 @@
+ 
+ static unsigned int ntsl_spin_ns;
+ static bool ntsl_spin_rt = true;
++static bool ntsl_spin_adaptive;
+ static struct ntsl_comm __rcu *ntsl_comm;
+ static DEFINE_MUTEX(ntsl_param_lock);
+ 
+@@ -81,6 +84,9 @@
+ module_param_named(spin_rt, ntsl_spin_rt, bool, 0644);
+ MODULE_PARM_DESC(spin_rt, "ntsync-live: only realtime (SCHED_FIFO/RR) threads may spin (default 1)");
+ 
++module_param_named(spin_adaptive, ntsl_spin_adaptive, bool, 0644);
++MODULE_PARM_DESC(spin_adaptive, "ntsync-live: spin only when the thread's recent waits predict a short one (default 0)");
++
+ static int ntsl_set_spin_comm(const char *val, const struct kernel_param *kp)
+ {
+ 	struct ntsl_comm *c, *old;
+@@ -146,10 +152,11 @@
+ 		sum.hits += READ_ONCE(s->hits);
+ 		sum.misses += READ_ONCE(s->misses);
+ 		sum.aborts += READ_ONCE(s->aborts);
++		sum.skipped += READ_ONCE(s->skipped);
+ 		sum.spin_ns += READ_ONCE(s->spin_ns);
+ 	}
+-	return sysfs_emit(buf, "gated=%llu spins=%llu hits=%llu misses=%llu aborts=%llu spin_ns=%llu\n",
+-			  sum.gated, sum.spins, sum.hits, sum.misses, sum.aborts, sum.spin_ns);
++	return sysfs_emit(buf, "gated=%llu spins=%llu hits=%llu misses=%llu aborts=%llu skipped=%llu spin_ns=%llu\n",
++			  sum.gated, sum.spins, sum.hits, sum.misses, sum.aborts, sum.skipped, sum.spin_ns);
+ }
+ 
+ static const struct kernel_param_ops ntsl_stats_ops = {
+@@ -269,6 +276,7 @@
+ 	bool all;
+ 	bool ownerdead;
+ 	bool gated;	/* ntsync-live: this wait may spin before it sleeps */
++	bool spin;	/* ntsync-live: ... and does (the adaptive predictor agrees) */
+ 	__u32 count;
+ 	struct ntsync_q_entry entries[];
+ };
+@@ -981,6 +989,52 @@
+ }
+ 
+ /*
++ * ntsync-live: the adaptive predictor (spin_adaptive). Each gated thread has a slot: its pid (22 bits), the outcomes
++ * of its last 4 gated waits (1 = short: over within spin_ns) and 16 two-bit saturating counters, one per history.
++ * A wait spins when the counter for the current history is at least 2, so a thread that alternates one long wait with
++ * a few short ones (Live's AudioCalc workers between and within audio blocks) spins only on the short ones. A slot that
++ * changes owner starts again with every counter at 2. Only the owning thread writes its slot.
++ */
++#define NTSL_PRED_BITS		6
++#define NTSL_PID_MASK		0x3fffffULL
++static u64 ntsl_pred[1 << NTSL_PRED_BITS];
++
++static u64 *ntsl_pred_slot(void)
++{
++	return &ntsl_pred[hash_32(current->pid, NTSL_PRED_BITS)];
++}
++
++static bool ntsl_predict(void)
++{
++	u64 v = READ_ONCE(*ntsl_pred_slot());
++	u32 hist = (v >> 32) & 15;
++
++	if ((v >> 42) != (current->pid & NTSL_PID_MASK))
++		return true;
++	return (((u32)v >> (hist * 2)) & 3) >= 2;
++}
++
++static void ntsl_learn(bool short_wait)
++{
++	u64 *slot = ntsl_pred_slot(), v = READ_ONCE(*slot);
++	u64 pid = current->pid & NTSL_PID_MASK;
++	u32 hist = 0, ctr = 0xaaaaaaaa, c;
++
++	if ((v >> 42) == pid) {
++		hist = (v >> 32) & 15;
++		ctr = (u32)v;
++	}
++	c = (ctr >> (hist * 2)) & 3;
++	if (short_wait && c < 3)
++		c++;
++	else if (!short_wait && c > 0)
++		c--;
++	ctr = (ctr & ~(3U << (hist * 2))) | (c << (hist * 2));
++	hist = ((hist << 1) | short_wait) & 15;
++	WRITE_ONCE(*slot, (pid << 42) | ((u64)hist << 32) | ctr);
++}
++
++/*
+  * ntsync-live: may the current WAIT_ANY spin before it sleeps? Decided once per wait: spin_ns set, the thread
+  * realtime (unless spin_rt is 0) and its name starting with one of the spin_comm prefixes.
+  */
+@@ -1057,8 +1111,9 @@
+ 	clockid_t clock = CLOCK_MONOTONIC;
+ 	ktime_t *timeout_ptr;
+ 	int ret = 0;
++	u64 ntsl_t0 = q->gated ? local_clock() : 0;
+ 
+-	if (q->gated)
++	if (q->spin)
+ 		ntsl_spin_wait(q, args);
+ 
+ 	timeout_ptr = (args->timeout == U64_MAX ? NULL : &timeout);
+@@ -1083,6 +1138,9 @@
+ 	} while (ret < 0);
+ 	__set_current_state(TASK_RUNNING);
+ 
++	if (q->gated && READ_ONCE(ntsl_spin_adaptive))
++		ntsl_learn(local_clock() - ntsl_t0 <= READ_ONCE(ntsl_spin_ns));
++
+ 	return ret;
+ }
+ 
+@@ -1127,6 +1185,7 @@
+ 	q->all = all;
+ 	q->ownerdead = false;
+ 	q->gated = false;
++	q->spin = false;
+ 	q->count = count;
+ 
+ 	for (i = 0; i < total_count; i++) {
+@@ -1192,6 +1251,9 @@
+ 	if (ret < 0)
+ 		return ret;
+ 	q->gated = ntsl_gate();
++	q->spin = q->gated && (!READ_ONCE(ntsl_spin_adaptive) || ntsl_predict());
++	if (q->gated && !q->spin)
++		this_cpu_inc(ntsl_stats.skipped);
+ 
+ 	total_count = args.count;
+ 	if (args.alert)

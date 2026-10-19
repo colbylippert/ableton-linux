@@ -120,8 +120,13 @@ do_verify() {  # gates E1 and G2: the suite on stock, on live with its defaults,
         sudo -n "$H" knob set ntsync.spin_rt 0 >/dev/null && sudo -n "$H" knob set ntsync.spin_ns 20000 >/dev/null || rc=1
     NTSL_SELFTEST_FAILURES=$t/g2 NTSL_TESTS=$dir bash "$here/tests/run-suite.sh" "live-$s8, spinning 20 us for every thread (G2)" || rc=1
     echo "stats: $(cat /sys/module/ntsync/parameters/stats)"
+    if [ -e /sys/module/ntsync/parameters/spin_adaptive ]; then
+        sudo -n "$H" knob set ntsync.spin_adaptive 1 >/dev/null && sudo -n "$H" knob set ntsync.stats_reset 1 >/dev/null || rc=1
+        NTSL_SELFTEST_FAILURES=$t/g2a NTSL_TESTS=$dir bash "$here/tests/run-suite.sh" "live-$s8, adaptive spinning for every thread (G2)" || rc=1
+        echo "stats: $(cat /sys/module/ntsync/parameters/stats)"
+    else : > "$t/g2a"; cp "$t/stock" "$t/g2a"; fi
     sudo -n "$H" ntsync restore-stock >/dev/null || { echo "ntsync-live: could not restore the stock module" >&2; rc=1; }
-    for f in e1 g2; do  # the selftest must fail exactly as it does on the stock module
+    for f in e1 g2 g2a; do  # the selftest must fail exactly as it does on the stock module
         if cmp -s "$t/stock" "$t/$f"; then echo "selftest $f: same as stock (failing on stock too: $(cat "$t/stock"))"
         else echo "selftest $f: DIFFERS from stock: stock [$(cat "$t/stock")], $f [$(cat "$t/$f")]"; rc=1; fi
     done
@@ -134,9 +139,12 @@ do_g3() {  # gate G3: the fan-out per spin budget, calibrated to D0004 (5 worker
     local s8 dir ns
     prepare_tests
     sudo -n "$H" ntsync load "$s8" spin_comm=AudioCalc,pipeasio-rt || die "ntsync load $s8 failed"
-    for ns in 0 5000 10000 20000 40000; do
+    for cfg in 0:0 5000:0 10000:0 20000:0 40000:0 20000:1 40000:1; do   # spin_ns:spin_adaptive
+        ns=${cfg%:*}; ad=${cfg#*:}
+        [ "$ad" = 1 ] && [ ! -e /sys/module/ntsync/parameters/spin_adaptive ] && continue
+        [ -e /sys/module/ntsync/parameters/spin_adaptive ] && sudo -n "$H" knob set ntsync.spin_adaptive "$ad" >/dev/null
         sudo -n "$H" knob set ntsync.spin_ns "$ns" >/dev/null && sudo -n "$H" knob set ntsync.stats_reset 1 >/dev/null
-        echo "spin_ns=$ns: $("$dir/ntsl_stress" bench 5 20000 13 4 1333)"
+        echo "spin_ns=$ns adaptive=$ad: $("$dir/ntsl_stress" bench 5 20000 13 4 1333)"
         echo "  stats: $(cat /sys/module/ntsync/parameters/stats)"
     done
     sudo -n "$H" ntsync restore-stock >/dev/null || echo "ntsync-live: could not restore the stock module" >&2

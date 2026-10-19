@@ -12,7 +12,7 @@ Living document, approved 2026-10-19: the status table is updated as each item l
 | K0 census | **done** (D0004): ~83 sync calls per block; K5 syscall-free share ~40 %; spin budget 20–40 µs; K4 gate fires but C2 wakes look cheap; CPU 4 spends 5 % in xhci IRQs | D0004 | see K0 |
 | K1 SMT offline | registered as T0026; driver `profiler/trials/trial-T0026.sh` (`KEPT_CLEAR` from T0024's verdict); runs after T0024 is scored | T0026 | — |
 | K2 mitigations=off | registered as T0027; driver `profiler/trials/trial-T0027.sh` with `reboot-lib.sh` and `reboot-waiter.sh`; GRUB entry installed | T0027 | — |
-| K3 ntsync-live spin | **E0 PASS** (pristine srcversion 2C65A4C2795A6FEE73E9F96 = in-tree); stage 1 (0001–0003) builds clean as live-8b5e287b; root-helper ntsync verbs, the native suite (`ntsync-live verify`, `g3`) and the T0025 driver are written. Next on the laptop: verify (E1, G2), g3 | T0025 | — |
+| K3 ntsync-live spin | E0, E1, G2 **PASS**; G3 **FAIL** without the predictor (40 µs: block −23 %, CPU 1.72× > 1.5×); patch 0004 (adaptive) written, G3 again after T0024 | T0025 | — |
 | K4 C-state limit | gate fired (D0004: two thirds of audio wakes leave C2) but C2 wakes look cheap; registered as T0028, driver `profiler/trials/trial-T0028.sh`; p90/p99 per state checked before it runs | T0028 | — |
 | K5 LiveSync | not started; D0004 sizes it (about 40 % of sync calls syscall-free, every reset waiter-free, no alertable or multi-object audio waits) | next free IDs | — |
 | K6 isolation | registered as T0029; driver `profiler/trials/trial-T0029.sh` (reboot per run; isolated entry installed) | T0029 | — |
@@ -232,6 +232,26 @@ Trial IDs are assigned when each item is registered. The campaign's pending T002
     - a 1333 µs period with 5 rounds per block;
     - work per round calibrated to K0's medians.
     - Choose the smallest `spin_ns` from {5, 10, 20, 40 µs} within 2 % of the best. Required: ≥10 % lower median block time than spin off, p99 no worse, CPU per round ≤1.5×. Otherwise stop and record the mechanism only.
+- **Gate results (2026-10-19, live-8b5e287b = 0001–0003, on the laptop after a fresh boot):**
+  - **E0 PASS:** the pristine build's srcversion (2C65A4C2795A6FEE73E9F96) equals the in-tree module's.
+  - **E1 PASS:** `ntsync-live verify` ran the suite on stock and on live with defaults.
+    - The selftest results are identical. Only `wake_all` fails, on stock too: upstream's v7.2.11 test checks `EXPECT_EQ(0, fd)` where `EXPECT_LE` is meant.
+    - The selftest is built unoptimised, as upstream builds it. At -O2 `stress_wait` miscounts a static variable the compiler keeps in a register.
+    - The native torture and ping-pong (10⁶ rounds each) have no lost wake-ups or double consumptions, timings match within 1 %, and the kernel log is clean.
+  - **G2 PASS:** the same suite with 20 µs spinning for every thread passes. Torture is 35 % faster (4.38 → 2.85 µs per round) and ping-pong 68 % faster (3.03 → 0.98 µs); 99.96 % of spins were satisfied while spinning.
+  - **G3 FAIL (non-adaptive), recorded as mechanism only.** The D0004-calibrated fan-out bench (5 workers, 4 rounds of 13 µs per 1333 µs block):
+
+    | spin_ns | block p50 | p99 | CPU per round | spins satisfied |
+    |---|---|---|---|---|
+    | 0 | 193.1 µs | 221.6 µs | 146 µs | — |
+    | 5 µs | 191.5 | 219.4 | 182 | 0 % |
+    | 10 µs | 200.0 | 229.4 | 222 | 0.3 % |
+    | 20 µs | 162.6 | 235.1 | 242 | 66 % |
+    | 40 µs | 148.9 (−23 %) | 169.8 (−23 %) | 252 (1.72×) | 79 % |
+
+    - 40 µs is the pick: −23 % median and a better p99. But at 1.72× the CPU it breaks the ≤ 1.5× limit.
+    - Much of the extra CPU should be the futile spin on each thread's long wait between blocks.
+  - **Next:** patch 0004 (the adaptive predictor), then G3 again with `spin_adaptive=1` at 20 and 40 µs as its own evaluation (T0025's B arm allows `spin_adaptive=P*`), with E1/G2 repeated on the 0001–0004 build.
 - **T0025:**
   - A: `spin_ns=0`. B: `spin_ns=S*`, `spin_comm=AudioCalc,pipeasio-rt`, `spin_rt=1`, `spin_adaptive=P*`. The same module binary runs in both arms; parameters change between runs.
   - **Rule D with G4:** M's median increase ≤ +15 points of one core. A bigger CPU cost turns a keep into mechanism-confirmed for the user to decide.
