@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+# ntsync-live: build and check the profiler's ntsync module (profiler/plans/kernel-plan.md K3/K5). Runs on the laptop
+# from the checkout, between trials only (it takes the Live session lock); loading goes through the root helper.
+#
+#   ntsync-live build [--pristine]   upstream/ plus the patches in SERIES (none with --pristine), built for the running
+#                                    kernel into ~/.local/opt/ntsync-live/<series8>/ntsync.ko; prints the directory
+#   ntsync-live e0                   gate E0: the pristine build against the in-tree module (srcversion, else the
+#                                    disassembly with addresses stripped)
+#   ntsync-live status               the loaded module: stock or live-<series8>, and its parameters
+#
+# series8: the first 8 hex digits of the sha256 over SERIES and each patch it names ("pristine" for none). The module
+# keeps the name ntsync, its misc device and its function names (wine-trace attaches to ntsync_char_ioctl and
+# ntsync_obj_ioctl), and says MODULE_VERSION("live-<series8>") once a patch adds it.
+set -euo pipefail
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+out_root=~/.local/opt/ntsync-live
+kver=$(uname -r)
+kbuild=/usr/lib/modules/$kver/build
+die() { echo "ntsync-live: $*" >&2; exit 1; }
+
+series_files() { [ -f "$here/SERIES" ] && grep -v '^\s*#' "$here/SERIES" | sed '/^\s*$/d' || true; }
+series8() {
+    local files
+    files=$(series_files)
+    [ -n "$files" ] || { echo pristine; return; }
+    { cat "$here/SERIES"; for f in $files; do cat "$here/patches/$f"; done; } | sha256sum | cut -c1-8
+}
+
+preflight() {
+    [ "$kver" = 7.2.11-1-cachyos ] || die "the running kernel is $kver; upstream/ is v7.2.11 for 7.2.11-1-cachyos"
+    [ -d "$kbuild" ] || die "no kernel build tree at $kbuild"
+    local kcc
+    kcc=$(sed -n 's/.*(\(clang version [0-9.]*\).*/\1/p' /proc/version)
+    [ -n "$kcc" ] || die "cannot read the kernel's compiler from /proc/version"
+    clang --version | head -n 1 | grep -qF "$kcc" || die "clang is '$(clang --version | head -n 1)', the kernel was built with $kcc"
+    command -v ld.lld >/dev/null || die "ld.lld is missing"
+    command -v pahole >/dev/null || die "pahole is missing (module BTF, which wine-trace and the census need)"
+    [ -f "$kbuild/vmlinux" ] || die "no $kbuild/vmlinux (module BTF is built against it)"
+    (cd "$here/upstream" && sha256sum --quiet -c SHA256SUMS) || die "upstream/ does not match SHA256SUMS"
+}
+
+do_build() {
+    local pristine=0 s8 work f
+    [ "${1:-}" = --pristine ] && pristine=1
+    preflight
+    if [ "$pristine" = 1 ]; then s8=pristine; else s8=$(series8); fi
+    work=$out_root/$s8
+    rm -rf "$work"; mkdir -p "$work/src"
+    cp "$here/upstream/drivers/misc/ntsync.c" "$work/src/ntsync.c"
+    [ -d "$here/include" ] && cp -r "$here/include" "$work/src/include"
+    if [ "$pristine" = 0 ]; then
+        for f in $(series_files); do
+            patch -d "$work/src" -p1 --fuzz=0 --no-backup-if-mismatch < "$here/patches/$f" >/dev/null || die "patch $f does not apply"
+        done
+    fi
+    printf 'obj-m := ntsync.o\nccflags-y := -I$(src)/include\n' > "$work/src/Kbuild"
+    exec 9>~/.local/state/profiler/live-session.lock
+    flock -n 9 || die "the Live session lock is held (a trial is running); build between trials"
+    make -s LLVM=1 -C "$kbuild" M="$work/src" modules > "$work/build.log" 2>&1 || { tail -n 20 "$work/build.log" >&2; die "the build failed ($work/build.log)"; }
+    cp "$work/src/ntsync.ko" "$work/ntsync.ko"
+    [ "$(modinfo -F name "$work/ntsync.ko")" = ntsync ] || die "the module is not named ntsync"
+    [ "$(modinfo -F vermagic "$work/ntsync.ko")" = "$(modinfo -F vermagic ntsync)" ] || die "vermagic differs from the in-tree module"
+    readelf -S "$work/ntsync.ko" | grep -q '\.BTF' || die "the module has no .BTF section"
+    sha256sum "$work/ntsync.ko" | cut -d' ' -f1 > "$work/ntsync.ko.sha256"
+    { echo "series8=$s8"; echo "kernel=$kver"; echo "built=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      echo "checkout=$(git -C "$here" log --oneline -1 | cut -c1-72)"; echo "sha256=$(cat "$work/ntsync.ko.sha256")"
+      echo "params=$(modinfo -F parm "$work/ntsync.ko" | cut -d: -f1 | tr '\n' ' ')"; } > "$work/BUILD-INFO"
+    echo "$work"
+}
+
+disasm() {  # MODULE: the .text instructions with addresses, offsets and relocation targets stripped
+    llvm-objdump -d --no-show-raw-insn --no-leading-addr "$1" 2>/dev/null |
+        sed -E 's/<[^>]*\+0x[0-9a-f]+>/<+>/g; s/0x[0-9a-f]+/0x/g' | grep -v '^\s*$' | grep -v 'file format'
+}
+
+do_e0() {
+    local work stock tmp a b diffs
+    work=$(do_build --pristine)
+    tmp=$(mktemp -d)
+    stock=$(modinfo -n ntsync)
+    case $stock in *.zst) zstd -q -dc "$stock" > "$tmp/stock.ko" ;; *.xz) xz -dc "$stock" > "$tmp/stock.ko" ;; *) cp "$stock" "$tmp/stock.ko" ;; esac
+    a=$(modinfo -F srcversion "$tmp/stock.ko" 2>/dev/null || true)
+    b=$(modinfo -F srcversion "$work/ntsync.ko" 2>/dev/null || true)
+    if [ -n "$a" ] && [ -n "$b" ]; then
+        if [ "$a" = "$b" ]; then echo "E0 PASS: srcversion $a matches the in-tree module"; rm -rf "$tmp"; return 0; fi
+        echo "E0: srcversion differs ($a in-tree, $b built); comparing the disassembly"
+    fi
+    disasm "$tmp/stock.ko" > "$tmp/stock.s"; disasm "$work/ntsync.ko" > "$tmp/built.s"
+    diffs=$(diff "$tmp/stock.s" "$tmp/built.s" | grep -c '^[<>]' || true)
+    cp "$tmp/stock.s" "$tmp/built.s" "$work/"
+    rm -rf "$tmp"
+    if [ "$diffs" = 0 ]; then echo "E0 PASS: the disassembly matches the in-tree module ($(wc -l < "$work/built.s") lines)"
+    else echo "E0 FAIL: $diffs differing disassembly lines ($work/stock.s, $work/built.s): take the source from the linux-cachyos package"; return 1; fi
+}
+
+do_status() {
+    if [ ! -d /sys/module/ntsync ]; then echo "ntsync: not loaded"; return 0; fi
+    local v p
+    v=$(cat /sys/module/ntsync/version 2>/dev/null || true)
+    echo "ntsync: ${v:-stock} (refcount $(cat /sys/module/ntsync/refcnt 2>/dev/null || echo ?), taint $(cat /sys/module/ntsync/taint 2>/dev/null))"
+    for p in /sys/module/ntsync/parameters/*; do [ -e "$p" ] && echo "  ${p##*/}=$(cat "$p")"; done
+    return 0
+}
+
+case ${1:-} in
+    build) shift; do_build "$@" ;;
+    e0) do_e0 ;;
+    status) do_status ;;
+    *) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+esac

@@ -1,0 +1,17 @@
+Pristine Linux v7.2.11 sources for ntsync-live (profiler/plans/kernel-plan.md K3/K5). Never edit these files:
+the module is built from them plus ../patches/ (SERIES); SHA256SUMS pins them.
+
+Fetched 2026-10-19 from the stable tree, tag v7.2.11:
+  https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/<path>?h=v7.2.11
+
+  drivers/misc/ntsync.c                       <- drivers/misc/ntsync.c
+  include/uapi/linux/ntsync.h                 <- include/uapi/linux/ntsync.h (identical to vendor/ntsync-uapi/linux/ntsync.h)
+  selftests/ntsync.c                          <- tools/testing/selftests/drivers/ntsync/ntsync.c
+  selftests/Makefile.upstream, selftests/config  <- tools/testing/selftests/drivers/ntsync/{Makefile,config}
+  selftests/kselftest_harness.h, kselftest.h  <- tools/testing/selftests/{kselftest_harness.h,kselftest.h}
+
+The laptop runs 7.2.11-1-cachyos. Gate E0 (kernel-plan.md K3) checks that this source, built unpatched, matches
+the in-tree ntsync.ko (srcversion, or the disassembly with addresses stripped) before any patch is trusted;
+if it does not, the source comes from the linux-cachyos package instead.
+
+License: GPL-2.0-only (SPDX headers kept); ntsync-live, derived from it, is GPL-2.0-only too.

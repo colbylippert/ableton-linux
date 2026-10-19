@@ -1,0 +1,3 @@
+# ntsync-live patch series (kernel-plan.md K3/K5), applied in order to upstream/drivers/misc/ntsync.c.
+# Patches are against the flat build directory (a/ntsync.c, a/include/ntsync_live.h), applied with patch -p1 --fuzz=0.
+# Empty until stage 1 lands: 0001-identity-params-stats, 0002-features-ioctl, 0003-optimistic-spin, ...
