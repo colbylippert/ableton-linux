@@ -2,19 +2,25 @@
 # profiler/bin/boot-kernel — boot the laptop once into the normal or the RT-BORE kernel and wait until its
 # desktop session is back. Runs on the controlling host and reaches the laptop over ssh.
 #
-#   profiler/bin/boot-kernel [--host HOST] [--timeout SECONDS] normal|rt
+#   profiler/bin/boot-kernel [--host HOST] [--timeout SECONDS] normal|rt|VARIANT
 #   profiler/bin/boot-kernel [--host HOST] status
 #
-# The choice is one-shot (grub-reboot): GRUB's saved default stays the normal kernel, so a failed RT boot
+# VARIANT: a name from profiler/kernel/grub/variants (mitigations-off, isolated, …), the normal kernel with
+# that variant's extra arguments (entries installed by profiler/kernel/grub/install.sh; kernel-plan.md K2, K6).
+# The choice is one-shot (grub-reboot): GRUB's saved default stays the normal kernel, so a failed boot
 # recovers with a plain reboot or a power cycle. GRUB needs GRUB_DEFAULT=saved and a flat menu
 # (GRUB_DISABLE_SUBMENU=y); see profiler/plans/resume-plan.md, RT-BORE kernel phase.
 # After the boot it prints one health line: kernel and preemption model, session, compositor GPU,
-# audio node, /dev/ntsync, PREEMPT_RT IRQ threads.
+# audio node, /dev/ntsync, PREEMPT_RT IRQ threads, the variant arguments on the command line. A variant must
+# show each of its arguments in /proc/cmdline; mitigations=off also needs no vulnerability still mitigated and
+# nohz_full=L needs /sys/devices/system/cpu/nohz_full to be L.
 # Exit: 0 booted and verified · 1 failed · 2 usage · 3 the laptop did not come back in time
 set -u
 host=ableton-laptop
 timeout=600
-usage() { sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+usage() { sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+VARIANTS_FILE=$(cd "$(dirname "$0")" && pwd)/../kernel/grub/variants
+variant_args() { awk -F'|' -v n="$1" '$1 == n && $1 !~ /^#/ { print $2; exit }' "$VARIANTS_FILE" 2>/dev/null; }
 while [ $# -gt 0 ]; do
     case $1 in
         --host) host=$2; shift 2 ;;
@@ -25,7 +31,11 @@ while [ $# -gt 0 ]; do
     esac
 done
 want=${1:-}
-case $want in normal|rt|status) ;; *) usage 2 ;; esac
+args=
+case $want in
+    normal|rt|status) ;;
+    *) [[ "$want" =~ ^[a-z][a-z0-9-]{0,40}$ ]] && args=$(variant_args "$want") && [ -n "$args" ] || usage 2 ;;
+esac
 
 # the laptop's login shell is fish: always run bash there, with arguments that are plain words
 remote() { ssh -o BatchMode=yes -o ConnectTimeout=8 "$host" bash -s -- "$@"; }
@@ -41,9 +51,10 @@ gpu=$(profiler/bin/with-session-env bash -c 'qdbus6 org.kde.KWin /KWin supportIn
 node=$(sed -n 's/^audio_node=//p' ~/.config/profiler/setup.conf 2>/dev/null)
 have_node=$( [ -n "$node" ] && pw-cli ls Node 2>/dev/null | grep -q "$node" && echo yes || echo no)
 irq=$(ps -eLo comm,rtprio,cls 2>/dev/null | awk '$1 ~ /^irq\// {n++} END {print n + 0}')
-printf 'kernel %s (%s) | session %s | compositor %s | audio node %s | ntsync %s | irq threads %s\n' \
+extra=$(tr ' ' '\n' < /proc/cmdline | grep -E '^(mitigations|nohz_full|rcu_nocbs|irqaffinity|isolcpus)=' | tr '\n' ' ')
+printf 'kernel %s (%s) | session %s | compositor %s | audio node %s | ntsync %s | irq threads %s | cmdline %s\n' \
     "$(uname -r)" "$model" "$(systemctl --user is-active graphical-session.target)" "${gpu:-none}" "$have_node" \
-    "$( [ -c /dev/ntsync ] && echo yes || echo no)" "$irq"
+    "$( [ -c /dev/ntsync ] && echo yes || echo no)" "$irq" "${extra:-stock}"
 EOF
 }
 
@@ -55,7 +66,11 @@ fi
 
 old_boot=$(remote <<<'cut -c1-8 /proc/sys/kernel/random/boot_id') || { echo "boot-kernel: cannot reach $host" >&2; exit 1; }
 remote "$want" <<'EOF' || exit 1
-case $1 in normal) pat='with Linux linux-cachyos$' ;; rt) pat='with Linux linux-cachyos-rt-bore$' ;; esac
+case $1 in
+    normal) pat='with Linux linux-cachyos$' ;;
+    rt) pat='with Linux linux-cachyos-rt-bore$' ;;
+    *) pat="with Linux linux-cachyos \\(profiler: $1\\)\$" ;;
+esac
 pgrep -f 'Live 12 Trial.exe' >/dev/null && { echo "boot-kernel: Live is running; not rebooting" >&2; exit 1; }
 flock -n ~/.local/state/profiler/live-session.lock true || { echo "boot-kernel: the session lock is held; not rebooting" >&2; exit 1; }
 title=$(sudo -n grep -oE "^menuentry '[^']*'" /boot/grub/grub.cfg | cut -d"'" -f2 | grep -E "$pat" | head -1)
@@ -88,5 +103,20 @@ echo "$line"
 [ $session -eq 0 ] || exit 1
 case $want in
     rt) [[ $line == *PREEMPT_RT* ]] ;;
-    normal) [[ $line != *PREEMPT_RT* ]] ;;
+    normal) [[ $line != *PREEMPT_RT* && $line == *"cmdline stock"* ]] ;;
+    *) [[ $line != *PREEMPT_RT* ]] && remote $args <<'EOF'
+for tok in "$@"; do
+    tr ' ' '\n' < /proc/cmdline | grep -qxF -- "$tok" || { echo "boot-kernel: /proc/cmdline lacks $tok" >&2; exit 1; }
+    case $tok in
+        mitigations=off)
+            if grep -l '^Mitigation' /sys/devices/system/cpu/vulnerabilities/* >/dev/null 2>&1; then
+                echo "boot-kernel: still mitigated: $(grep -l '^Mitigation' /sys/devices/system/cpu/vulnerabilities/* | xargs -n1 basename | tr '\n' ' ')" >&2; exit 1
+            fi ;;
+        nohz_full=*)
+            [ "$(cat /sys/devices/system/cpu/nohz_full)" = "${tok#nohz_full=}" ] \
+                || { echo "boot-kernel: nohz_full is $(cat /sys/devices/system/cpu/nohz_full), not ${tok#nohz_full=}" >&2; exit 1; } ;;
+    esac
+done
+EOF
+    ;;
 esac || { echo "boot-kernel: the laptop did not boot the $want kernel" >&2; exit 1; }

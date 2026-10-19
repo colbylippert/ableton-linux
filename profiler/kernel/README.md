@@ -5,5 +5,6 @@ The items of `profiler/plans/kernel-plan.md` that live in the kernel or need roo
 | Directory | Item | Contents |
 |---|---|---|
 | `census/` | K0 (D0004) | `census-capture` (a bench-tracer stand-in: ntsync sets, resets and waits, sleeps, wake sources, IRQ time), `d0004.sh` (the census run in the kept configuration), `analyze.py` (the gates for K3, K4/K7, K5 and K6) |
+| `grub/` | K2, K6 (I0) | `variants` (NAME\|extra kernel arguments), `45_profiler-variants` (the grub.d script: one entry per variant, after the normal entries, cloned from the normal entry without `savedefault`), `install.sh` (`sudo profiler/kernel/grub/install.sh [--remove]`); `profiler/bin/boot-kernel VARIANT` boots one once and verifies it |
 
-Later items add `grub/` (boot variants, K2/K6), `ntsync-live/` (the custom ntsync module, K3/K5), `prewake/` (K7) and `scx/` (K9).
+Later items add `ntsync-live/` (the custom ntsync module, K3/K5), `prewake/` (K7) and `scx/` (K9).

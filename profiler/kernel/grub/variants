@@ -1,0 +1,6 @@
+# The profiler's boot variants (profiler/plans/kernel-plan.md K2, K6): NAME|extra kernel arguments.
+# install.sh copies this to /etc/default/profiler-grub-variants; profiler/bin/boot-kernel reads it for the
+# arguments each variant must show in /proc/cmdline. Arguments: letters, digits and _ . , = : - only.
+mitigations-off|mitigations=off
+isolated|nohz_full=0,2,4,6,8,10 rcu_nocbs=0,2,4,6,8,10 irqaffinity=12-15 isolcpus=managed_irq,0,2,4,6,8,10
+isolated-mitigations-off|mitigations=off nohz_full=0,2,4,6,8,10 rcu_nocbs=0,2,4,6,8,10 irqaffinity=12-15 isolcpus=managed_irq,0,2,4,6,8,10

@@ -1,0 +1,18 @@
+#!/bin/sh
+# /etc/grub.d/45_profiler-variants (from profiler/kernel/grub/, kernel-plan.md I0): one GRUB entry per profiler boot
+# variant, after the normal entries so their positions never shift. Each is the normal linux-cachyos entry, from the
+# template install.sh saved (without savedefault), with the variant's extra arguments on its linux line, titled
+# "<normal title> (profiler: NAME)". The default entry is never changed: profiler/bin/boot-kernel boots one with
+# grub-reboot, once.
+set -e
+TEMPLATE=/etc/default/profiler-grub-template
+VARIANTS=/etc/default/profiler-grub-variants
+[ -r "$TEMPLATE" ] && [ -r "$VARIANTS" ] || exit 0
+title=$(sed -n '1s/^title=//p' "$TEMPLATE")
+[ -n "$title" ] || exit 0
+grep -v '^#' "$VARIANTS" | while IFS='|' read -r name args; do
+    [ -n "$name" ] && [ -n "$args" ] || continue
+    printf "menuentry '%s (profiler: %s)' --class arch --class gnu-linux --class gnu --class os {\n" "$title" "$name"
+    sed -n '2,$p' "$TEMPLATE" | sed "s|^\([[:space:]]*linux[[:space:]].*\)\$|\1 $args|"
+    printf '}\n'
+done

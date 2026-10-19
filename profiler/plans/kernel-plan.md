@@ -7,7 +7,7 @@ Living document, approved 2026-10-19: the status table is updated as each item l
 |---|---|---|---|
 | T0022 physcore, 5 workers | recorded 2026-10-19: rule H PASS (9/9, −26.0 %) | T0022 | **keep**: the kept layout |
 | T0023 display, T0024 core clearing | registered, drivers on the laptop | T0023, T0024 | pending (run on physcore) |
-| I0 infrastructure | in progress: campaign tooling in `profiler/trials/`, rule D, root-helper knobs cpu-online/cpuidle/cpuidle-governor (to test and install on the laptop after T0023); GRUB variants, boot-kernel table, ledger kind still to do | — | — |
+| I0 infrastructure | in progress: campaign tooling in `profiler/trials/`, rule D, root-helper knobs (cpu-online, cpuidle, cpuidle-governor), ledger kinds `kernel`/`kernel-module` (validator fixed), GRUB variants (`profiler/kernel/grub/`, grub.d `45_`, not `09_`, so the normal entries never shift) and the `boot-kernel` variant table. To do on the laptop after T0023: install the helper and the GRUB variants, test rule D and the knobs | — | — |
 | K0 census | tool written (`profiler/kernel/census/`); runs after T0023 | D0004 | — |
 | K1 SMT offline | not started | next free ID | — |
 | K2 mitigations=off | not started | next free ID | — |
@@ -106,7 +106,7 @@ Trial IDs are assigned when each item is registered. The campaign's pending T002
    - `module param ntsync.<name> <value>`
    - Drivers use these verbs instead of bare `sudo -n`.
 3. **GRUB variants:**
-   - `profiler/kernel/grub/09_profiler-variants`, installed to `/etc/grub.d/` by `profiler/kernel/grub/install.sh`, emits entries titled `CachyOS Linux, with Linux linux-cachyos (profiler: <name>)`.
+   - `profiler/kernel/grub/45_profiler-variants`, installed to `/etc/grub.d/` by `profiler/kernel/grub/install.sh`, emits entries titled `CachyOS Linux, with Linux linux-cachyos (profiler: <name>)` after the normal entries (45, not 09: earlier entries would shift the saved default's position).
    - Each entry clones the normal entry's `linux`/`initrd` lines, which `install.sh` reads from `grub.cfg` and templates. The extra arguments come from `/etc/default/profiler-grub-variants` (`name|args`).
    - `install.sh` runs `grub-mkconfig` and checks the titles appear. `GRUB_DEFAULT` is never touched.
 4. **`profiler/bin/boot-kernel`:** replace the `normal|rt` case with a table: name → title regex → expected `/proc/cmdline` tokens → extra check.
