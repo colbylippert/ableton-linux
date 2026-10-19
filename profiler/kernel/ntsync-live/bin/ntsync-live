@@ -99,38 +99,40 @@ do_e0() {
 
 H=/usr/local/sbin/profiler-root-helper
 
-prepare_tests() {  # the newest build installed and the tests built; prints "series8 test-dir"; takes the session lock
-    local s8 dir
+prepare_tests() {  # the session lock (held by the calling shell), the newest build installed, the tests built
     s8=$(series8)
     [ -f "$out_root/$s8/ntsync.ko" ] || die "no build for $s8 (ntsync-live build)"
-    dir=$(bash "$here/tests/build.sh") || die "the tests do not build"
     exec 9>~/.local/state/profiler/live-session.lock
     flock -n 9 || die "the Live session lock is held (a trial is running)"
+    dir=$(bash "$here/tests/build.sh") || die "the tests do not build"
     sudo -n "$H" ntsync install "$s8" >/dev/null || die "ntsync install $s8 failed"
-    echo "$s8 $dir"
 }
 
 do_verify() {  # gates E1 and G2: the suite on stock, on live with its defaults, and on live spinning every thread
-    local s8 dir rc=0
-    read -r s8 dir < <(prepare_tests) || exit 1
-    [ -n "$dir" ] || exit 1
+    local s8 dir rc=0 t f
+    prepare_tests
+    t=$(mktemp -d)
     sudo -n "$H" ntsync restore-stock >/dev/null || die "cannot load the stock module"
-    NTSL_TESTS=$dir bash "$here/tests/run-suite.sh" stock || rc=1
+    NTSL_SELFTEST_FAILURES=$t/stock NTSL_TESTS=$dir bash "$here/tests/run-suite.sh" stock || rc=1
     sudo -n "$H" ntsync load "$s8" || die "ntsync load $s8 failed"
-    NTSL_TESTS=$dir bash "$here/tests/run-suite.sh" "live-$s8, defaults (E1)" || rc=1
+    NTSL_SELFTEST_FAILURES=$t/e1 NTSL_TESTS=$dir bash "$here/tests/run-suite.sh" "live-$s8, defaults (E1)" || rc=1
     sudo -n "$H" knob set ntsync.spin_comm ntsync,AudioCalc,pipeasio-rt >/dev/null &&
         sudo -n "$H" knob set ntsync.spin_rt 0 >/dev/null && sudo -n "$H" knob set ntsync.spin_ns 20000 >/dev/null || rc=1
-    NTSL_TESTS=$dir bash "$here/tests/run-suite.sh" "live-$s8, spinning 20 us for every thread (G2)" || rc=1
+    NTSL_SELFTEST_FAILURES=$t/g2 NTSL_TESTS=$dir bash "$here/tests/run-suite.sh" "live-$s8, spinning 20 us for every thread (G2)" || rc=1
     echo "stats: $(cat /sys/module/ntsync/parameters/stats)"
     sudo -n "$H" ntsync restore-stock >/dev/null || { echo "ntsync-live: could not restore the stock module" >&2; rc=1; }
+    for f in e1 g2; do  # the selftest must fail exactly as it does on the stock module
+        if cmp -s "$t/stock" "$t/$f"; then echo "selftest $f: same as stock (failing on stock too: $(cat "$t/stock"))"
+        else echo "selftest $f: DIFFERS from stock: stock [$(cat "$t/stock")], $f [$(cat "$t/$f")]"; rc=1; fi
+    done
+    rm -rf "$t"
     echo "verify: $([ "$rc" = 0 ] && echo PASS || echo FAIL)"
     return $rc
 }
 
 do_g3() {  # gate G3: the fan-out per spin budget, calibrated to D0004 (5 workers, 4 rounds of 13 us per 1333 us block)
-    local s8 dir ns base=
-    read -r s8 dir < <(prepare_tests) || exit 1
-    [ -n "$dir" ] || exit 1
+    local s8 dir ns
+    prepare_tests
     sudo -n "$H" ntsync load "$s8" spin_comm=AudioCalc,pipeasio-rt || die "ntsync load $s8 failed"
     for ns in 0 5000 10000 20000 40000; do
         sudo -n "$H" knob set ntsync.spin_ns "$ns" >/dev/null && sudo -n "$H" knob set ntsync.stats_reset 1 >/dev/null
