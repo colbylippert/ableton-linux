@@ -651,6 +651,46 @@ Next candidates (user to choose; none pre-registered yet):
   - Context, not part of the rule: this A arm had 14 errors, against 1 in T0018's A arm (the old display setup) and 5 in T0015's normal-kernel arm. Dropout counts drift between sessions by more than most trial effects, and only the interleaved ABAB design absorbs that drift.
   - Kept as is: patch 0111 stays in the series and the runtime as an opt-in switch, default off. The configuration does not change.
 
+**Diagnostic D0003: what happens in late audio blocks (user decision 2026-10-19: "Lets dig into late blocks")**
+- Question: D0001 saw a few late blocks per Set in which an audio worker runs about 1.1 ms while the callback waits, with 10–50 `FlushInstructionCache` calls. Where does that time go, and does Wine add to it?
+- Method:
+  - D0001's traced blocks re-read: every late and near-late block, placed on the song.
+  - A capture run as the bench's tracer (`~/.local/state/profiler/d0003-capture`, started right after play).
+    - bpftrace on PipeASIO's block markers: every block over 700 µs.
+    - Every user page fault in Live (address, faulting IP, error code), and `handle_mm_fault` timed.
+    - `/proc/PID/smaps` at start and stop.
+    - Optionally perf: CPU samples with cycles, instructions and reference cycles; scheduler switches and wakeups of the audio threads; IRQs.
+  - Smoke runs on the kept configuration; analysis `d0003_analyze.py`, `d0003_faults.py`.
+- Findings:
+  - The three heavy Sets are the same song (112 BPM, loop beats 16–112, clips starting on the same beats), so their late blocks coincide.
+    - In every run they fall at beats 16.4, 17.4, 46.4 and 49.4, about 0.4 beats after bars where clips start, and only in the loop's first pass.
+    - D0001 shows the same beats once its trace start is placed correctly (1.2 s after play).
+  - In each late block, one audio thread (a worker or the callback) runs 1.3–2.4 ms at about 4.7 GHz.
+    - The time is page faults: 1,140–1,560 per block. All have error code 7, a write to a present but write-protected page, one per 4 KiB page, in Live's ordinary heap regions (16–80 MB anonymous mappings, almost fully resident before the storm).
+    - The faulting code is Live's first-use copies (`vcruntime140.dll` memcpy, `Live.exe+0x4a68210` and others).
+    - About 60 % of Live's page faults in a window fall inside these four blocks.
+    - perf's per-process page-fault tracepoint missed most of them; bpftrace counts are the reliable ones.
+  - Ruled out: swap (zram unused), THP compaction (0 stalls), KSM (off), and Wine's userfaultfd write-watch (no `uw` regions, no write-watch calls).
+  - Cause: Wine's `spawn_process()` (`dlls/ntdll/unix/process.c`) starts every new process with `fork()`.
+    - Live starts four helper processes while the Set loads, 7.3–6.5 s before play.
+    - Each `fork()` write-protects all of Live's private writable memory for copy-on-write. Once the short-lived intermediate child is gone, the pages are Live's alone again, but the first write to each one still takes a fault.
+    - Huge pages do not help: Wine's 64 KiB-granular heap pieces are not backed by them.
+    - Windows has no fork, so this cost exists only under Wine.
+  - Probe `spawncowprobe.c` (1 MiB chunks, so not huge-page-backed): after `CreateProcess`, writing 32,768 populated pages takes 17.6 ms (0.53 µs per page, one fault per page) against 0.6 ms warm.
+- Candidate fix (dev tree e3fcf96): `WINE_POSIX_SPAWN=1` starts processes with `posix_spawn()`, which shares the address space until exec (CLONE_VM | CLONE_VFORK), so nothing is copied or write-protected.
+  - The probe passes: 0.6 ms after the child, and the child even starts faster (5–9 ms against 12 ms).
+  - Dev-runtime A/B, kept configuration, heavy Sets, one 60 s window each (the whole first pass), block and fault capture:
+
+    | Set | fork: late / longest / Live faults | posix_spawn: late / longest / Live faults |
+    |---|---|---|
+    | Inbuilts | 5 / 1856 µs / 12,632 | 0 / 890 µs / 325 |
+    | Max4Live | 4 / 1863 µs / 13,583 | 0 / 897 µs / 295 |
+    | VSTs | 3 / 1897 µs / 11,879 | 0 / 895 µs / 295 |
+
+  - Live, Max for Live and the helpers ran normally. The remaining slow blocks (about 0.9 ms) are Live's own first-use work, within the 1.33 ms period.
+- Side observations: while workers go to sleep, the kernel's RT balancing (`balance_rt` → `double_rq_lock`) spins on runqueue locks. The audio threads switch about 53,000 times per second (the AudioCalc fan-out).
+- Next: patch 0112 and a pre-registered trial (T0020).
+
 **Wine hot-path research (2026-10-18 morning)**
 
 Diagnostic D0001: one traced run on the kept configuration (heavy Sets, 60 s each, 45,000 blocks per Set; history `diag-D0001-traced`).
