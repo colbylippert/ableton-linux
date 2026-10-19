@@ -551,6 +551,23 @@ Next candidates (user to choose; none pre-registered yet):
       - B's PipeWire errors are not significantly higher than A's (a one-sided binomial test of B's share of all errors, p ≥ 0.05);
       - the bench measured a 32-frame quantum in every B Set-run.
     - Otherwise 64 frames stays.
+  - **T0018, the display setup** (user decision 2026-10-18: "That sounds good queue it up"; pre-registered before running; queued after T0017). It follows from T0016's normal-kernel arm, which had 20 errors against 5 in T0015's after the display setup changed.
+    - A: the old display setup. wined3d on OpenGL (the launcher's default `WINE_D3D_CONFIG=csmt=0x1`), Live's GPU renderer off (the previous golden, `golden.20261018T223420Z`), every frame shown (`WINED3D_PRESENT_SKIP` unset).
+    - B: the new display setup. wined3d's Vulkan back end, the GPU renderer on (golden), `WINED3D_PRESENT_SKIP=6`.
+    - Both arms:
+      - the normal kernel 7.2.11-1 with stock priorities, and the official runtime with 0110 (the switch acts only in B);
+      - `PIPEASIO_REALTIME=1`, pinning, nine workers, the normal window, 64 frames;
+      - the NVIDIA-only external display and wired Ethernet;
+      - RT throttling off (`sched_rt_runtime_us` = period, as in T0015; T0016 and T0017 had the 95 % safety net, the other difference to T0016's arm).
+    - ABAB × 3, back to back on T0017's boot (its per-boot timers are already stopped); Inbuilts, Max4Live, VSTs; 120 s.
+    - Rule (non-inferiority: the new setup was adopted to save display CPU, so the question is whether it costs dropouts). Keep the new setup iff:
+      - B has no xruns;
+      - its PipeWire errors are not significantly higher than A's (a one-sided binomial test of B's share, p ≥ 0.05);
+      - no Set's median DSP average is worse in B by more than 2× its A/A spread.
+    - Otherwise revert to the old display setup: golden back to the old snapshot, and the environment.d file removed. Patch 0110 stays in the runtime as an opt-in switch.
+    - Mechanism check: each Set-run's Live log shows the GPU renderer off in A and on in B, and Wine logs the Vulkan renderer and the skip only in B.
+    - Secondary readouts: compositor CPU (kwin_wayland + Xwayland) per run, Live's per-thread CPU (UI thread, `wined3d_cs`), DSP peaks.
+    - Driver `~/.local/state/profiler/trial-T0018.sh`, started by `queue-T0018.sh` when T0017 ends.
 - GPU mode: whatever T0014 keeps.
   - The earlier "T0017, Live on the NVIDIA GPU" was dropped ("As we will not use GPU rendering lets stay on the intel driver"). The user then moved the discrete-mode test ahead of this phase, as T0014.
   - The laptop (MSI Katana 15 B13VFK) has a MUX: the NVIDIA card has its own built-in-screen output (`eDP-2`), switchable only in the firmware.
