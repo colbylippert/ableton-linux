@@ -12,7 +12,7 @@ Living document, approved 2026-10-19: the status table is updated as each item l
 | K0 census | tool written (`profiler/kernel/census/`); runs after T0023 | D0004 | — |
 | K1 SMT offline | not started | next free ID | — |
 | K2 mitigations=off | not started | next free ID | — |
-| K3 ntsync-live spin | v7.2.11 sources imported (`profiler/kernel/ntsync-live/upstream/`), build tool written; E0 (pristine build vs in-tree) runs after T0023 | T0025 | — |
+| K3 ntsync-live spin | **E0 PASS** (pristine build srcversion 2C65A4C2795A6FEE73E9F96 = in-tree); stage 1 (0001–0003) builds clean as live-8b5e287b. Next: root-helper ntsync verbs, native suite, E1–G3 | T0025 | — |
 | K4 C-state limit | gated on K0 | — | — |
 | K5 LiveSync | not started | K5a, K5b | — |
 | K6 to K9 | not started | — | — |
