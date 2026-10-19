@@ -590,6 +590,13 @@ Next candidates (user to choose; none pre-registered yet):
   - The NVIDIA driver stays installed on both kernels, so the kernel A/B loads the same drivers. If T0014 keeps discrete mode, the RT kernel's `nvidia-open` module drives the screen, and R1 must pass before any RT trial.
   - Open option (hybrid): the idle dGPU stays awake in P0 because the compositor holds its DRM device. Letting it power down (runtime D3) could cut heat in the cooling the CPU shares.
 
+**Diagnostic D0002: what wakes wineserver ~3,000 times per second (user decision 2026-10-18: "Lets do item 3"; open since T0012)**
+- Question: wineserver sleeps and wakes about 3,060 times per second during playback (T0012, both arms). D0001 counted only ~370 server requests per second from Live's own process, so either other Wine processes (Max, explorer, services, plugin hosts) talk to it, or something besides requests wakes it, such as timers.
+- Setup: kept configuration, normal kernel, golden (OpenGL, renderer off). Inbuilts and Max4Live (Max4Live had the most errors in T0016–T0018 and runs the separate Max process); one 60 s window each.
+  - Part 1, official runtime: for 30 s inside the window, `bpftrace` counts wineserver's syscalls by number, how its `epoll_wait`/`epoll_pwait2` calls return (timeout vs client events, plus ready fds), and its voluntary sleeps.
+  - Part 2, the dev runtime with `bin/wineserver` wrapped to run with `-d1`, wineserver's own request log: the requests of a 30 s slice of the window by type and by client thread. A `/proc` snapshot taken during the window names the threads. The wrapper is removed on exit.
+- Script `~/.local/state/profiler/d0002.sh`; summary `d0002_analyze.py`.
+
 **Wine hot-path research (2026-10-18 morning)**
 
 Diagnostic D0001: one traced run on the kept configuration (heavy Sets, 60 s each, 45,000 blocks per Set; history `diag-D0001-traced`).
