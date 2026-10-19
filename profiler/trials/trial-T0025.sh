@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Trial T0025: ntsync-live's in-kernel optimistic spin (kernel plan K3; pre-registered in profiler/plans/kernel-plan.md).
 # Usage: KEPT_LAYOUT=physcore KEPT_WORKERS=5 KEPT_DISPLAY=new KEPT_CLEAR=0|1 NTSL_S8=<series8> NTSL_SPIN_NS=<G3's S*> \
-#          NTSL_ADAPTIVE=<G3's P*: 0|1> profiler/trials/trial-T0025.sh
+#          NTSL_ADAPTIVE=<G3's P*: 0|1> KEPT_SMT=on|off profiler/trials/trial-T0025.sh   (KEPT_SMT=off: T0026 kept)
 # Both arms run the same module, live-$NTSL_S8, loaded once before the first run through the root helper (installed by
 # ntsync-live verify or g3) with spin_comm=AudioCalc,pipeasio-rt, spin_rt=1 and spin_adaptive=$NTSL_ADAPTIVE; the stock
 # module comes back when the driver exits. A: spin_ns=0 (no wait spins, whatever spin_adaptive says).
@@ -13,7 +13,7 @@
 set -u
 TRIAL=T0025
 source "$(dirname "${BASH_SOURCE[0]}")/trial-lib.sh"
-: "${KEPT_LAYOUT:?}" "${KEPT_WORKERS:?}" "${KEPT_DISPLAY:?}" "${KEPT_CLEAR:?}" "${NTSL_S8:?}" "${NTSL_SPIN_NS:?}" "${NTSL_ADAPTIVE:?}"
+: "${KEPT_LAYOUT:?}" "${KEPT_WORKERS:?}" "${KEPT_DISPLAY:?}" "${KEPT_CLEAR:?}" "${NTSL_S8:?}" "${NTSL_SPIN_NS:?}" "${NTSL_ADAPTIVE:?}" "${KEPT_SMT:?}"
 export ABLETON_MAX_AUDIO_THREADS=$KEPT_WORKERS
 H=/usr/local/sbin/profiler-root-helper
 P=/sys/module/ntsync/parameters
@@ -28,6 +28,7 @@ arm_env() {
 }
 arm_setup() {  # $tag: run_one's
   [ "$KEPT_CLEAR" = 1 ] && cores_clear_on
+  [ "$KEPT_SMT" = off ] && smt_siblings_off
   sudo -n "$H" knob set ntsync.spin_ns "$(spin_for "$1")" >/dev/null && sudo -n "$H" knob set ntsync.stats_reset 1 >/dev/null \
     || echo "ntsync parameters not set for $1"
   sampler_start "$R/$tag.power.tsv"
@@ -35,6 +36,7 @@ arm_setup() {  # $tag: run_one's
 arm_teardown() {
   sampler_stop
   STATS=$(cat $P/stats 2>/dev/null); MODULE="$(cat /sys/module/ntsync/version 2>/dev/null) spin_ns=$(cat $P/spin_ns 2>/dev/null) spin_comm=$(cat $P/spin_comm 2>/dev/null) spin_rt=$(cat $P/spin_rt 2>/dev/null) spin_adaptive=$(cat $P/spin_adaptive 2>/dev/null)"
+  [ "$KEPT_SMT" = off ] && smt_siblings_on
   [ "$KEPT_CLEAR" = 1 ] && cores_clear_off
   return 0
 }
