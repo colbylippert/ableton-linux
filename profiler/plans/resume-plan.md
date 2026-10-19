@@ -820,6 +820,30 @@ Next candidates (user to choose; none pre-registered yet):
   - Rule H. Mechanism:
     - (a) each B run records kwin's and a system service's CPU mask (12–15) and the xhci IRQ's effective CPU;
     - (b) traced, one 60 s Inbuilts run per arm with `d0003-capture`: IRQ time and preemptions on the audio threads are lower in B by at least half.
+- **Ideas backlog** (user, 2026-10-19: "lets remember these ideas and keep discussing"; not yet registered):
+  - Evidence:
+    - P-cores idle through ACPI C1 / C2 / C3 with exit latencies of 1 / 127 / 1048 µs; block wake latency p50 31–44 µs, max ~320 µs (D0001).
+    - The RFDS mitigation clears registers (VERW) on every return to user space.
+    - 76 Live threads run RR 10, the UI thread included.
+    - Live imports `AvSetMmThreadCharacteristicsW` (MMCSS "Pro Audio", stubbed in Wine), `SetThreadAffinityMask` and `GetLogicalProcessorInformationEx`. It logs its P-core mask, but unpinned its audio threads run on CPUs 0–15.
+  - Kernel and configuration:
+    - C2/C3 disabled on P-cores 0–11 (the top pick);
+    - poll-only idle on the audio cores;
+    - `reg_file_data_sampling=off` or `mitigations=off` as a boot entry;
+    - an ntsync module with in-kernel optimistic spinning for RT waiters;
+    - nohz_full / rcu_nocbs / isolcpus;
+    - period-aware pre-wake of the audio cores before each block;
+    - a sched_ext audio policy.
+  - Wine, specific to Live:
+    - MMCSS "Pro Audio" mapped to SCHED_FIFO above Live's other threads;
+    - a fixme-logging launch to list the APIs Live calls that Wine stubs;
+    - huge pages for Live's heap and its ~100 MB of code (measure TLB walks first);
+    - a lighter syscall dispatcher for the hot sync calls;
+    - a re-test of 0109.
+  - The "LiveSync" concept (bake the fan-out's hot path into kernel and Wine together):
+    - ntsync event state in shared memory (a patched module mmaps a per-event slot; the kernel stays authoritative through atomics);
+    - Wine makes ResetEvent, SetEvent with no sleeper, and the acquire of a signaled event syscall-free;
+    - AudioCalc and pipeasio-rt spin on the memory word before sleeping in the kernel.
 - **T0025, spinning before sleeping (item 3).** A Wine patch (0113) that lets threads named AudioCalc or pipeasio-rt spin briefly on their event before sleeping. It will be pre-registered with its probe once built; it is not run before then.
 
 **Wine hot-path research (2026-10-18 morning)**
