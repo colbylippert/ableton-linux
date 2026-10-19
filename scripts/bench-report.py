@@ -382,15 +382,38 @@ def benchmark_environment(environment: dict[str, str] | None = None) -> dict[str
     }
 
 
+NTSYNC_MODULE_GATES = (  # ntsync-live parameter -> gate name (profiler/plans/kernel-plan.md K3, K5)
+    ("spin_ns", "NTSYNC_SPIN_NS"), ("spin_comm", "NTSYNC_SPIN_COMM"), ("spin_rt", "NTSYNC_SPIN_RT"),
+    ("spin_adaptive", "NTSYNC_SPIN_ADAPTIVE"), ("onstack_q", "NTSYNC_ONSTACK_Q"), ("livesync", "NTSYNC_LIVESYNC"),
+)
+
+
+def ntsync_module_gates(root: Path = Path("/sys/module/ntsync")) -> dict[str, str]:
+    """The loaded ntsync-live module (version live-<series8>) and its parameters; nothing for the stock module."""
+    version = read_text(root / "version").strip()
+    if not version.startswith("live-"):
+        return {}
+    gates = {"NTSYNC_LIVE": version}
+    for name, key in NTSYNC_MODULE_GATES:
+        value = read_text(root / "parameters" / name).strip()
+        if value:
+            gates[key] = value
+    return gates
+
+
 def benchmark_gate_environment(environment: dict[str, str] | None = None) -> dict[str, str]:
-    """Return settings that can change CPU or audio results."""
+    """Return settings that can change CPU or audio results: the environment's, and for a live run (no
+    environment given) a loaded ntsync-live module's."""
     values = benchmark_environment(environment)
-    return {
+    gates = {
         key: value for key, value in values.items()
         if key in BENCHMARK_WINE_ENV_KEYS
         or key.startswith("PIPEASIO_")
         or key in BENCHMARK_ABLETON_ENV_KEYS
     }
+    if environment is None:
+        gates.update(ntsync_module_gates())
+    return gates
 
 
 def cpu_sysfs_inventory(root: Path = Path("/sys/devices/system/cpu")) -> dict[str, Any]:
