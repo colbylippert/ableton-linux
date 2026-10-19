@@ -715,6 +715,31 @@ Next candidates (user to choose; none pre-registered yet):
   - revert: a guard fails, or a mechanism check does not hold.
 - Context readouts: worst DSP peak medians, Live CPU, wineserver CPU, xruns.
 - Driver `~/.local/state/profiler/trial-T0020.sh`. Scored by `plans/tools/trial-analyze.py T0020 --rule t0004` plus `t0020_mechanism.py`.
+- Before the trial (2026-10-19): the official build of 9378f44 took 4m19s, the audit passed (193 checks, including 0112's fingerprint), and the runtime is installed on the laptop. The probe on the official runtime fails without the switch (17.4 ms, 0.53 µs per page after the child) and passes twice with it (0.6 ms): 4 PASS, 0 FAIL.
+- **T0020 — KEEP (2026-10-19, 02:24–03:19, normal kernel; all six runs and both traced runs clean):** the first trial whose verdict comes from a Wine patch.
+  - Rule PASS on [E]; both guards pass.
+    - Dropouts: PipeWire errors 11 → 1, 91 % fewer (A: Inbuilts 2/0/0, Max4Live 0/0/1, VSTs 0/0/8; B: VSTs 1/0/0, otherwise 0). One-sided p = 0.0032. xruns 0 → 0.
+    - DSP average 9.68 / 9.89 / 9.43 → 9.94 / 9.69 / 9.37, at most 0.24 × the spread.
+  - Both mechanism checks held:
+    - Wine logged the posix_spawn line in every B run and in no A run.
+    - Traced (60 s windows):
+
+      | Set | A: late / longest / storm blocks / Live faults | B: late / longest / storm blocks / Live faults |
+      |---|---|---|
+      | Inbuilts | 3 / 1948 µs / 5 / 12,744 | 0 / 906 µs / 0 / 309 |
+      | Max4Live | 5 / 1951 µs / 5 / 19,695 | 0 / 963 µs / 0 / 409 |
+      | VSTs | 4 / 1889 µs / 5 / 11,571 | 0 / 951 µs / 0 / 289 |
+
+      The biggest fault count in any B block was 46; in A blocks it was up to 1,582.
+  - Context, not part of the rule:
+    - Worst DSP peak medians 99.8 / 86.6 / 99.1 → 66.5 / 63.0 / 62.7 %, and no B Set-run peaked over 75 %.
+    - Live CPU 47.1 vs 46.9 % of one core.
+    - PipeWire's error counter at the window start (errors since Live opened, Set load included) was 29–33 in A runs against 9 in B1, so the forks also glitched the load.
+  - Kept:
+    - From T0021, trials set `WINE_POSIX_SPAWN=1` in both arms.
+    - Desktop launches get it from `~/.config/environment.d/91-profiler-wine-posix-spawn.conf`; it takes effect at the next login.
+    - Patch 0112 stays opt-in in the series, as every fix does.
+  - Upstream candidate (the user's call): the change is generic Wine, not Ableton-specific. Any Wine process that starts other processes pays this copy-on-write cost afterwards.
 
 **Wine hot-path research (2026-10-18 morning)**
 
