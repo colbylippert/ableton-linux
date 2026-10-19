@@ -1,0 +1,139 @@
+#!/usr/bin/env bash
+# d0003-capture: a stand-in for wine-trace under bench-suite's tracer contract, run as root through sudo
+# (ABLETON_BENCH_TRACER=this, ABLETON_BENCH_ROOT_HELPER=/nonexistent/...):
+#   d0003-capture start --out DIR --pid P [--run-id T] [--mode M]     returns once everything is attached
+#   d0003-capture stop  --out DIR
+# Diagnostic D0003 (late audio blocks). From play to the end of the window it records:
+#   blocks.txt       bpftrace on PipeASIO's block_start/block_end USDT probes: the callback tid, every block longer than
+#                    700 us (seq, start, elapsed, slack against the deadline; CLOCK_MONOTONIC ns) and one line per second
+#                    (blocks, longest block); and handle_mm_fault timed for Live's threads (kprobe/kretprobe): every
+#                    fault longer than 10 us (tid, start, duration, address) and the totals; every user page fault
+#                    in Live (tid, time, address, faulting IP, error code) and per slow block the fault count
+#   perf-live.data   perf on Live's process: CPU samples on the P-cores, each with its cycles, instructions and reference
+#                    cycles (so on-CPU time, clock speed and IPC), the kernel call chain and the user IP; page faults,
+#                    non-ioctl syscalls, signals
+#   perf-sched.data  perf on every CPU: scheduler switches and wakeups, hard and soft IRQs
+#   tasks-*.txt, maps-*.txt, smaps-*.txt, start-mono.txt   Live's threads and memory map (with VMA flags) at start
+#                    and stop; the start time
+# Invoked as d0003-capture-light (a symlink) it records blocks.txt only.
+set -u
+verb=${1:-}
+[ $# -gt 0 ] && shift
+out= pids=()
+while [ $# -gt 0 ]; do
+  case $1 in
+    --out) out=$2; shift 2 ;;
+    --pid) pids+=("$2"); shift 2 ;;
+    *) shift ;;
+  esac
+done
+[ -n "$out" ] || { echo "d0003-capture: --out is required" >&2; exit 2; }
+light=0
+case ${0##*/} in *-light) light=1 ;; esac
+[ "${D0003_LIGHT:-0}" = 1 ] && light=1   # the same, without the symlink
+owner() { chown -R "${SUDO_UID:-0}:${SUDO_GID:-0}" "$out" 2>/dev/null || true; }
+snap() {  # pid suffix
+  local t
+  for t in /proc/$1/task/[0-9]*; do echo "${t##*/} $(cat "$t/comm" 2>/dev/null)"; done > "$out/tasks-$2.txt"
+  cp "/proc/$1/maps" "$out/maps-$2.txt" 2>/dev/null
+  cp "/proc/$1/smaps" "$out/smaps-$2.txt" 2>/dev/null
+}
+
+case $verb in
+start)
+  pid=${pids[0]:-}
+  [ -n "$pid" ] || { echo "d0003-capture: --pid is required" >&2; exit 2; }
+  mkdir -p "$out"
+  python3 -c 'import time; print(time.monotonic_ns())' > "$out/start-mono.txt"
+  echo "$pid" > "$out/live.pid"
+  so=$(awk '/pipeasio64\.dll\.so$/ {print $6; exit}' "/proc/$pid/maps")
+  [ -n "$so" ] || { echo "d0003-capture: pipeasio64.dll.so is not mapped in $pid" >&2; exit 1; }
+  snap "$pid" start
+  cat > "$out/blocks.bt" <<BT
+BEGIN { printf("READY %lu\n", nsecs(monotonic)); }
+usdt:$so:pipeasio:block_start /pid == $pid/ {
+  if (@tid == 0) { @tid = tid; printf("T %d\n", tid); }
+  @t0 = nsecs(monotonic); @dl = arg4; @seq = arg0; @btp = 0; @bmm = 0;
+}
+usdt:$so:pipeasio:block_end /pid == $pid && @t0 > 0/ {
+  \$e = nsecs(monotonic) - @t0;
+  @cnt = @cnt + 1;
+  if (\$e > @mxe) { @mxe = \$e; }
+  if (\$e > 700000) { printf("B %lu %lu %lu %ld\n", @seq, @t0, \$e, (int64)@dl - (int64)(@t0 + \$e)); printf("C %lu %lu %lu\n", @seq, @btp, @bmm); }
+}
+interval:s:1 { printf("S %lu %lu %lu\n", nsecs(monotonic), @cnt, @mxe); @cnt = 0; @mxe = 0; }
+tracepoint:exceptions:page_fault_user /pid == $pid/ {
+  @btp = @btp + 1; @tpn = @tpn + 1;
+  printf("P %d %lu %lx %lx %lu\n", tid, nsecs(monotonic), args.address, args.ip, args.error_code);
+}
+kprobe:handle_mm_fault /pid == $pid/ { @pf[tid] = nsecs(monotonic); @pfa[tid] = arg1; @bmm = @bmm + 1; }
+kretprobe:handle_mm_fault /pid == $pid && @pf[tid] > 0/ {
+  \$d = nsecs(monotonic) - @pf[tid];
+  @pfn = @pfn + 1; @pft = @pft + \$d;
+  if (\$d > 10000) { printf("F %d %lu %lu %lx\n", tid, @pf[tid], \$d, @pfa[tid]); }
+  @pf[tid] = 0;
+}
+END { printf("FAULTS %lu %lu\n", @pfn, @pft); printf("TPFAULTS %lu\n", @tpn); clear(@pf); clear(@pfa); }
+BT
+  setsid bpftrace -q --no-warnings "$out/blocks.bt" > "$out/blocks.txt" 2> "$out/blocks.err" < /dev/null &
+  echo $! > "$out/blocks.pid"
+  if [ "$light" = 0 ]; then
+    # kernel call chains only (user frames of MSVC code cannot be walked by frame pointer, and walking them costs);
+    # the tracepoints carry no call chain at all (the fault event has the faulting IP itself)
+    setsid taskset -c 12-15 perf record -q -o "$out/perf-live.data" -k CLOCK_MONOTONIC -m 1024 \
+      -F 10000 --call-graph fp --kernel-callchains --sample-cpu \
+      -e '{cpu_core/cycles/,cpu_core/instructions/,cpu_core/ref-cycles/}:S' \
+      -e 'exceptions:page_fault_user/call-graph=no/' \
+      -e 'raw_syscalls:sys_enter/call-graph=no/' --filter 'id != 16' -e 'signal:signal_deliver/call-graph=no/' \
+      -p "$pid" > "$out/perf-live.log" 2>&1 < /dev/null &
+    echo $! > "$out/perf-live.pid"
+    # scheduler events only for the audio threads (filtered in the kernel); IRQs on every CPU
+    setsid taskset -c 12-15 perf record -q -o "$out/perf-sched.data" -k CLOCK_MONOTONIC -m 1024 -a \
+      -e sched:sched_switch \
+      --filter 'prev_comm ~ "AudioCalc*" || next_comm ~ "AudioCalc*" || prev_comm == "pipeasio-rt" || next_comm == "pipeasio-rt"' \
+      -e sched:sched_wakeup --filter 'comm ~ "AudioCalc*" || comm == "pipeasio-rt"' \
+      -e irq:irq_handler_entry -e irq:irq_handler_exit \
+      -e irq:softirq_entry -e irq:softirq_exit > "$out/perf-sched.log" 2>&1 < /dev/null &
+    echo $! > "$out/perf-sched.pid"
+  fi
+  # attached when bpftrace has run BEGIN and both perf sessions are alive with data written
+  for _ in $(seq 1 120); do
+    ok=1
+    grep -q '^READY' "$out/blocks.txt" 2>/dev/null || ok=0
+    kill -0 "$(cat "$out/blocks.pid")" 2>/dev/null || { echo "d0003-capture: bpftrace exited: $(head -c 300 "$out/blocks.err")" >&2; owner; exit 1; }
+    if [ "$light" = 0 ]; then
+      for p in perf-live perf-sched; do
+        kill -0 "$(cat "$out/$p.pid")" 2>/dev/null || { echo "d0003-capture: $p exited: $(head -c 300 "$out/$p.log")" >&2; owner; exit 1; }
+        [ -s "$out/$p.data" ] || ok=0
+      done
+    fi
+    [ "$ok" = 1 ] && break
+    sleep 0.25
+  done
+  [ "$ok" = 1 ] || { echo "d0003-capture: not attached after 30 s" >&2; owner; exit 1; }
+  echo "wine-trace: started: d0003-capture (light=$light) pid $pid, out=$out"
+  owner
+  ;;
+stop)
+  for p in perf-live perf-sched blocks; do
+    [ -f "$out/$p.pid" ] && kill -INT "$(cat "$out/$p.pid")" 2>/dev/null
+  done
+  for _ in $(seq 1 240); do
+    alive=0
+    for p in perf-live perf-sched blocks; do
+      [ -f "$out/$p.pid" ] && kill -0 "$(cat "$out/$p.pid")" 2>/dev/null && alive=1
+    done
+    [ "$alive" = 0 ] && break
+    sleep 0.25
+  done
+  pid=$(cat "$out/live.pid" 2>/dev/null)
+  [ -n "$pid" ] && [ -d "/proc/$pid" ] && snap "$pid" stop
+  python3 -c 'import time; print(time.monotonic_ns())' > "$out/stop-mono.txt"
+  owner
+  echo "wine-trace: stopped: d0003-capture out=$out"
+  ;;
+*)
+  echo "usage: d0003-capture start --out DIR --pid P | stop --out DIR" >&2
+  exit 2
+  ;;
+esac
