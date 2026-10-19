@@ -596,6 +596,20 @@ Next candidates (user to choose; none pre-registered yet):
   - Part 1, official runtime: for 30 s inside the window, `bpftrace` counts wineserver's syscalls by number, how its `epoll_wait`/`epoll_pwait2` calls return (timeout vs client events, plus ready fds), and its voluntary sleeps.
   - Part 2, the dev runtime with `bin/wineserver` wrapped to run with `-d1`, wineserver's own request log: the requests of a 30 s slice of the window by type and by client thread. A `/proc` snapshot taken during the window names the threads. The wrapper is removed on exit.
 - Script `~/.local/state/profiler/d0002.sh`; summary `d0002_analyze.py`.
+- **Result (2026-10-18 22:51–22:58; the same on both Sets):**
+  - Part 1: wineserver sleeps and wakes about 2,300 times per second. Its epoll waits return with client events about 2,290 times per second and time out only 10 times per second. The syscalls per second are the request cycle: `epoll_pwait2` 2,294, `read` 2,293, `ioctl` 2,239, `write` 2,106. So every wakeup is a client request; timers do not matter.
+  - Part 2: about 2,260 requests per second, about 1,735 of them from Live's UI thread (its main thread).
+    - By type: `get_message` ~515, `get_hook_info` ~314, `start_hook_chain` ~254, `finish_hook_chain` ~254, `send_message` ~246, `set_queue_mask` ~190, `reply_message` ~120, `get_update_region` ~120.
+    - The hooks were all installed by Live's UI thread on itself:
+      - `WH_GETMESSAGE` with its procedure in **wined3d.dll** (offset `0xe1520`, mapped in a running session), called ~194 times per second;
+      - `WH_CALLWNDPROC` from **MaxPlug.dll** (Max for Live's integration, installed twice), ~60 per second;
+      - a WinEvent hook for focus events, which does not fire during playback.
+    - The posted messages come from Live itself: three unnamed Live threads post message `0x47B` to the UI thread's window about 60 times per second each, and `DWM-Sync` posts `0x401` 60 times per second.
+  - Reading:
+    - Each of those ~246 messages per second costs about five wineserver round trips: the post, the `get_message`, and about three for wined3d's hook chain (`start_hook_chain`, `get_hook_info` for `CallNextHookEx`, `finish_hook_chain`).
+    - wined3d installs that `WH_GETMESSAGE` hook on every thread that owns a swap-chain window, only to catch Alt+Enter for DXGI's exclusive-fullscreen toggle (`dlls/wined3d/wined3d_main.c`, `wined3d_hook_proc`, installed at line 922). Live never uses that toggle.
+    - Not installing the hook would remove about 600–750 wineserver requests per second, about a third of its wakeups, and three round trips from every message Live's UI loop handles.
+    - The MaxPlug hook and the posted messages are Live's and Max's own design.
 
 **Wine hot-path research (2026-10-18 morning)**
 
