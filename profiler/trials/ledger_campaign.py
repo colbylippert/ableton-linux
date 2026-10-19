@@ -61,11 +61,13 @@ rec = lambda r: json.load(open(f"profiler/history/runs/{r}.json"))
 a1 = rec(pairs[0]["a"])
 started = datetime.datetime.fromisoformat(a1["started_at"].replace("Z", "+00:00"))
 ended = datetime.datetime.fromtimestamp(os.path.getmtime(OUT), datetime.timezone.utc)
-if spec["rule"] == "D":
-    per_set = {s: {"a_median": rule["dsp_avg"][s]["a_median"], "b_median": rule["dsp_avg"][s]["b_median"],
-                   "pairs_a_b": rule["dsp_pairs"][s]} for s in SETS}
-else:
-    per_set = {s: {"a_median": rule["m_median"]["a"][i], "b_median": rule["m_median"]["b"][i],
+if spec["rule"] == "D":  # the DSP average has T0002's A/A spread
+    per_set = {s: {"a_median": d["a_median"], "b_median": d["b_median"], "aa_spread": d["aa_spread"], "delta": d["delta"],
+                   "ratio_to_spread": d["ratio_to_spread"], "pairs_a_b": rule["dsp_pairs"][s]}
+               for s, d in ((s, rule["dsp_avg"][s]) for s in SETS)}
+else:  # the audio-thread CPU has no A/A spread
+    per_set = {s: {"a_median": rule["m_median"]["a"][i], "b_median": rule["m_median"]["b"][i], "aa_spread": None,
+                   "delta": round(rule["m_median"]["b"][i] - rule["m_median"]["a"][i], 2), "ratio_to_spread": None,
                    "pairs_a_b": rule["m_pairs"][s]} for i, s in enumerate(SETS)}
 entry = {
     "schema": "ableton-linux-profiler-ledger/v1",

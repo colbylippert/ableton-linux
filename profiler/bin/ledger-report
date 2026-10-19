@@ -26,13 +26,15 @@ SCHEMA = "ableton-linux-profiler-ledger/v1"
 VERDICTS = ("keep", "revert", "inconclusive", "tooling", "mechanism-confirmed")
 # A virtualised host supports no timing claim (CLAUDE.md).
 VIRTUAL_VERDICTS = ("tooling", "mechanism-confirmed")
-CHANGE_KINDS = ("wine-patch", "pipeasio-patch", "launcher", "config", "tooling")
+CHANGE_KINDS = ("wine-patch", "pipeasio-patch", "launcher", "config", "tooling", "kernel", "kernel-module")
 PATCH_KINDS = ("wine-patch", "pipeasio-patch")
 FIELDS = (
     "schema", "trial", "date", "host", "branch", "hypothesis", "evidence", "change", "probe_result",
     "runs", "metrics", "traced_confirmation", "verdict", "rationale", "commit", "minutes",
 )
 EVIDENCE_KEYS = ("run", "set", "call_site", "share_of_lost_slack")
+# what a diagnostic measured beside the lost-slack share (D0002, D0003)
+OPTIONAL_EVIDENCE_KEYS = ("share_of_wineserver_requests", "faults_per_late_block")
 CHANGE_KEYS = ("kind", "patch", "switch", "probe", "note")
 PROBE_KEYS = ("pass", "fail", "skip", "log")
 RUNS_KEYS = ("aa", "abab", "traced")
@@ -42,11 +44,13 @@ METRICS_KEYS = ("primary", "per_set", "xruns", "cpu_live_pct")
 # sign-test figures, and the secondary metrics they report beside the primary one.
 OPTIONAL_METRICS_KEYS = ("pipewire_errors", "secondary")
 PER_SET_KEYS = ("a_median", "b_median", "aa_spread", "delta", "ratio_to_spread")
-OPTIONAL_PER_SET_KEYS = ("aa_spread_from", "a_runs", "b_runs")
+OPTIONAL_PER_SET_KEYS = ("aa_spread_from", "a_runs", "b_runs", "pairs_a_b")
 # Trials recorded directly on the work branch, one commit each (what the bare-metal
 # campaign does), next to the agent loop's trial/T<id>-<slug> branches.
 WORK_BRANCHES = ("profiler",)
 CONFIRMATION_KEYS = ("call_site_share_before", "after")
+# the campaign form (T0019 on): what the traced runs measured before and after, free-form per trial
+MEASURED_CONFIRMATION_KEYS = ("before", "after")
 TRIAL_RE = re.compile(r"T[0-9]{4}")
 DATE_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?Z")
 HOST_RE = re.compile(r"bare-metal|vm:[A-Za-z0-9._-]+")
@@ -86,6 +90,18 @@ def expect_pair(value: Any, where: str) -> list[str]:
     return [f"{where}.{name} must be a run id" for name in PAIR_KEYS if not is_text(value[name])]
 
 
+def expect_traced_pair(value: Any, where: str) -> list[str]:
+    """{a, b}: one traced run id per arm, or a list of them (one per Set traced)"""
+    problems = expect_object(value, where, PAIR_KEYS)
+    if problems:
+        return problems
+    for name in PAIR_KEYS:
+        runs = value[name]
+        if not (is_text(runs) or (isinstance(runs, list) and runs and all(is_text(run) for run in runs))):
+            problems.append(f"{where}.{name} must be a run id or a list of run ids")
+    return problems
+
+
 def expect_arm_values(value: Any, where: str) -> list[str]:
     if value is None:
         return []
@@ -101,12 +117,15 @@ def validate_evidence(value: Any) -> list[str]:
     problems: list[str] = []
     for index, item in enumerate(value):
         where = f"evidence[{index}]"
-        item_problems = expect_object(item, where, EVIDENCE_KEYS)
+        item_problems = expect_object(item, where, EVIDENCE_KEYS, OPTIONAL_EVIDENCE_KEYS)
         if item_problems:
             problems.extend(item_problems)
             continue
         problems.extend(f"{where}.{name} must be a non-empty string" for name in ("run", "set", "call_site") if not is_text(item[name]))
         share = item["share_of_lost_slack"]
+        # null when the diagnostic measured something else (an OPTIONAL_EVIDENCE_KEYS value)
+        if share is None and any(key in item for key in OPTIONAL_EVIDENCE_KEYS):
+            continue
         if not (is_number(share) and 0 <= share <= 1):
             problems.append(f"{where}.share_of_lost_slack must be a number between 0 and 1")
     return problems
@@ -157,7 +176,7 @@ def validate_runs(value: Any) -> list[str]:
         for index, pair in enumerate(value["abab"]):
             problems.extend(expect_pair(pair, f"runs.abab[{index}]"))
     if value["traced"] is not None:
-        problems.extend(expect_pair(value["traced"], "runs.traced"))
+        problems.extend(expect_traced_pair(value["traced"], "runs.traced"))
     return problems
 
 
@@ -184,6 +203,9 @@ def validate_metrics(value: Any) -> list[str]:
             for key in ("a_runs", "b_runs"):
                 if key in values and not (isinstance(values[key], list) and all(item is None or is_number(item) for item in values[key])):
                     problems.append(f"{where}.{key} must be a list of numbers")
+            if "pairs_a_b" in values and not (isinstance(values["pairs_a_b"], list) and all(
+                    isinstance(pair, list) and len(pair) == 2 and all(is_number(item) for item in pair) for pair in values["pairs_a_b"])):
+                problems.append(f"{where}.pairs_a_b must be a list of [a, b] number pairs")
     problems.extend(expect_arm_values(value["xruns"], "metrics.xruns"))
     problems.extend(expect_arm_values(value["cpu_live_pct"], "metrics.cpu_live_pct"))
     errors = value.get("pipewire_errors")
@@ -203,6 +225,11 @@ def validate_metrics(value: Any) -> list[str]:
 def validate_traced_confirmation(value: Any) -> list[str]:
     if value is None:
         return []
+    if isinstance(value, dict) and "before" in value:
+        problems = expect_object(value, "traced_confirmation", MEASURED_CONFIRMATION_KEYS)
+        if problems:
+            return problems
+        return [f"traced_confirmation.{name} must be an object" for name in MEASURED_CONFIRMATION_KEYS if not isinstance(value[name], dict)]
     problems = expect_object(value, "traced_confirmation", CONFIRMATION_KEYS)
     if problems:
         return problems
@@ -337,8 +364,13 @@ def cited_runs(trial: dict[str, Any]) -> list[str]:
     for pair in runs["abab"]:
         names.extend((pair["a"], pair["b"]))
     if runs["traced"] is not None:
-        names.extend((runs["traced"]["a"], runs["traced"]["b"]))
+        names.extend(as_runs(runs["traced"]["a"]) + as_runs(runs["traced"]["b"]))
     return list(dict.fromkeys(names))
+
+
+def as_runs(value: Any) -> list[str]:
+    """one traced arm: a run id or a list of them"""
+    return list(value) if isinstance(value, list) else [value]
 
 
 def virtualised_trials(trials: list[dict[str, Any]], history: dict[str, Any]) -> dict[str, str]:
@@ -466,9 +498,13 @@ def kept_block(trial: dict[str, Any], history: dict[str, Any], history_dir: Path
     traced = runs["traced"]
     if traced is not None:
         confirmation = trial["traced_confirmation"] or {}
-        before, after = confirmation.get("call_site_share_before"), confirmation.get("after")
-        lines.append(f"- Traced: {link(traced['a'])} -> {link(traced['b'])}; call-site share {share_cell(before)} -> {share_cell(after)}.")
-        sources = [history["runs"].get(traced[name], {}).get("source_dir") for name in PAIR_KEYS]
+        arms = {name: ", ".join(link(run) for run in as_runs(traced[name])) for name in PAIR_KEYS}
+        if "before" in confirmation:
+            lines.append(f"- Traced: {arms['a']} -> {arms['b']}; measured before and after (the rationale has the figures).")
+        else:
+            before, after = confirmation.get("call_site_share_before"), confirmation.get("after")
+            lines.append(f"- Traced: {arms['a']} -> {arms['b']}; call-site share {share_cell(before)} -> {share_cell(after)}.")
+        sources = [history["runs"].get(traced[name], {}).get("source_dir") if is_text(traced[name]) else None for name in PAIR_KEYS]
         if all(is_text(source) for source in sources):
             lines.append(
                 f"- Compare: `python3 scripts/bench-report.py compare --before {sources[0]} --after {sources[1]} --output <dir>`"

@@ -143,7 +143,9 @@ class ValidationTests(unittest.TestCase):
         runs = trial()["runs"]
         self.assertEqual(problems(runs={**runs, "abab": [{"a": "x"}]}), ["runs.abab[0] is missing b"])
         self.assertEqual(problems(runs={**runs, "aa": [["only-one"]]}), ["runs.aa[0] must be [run, run]"])
-        self.assertEqual(problems(runs={**runs, "traced": {"a": "x", "b": ""}}), ["runs.traced.b must be a run id"])
+        self.assertEqual(problems(runs={**runs, "traced": {"a": "x", "b": ""}}), ["runs.traced.b must be a run id or a list of run ids"])
+        self.assertEqual(problems(runs={**runs, "traced": {"a": ["x-Inbuilts", "x-VSTs"], "b": ["y"]}}), [])
+        self.assertEqual(problems(runs={**runs, "traced": {"a": [], "b": ["y"]}}), ["runs.traced.a must be a run id or a list of run ids"])
         metrics = trial()["metrics"]
         self.assertEqual(problems(metrics={**metrics, "per_set": {"S": {"a_median": "1"}}}),
                          ["metrics.per_set[S] is missing b_median", "metrics.per_set[S] is missing aa_spread",
@@ -166,6 +168,17 @@ class ValidationTests(unittest.TestCase):
         self.assertEqual(problems(metrics={**dropouts, "per_set": {"S": {**per_set["S"], "extra": 1}}}),
                          ["metrics.per_set[S] has unknown key extra"])
         self.assertEqual(problems(traced_confirmation={"call_site_share_before": 0.6}), ["traced_confirmation is missing after"])
+        # the headroom campaign (T0019 on): per-pair values, measured confirmations, a diagnostic's other measure
+        self.assertEqual(problems(metrics={**dropouts, "per_set": {"S": {**per_set["S"], "pairs_a_b": [[34.5, 23.9], [34.7, 27.4]]}}}), [])
+        self.assertEqual(problems(metrics={**dropouts, "per_set": {"S": {**per_set["S"], "pairs_a_b": [[1]]}}}),
+                         ["metrics.per_set[S].pairs_a_b must be a list of [a, b] number pairs"])
+        self.assertEqual(problems(traced_confirmation={"before": {"share": 0.086}, "after": {"share": 0.019}}), [])
+        self.assertEqual(problems(traced_confirmation={"before": {"share": 0.086}, "after": 0.019}),
+                         ["traced_confirmation.after must be an object"])
+        self.assertEqual(problems(evidence=[{"run": "d0003", "set": "s", "call_site": "c", "share_of_lost_slack": None,
+                                             "faults_per_late_block": "1140-1561"}]), [])
+        self.assertEqual(problems(evidence=[{"run": "d0003", "set": "s", "call_site": "c", "share_of_lost_slack": None}]),
+                         ["evidence[0].share_of_lost_slack must be a number between 0 and 1"])
 
     def test_keep_gate(self):
         virtual = ["verdicts on a virtualised host are limited to tooling or mechanism-confirmed"]
