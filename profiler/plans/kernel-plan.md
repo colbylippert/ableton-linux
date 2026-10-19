@@ -14,7 +14,7 @@ Living document, approved 2026-10-19: the status table is updated as each item l
 - **What the traced runs show:** about 77 % of the audio threads' cycles are Live's own native code; ntsync calls are about 16 %.
 - **T0027 halted after A1, B1, A2** (B2 interrupted); the runs are set aside in `t0027-halted` and it reruns from A1 later.
 - **Next:**
-  1. Shrink the laptop's btrfs root to half (about 477 GiB left unallocated for Windows).
+  1. ~~Shrink the laptop's btrfs root to half~~ — **done 16:2x (2026-10-19):** btrfs and partition 2 are 476.5 GiB (same start, UUIDs and name); 477 GiB is unallocated at the end of the disk. A reboot was verified clean. The partition table from before is saved as `~/partition-table-before-windows.sfdisk` on the laptop, with a copy on the workstation.
   2. The user installs Windows 11.
   3. Fix the boot order (GRUB first, os-prober for Windows).
   4. A Windows measurement harness and an interleaved Linux-vs-Windows trial.
