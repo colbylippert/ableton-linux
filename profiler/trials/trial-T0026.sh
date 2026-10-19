@@ -13,10 +13,6 @@ source "$(dirname "${BASH_SOURCE[0]}")/trial-lib.sh"
 : "${KEPT_LAYOUT:?}" "${KEPT_WORKERS:?}" "${KEPT_DISPLAY:?}" "${KEPT_CLEAR:?}"
 [ "$KEPT_LAYOUT" = physcore ] || { echo "T0026 needs KEPT_LAYOUT=physcore (audio threads on CPUs 0, 2, 4, 6, 8, 10)"; exit 2; }
 export ABLETON_MAX_AUDIO_THREADS=$KEPT_WORKERS
-H=/usr/local/sbin/profiler-root-helper
-SIBLINGS="1 3 5 7 9 11"
-smt_off() { local c; for c in $SIBLINGS; do sudo -n "$H" knob set "cpu-online.$c" 0 >/dev/null || echo "cpu$c: offline failed"; done; }
-smt_on() { local c; for c in $SIBLINGS; do sudo -n "$H" knob set "cpu-online.$c" 1 >/dev/null || echo "cpu$c: online failed"; done; }
 ticks() { local p; p=$(pgrep -xo "$1") || { echo 0; return; }; awk '{print $14 + $15}' "/proc/$p/stat"; }
 arm_env() {
   if [ "$KEPT_DISPLAY" = new ]; then export WINE_D3D_CONFIG=csmt=0x1,renderer=vulkan WINED3D_PRESENT_SKIP=6
@@ -24,7 +20,7 @@ arm_env() {
 }
 arm_setup() {  # $tag: run_one's
   [ "$KEPT_CLEAR" = 1 ] && cores_clear_on
-  if [ "$1" = B ]; then smt_off; else smt_on; fi
+  if [ "$1" = B ]; then smt_siblings_off; else smt_siblings_on; fi
   K0=$(ticks kwin_wayland); X0=$(ticks Xwayland); T0=$(date +%s.%N)
   sampler_start "$R/$tag.power.tsv"
 }
@@ -32,7 +28,7 @@ arm_teardown() {
   sampler_stop
   ONLINE=$(cat /sys/devices/system/cpu/online)
   K1=$(ticks kwin_wayland); X1=$(ticks Xwayland); T1=$(date +%s.%N)
-  smt_on
+  smt_siblings_on
   [ "$KEPT_CLEAR" = 1 ] && cores_clear_off
   return 0
 }

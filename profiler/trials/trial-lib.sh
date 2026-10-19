@@ -149,6 +149,12 @@ cores_clear_off() {
   echo ffff | sudo -n tee /sys/devices/virtual/workqueue/cpumask >/dev/null
 }
 
+# The audio cores' SMT siblings (CPUs 1, 3, 5, 7, 9, 11) offline or online through the root helper (T0026, K1)
+HELPER=/usr/local/sbin/profiler-root-helper
+SMT_SIBLINGS="1 3 5 7 9 11"
+smt_siblings_off() { local c; for c in $SMT_SIBLINGS; do sudo -n "$HELPER" knob set "cpu-online.$c" 0 >/dev/null || echo "cpu$c: offline failed"; done; }
+smt_siblings_on() { local c; for c in $SMT_SIBLINGS; do sudo -n "$HELPER" knob set "cpu-online.$c" 1 >/dev/null || echo "cpu$c: online failed"; done; }
+
 run_one() {  # TAG ARM
   local tag=$1 arm=$2 rc pinner
   profiler/bin/state restore --name "$(golden_for "$arm")" >/dev/null 2>&1

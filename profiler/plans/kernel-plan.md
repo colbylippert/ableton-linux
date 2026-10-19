@@ -13,7 +13,7 @@ Living document, approved 2026-10-19: the status table is updated as each item l
 | K1 SMT offline | registered as T0026; driver `profiler/trials/trial-T0026.sh` (`KEPT_CLEAR` from T0024's verdict); runs after T0024 is scored | T0026 | — |
 | K2 mitigations=off | registered as T0027; driver `profiler/trials/trial-T0027.sh` with `reboot-lib.sh` and `reboot-waiter.sh`; GRUB entry installed | T0027 | — |
 | K3 ntsync-live spin | **E0 PASS** (pristine srcversion 2C65A4C2795A6FEE73E9F96 = in-tree); stage 1 (0001–0003) builds clean as live-8b5e287b; root-helper ntsync verbs, the native suite (`ntsync-live verify`, `g3`) and the T0025 driver are written. Next on the laptop: verify (E1, G2), g3 | T0025 | — |
-| K4 C-state limit | gated on K0 | — | — |
+| K4 C-state limit | gate fired (D0004: two thirds of audio wakes leave C2) but C2 wakes look cheap; registered as T0028, driver `profiler/trials/trial-T0028.sh`; p90/p99 per state checked before it runs | T0028 | — |
 | K5 LiveSync | not started | K5a, K5b | — |
 | K6 to K9 | not started | — | — |
 | Dev commit cd5ca47 (dropped Wine-side spin) | to revert | — | — |
@@ -335,7 +335,7 @@ Trial IDs are assigned when each item is registered. The campaign's pending T002
 - Reboot per run; **rule D**. The mechanism checks `/sys/devices/system/cpu/nohz_full`, the IRQ affinities and that the audio CPUs' RCU callback (rcuo) threads are offloaded.
 - T0024's runtime result predicts the size of the effect.
 
-## K4 Per-core C-state limit (gated by K0)
+## K4 Per-core C-state limit (gated by K0) — trial T0028
 - **B:** C2 and C3 disabled on CPUs 0–11 (`cpuidle.<cpu>.2|3 = 1`); E-cores untouched. A core's depth follows both siblings, so all 12 are limited, or only the 6 audio CPUs if K1 kept.
 - Variant B2: governor `teo` instead of the limit.
 - **Rule D.** Power and temperature reported. The mechanism checks the per-state usage counters: no C2/C3 entries on audio CPUs in B.
