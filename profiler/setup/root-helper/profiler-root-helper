@@ -159,7 +159,9 @@ usage: sudo -n profiler-root-helper VERB …
   knob get KEY
   knob set KEY VALUE
       KEY: thp | governor | epp | ananicy | wifi-powersave.<iface> |
-           sysctl.<allowlisted key> | irq-affinity.<N> | irq-prio.<N> | rt-prio.<pid>
+           sysctl.<allowlisted key> | irq-affinity.<N> | irq-prio.<N> | rt-prio.<pid> |
+           cpu-online.<1-11> | cpuidle.<cpu>.<state> | cpuidle-governor | ntsync.<param>
+  ntsync status | install SERIES8 | load SERIES8 [PARAM=VALUE …] | restore-stock
   trace start --tool NAME --run-dir DIR [--id ID] [--tool-dir DIR] [--pid N]…
               [--duration S] [-- ARGS…]
   trace stop  ID [--signal SIG] [--timeout S]
