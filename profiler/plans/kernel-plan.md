@@ -10,7 +10,7 @@ Living document, approved 2026-10-19: the status table is updated as each item l
 | T0024 core clearing | running since 11:37 (`physcore`, 5 workers, new display) | T0024 | pending |
 | I0 infrastructure | in progress: campaign tooling in `profiler/trials/`, rule D, root-helper knobs (cpu-online, cpuidle, cpuidle-governor), ledger kinds `kernel`/`kernel-module` (validator fixed), GRUB variants (`profiler/kernel/grub/`, grub.d `45_`, not `09_`, so the normal entries never shift) and the `boot-kernel` variant table. To do on the laptop after T0023: install the helper and the GRUB variants, test rule D and the knobs | — | — |
 | K0 census | **done** (D0004): ~83 sync calls per block; K5 syscall-free share ~40 %; spin budget 20–40 µs; K4 gate fires but C2 wakes look cheap; CPU 4 spends 5 % in xhci IRQs | D0004 | see K0 |
-| K1 SMT offline | registered as T0026; driver after T0024 (it inherits T0024's kept core clearing) | T0026 | — |
+| K1 SMT offline | registered as T0026; driver `profiler/trials/trial-T0026.sh` (`KEPT_CLEAR` from T0024's verdict); runs after T0024 is scored | T0026 | — |
 | K2 mitigations=off | registered as T0027; driver `profiler/trials/trial-T0027.sh` with `reboot-lib.sh` and `reboot-waiter.sh`; GRUB entry installed | T0027 | — |
 | K3 ntsync-live spin | **E0 PASS** (pristine build srcversion 2C65A4C2795A6FEE73E9F96 = in-tree); stage 1 (0001–0003) builds clean as live-8b5e287b. Next: root-helper ntsync verbs, native suite, E1–G3 | T0025 | — |
 | K4 C-state limit | gated on K0 | — | — |

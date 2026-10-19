@@ -99,43 +99,6 @@ settle() {  # 120 s, then until the 1-minute load average is below 1.0; at most 
   echo "$(date +%T) settled: load $la after $((SECONDS - t0)) s, uptime $(cut -d' ' -f1 /proc/uptime)s"
 }
 
-sampler_start() {  # TSV: epoch, RAPL package energy (uJ), package temp (m°C), mean P-core kHz; every 5 s
-  local hw= h
-  SAMPLER_FLAG=$S/trial-$TRIAL.sampler.on; touch "$SAMPLER_FLAG"
-  for h in /sys/class/hwmon/hwmon*; do [ "$(cat "$h/name")" = coretemp ] && { hw=$h/temp1_input; break; }; done
-  : > "$1"
-  sudo -n bash -c '
-    out=$1; flag=$2; temp=$3; cpus=$4; end=$((SECONDS + 1800))
-    while [ -e "$flag" ] && [ $SECONDS -lt $end ]; do
-      read -r e < /sys/class/powercap/intel-rapl:0/energy_uj
-      read -r t < "$temp"
-      s=0; n=0
-      for c in $cpus; do read -r f < /sys/devices/system/cpu/cpu$c/cpufreq/scaling_cur_freq 2>/dev/null || continue; s=$((s + f)); n=$((n + 1)); done
-      echo "$EPOCHREALTIME $e $t $((s / (n ? n : 1)))" >> "$out"
-      sleep 5
-    done' bash "$1" "$SAMPLER_FLAG" "$hw" "$(seq -s ' ' 0 11)" &
-  SAMPLER_PID=$!
-}
-sampler_stop() { rm -f "$SAMPLER_FLAG"; wait "$SAMPLER_PID" 2>/dev/null; }
-
-power_summary() {
-  python3 - "$1" <<'PY'
-import statistics, sys
-rows = []
-for line in open(sys.argv[1]):
-    p = line.split()
-    if len(p) == 4:
-        rows.append((float(p[0]), int(p[1]), int(p[2]), int(p[3])))
-w = [(b[1] - a[1]) / (b[0] - a[0]) / 1e6 for a, b in zip(rows, rows[1:]) if b[1] >= a[1] and b[0] > a[0]]
-if not w:
-    print("power=n/a")
-else:
-    print("pkg_w_median=%.1f pkg_temp_median=%.0f pkg_temp_max=%.0f pcore_mhz_median=%.0f samples=%d" % (
-        statistics.median(w), statistics.median(r[2] for r in rows) / 1000, max(r[2] for r in rows) / 1000,
-        statistics.median(r[3] for r in rows) / 1000, len(rows)))
-PY
-}
-
 reboot_finish() {
   (cd ~/Projects/ableton-linux && profiler/bin/state restore --name golden >/dev/null 2>&1)
   mark TRIAL_DONE "runs:$(get done)"

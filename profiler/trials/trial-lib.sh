@@ -72,6 +72,83 @@ pin_kept() {
   esac
 }
 
+# RAPL package power, package temperature and the mean P-core clock, every 5 s, for a driver's arm hooks
+sampler_start() {  # TSV: epoch, RAPL package energy (uJ), package temp (m°C), mean P-core kHz; every 5 s
+  local hw= h
+  SAMPLER_FLAG=$S/trial-$TRIAL.sampler.on; touch "$SAMPLER_FLAG"
+  for h in /sys/class/hwmon/hwmon*; do [ "$(cat "$h/name")" = coretemp ] && { hw=$h/temp1_input; break; }; done
+  : > "$1"
+  sudo -n bash -c '
+    out=$1; flag=$2; temp=$3; cpus=$4; end=$((SECONDS + 1800))
+    while [ -e "$flag" ] && [ $SECONDS -lt $end ]; do
+      read -r e < /sys/class/powercap/intel-rapl:0/energy_uj
+      read -r t < "$temp"
+      s=0; n=0
+      for c in $cpus; do read -r f < /sys/devices/system/cpu/cpu$c/cpufreq/scaling_cur_freq 2>/dev/null || continue; s=$((s + f)); n=$((n + 1)); done
+      echo "$EPOCHREALTIME $e $t $((s / (n ? n : 1)))" >> "$out"
+      sleep 5
+    done' bash "$1" "$SAMPLER_FLAG" "$hw" "$(seq -s ' ' 0 11)" &
+  SAMPLER_PID=$!
+}
+sampler_stop() { rm -f "$SAMPLER_FLAG"; wait "$SAMPLER_PID" 2>/dev/null; }
+
+power_summary() {
+  python3 - "$1" <<'PY'
+import statistics, sys
+rows = []
+for line in open(sys.argv[1]):
+    p = line.split()
+    if len(p) == 4:
+        rows.append((float(p[0]), int(p[1]), int(p[2]), int(p[3])))
+w = [(b[1] - a[1]) / (b[0] - a[0]) / 1e6 for a, b in zip(rows, rows[1:]) if b[1] >= a[1] and b[0] > a[0]]
+if not w:
+    print("power=n/a")
+else:
+    print("pkg_w_median=%.1f pkg_temp_median=%.0f pkg_temp_max=%.0f pcore_mhz_median=%.0f samples=%d" % (
+        statistics.median(w), statistics.median(r[2] for r in rows) / 1000, max(r[2] for r in rows) / 1000,
+        statistics.median(r[3] for r in rows) / 1000, len(rows)))
+PY
+}
+
+# Audio cores kept clear (T0024's B arm, for drivers whose kept configuration includes it; T0024's driver keeps its
+# own copy, as run): every movable IRQ on CPUs 12-15 except the Focusrite's xhci controller (CPU 11 for the 1to1
+# layout, else CPU 12); system.slice, init.scope and, in the user manager, app.slice, background.slice and every
+# session.slice unit except pipewire.service on AllowedCPUs=12-15; the unbound-workqueue cpumask on CPUs 12-15.
+# The IRQ affinities before the first clearing are saved once per trial, and cores_clear_off restores them.
+cores_clear_on() {
+  local d i unit xhci xcpu=12 saved=$R/$TRIAL-irq-affinity.saved units=$R/$TRIAL-units.changed
+  [ "${KEPT_LAYOUT:-}" = 1to1 ] && xcpu=11
+  xhci=$(awk -F: '/xhci_hcd/ {gsub(/ /, "", $1); print $1; exit}' /proc/interrupts)
+  [ -s "$saved" ] || for d in /proc/irq/[0-9]*; do echo "${d##*/} $(cat "$d/smp_affinity_list" 2>/dev/null)"; done > "$saved"
+  for d in /proc/irq/[0-9]*; do
+    i=${d##*/}
+    if [ "$i" = "$xhci" ]; then echo "$xcpu" | sudo -n tee "$d/smp_affinity_list" >/dev/null 2>&1
+    else echo 12-15 | sudo -n tee "$d/smp_affinity_list" >/dev/null 2>&1; fi
+  done
+  : > "$units"
+  for unit in system.slice init.scope; do
+    sudo -n systemctl set-property --runtime "$unit" AllowedCPUs=12-15 && echo "system $unit" >> "$units"
+  done
+  for unit in app.slice background.slice $(ls /sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/session.slice | grep -E '\.(service|scope)$' | grep -vx pipewire.service); do
+    systemctl --user set-property --runtime "$unit" AllowedCPUs=12-15 2>/dev/null && echo "user $unit" >> "$units"
+  done
+  echo f000 | sudo -n tee /sys/devices/virtual/workqueue/cpumask >/dev/null
+}
+cores_clear_off() {
+  local i aff kind unit saved=$R/$TRIAL-irq-affinity.saved units=$R/$TRIAL-units.changed
+  if [ -s "$saved" ]; then
+    while read -r i aff; do [ -n "$aff" ] && echo "$aff" | sudo -n tee "/proc/irq/$i/smp_affinity_list" >/dev/null 2>&1; done < "$saved"
+  fi
+  if [ -f "$units" ]; then
+    while read -r kind unit; do
+      if [ "$kind" = system ]; then sudo -n systemctl set-property --runtime "$unit" AllowedCPUs=
+      else systemctl --user set-property --runtime "$unit" AllowedCPUs= 2>/dev/null; fi
+    done < "$units"
+    rm -f "$units"
+  fi
+  echo ffff | sudo -n tee /sys/devices/virtual/workqueue/cpumask >/dev/null
+}
+
 run_one() {  # TAG ARM
   local tag=$1 arm=$2 rc pinner
   profiler/bin/state restore --name "$(golden_for "$arm")" >/dev/null 2>&1
