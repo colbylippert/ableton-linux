@@ -13,6 +13,12 @@ Living document, approved 2026-10-19: the status table is updated as each item l
   - T0030 EPP: withdrawn; the bench already runs with EPP `performance`.
 - **What the traced runs show:** about 77 % of the audio threads' cycles are Live's own native code; ntsync calls are about 16 %.
 - **T0027 halted after A1, B1, A2** (B2 interrupted); the runs are set aside in `t0027-halted` and it reruns from A1 later.
+- **Display moved back to the built-in panel (2026-10-19, user):** the BIOS is back at defaults, so the Intel/NVIDIA mux is hybrid and the panel hangs off the Intel GPU.
+  - `video=eDP-1:d` is gone from `/etc/default/grub` (backup `grub.profiler-<timestamp>`) and from every profiler variant.
+  - `90-profiler-kwin-gpu.conf` (`KWIN_DRM_DEVICES=/dev/dri/nvidia-dgpu`) is moved to `~/.config/environment.d.off/`.
+  - KWin now composites on the Intel GPU. eDP-1 runs at 1920×1080 @ 60.32 Hz (like the old external monitor's 59.94 Hz, not the panel's 144 Hz). The external HDMI output on the NVIDIA GPU is disabled.
+  - **This shifts the display baseline:** trials before it ran with the NVIDIA-only external display. Interleaved A/B trials stay valid, but absolute display-CPU figures (T0023) do not carry over.
+  - To check at the next Live run: which GPU wined3d's Vulkan renderer picks (Intel or NVIDIA). The iGPU shares the package power budget with the P-cores.
 - **Next:**
   1. ~~Shrink the laptop's btrfs root to half~~ — **done 16:2x (2026-10-19):** btrfs and partition 2 are 476.5 GiB (same start, UUIDs and name); 477 GiB is unallocated at the end of the disk. A reboot was verified clean. The partition table from before is saved as `~/partition-table-before-windows.sfdisk` on the laptop, with a copy on the workstation.
   2. The user installs Windows 11.
