@@ -7,7 +7,8 @@ Living document, approved 2026-10-19: the status table is updated as each item l
 |---|---|---|---|
 | T0022 physcore, 5 workers | recorded 2026-10-19: rule H PASS (9/9, −26.0 %) | T0022 | **keep**: the kept layout |
 | T0023 display | recorded 2026-10-19: non-inferiority PASS, display CPU −1 point in Live and −2.9 in the compositor | T0023 | **keep**: GPU renderer, Vulkan, present skip 6 |
-| T0024 core clearing | running since 11:37 (`physcore`, 5 workers, new display) | T0024 | pending |
+| T0024 core clearing | recorded 2026-10-19 (second attempt; the first was aborted, its restore left IRQs on 12–15): rule H FAIL, audio CPU +14.5 %; IRQ time on audio threads up; workers clocked 3.23 vs 3.51 GHz | T0024 | **revert** |
+| K10 P-core frequency policy (new, from T0024) | idea: the audio threads average 3.2–3.5 of 4.7 GHz under `powersave` with EPP `balance_performance`; EPP `performance` (or HWP dynamic boost) on the P-cores, rule D with power reported | next free ID | — |
 | I0 infrastructure | in progress: campaign tooling in `profiler/trials/`, rule D, root-helper knobs (cpu-online, cpuidle, cpuidle-governor), ledger kinds `kernel`/`kernel-module` (validator fixed), GRUB variants (`profiler/kernel/grub/`, grub.d `45_`, not `09_`, so the normal entries never shift) and the `boot-kernel` variant table. To do on the laptop after T0023: install the helper and the GRUB variants, test rule D and the knobs | — | — |
 | K0 census | **done** (D0004): ~83 sync calls per block; K5 syscall-free share ~40 %; spin budget 20–40 µs; K4 gate fires but C2 wakes look cheap; CPU 4 spends 5 % in xhci IRQs | D0004 | see K0 |
 | K1 SMT offline | registered as T0026; driver `profiler/trials/trial-T0026.sh` (`KEPT_CLEAR` from T0024's verdict); runs after T0024 is scored | T0026 | — |
@@ -15,7 +16,7 @@ Living document, approved 2026-10-19: the status table is updated as each item l
 | K3 ntsync-live spin | E0, E1, G2 **PASS**; G3 **FAIL** without the predictor (40 µs: block −23 %, CPU 1.72× > 1.5×); patch 0004 (adaptive) written, G3 again after T0024 | T0025 | — |
 | K4 C-state limit | gate fired (D0004: two thirds of audio wakes leave C2) but C2 wakes look cheap; registered as T0028, driver `profiler/trials/trial-T0028.sh`; p90/p99 per state checked before it runs | T0028 | — |
 | K5 LiveSync | not started; D0004 sizes it (about 40 % of sync calls syscall-free, every reset waiter-free, no alertable or multi-object audio waits) | next free IDs | — |
-| K6 isolation | registered as T0029; driver `profiler/trials/trial-T0029.sh` (reboot per run; isolated entry installed) | T0029 | — |
+| K6 isolation | registered as T0029 (driver ready); T0024 predicts no gain from moving IRQs off the audio cores, so it waits behind K10 | T0029 | — |
 | K5 LiveSync, K7–K9 | not started (K5's trials take the next free IDs) | — | — |
 | Dev commit cd5ca47 (dropped Wine-side spin) | to revert | — | — |
 
