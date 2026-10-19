@@ -691,6 +691,31 @@ Next candidates (user to choose; none pre-registered yet):
 - Side observations: while workers go to sleep, the kernel's RT balancing (`balance_rt` → `double_rq_lock`) spins on runqueue locks. The audio threads switch about 53,000 times per second (the AudioCalc fan-out).
 - Next: patch 0112 and a pre-registered trial (T0020).
 
+**T0020, starting processes with posix_spawn (patch 0112; follows from D0003; pre-registered before running)**
+- Change: patch 0112 (9378f44). With `WINE_POSIX_SPAWN=1`, `spawn_process()` starts new processes with `posix_spawn()` instead of `fork()`, so starting Live's helpers no longer write-protects Live's memory. Unset, nothing changes.
+- A: the kept configuration, with `WINE_POSIX_SPAWN` unset. B: the same with `WINE_POSIX_SPAWN=1`.
+- Both arms:
+  - the official runtime with 0112, built on the workstation from 9378f44;
+  - the normal kernel 7.2.11-1 with stock priorities;
+  - `PIPEASIO_REALTIME=1`, pinning, nine workers, the normal window, 64 frames;
+  - golden (OpenGL, renderer off), RT throttling off, the NVIDIA-only display and wired Ethernet;
+  - one harness, with the laptop's checkout fast-forwarded first so the bench records the switch.
+- ABAB × 3, back to back on the current boot (its per-boot timers are stopped). Inbuilts, Max4Live, VSTs; 120 s; untraced.
+- Expected: the first-pass late blocks (beats 16.4, 17.4, 46.4, 49.4) disappear, so PipeWire errors should fall sharply. T0019's A arm, the same configuration, had 14 errors in 9 Set-runs.
+  - Risk: error counts drift between sessions (T0018's A arm had 1). A quiet A arm can leave [E] short of significance even if B has none.
+- Rule: the T0004 rule ([D] or [E], plus both guards), with the T0002 A/A spreads.
+- Mechanism checks:
+  - Untraced runs: Wine logs `Starting new processes with posix_spawn` in every B run and in no A run.
+  - Traced, after the ABAB runs: one run per arm on the three heavy Sets, 60 s windows (the loop's whole first pass), with `d0003-capture-light` as the bench's tracer (block markers and page faults).
+    - It holds iff A shows a fault storm on every Set: at least one block over 700 µs with 500 or more page faults.
+    - And B shows none: no block over 700 µs with 500 or more faults, and Live's page faults per window at most 10 % of A's on every Set.
+- Verdict:
+  - keep: the rule passes, both mechanism checks hold, and the probe passes on the official runtime. The configuration then adds `WINE_POSIX_SPAWN=1`: trials from T0021 set it in both arms, and desktop launches get it from an environment.d file.
+  - mechanism-confirmed: both guards and both mechanism checks hold, but neither [D] nor [E] is met. The switch stays opt-in and the configuration does not change.
+  - revert: a guard fails, or a mechanism check does not hold.
+- Context readouts: worst DSP peak medians, Live CPU, wineserver CPU, xruns.
+- Driver `~/.local/state/profiler/trial-T0020.sh`. Scored by `plans/tools/trial-analyze.py T0020 --rule t0004` plus `t0020_mechanism.py`.
+
 **Wine hot-path research (2026-10-18 morning)**
 
 Diagnostic D0001: one traced run on the kept configuration (heavy Sets, 60 s each, 45,000 blocks per Set; history `diag-D0001-traced`).
