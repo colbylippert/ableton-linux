@@ -61,7 +61,7 @@ rec = lambda r: json.load(open(f"profiler/history/runs/{r}.json"))
 a1 = rec(pairs[0]["a"])
 started = datetime.datetime.fromisoformat(a1["started_at"].replace("Z", "+00:00"))
 ended = datetime.datetime.fromtimestamp(os.path.getmtime(OUT), datetime.timezone.utc)
-if spec["rule"] == "D":  # the DSP average has T0002's A/A spread
+if spec["rule"] in ("D", "noninferiority"):  # judged on the DSP average, which has T0002's A/A spread
     per_set = {s: {"a_median": d["a_median"], "b_median": d["b_median"], "aa_spread": d["aa_spread"], "delta": d["delta"],
                    "ratio_to_spread": d["ratio_to_spread"], "pairs_a_b": rule["dsp_pairs"][s]}
                for s, d in ((s, rule["dsp_avg"][s]) for s in SETS)}
@@ -82,7 +82,7 @@ entry = {
     "runs": {"aa": [["aa-focusrite-1", "aa-focusrite-2"], ["aa-focusrite-2", "aa-focusrite-3"]], "abab": pairs,
              "traced": spec.get("traced")},
     "metrics": {
-        "primary": {"H": "audio_thread_cpu_pct", "D": "dsp_avg"}.get(spec["rule"], "pipewire_errors"),
+        "primary": {"H": "audio_thread_cpu_pct", "D": "dsp_avg", "noninferiority": "dsp_avg"}[spec["rule"]],
         "per_set": per_set,
         "pipewire_errors": pe,
         "secondary": {"dsp_avg": dsp, "dsp_peak_median": rule["dsp_peak_median"], "worker_wait_ms": rule["worker_wait_ms"],
