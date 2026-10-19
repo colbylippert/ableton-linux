@@ -5,7 +5,7 @@ Living document, approved 2026-10-19: the status table is updated as each item l
 ## Status (updated as items land)
 | Item | State | Trial | Result |
 |---|---|---|---|
-| T0022 physcore, 5 workers | scored: rule H PASS (9/9, −26.0 %) | T0022 | keep, still to record |
+| T0022 physcore, 5 workers | recorded 2026-10-19: rule H PASS (9/9, −26.0 %) | T0022 | **keep**: the kept layout |
 | T0023 display, T0024 core clearing | registered, drivers on the laptop | T0023, T0024 | pending (run on physcore) |
 | I0 infrastructure | not started | — | — |
 | K0 census | not started | D0004 | — |

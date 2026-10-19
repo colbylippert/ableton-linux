@@ -802,6 +802,13 @@ Next candidates (user to choose; none pre-registered yet):
   - Rule H; [G3] guards against the per-block wall time growing with fewer workers.
   - Mechanism: every B Set-run shows five AudioCalc threads on CPUs 2, 4, 6, 8, 10 and pipeasio-rt on CPU 0; A shows nine on 0–11.
   - Keep: that layout (`physcore`) becomes the configuration.
+  - **T0022 — KEEP (2026-10-19, 09:14–10:00; all six runs clean):** one audio thread per physical core cuts the audio threads' CPU by a quarter.
+    - Rule H PASS: B's audio-thread CPU was lower in 9 of 9 Set-pairs (sign test p = 0.002), median paired change −26.0 %. Set medians (% of one core): Inbuilts 34.5 → 23.9, Max4Live 34.7 → 27.4, VSTs 32.0 → 21.0.
+    - Guards pass: xruns 0 → 0, PipeWire errors 10 → 11 (p = 0.5), DSP average 9.74 / 9.51 / 9.36 → 8.96 / 9.40 / 8.56.
+    - Mechanism held: in every B Set-run pipeasio-rt was on CPU 0 and the five workers on CPUs 2, 4, 6, 8, 10, one each; in every A Set-run all ten audio threads were on 0–11. The workers' run-queue wait fell from 43 / 47 / 42 to 16 / 11 / 18 ms per window.
+    - Also: Live CPU 46.9 → 35.0 %. Worst DSP peak medians 67.7 / 62.1 / 68.4 → 64.7 / 81.6 / 66.5 %, so Max4Live's peak rose, with no xruns.
+    - **Kept:** `physcore` with 5 workers (`ABLETON_MAX_AUDIO_THREADS=5`, pipeasio-rt on CPU 0, workers on CPUs 2, 4, 6, 8, 10) is the configuration. T0023 and T0024 run on it (`KEPT_LAYOUT=physcore KEPT_WORKERS=5`).
+    - The kernel-level work that follows is planned in `profiler/plans/kernel-plan.md`.
 - **T0023, the display setup again (item 4; runs after T0022).**
   - A: the current display: OpenGL, renderer off (golden), every frame shown.
   - B: wined3d's Vulkan back end (`WINE_D3D_CONFIG=csmt=0x1,renderer=vulkan`), Live's GPU renderer on (`golden.20261019T011657Z`), and `WINED3D_PRESENT_SKIP=6`.
