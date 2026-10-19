@@ -180,8 +180,22 @@ cores_masks() {  # one line: kwin's and journald's CPUs, system.slice's AllowedC
 # The audio cores' SMT siblings (CPUs 1, 3, 5, 7, 9, 11) offline or online through the root helper (T0026, K1)
 HELPER=/usr/local/sbin/profiler-root-helper
 SMT_SIBLINGS="1 3 5 7 9 11"
-smt_siblings_off() { local c; for c in $SMT_SIBLINGS; do sudo -n "$HELPER" knob set "cpu-online.$c" 0 >/dev/null || echo "cpu$c: offline failed"; done; }
-smt_siblings_on() { local c; for c in $SMT_SIBLINGS; do sudo -n "$HELPER" knob set "cpu-online.$c" 1 >/dev/null || echo "cpu$c: online failed"; done; }
+smt_siblings_off() { power_prehold_on; local c; for c in $SMT_SIBLINGS; do sudo -n "$HELPER" knob set "cpu-online.$c" 0 >/dev/null || echo "cpu$c: offline failed"; done; }
+smt_siblings_on() { local c; for c in $SMT_SIBLINGS; do sudo -n "$HELPER" knob set "cpu-online.$c" 1 >/dev/null || echo "cpu$c: online failed"; done; power_prehold_off; }
+
+# The bench holds the performance power profile for every run (EPP performance), but power-profiles-daemon cannot
+# apply a profile while CPUs are offline, so with the siblings offline the bench refuses to measure (T0026's first
+# attempt). A hold taken while every CPU is online keeps the profile, and the bench's own hold then succeeds. It runs
+# in the user manager (systemd-run --user), as the bench's does: polkit does not grant holds to an ssh session.
+power_prehold_on() {
+  local i
+  systemd-run --user --scope --quiet --collect --unit="profiler-$TRIAL-prehold" -- \
+    powerprofilesctl launch -p performance -r "profiler $TRIAL pre-hold" -i profiler-trial -- sleep 3600 >/dev/null 2>&1 &
+  for i in $(seq 1 20); do [ "$(powerprofilesctl get 2>/dev/null)" = performance ] && return 0; sleep 0.5; done
+  echo "power pre-hold failed (profile $(powerprofilesctl get 2>/dev/null))"
+  return 1
+}
+power_prehold_off() { systemctl --user stop "profiler-$TRIAL-prehold.scope" >/dev/null 2>&1 || true; }
 
 run_one() {  # TAG ARM
   local tag=$1 arm=$2 rc pinner

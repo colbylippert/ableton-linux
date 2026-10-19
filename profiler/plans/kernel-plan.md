@@ -8,10 +8,10 @@ Living document, approved 2026-10-19: the status table is updated as each item l
 | T0022 physcore, 5 workers | recorded 2026-10-19: rule H PASS (9/9, −26.0 %) | T0022 | **keep**: the kept layout |
 | T0023 display | recorded 2026-10-19: non-inferiority PASS, display CPU −1 point in Live and −2.9 in the compositor | T0023 | **keep**: GPU renderer, Vulkan, present skip 6 |
 | T0024 core clearing | recorded 2026-10-19 (second attempt; the first was aborted, its restore left IRQs on 12–15): rule H FAIL, audio CPU +14.5 %; IRQ time on audio threads up; workers clocked 3.23 vs 3.51 GHz | T0024 | **revert** |
-| K10 P-core frequency policy (new, from T0024) | registered as T0030 (EPP performance, rule D); driver `profiler/trials/trial-T0030.sh` | T0030 | — |
+| K10 P-core frequency policy (new, from T0024) | **withdrawn unrun**: the bench's power hold already sets EPP performance for every run; the clocks look power/thermal-limited | T0030 | — |
 | I0 infrastructure | in progress: campaign tooling in `profiler/trials/`, rule D, root-helper knobs (cpu-online, cpuidle, cpuidle-governor), ledger kinds `kernel`/`kernel-module` (validator fixed), GRUB variants (`profiler/kernel/grub/`, grub.d `45_`, not `09_`, so the normal entries never shift) and the `boot-kernel` variant table. To do on the laptop after T0023: install the helper and the GRUB variants, test rule D and the knobs | — | — |
 | K0 census | **done** (D0004): ~83 sync calls per block; K5 syscall-free share ~40 %; spin budget 20–40 µs; K4 gate fires but C2 wakes look cheap; CPU 4 spends 5 % in xhci IRQs | D0004 | see K0 |
-| K1 SMT offline | running since 13:09 (`KEPT_CLEAR=0`) | T0026 | pending |
+| K1 SMT offline | first attempt invalid (13:09–13:33): the bench refused every B run, power-profiles-daemon cannot apply the bench's profile hold with CPUs offline; fixed (a hold taken before the CPUs go offline), rerun pending | T0026 | pending |
 | K2 mitigations=off | registered as T0027; driver `profiler/trials/trial-T0027.sh` with `reboot-lib.sh` and `reboot-waiter.sh`; GRUB entry installed | T0027 | — |
 | K3 ntsync-live spin | E0, E1, G2 **PASS**; G3 **PASS** with 0004 (live-7a94c377): 40 µs adaptive, block −26 % at 1.32× CPU (fixed spin failed at 1.71×). T0025 ready: `spin_ns=40000 spin_adaptive=1`; runs after T0026 | T0025 | — |
 | K4 C-state limit | gate fired (D0004: two thirds of audio wakes leave C2) but C2 wakes look cheap; registered as T0028, driver `profiler/trials/trial-T0028.sh`; p90/p99 per state checked before it runs | T0028 | — |
@@ -409,7 +409,11 @@ Trial IDs are assigned when each item is registered. The campaign's pending T002
 - Then a custom `scx_ableton` (BPF): each audio thread dispatched to its own CPU's local queue on wake with `SCX_KICK_PREEMPT`, and block-aware boosting from a uprobe on PipeASIO's `block_start`.
 - sched_ext's watchdog falls back to the normal scheduler on failure. **Rule D.**
 
-## K10 The P-cores' frequency policy (new, from T0024) — trial T0030
+## K10 The P-cores' frequency policy (new, from T0024) — trial T0030, WITHDRAWN unrun
+- **Withdrawn the same day:** the bench holds the `performance` power profile for every run, so EPP is already `performance` during every trial run (bench log: "governor powersave, EPP performance, profile performance"). B would equal A.
+  - The workers' 3.2–3.5 GHz under six busy P-cores, with the package at 85–93 °C, looks like the all-core power and thermal limit, so a frequency floor would not raise it either.
+  - Revisit only with per-core turbo data (turbostat) showing headroom.
+  - The design below is kept as registered.
 - **Evidence:** in T0024's traced runs the audio workers averaged 3.51 GHz (A) and 3.23 GHz (B) on cores that turbo to 4.7 GHz.
   - The laptop runs intel_pstate's `powersave` governor with EPP `balance_performance` (power profile `balanced`, HWP dynamic boost off).
   - The hardware clocks bursty, mostly idle cores down. Clearing the audio cores (T0024 B) idled them more and lowered the clock further, which is why the audio CPU rose there.

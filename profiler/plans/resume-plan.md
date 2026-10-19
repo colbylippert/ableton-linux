@@ -839,11 +839,13 @@ Next candidates (user to choose; none pre-registered yet):
     - Guards pass: xruns 0 → 0; PipeWire errors 2 → 1; DSP average 8.90 / 9.29 / 8.28 → 9.86 / 9.61 / 9.20, higher but within 2× the A/A spread.
     - Mechanism (a) held in every run: B had kwin, journald and `system.slice` on CPUs 12–15, the workqueues on 12–15 and xhci on CPU 12. A was as-is (xhci on CPU 4), with every IRQ back on its own CPU after each restore.
     - Mechanism (b) failed. In the traced runs the IRQ time on the audio threads rose: workers 153 → 221 µs/s, pipeasio-rt 27 → 36 µs/s, with remote wake-ups through IPIs (`__smp_call_single_queue` among B's top kernel functions). Preemptions were already near zero.
-    - **Why the CPU rose:** the workers ran at 3.23 GHz in B against 3.51 GHz in A. Without the system's other work the audio cores idle more, and the hardware P-states (`powersave` governor, EPP `balance_performance`) clock them lower, so the same audio work takes more CPU. The workers' run-queue wait did fall (15 / 28 / 17 → 11 / 8 / 12 ms per window).
+    - **Why the CPU rose:** the workers ran at 3.23 GHz in B against 3.51 GHz in A, so the same audio work took more CPU. The workers' run-queue wait did fall (15 / 28 / 17 → 11 / 8 / 12 ms per window).
+      - Correction (the same day): both arms ran with EPP `performance`, because the bench holds the `performance` power profile for every run (bench log: "governor powersave, EPP performance, profile performance"). So the clock difference is not the EPP.
+      - The likely cause is the shared power and thermal budget. B moved the system's work onto the E-cores, and the package reaches 85–93 °C in A runs. The ledger line's remark about an EPP lever is superseded by this note.
     - Consequences:
       - The cores stay as they are (`KEPT_CLEAR=0` for T0026 and T0028).
       - K6's boot-time isolation (`irqaffinity=12-15`) is predicted not to help as designed.
-      - New lever: the P-cores' frequency policy. The audio threads average 3.2–3.5 GHz of the 4.7 GHz turbo.
+      - The P-cores' frequency is near its limit under this load. T0030 (EPP `performance`) is withdrawn unrun: EPP is already `performance` during runs.
 - **Ideas backlog** (user, 2026-10-19: "lets remember these ideas and keep discussing"; not yet registered):
   - Evidence:
     - P-cores idle through ACPI C1 / C2 / C3 with exit latencies of 1 / 127 / 1048 µs; block wake latency p50 31–44 µs, max ~320 µs (D0001).

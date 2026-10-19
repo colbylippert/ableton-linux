@@ -179,6 +179,10 @@ class ValidationTests(unittest.TestCase):
                                              "faults_per_late_block": "1140-1561"}]), [])
         self.assertEqual(problems(evidence=[{"run": "d0003", "set": "s", "call_site": "c", "share_of_lost_slack": None}]),
                          ["evidence[0].share_of_lost_slack must be a number between 0 and 1"])
+        # lines are never edited: T0019/T0020's kind "patch" and T0021/T0022's per_set (per-pair values, no spread fields)
+        self.assertEqual(problems(change={**trial()["change"], "kind": "patch"}), [])
+        self.assertEqual(problems(metrics={**dropouts, "per_set": {"S": {"a_median": 34.5, "b_median": 23.9,
+                                                                          "pairs_a_b": [[34.5, 23.9]]}}}), [])
 
     def test_keep_gate(self):
         virtual = ["verdicts on a virtualised host are limited to tooling or mechanism-confirmed"]

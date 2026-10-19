@@ -27,7 +27,9 @@ VERDICTS = ("keep", "revert", "inconclusive", "tooling", "mechanism-confirmed")
 # A virtualised host supports no timing claim (CLAUDE.md).
 VIRTUAL_VERDICTS = ("tooling", "mechanism-confirmed")
 CHANGE_KINDS = ("wine-patch", "pipeasio-patch", "launcher", "config", "tooling", "kernel", "kernel-module")
-PATCH_KINDS = ("wine-patch", "pipeasio-patch")
+# T0019 and T0020 recorded a Wine patch as "patch"; lines are never edited, so the old name stays valid
+LEGACY_CHANGE_KINDS = ("patch",)
+PATCH_KINDS = ("wine-patch", "pipeasio-patch", "patch")
 FIELDS = (
     "schema", "trial", "date", "host", "branch", "hypothesis", "evidence", "change", "probe_result",
     "runs", "metrics", "traced_confirmation", "verdict", "rationale", "commit", "minutes",
@@ -135,7 +137,7 @@ def validate_change(value: Any) -> list[str]:
     problems = expect_object(value, "change", CHANGE_KEYS)
     if problems:
         return problems
-    if value["kind"] not in CHANGE_KINDS:
+    if value["kind"] not in CHANGE_KINDS and value["kind"] not in LEGACY_CHANGE_KINDS:
         problems.append("change.kind must be one of " + ", ".join(CHANGE_KINDS))
     for name in ("patch", "probe", "note"):
         if value[name] is not None and not is_text(value[name]):
@@ -193,11 +195,14 @@ def validate_metrics(value: Any) -> list[str]:
     else:
         for name, values in value["per_set"].items():
             where = f"metrics.per_set[{name}]"
-            set_problems = expect_object(values, where, PER_SET_KEYS, OPTIONAL_PER_SET_KEYS)
+            # the campaign's first rule-H records (T0021, T0022) give the per-pair values instead of the spread fields
+            required = PER_SET_KEYS if not (isinstance(values, dict) and "pairs_a_b" in values) else PER_SET_KEYS[:2]
+            set_problems = expect_object(values, where, required, OPTIONAL_PER_SET_KEYS + PER_SET_KEYS[2:])
             if set_problems:
                 problems.extend(set_problems)
                 continue
-            problems.extend(f"{where}.{key} must be null or a number" for key in PER_SET_KEYS if values[key] is not None and not is_number(values[key]))
+            problems.extend(f"{where}.{key} must be null or a number" for key in PER_SET_KEYS
+                            if key in values and values[key] is not None and not is_number(values[key]))
             if "aa_spread_from" in values and not is_text(values["aa_spread_from"]):
                 problems.append(f"{where}.aa_spread_from must be a non-empty string")
             for key in ("a_runs", "b_runs"):
@@ -467,7 +472,7 @@ def primary_cell(metrics: Any) -> str:
         return "-"
     parts = []
     for set_name, values in sorted(metrics["per_set"].items()):
-        delta, ratio = values["delta"], values["ratio_to_spread"]
+        delta, ratio = values.get("delta"), values.get("ratio_to_spread")
         if delta is None:
             continue
         ratio_text = f"{ratio:.1f}x spread" if is_number(ratio) else "spread unknown"
