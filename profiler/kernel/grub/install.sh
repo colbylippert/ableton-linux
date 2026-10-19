@@ -27,6 +27,9 @@ while IFS='|' read -r name args; do
     [[ "$args" =~ ^[A-Za-z0-9_.,=:\ -]+$ ]] || die "variant $name: arguments may hold letters, digits and _ . , = : - only"
 done < "$here/variants"
 
+# regenerate first, so the template is the normal entry for the current /etc/default/grub (a stale grub.cfg once
+# carried an old kernel option into every variant)
+grub-mkconfig -o "$cfg" >/dev/null 2>&1 || die "grub-mkconfig failed"
 title=$(grep -oE "^menuentry '[^']*with Linux linux-cachyos'" "$cfg" | head -n 1 | cut -d"'" -f2)
 [ -n "$title" ] || die "no normal linux-cachyos entry in $cfg"
 body=$(awk -v t="menuentry '$title'" 'index($0, t) == 1 { on = 1; next } on && /^}/ { exit } on' "$cfg" |
