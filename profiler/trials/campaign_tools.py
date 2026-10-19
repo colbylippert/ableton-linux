@@ -3,6 +3,7 @@
 usage:
   campaign_tools.py affinity BENCH_DIR        per Set: CPU masks of pipeasio-rt and the AudioCalc threads at window end
   campaign_tools.py audiocpu BENCH_DIR        per Set: M, the audio-thread CPU (% of one core), and Live's CPU
+  campaign_tools.py vcs BENCH_DIR             per Set: the audio threads' voluntary context switches over the window
   campaign_tools.py rule-h TRIAL              score TRIAL against rule H (profiler/plans/resume-plan.md); JSON last line
   campaign_tools.py rule-d TRIAL [G4_POINTS]  score TRIAL against rule D (profiler/plans/kernel-plan.md); JSON last line.
                                               G4_POINTS: spin items' CPU limit in points of one core (else +5 %)
@@ -51,6 +52,7 @@ def per_set(bench_dir):
                               key=lambda x: (len(x), x)),
             "worker_wait_ms": round(sum((t.get("schedstat") or {}).get("run_delay_ns", 0) for t in audio
                                         if (t.get("comm") or "").startswith("AudioCalc")) / 1e6, 1),
+            "vcs": sum(t.get("voluntary_context_switches") or 0 for t in audio),
         }
     return out
 
@@ -64,6 +66,12 @@ def cmd_affinity(bench_dir):
 def cmd_audiocpu(bench_dir):
     for s, v in per_set(bench_dir).items():
         print(f"{s.replace('Benchmark_', '')}: M={v['m']} live={v['live']}", end="  ")
+    print()
+
+
+def cmd_vcs(bench_dir):
+    for s, v in per_set(bench_dir).items():
+        print(f"{s.replace('Benchmark_', '')}: audio-thread voluntary switches={v['vcs']}", end="  ")
     print()
 
 
@@ -137,6 +145,7 @@ def score(trial, rule, g4_points=None):
     live = {arm: round(statistics.median(data[p[i]][s]["live"] for p in pairs for s in SETS), 1) for i, arm in ((0, "a"), (1, "b"))}
     mmed = {arm: [round(statistics.median(data[p[i]][s]["m"] for p in pairs), 2) for s in SETS] for i, arm in ((0, "a"), (1, "b"))}
     wait = {arm: [round(statistics.median(data[p[i]][s]["worker_wait_ms"] for p in pairs), 1) for s in SETS] for i, arm in ((0, "a"), (1, "b"))}
+    vcs = {arm: [statistics.median(data[p[i]][s]["vcs"] for p in pairs) for s in SETS] for i, arm in ((0, "a"), (1, "b"))}
     print(f"\n  B lower in {lower} of 9 Set-pairs (one-sided sign p = {p_sign:.4f}); median change {med:+.1%}")
     print(f"  M medians per Set A {mmed['a']} B {mmed['b']}; Live CPU median {live['a']} -> {live['b']}")
     print(f"  PipeWire errors {ea} -> {eb} (p B more = {p_more:.3f}); xruns {xr_a} -> {xr_b}")
@@ -150,7 +159,7 @@ def score(trial, rule, g4_points=None):
                       "median_change": round(med, 4), "m_median": mmed, "live_cpu": live,
                       "m_median_change": round(m_med, 4), "m_median_points": round(m_pts, 2), "g4_limit": g4_limit,
                       "pipewire_errors": {"a": ea, "b": eb, "p_b_more": round(p_more, 4)}, "xruns": {"a": xr_a, "b": xr_b},
-                      "dsp_avg": dsp, "dsp_peak_median": peak, "worker_wait_ms": wait,
+                      "dsp_avg": dsp, "dsp_peak_median": peak, "worker_wait_ms": wait, "audio_vcs_median": vcs,
                       "m_pairs": {s: [[data[a][s]["m"], data[b][s]["m"]] for a, b in pairs] for s in SETS},
                       "dsp_pairs": {s: [[rec[a]["sets"][s]["dsp_avg"], rec[b]["sets"][s]["dsp_avg"]] for a, b in pairs]
                                     for s in SETS}}))
@@ -207,5 +216,5 @@ def cmd_breakdown(interface):
 
 
 if __name__ == "__main__":
-    {"affinity": cmd_affinity, "audiocpu": cmd_audiocpu, "rule-h": cmd_rule_h, "rule-d": cmd_rule_d,
+    {"affinity": cmd_affinity, "audiocpu": cmd_audiocpu, "vcs": cmd_vcs, "rule-h": cmd_rule_h, "rule-d": cmd_rule_d,
      "breakdown": cmd_breakdown}[sys.argv[1]](*sys.argv[2:])

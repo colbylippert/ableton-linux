@@ -12,7 +12,7 @@ Living document, approved 2026-10-19: the status table is updated as each item l
 | K0 census | **done** (D0004): ~83 sync calls per block; K5 syscall-free share ~40 %; spin budget 20–40 µs; K4 gate fires but C2 wakes look cheap; CPU 4 spends 5 % in xhci IRQs | D0004 | see K0 |
 | K1 SMT offline | registered as T0026; driver `profiler/trials/trial-T0026.sh` (`KEPT_CLEAR` from T0024's verdict); runs after T0024 is scored | T0026 | — |
 | K2 mitigations=off | registered as T0027; driver `profiler/trials/trial-T0027.sh` with `reboot-lib.sh` and `reboot-waiter.sh`; GRUB entry installed | T0027 | — |
-| K3 ntsync-live spin | **E0 PASS** (pristine build srcversion 2C65A4C2795A6FEE73E9F96 = in-tree); stage 1 (0001–0003) builds clean as live-8b5e287b. Next: root-helper ntsync verbs, native suite, E1–G3 | T0025 | — |
+| K3 ntsync-live spin | **E0 PASS** (pristine srcversion 2C65A4C2795A6FEE73E9F96 = in-tree); stage 1 (0001–0003) builds clean as live-8b5e287b; root-helper ntsync verbs, the native suite (`ntsync-live verify`, `g3`) and the T0025 driver are written. Next on the laptop: verify (E1, G2), g3 | T0025 | — |
 | K4 C-state limit | gated on K0 | — | — |
 | K5 LiveSync | not started | K5a, K5b | — |
 | K6 to K9 | not started | — | — |
