@@ -573,6 +573,17 @@ Next candidates (user to choose; none pre-registered yet):
     - Mechanism check: each Set-run's Live log shows the GPU renderer off in A and on in B, and Wine logs the Vulkan renderer and the skip only in B.
     - Secondary readouts: compositor CPU (kwin_wayland + Xwayland) per run, Live's per-thread CPU (UI thread, `wined3d_cs`), DSP peaks.
     - Driver `~/.local/state/profiler/trial-T0018.sh`, started by `queue-T0018.sh` when T0017 ends.
+    - **T0018 — REVERT (2026-10-18, 20:29–21:15, normal kernel, all six runs clean):** back to the old display setup.
+      - Dropouts: PipeWire errors 1 → 22. Old setup: 1/0/0, 0/0/0, 0/0/0. New setup: Inbuilts 1/5/5, Max4Live 0/7/2, VSTs 0/0/2. One-sided p ≈ 0.000, so non-inferiority fails.
+      - xruns 0 → 0, and the DSP guard passes (DSP average 10.25 / 9.52 / 9.12 → 9.90 / 10.04 / 9.49).
+      - The mechanism held in every run: Live's GPU renderer off in A (`Off (Platform default)`) and on in B (`OnAlways (User setting)`); Wine logged the Vulkan renderer and the skip only in B.
+      - The new setup does save display CPU (medians, % of one core): Live's UI thread 9.9 → 9.3, `wined3d_cs` 2.4 → 1.3, compositor 4.8 → 1.6, about 5 points in all. But it costs dropouts.
+      - RT throttling was off in both arms, so the display setup alone explains the higher errors of T0016's and T0017's normal-kernel arms (20 and 19). The new setup bundles three changes (Vulkan back end, GPU renderer, present skipping), and this trial does not separate them.
+      - Done:
+        - golden is restored from the old snapshot and rebaselined. The GPU-renderer golden is kept as `golden.20261019T011657Z`.
+        - `~/.config/environment.d/90-profiler-ableton-display.conf` is removed, and the user manager's environment is reloaded clean.
+        - Patch 0110 stays in the runtime as an opt-in switch (`WINED3D_PRESENT_SKIP`, default off).
+      - The configuration is again OpenGL with the renderer off and every frame shown. `KWIN_DRM_DEVICES` (NVIDIA-only external display) is unchanged.
 - GPU mode: whatever T0014 keeps.
   - The earlier "T0017, Live on the NVIDIA GPU" was dropped ("As we will not use GPU rendering lets stay on the intel driver"). The user then moved the discrete-mode test ahead of this phase, as T0014.
   - The laptop (MSI Katana 15 B13VFK) has a MUX: the NVIDIA card has its own built-in-screen output (`eDP-2`), switchable only in the firmware.
