@@ -65,7 +65,23 @@ Living document, approved 2026-10-19: the status table is updated as each item l
   - Live's total CPU is about equal.
   - Five workers beat Live's own default on Windows too: 22 workers gave +1.0–1.3 DSP points, +5–7 CPU points, and the only missed deadline.
   - No missed deadlines with 5 workers.
-- **Next:** an interleaved Linux-vs-Windows trial, alternating boots three times per Set, judged with the same sign test, so session drift cannot pass for an OS difference.
+- **D0005, the interleaved comparison (pre-registered 2026-10-19 ~19:25, before any of its runs):**
+  - **Design:** order A1 B1 A2 B2 A3 B3, every run from a fresh boot into its system, the boots alternating; each run plays Inbuilts, Max4Live and VSTs for 120 s.
+    - **A:** Linux in the kept configuration, through `profiler/windows/linux-run.sh`, settled as T0015/T0027 were.
+    - **B:** Windows 11, through `bench-win.py` with 5 workers, after `settle.ps1` (desktop session, 120 s, then total CPU below 10 %).
+    - Driver `profiler/windows/cross-os-trial.sh` on the workstation.
+  - **Primary: Live's DSP average per Set-run (9 pairs).**
+    - Windows lower in at least 8 of 9 pairs (sign test p = 0.02) means Windows is faster.
+    - Linux lower in at least 8 of 9 means Linux is faster.
+    - Otherwise no significant difference.
+    - The median paired change is reported either way.
+  - **Secondary:**
+    - audio-thread CPU (AudioCalc plus the callback thread: `pipeasio-rt` against the ASIO driver's);
+    - Live's CPU;
+    - the peak median;
+    - peaks over 100 % (the dropout measure both systems share);
+    - Linux's PipeWire errors.
+  - It is a comparison of two platforms, so it gets no ledger verdict. The result goes here.
 
 ## Context
 - `WINE_POSIX_SPAWN=1` (T0020) removed the fork-induced page-fault storms, and dropouts are now rare. **T0022 (one audio thread per physical P-core, 5 workers) is a keep**: audio-thread CPU −26 %, Live CPU 46.9 → 35.0 %, DSP average lower. The goal now is more headroom: shorter, steadier audio blocks and less CPU, through kernel-level changes.
