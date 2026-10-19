@@ -10,7 +10,7 @@ SERIES="$root/patches/SERIES.sha256"
 say()  { printf '%s\n' "$*"; }
 fail() { printf '!! %s\n' "$*" >&2; exit 1; }
 
-readonly REQUIRED_WINE_TAIL='0110-wined3d-present-skip.patch'
+readonly REQUIRED_WINE_TAIL='0111-wined3d-skip-alt-enter-hook.patch'
 readonly REQUIRED_PERFORMANCE_TAIL='performance/0001-ntdll-alertable-sleep-fast-path.patch'
 readonly REQUIRED_PIPEASIO_TAIL='pipeasio/0017-usdt-block-markers.patch'
 
@@ -488,6 +488,7 @@ FINGERPRINTS='
 0108|ascii|lib/wine/x86_64-unix/ntdll.so|WINE_USDT_V2
 0109|ascii|bin/wineserver|WINE_QPC_TSC
 0110|ascii|lib/wine/x86_64-windows/wined3d.dll|WINED3D_PRESENT_SKIP
+0111|ascii|lib/wine/x86_64-windows/wined3d.dll|WINED3D_NO_ALT_ENTER_HOOK
 performance/0001|ascii|lib/wine/x86_64-unix/ntdll.so|WINE_APC_FASTPATH
 pipeasio/0001|ascii|lib/wine/x86_64-unix/pipeasio.dll.so|pipeasio-clamp-sample-rate
 pipeasio/0002|ascii|lib/wine/x86_64-unix/pipeasio.dll.so|pipeasio-midi-timebase

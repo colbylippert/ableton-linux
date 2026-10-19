@@ -1,0 +1,71 @@
+From 527912558a9d9c8ac5d5a63c30cb9ea76f835b17 Mon Sep 17 00:00:00 2001
+From: dist <build@localhost>
+Date: Sun, 18 Oct 2026 23:23:58 -0400
+Subject: [PATCH] wined3d: Optionally skip the Alt+Enter message hook
+ (WINED3D_NO_ALT_ENTER_HOOK).
+
+---
+ dlls/wined3d/wined3d_main.c | 29 ++++++++++++++++++++++++++---
+ 1 file changed, 26 insertions(+), 3 deletions(-)
+
+diff --git a/dlls/wined3d/wined3d_main.c b/dlls/wined3d/wined3d_main.c
+index 500daed..c7397bc 100644
+--- a/dlls/wined3d/wined3d_main.c
++++ b/dlls/wined3d/wined3d_main.c
+@@ -537,7 +537,8 @@ static BOOL wined3d_dll_destroy(HINSTANCE hInstDLL)
+     for (i = 0; i < swapchain_state_table.hook_count; ++i)
+     {
+         WARN("Leftover swapchain state hook %p.\n", &swapchain_state_table.hooks[i]);
+-        UnhookWindowsHookEx(swapchain_state_table.hooks[i].hook);
++        if (swapchain_state_table.hooks[i].hook)
++            UnhookWindowsHookEx(swapchain_state_table.hooks[i].hook);
+     }
+     free(swapchain_state_table.hooks);
+ 
+@@ -683,6 +684,26 @@ static LRESULT CALLBACK wined3d_wndproc(HWND window, UINT message, WPARAM wparam
+     return CallWindowProcA(proc, window, message, wparam, lparam);
+ }
+ 
++/* WINED3D_NO_ALT_ENTER_HOOK=1 keeps wined3d from installing its WH_GETMESSAGE hook
++ * on the threads that own swap chain windows. The hook only catches Alt+Enter to
++ * toggle DXGI's exclusive fullscreen, but every message such a thread retrieves then
++ * runs the hook chain: about three wineserver round trips per message, a third of all
++ * wineserver requests while Ableton Live plays. Applications that never toggle
++ * exclusive fullscreen with Alt+Enter lose nothing. Unset: the hook is installed. */
++static BOOL wined3d_alt_enter_hook_disabled(void)
++{
++    static int disabled = -1;
++    const char *env;
++
++    if (disabled < 0)
++    {
++        disabled = (env = getenv("WINED3D_NO_ALT_ENTER_HOOK")) && !strcmp(env, "1");
++        if (disabled)
++            ERR_(winediag)("Not installing the Alt+Enter message hook (WINED3D_NO_ALT_ENTER_HOOK).\n");
++    }
++    return disabled;
++}
++
+ static LRESULT CALLBACK wined3d_hook_proc(int code, WPARAM wparam, LPARAM lparam)
+ {
+     struct wined3d_swapchain_desc swapchain_desc;
+@@ -919,7 +940,8 @@ void wined3d_swapchain_state_register(struct wined3d_swapchain_state *state)
+ 
+     hook = &swapchain_state_table.hooks[swapchain_state_table.hook_count++];
+     hook->thread_id = state_entry->thread_id;
+-    hook->hook = SetWindowsHookExW(WH_GETMESSAGE, wined3d_hook_proc, 0, hook->thread_id);
++    hook->hook = wined3d_alt_enter_hook_disabled() ? NULL
++            : SetWindowsHookExW(WH_GETMESSAGE, wined3d_hook_proc, 0, hook->thread_id);
+     hook->count = 1;
+ 
+     wined3d_wndproc_mutex_unlock();
+@@ -942,7 +964,8 @@ static void wined3d_swapchain_state_unregister(struct wined3d_swapchain_state *s
+ 
+         if ((hook = wined3d_find_hook(state_entry->thread_id)) && !--hook->count)
+         {
+-            UnhookWindowsHookEx(hook->hook);
++            if (hook->hook)
++                UnhookWindowsHookEx(hook->hook);
+             last_hook = &swapchain_state_table.hooks[--swapchain_state_table.hook_count];
+             if (hook != last_hook)
+                 *hook = *last_hook;

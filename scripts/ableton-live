@@ -135,6 +135,11 @@ RUNTIME VARIABLES:
         2-60): Live keeps drawing at the display rate and the screen
         updates at 1/N of it; unset shows every present
 
+    WINED3D_NO_ALT_ENTER_HOOK=1
+        keep wined3d from hooking every window message of Live's UI
+        thread for Alt+Enter (patch 0111); Alt+Enter then no longer
+        toggles exclusive fullscreen; unset installs the hook
+
     The pointer variables below override the saved pointer setting
     for one launch; the launcher exports none of them, and registry
     values hold the persistent settings. Values ignore letter case;

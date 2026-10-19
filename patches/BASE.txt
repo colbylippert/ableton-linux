@@ -11,7 +11,7 @@ point-version gap with upstream's actively-maintained branch and with ENCORE
 The rebase involved five merge conflicts and uncovered three additional build
 breaks, plus a `build.sh`/`pipefail` tooling issue.
 
-The Wine series contains 98 patch files and ends at 0110. The absent numbers
+The Wine series contains 99 patch files and ends at 0111. The absent numbers
 are 0027, 0044, 0072, 0074, 0090 through 0095, 0097, and 0098; their reasons
 are declared in `SERIES_GAPS` in `scripts/build-audit.sh`. Patch 0073 keeps
 the wheel coordinate fix separate. Patch 0100 combines 10 pointer patches.
@@ -497,6 +497,18 @@ Patch 0110 adds present skipping (`WINED3D_PRESENT_SKIP`).
   the semaphore the worker thread would have released. Unset, every present is
   shown. The fingerprint literal is `WINED3D_PRESENT_SKIP` in `wined3d.dll`. See
   `notes/ABLETON-WINE-PRESENT-SKIP.md` and `tools/presentskipprobe.c`.
+Patch 0111 lets wined3d skip its Alt+Enter message hook (`WINED3D_NO_ALT_ENTER_HOOK`).
+  wined3d installs a `WH_GETMESSAGE` hook on every thread that owns a swap chain
+  window, only to catch Alt+Enter for DXGI's exclusive-fullscreen toggle. Every
+  message the thread retrieves then runs the hook chain, about three wineserver
+  round trips per message: a third of all wineserver requests while Live plays
+  (diagnostic D0002). With `WINED3D_NO_ALT_ENTER_HOOK=1`,
+  `wined3d_swapchain_state_register` (`dlls/wined3d/wined3d_main.c`) keeps its
+  per-thread entry but installs no hook, and the unhook paths skip an empty one;
+  Alt+Enter then no longer toggles exclusive fullscreen. Unset, the hook is
+  installed. The fingerprint literal is `WINED3D_NO_ALT_ENTER_HOOK` in
+  `wined3d.dll`. See `notes/ABLETON-WINE-NO-ALT-ENTER-HOOK.md` and
+  `tools/msghookprobe.c`.
 - `pipeasio/0017` adds six USDT probes (provider `pipeasio`) to the PipeASIO
   driver: `cycle_start` and `cycle_end` around the PipeWire cycle in
   `audio_on_process`, and `block_start`, `block_before_live`,
