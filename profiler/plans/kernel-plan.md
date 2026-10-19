@@ -44,6 +44,29 @@ Living document, approved 2026-10-19: the status table is updated as each item l
 | K7–K9 | not started (K7 pre-wake and K8 direct entry also deprioritised: C2 wakes are cheap, and T0025 showed the sync path is not the block-time limit) | — | — |
 | Dev commit cd5ca47 (dropped Wine-side spin) | to revert | — | — |
 
+## Windows 11 baseline (same laptop, dual boot; first look 2026-10-19 19:00–19:15)
+- **Setup:**
+  - Windows 11 Home build 26300 on the same laptop, Live 12 Trial 12.4.6 and the same Sets.
+  - Focusrite USB ASIO at 48 kHz with 64 samples.
+  - High performance power plan; the trial dialog answered as on Linux.
+  - Harness `profiler/windows/bench-win.py`: the bench handler's DSP reports, per-thread CPU via psutil and GetThreadDescription, the Linux bench's launch→ready→settle→play→window sequence.
+  - `-MaxAudioThreads` in `Options.txt` sets the worker count.
+- **First look:** single 120 s runs per Set, not interleaved; the Linux column is the kept configuration's A arms (T0023–T0026), on the old external display.
+
+  | Set | DSP avg Win, 5 workers | DSP avg Linux (kept) | DSP avg Win, Live's default (22) | audio threads Win 5w (AudioCalc + ASIO callback) | audio threads Linux (AudioCalc + pipeasio-rt) | Live CPU Win 5w |
+  |---|---|---|---|---|---|---|
+  | Inbuilts | 8.50 | ~9.0 | 9.49 | 18.1 + 13.9 = 32.0 | ~24.5 | 37.8 |
+  | Max4Live | 9.33 | ~9.3 | 10.07 | 18.3 + 13.6 = 31.9 | ~27.5 | 35.8 |
+  | VSTs | 7.48 | ~8.5 | 8.79 | 12.1 + 11.7 = 23.8 | ~22.2 | 27.1 |
+
+- **Readings:**
+  - Windows is 0–1 point lower on DSP average.
+  - The workers cost about the same on both systems, but the Focusrite ASIO driver's callback thread (named `0xdd100001`) costs about twice PipeASIO's `pipeasio-rt` (~7 %).
+  - Live's total CPU is about equal.
+  - Five workers beat Live's own default on Windows too: 22 workers gave +1.0–1.3 DSP points, +5–7 CPU points, and the only missed deadline.
+  - No missed deadlines with 5 workers.
+- **Next:** an interleaved Linux-vs-Windows trial, alternating boots three times per Set, judged with the same sign test, so session drift cannot pass for an OS difference.
+
 ## Context
 - `WINE_POSIX_SPAWN=1` (T0020) removed the fork-induced page-fault storms, and dropouts are now rare. **T0022 (one audio thread per physical P-core, 5 workers) is a keep**: audio-thread CPU −26 %, Live CPU 46.9 → 35.0 %, DSP average lower. The goal now is more headroom: shorter, steadier audio blocks and less CPU, through kernel-level changes.
 - User (2026-10-19): "We want ableton specific improvement… lets get clever and esoteric for this ableton only kernel patch concept"; then "complete implementation plan for kernel level items".
