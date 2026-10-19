@@ -8,7 +8,7 @@ Living document, approved 2026-10-19: the status table is updated as each item l
 | T0022 physcore, 5 workers | recorded 2026-10-19: rule H PASS (9/9, −26.0 %) | T0022 | **keep**: the kept layout |
 | T0023 display, T0024 core clearing | registered, drivers on the laptop | T0023, T0024 | pending (run on physcore) |
 | I0 infrastructure | in progress: campaign tooling in `profiler/trials/`, rule D added (to test after T0023) | — | — |
-| K0 census | not started | D0004 | — |
+| K0 census | tool written (`profiler/kernel/census/`); runs after T0023 | D0004 | — |
 | K1 SMT offline | not started | next free ID | — |
 | K2 mitigations=off | not started | next free ID | — |
 | K3 ntsync-live spin | not started | T0025 | — |

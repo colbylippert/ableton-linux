@@ -106,7 +106,7 @@ traced_one() {  # TAG ARM SETS DURATION TRACER: one bench run with a d0003 captu
   echo "  affinity: $($TOOLS affinity "$R/$tag/bench" 2>&1)"
 }
 
-campaign_main() {
+campaign_setup() {  # the session lock, kernel and runtime checks, the common environment; leaves the shell in the checkout
   exec 9>"$S/live-session.lock"
   flock -w 900 9 || { echo "lock busy"; exit 9; }
   case $(uname -v) in *PREEMPT_RT*) echo "the laptop runs the RT kernel; the campaign runs on the normal kernel"; exit 2 ;; esac
@@ -118,6 +118,10 @@ campaign_main() {
     ABLETON_BENCH_TRACER ABLETON_BENCH_ROOT_HELPER
   sudo -n sysctl -q kernel.sched_rt_runtime_us="$(cat /proc/sys/kernel/sched_rt_period_us)"
   echo "$TRIAL: kernel $(uname -r); sched_rt_runtime_us=$(cat /proc/sys/kernel/sched_rt_runtime_us); checkout $(git log --oneline -1 | cut -c1-72)"
+}
+
+campaign_main() {
+  campaign_setup
   local i arm tag
   for i in 1 2 3; do
     for arm in A B; do

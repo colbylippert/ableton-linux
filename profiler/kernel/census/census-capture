@@ -1,0 +1,166 @@
+#!/usr/bin/env bash
+# census-capture: the K0 ntsync and wake census (diagnostic D0004, profiler/plans/kernel-plan.md), a stand-in for
+# wine-trace under bench-suite's tracer contract, run as root through sudo
+# (ABLETON_BENCH_TRACER=this, ABLETON_BENCH_ROOT_HELPER=/nonexistent/...):
+#   census-capture start --out DIR --pid P [--run-id T] [--mode M]     returns once everything is attached
+#   census-capture stop  --out DIR
+# One bpftrace session (JSON output, census.json) aggregates in the kernel, from play to the end of the window:
+#   sets      ntsync_event_set per caller role (other Live thread, AudioCalc, pipeasio-rt, wineserver), auto or manual
+#             event, already signaled, a WAIT_ANY waiter queued, a wait-all hint, pulse
+#   resets    EVENT_RESET (seen at ntsync_obj_ioctl; ntsync_event_reset is inlined) per role, auto or manual,
+#             signaled before, a waiter queued, a wait-all hint; and every object ioctl per role and command
+#   waits     WAIT_ANY / WAIT_ALL from Live per role, object count, alertable, poll (timeout already passed),
+#             slept or not, result; how long the wait took (slept: us; not slept: ns)
+#   sleeps    for waits that slept: the time off CPU (us, log2 and 5 us bins to 400 us), the wake latency (waking to
+#             running), and the idle state the woken thread's CPU came out of (99 when it was running another task)
+#   irqs      hard and soft IRQ time per CPU
+#   seconds   one line per second: blocks (PipeASIO block_start), sets, resets, waits
+# The block probe is a uprobe: kernel 7.2 runs uprobe programs preemptible on a per-CPU private stack, so it stays
+# a one-line counter (profiler/plans/findings/b5-tproto-rootcause.md).
+set -u
+verb=${1:-}
+[ $# -gt 0 ] && shift
+out= pids=()
+while [ $# -gt 0 ]; do
+  case $1 in
+    --out) out=$2; shift 2 ;;
+    --pid) pids+=("$2"); shift 2 ;;
+    *) shift ;;
+  esac
+done
+[ -n "$out" ] || { echo "census-capture: --out is required" >&2; exit 2; }
+owner() { chown -R "${SUDO_UID:-0}:${SUDO_GID:-0}" "$out" 2>/dev/null || true; }
+
+# ntsync ioctls (vendor/ntsync-uapi/linux/ntsync.h): _IOWR('N', 0x82/0x83, struct ntsync_wait_args), _IOR('N', 0x89, __u32)
+WAIT_ANY=0xc0284e82 WAIT_ALL=0xc0284e83 EVENT_RESET=0x80044e89
+
+case $verb in
+start)
+  pid=${pids[0]:-}
+  [ -n "$pid" ] || { echo "census-capture: --pid is required" >&2; exit 2; }
+  mkdir -p "$out"
+  echo "$pid" > "$out/live.pid"
+  so=$(awk '/pipeasio64\.dll\.so$/ {print $6; exit}' "/proc/$pid/maps")
+  [ -n "$so" ] || { echo "census-capture: pipeasio64.dll.so is not mapped in $pid" >&2; exit 1; }
+  for t in /proc/$pid/task/[0-9]*; do echo "${t##*/} $(cat "$t/comm" 2>/dev/null)"; done > "$out/tasks-start.txt"
+  grep -H . /sys/devices/system/cpu/cpu0/cpuidle/state*/name /sys/devices/system/cpu/cpu0/cpuidle/state*/latency \
+    > "$out/cpuidle-states.txt" 2>/dev/null
+  cat > "$out/census.bt" <<BT
+BEGIN { printf("READY %lu\n", nsecs(monotonic)); }
+
+usdt:$so:pipeasio:block_start /pid == $pid/ { @nb = @nb + 1; }
+
+fentry:ntsync:ntsync_event_set /pid == $pid || comm == "wineserver"/ {
+  \$r = 0;
+  if (strncmp(comm, "AudioCalc", 9) == 0) { \$r = 1; } else if (comm == "pipeasio-rt") { \$r = 2; } else if (comm == "wineserver") { \$r = 3; }
+  \$e = args.event;
+  \$n = \$e->any_waiters.next;
+  @set[\$r, \$e->u.event.manual, \$e->u.event.signaled, \$n->next != \$n, \$e->all_hint.counter > 0, args.pulse] = count();
+  @nset = @nset + 1;
+}
+
+fentry:ntsync:ntsync_obj_ioctl /pid == $pid || comm == "wineserver"/ {
+  \$r = 0;
+  if (strncmp(comm, "AudioCalc", 9) == 0) { \$r = 1; } else if (comm == "pipeasio-rt") { \$r = 2; } else if (comm == "wineserver") { \$r = 3; }
+  @objcmd[\$r, args.cmd] = count();
+  if (args.cmd == $EVENT_RESET) {
+    \$o = (struct ntsync_obj *)args.file->private_data;
+    \$m = \$o->any_waiters.next;
+    @reset[\$r, \$o->u.event.manual, \$o->u.event.signaled, \$m->next != \$m, \$o->all_hint.counter > 0] = count();
+    @nreset = @nreset + 1;
+  }
+}
+
+fentry:ntsync:ntsync_char_ioctl /pid == $pid && (args.cmd == $WAIT_ANY || args.cmd == $WAIT_ALL)/ {
+  \$p = args.parm;
+  \$to = *(uint64 *)uptr(\$p);
+  \$fl = *(uint32 *)uptr(\$p + 24);
+  \$poll = 0;
+  if (\$fl & 1) { \$poll = 2; } else if (\$to <= nsecs(monotonic)) { \$poll = 1; }
+  @wcnt[tid] = *(uint32 *)uptr(\$p + 16);
+  @walert[tid] = *(uint32 *)uptr(\$p + 32) != 0;
+  @wpoll[tid] = \$poll;
+  @wsl[tid] = 0;
+  @w0[tid] = nsecs;
+  @nwait = @nwait + 1;
+}
+
+fexit:ntsync:ntsync_char_ioctl /@w0[tid]/ {
+  \$r = 0;
+  if (strncmp(comm, "AudioCalc", 9) == 0) { \$r = 1; } else if (comm == "pipeasio-rt") { \$r = 2; }
+  \$d = nsecs - @w0[tid];
+  \$slept = @wsl[tid] > 0;
+  @wait[\$r, args.cmd == $WAIT_ALL, @wcnt[tid], @walert[tid], @wpoll[tid], \$slept, retval] = count();
+  if (\$slept) { @wait_slept_us[\$r] = hist(\$d / 1000); } else { @wait_fast_ns[\$r] = hist(\$d); }
+  delete(@w0, tid); delete(@wsl, tid); delete(@wcnt, tid); delete(@walert, tid); delete(@wpoll, tid);
+}
+
+tracepoint:sched:sched_switch {
+  \$q = (uint32)args.prev_pid;
+  if (@w0[\$q] && args.prev_state != 0) {
+    @wsl[\$q] = @wsl[\$q] + 1;
+    @soff[\$q] = nsecs;
+  }
+  \$t = (uint32)args.next_pid;
+  if (@soff[\$t]) {
+    \$r = 0;
+    if (strncmp(args.next_comm, "AudioCalc", 9) == 0) { \$r = 1; } else if (args.next_comm == "pipeasio-rt") { \$r = 2; }
+    \$s = nsecs - @soff[\$t];
+    @sleep_us[\$r] = hist(\$s / 1000);
+    @sleep_lin[\$r] = lhist(\$s / 1000, 0, 400, 5);
+    if (@wk[\$t]) {
+      \$from = (uint64)99;
+      if (args.prev_pid == 0) { \$from = (uint64)@lastidle[cpu]; }
+      @wake_from[\$r, \$from] = count();
+      @wake_lat_us[\$r, \$from] = hist((nsecs - @wk[\$t]) / 1000);
+      delete(@wk, \$t);
+    }
+    delete(@soff, \$t);
+  }
+}
+
+tracepoint:sched:sched_waking /@soff[(uint32)args.pid]/ { @wk[(uint32)args.pid] = nsecs; }
+
+tracepoint:power:cpu_idle /args.state != 4294967295/ { @lastidle[cpu] = args.state; }
+
+tracepoint:irq:irq_handler_entry { @irq0[cpu] = nsecs; }
+tracepoint:irq:irq_handler_exit /@irq0[cpu]/ { @irq_ns[cpu] = sum(nsecs - @irq0[cpu]); @irq0[cpu] = 0; }
+tracepoint:irq:softirq_entry { @sirq0[cpu] = nsecs; }
+tracepoint:irq:softirq_exit /@sirq0[cpu]/ { @sirq_ns[cpu, args.vec] = sum(nsecs - @sirq0[cpu]); @sirq0[cpu] = 0; }
+
+interval:s:1 {
+  printf("S %lu %lu %lu %lu %lu\n", nsecs(monotonic), @nb, @nset, @nreset, @nwait);
+  @nb = 0; @nset = 0; @nreset = 0; @nwait = 0;
+}
+
+END {
+  printf("END %lu\n", nsecs(monotonic));
+  clear(@w0); clear(@wsl); clear(@wcnt); clear(@walert); clear(@wpoll); clear(@soff); clear(@wk); clear(@lastidle);
+  clear(@irq0); clear(@sirq0); clear(@nb); clear(@nset); clear(@nreset); clear(@nwait);
+}
+BT
+  setsid taskset -c 12-15 bpftrace -q --no-warnings -f json "$out/census.bt" > "$out/census.json" 2> "$out/census.err" < /dev/null &
+  echo $! > "$out/census.pid"
+  for _ in $(seq 1 120); do
+    grep -q '"READY ' "$out/census.json" 2>/dev/null && break
+    kill -0 "$(cat "$out/census.pid")" 2>/dev/null || { echo "census-capture: bpftrace exited: $(head -c 400 "$out/census.err")" >&2; owner; exit 1; }
+    sleep 0.25
+  done
+  grep -q '"READY ' "$out/census.json" 2>/dev/null || { echo "census-capture: not attached after 30 s" >&2; owner; exit 1; }
+  echo "wine-trace: started: census-capture pid $pid, out=$out"
+  owner
+  ;;
+stop)
+  [ -f "$out/census.pid" ] && kill -INT "$(cat "$out/census.pid")" 2>/dev/null
+  for _ in $(seq 1 240); do
+    [ -f "$out/census.pid" ] && kill -0 "$(cat "$out/census.pid")" 2>/dev/null || break
+    sleep 0.25
+  done
+  owner
+  echo "wine-trace: stopped: census-capture out=$out"
+  ;;
+*)
+  echo "usage: census-capture start --out DIR --pid P | stop --out DIR" >&2
+  exit 2
+  ;;
+esac
