@@ -12,6 +12,7 @@ documents describe lives in the rest of `profiler/` and in `patches/0108-…` / 
 | `design-C-control-suite-agent-loop.md` | AbletonOSC control layer, scenarios, bench integration, agent loop |
 | `research-*.md` | Phase 0 research: the build system, installing and launching Live, the bench suite and telemetry |
 | `resume-plan.md` | The block log (B0–B7, B5b, B5c), the strategy and the "proving gains" record — the current state lives here |
+| `kernel-plan.md` | The kernel-level performance plan (I0, K0–K9: census, SMT offline, `mitigations=off`, the ntsync-live module with in-kernel spin and LiveSync, C-states, isolation, pre-wake, direct NT entry, sched_ext), with its status table |
 | `findings/b5-tproto-rootcause.md` | Root cause of the tracer crashes: kernel 7.2's per-CPU private BPF stack and preemptible uprobe programs |
 | `findings/b5-kernel-oops-24441.txt` | The kernel oops that led to it |
 | `findings/wf*.json` | Review findings from the first implementation workflows |
