@@ -3,16 +3,34 @@
 Living document, approved 2026-10-19: the status table is updated as each item lands, and each item's section records its result.
 
 ## Status (updated as items land)
+**Halted 2026-10-19 16:08 (user: "halt trials and report and save progress then shrink the partition") for a Windows 11 dual boot.**
+- **Plan:** a native Windows baseline on the same laptop, the same Sets and the same buffer.
+- **Kept configuration at the halt:** `posix_spawn` (0112), `physcore` with 5 workers, the new display.
+- **No kernel-level change has improved Live:**
+  - T0024 core clearing: revert.
+  - T0026 SMT siblings offline: mechanism-confirmed, no gain.
+  - T0025 in-kernel spin: revert. It worked (context switches −64 %), but the DSP average did not move and the audio CPU doubled.
+  - T0030 EPP: withdrawn; the bench already runs with EPP `performance`.
+- **What the traced runs show:** about 77 % of the audio threads' cycles are Live's own native code; ntsync calls are about 16 %.
+- **T0027 halted after A1, B1, A2** (B2 interrupted); the runs are set aside in `t0027-halted` and it reruns from A1 later.
+- **Next:**
+  1. Shrink the laptop's btrfs root to half (about 477 GiB left unallocated for Windows).
+  2. The user installs Windows 11.
+  3. Fix the boot order (GRUB first, os-prober for Windows).
+  4. A Windows measurement harness and an interleaved Linux-vs-Windows trial.
+  5. Rerun T0027.
+  6. A TLB-walk diagnostic (`perf stat`), then a transparent-huge-pages trial for Live's own code.
+
 | Item | State | Trial | Result |
 |---|---|---|---|
 | T0022 physcore, 5 workers | recorded 2026-10-19: rule H PASS (9/9, −26.0 %) | T0022 | **keep**: the kept layout |
 | T0023 display | recorded 2026-10-19: non-inferiority PASS, display CPU −1 point in Live and −2.9 in the compositor | T0023 | **keep**: GPU renderer, Vulkan, present skip 6 |
 | T0024 core clearing | recorded 2026-10-19 (second attempt; the first was aborted, its restore left IRQs on 12–15): rule H FAIL, audio CPU +14.5 %; IRQ time on audio threads up; workers clocked 3.23 vs 3.51 GHz | T0024 | **revert** |
 | K10 P-core frequency policy (new, from T0024) | **withdrawn unrun**: the bench's power hold already sets EPP performance for every run; the clocks look power/thermal-limited | T0030 | — |
-| I0 infrastructure | in progress: campaign tooling in `profiler/trials/`, rule D, root-helper knobs (cpu-online, cpuidle, cpuidle-governor), ledger kinds `kernel`/`kernel-module` (validator fixed), GRUB variants (`profiler/kernel/grub/`, grub.d `45_`, not `09_`, so the normal entries never shift) and the `boot-kernel` variant table. To do on the laptop after T0023: install the helper and the GRUB variants, test rule D and the knobs | — | — |
+| I0 infrastructure | done (reboot-per-run trials proven by T0027's first runs): campaign tooling in `profiler/trials/`, rule D, root-helper knobs (cpu-online, cpuidle, cpuidle-governor), ledger kinds `kernel`/`kernel-module` (validator fixed), GRUB variants (`profiler/kernel/grub/`, grub.d `45_`, not `09_`, so the normal entries never shift) and the `boot-kernel` variant table. To do on the laptop after T0023: install the helper and the GRUB variants, test rule D and the knobs | — | — |
 | K0 census | **done** (D0004): ~83 sync calls per block; K5 syscall-free share ~40 %; spin budget 20–40 µs; K4 gate fires but C2 wakes look cheap; CPU 4 spends 5 % in xhci IRQs | D0004 | see K0 |
 | K1 SMT offline | recorded 2026-10-19 (second attempt): audio CPU +2.9 %, Live CPU 34.8 → 39.7 %; siblings offline in every B run | T0026 | **mechanism-confirmed** (not kept) |
-| K2 mitigations=off | registered as T0027; driver `profiler/trials/trial-T0027.sh` with `reboot-lib.sh` and `reboot-waiter.sh`; GRUB entry installed | T0027 | — |
+| K2 mitigations=off | halted 16:08 after A1, B1, A2 (B2 interrupted) for the Windows install; the mechanism worked (B: 0 vulnerabilities mitigated, A: 5); reruns from A1 later | T0027 | halted |
 | K3 ntsync-live spin | recorded 2026-10-19: in Live the DSP average did not move (5 of 9 pairs, −0.4 %) while audio CPU doubled (+22.9 points); the spin worked (context switches −64 %), wake-ups are not the bottleneck | T0025 | **revert** |
 | K4 C-state limit | gate fired (D0004: two thirds of audio wakes leave C2) but C2 wakes look cheap; registered as T0028, driver `profiler/trials/trial-T0028.sh`; p90/p99 per state checked before it runs | T0028 | — |
 | K5 LiveSync | not started; deprioritised by T0025: ntsync is 16 % of audio cycles, so at most a CPU gain, not block time (D0004: ~40 % of calls could be syscall-free) | — | — |
