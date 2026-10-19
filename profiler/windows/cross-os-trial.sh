@@ -31,8 +31,12 @@ wait_for() {  # linux|windows [timeout s]
 }
 
 boot_into() {  # linux|windows: a fresh boot into it
-  local cur
+  local cur t0=$SECONDS
   cur=$(current_os)
+  while [ "$cur" = none ] && [ $((SECONDS - t0)) -lt 600 ]; do   # mid-reboot: wait for either system
+    sleep 15
+    cur=$(current_os)
+  done
   say "boot into $1 (now $cur)"
   case $cur in
     linux)
@@ -72,7 +76,9 @@ for r in $ORDER; do
   say "run $tag on $os"
   if [ "$os" = linux ]; then run_linux "$tag"; else run_windows "$tag"; fi
   tr -d '\r' < "$OUT/$tag.jsonl" | grep '^{' | sed "s/^{/{\"run\": \"$r\", /" >> "$OUT/results.jsonl"
-  say "run $tag done: $(tr -d '\r' < "$OUT/$tag.jsonl" | grep -c '^{') Set results"
+  n=$(tr -d '\r' < "$OUT/$tag.jsonl" | grep -c '^{')
+  say "run $tag done: $n Set results"
+  [ "$n" -gt 0 ] || { say "run $tag produced no results (see $OUT/$tag.log); stopping"; exit 1; }
 done
 [ "$(current_os)" = linux ] || boot_into linux
 say "D0005 $TAG done"

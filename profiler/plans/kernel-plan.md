@@ -82,6 +82,10 @@ Living document, approved 2026-10-19: the status table is updated as each item l
     - peaks over 100 % (the dropout measure both systems share);
     - Linux's PipeWire errors.
   - It is a comparison of two platforms, so it gets no ledger verdict. The result goes here.
+  - **First attempt stopped at B1 (19:26–19:39):** Windows was finishing an OS upgrade (build 26300 → 26300.9711, a restart "Operating System: Upgrade (Planned)" at 19:24:59). D0005's reboot into Linux for A1 interrupted it; on B1's boot it resumed, restarted Windows, and GRUB's default turned that into Linux.
+    - Windows Update is now paused for 7 days, with no restart pending.
+    - The driver waits through a reboot in progress and stops on a run without results.
+    - D0005 restarts from A1 (`d0005b`), so all six runs share one Windows build. The first attempt's A1 is kept for reference only.
 
 ## Context
 - `WINE_POSIX_SPAWN=1` (T0020) removed the fork-induced page-fault storms, and dropouts are now rare. **T0022 (one audio thread per physical P-core, 5 workers) is a keep**: audio-thread CPU −26 %, Live CPU 46.9 → 35.0 %, DSP average lower. The goal now is more headroom: shorter, steadier audio blocks and less CPU, through kernel-level changes.
