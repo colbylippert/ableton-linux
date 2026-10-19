@@ -13,9 +13,9 @@ Living document, approved 2026-10-19: the status table is updated as each item l
 | K0 census | **done** (D0004): ~83 sync calls per block; K5 syscall-free share ~40 %; spin budget 20–40 µs; K4 gate fires but C2 wakes look cheap; CPU 4 spends 5 % in xhci IRQs | D0004 | see K0 |
 | K1 SMT offline | recorded 2026-10-19 (second attempt): audio CPU +2.9 %, Live CPU 34.8 → 39.7 %; siblings offline in every B run | T0026 | **mechanism-confirmed** (not kept) |
 | K2 mitigations=off | registered as T0027; driver `profiler/trials/trial-T0027.sh` with `reboot-lib.sh` and `reboot-waiter.sh`; GRUB entry installed | T0027 | — |
-| K3 ntsync-live spin | E0, E1, G2, G3 **PASS** (G3 with 0004: 40 µs adaptive, block −26 % at 1.32× CPU); T0025 running since 14:38 (`spin_ns=40000 spin_adaptive=1`, live-7a94c377) | T0025 | pending |
+| K3 ntsync-live spin | recorded 2026-10-19: in Live the DSP average did not move (5 of 9 pairs, −0.4 %) while audio CPU doubled (+22.9 points); the spin worked (context switches −64 %), wake-ups are not the bottleneck | T0025 | **revert** |
 | K4 C-state limit | gate fired (D0004: two thirds of audio wakes leave C2) but C2 wakes look cheap; registered as T0028, driver `profiler/trials/trial-T0028.sh`; p90/p99 per state checked before it runs | T0028 | — |
-| K5 LiveSync | not started; D0004 sizes it (about 40 % of sync calls syscall-free, every reset waiter-free, no alertable or multi-object audio waits) | next free IDs | — |
+| K5 LiveSync | not started; deprioritised by T0025: ntsync is 16 % of audio cycles, so at most a CPU gain, not block time (D0004: ~40 % of calls could be syscall-free) | — | — |
 | K6 isolation | registered as T0029 (driver ready); T0024 predicts no gain from moving IRQs off the audio cores, so it waits behind K10 | T0029 | — |
 | K5 LiveSync, K7–K9 | not started (K5's trials take the next free IDs) | — | — |
 | Dev commit cd5ca47 (dropped Wine-side spin) | to revert | — | — |
@@ -284,6 +284,19 @@ Trial IDs are assigned when each item is registered. The campaign's pending T002
     - gated waits only on audio threads, ≥1 per block, ≥30 % satisfied while spinning;
     - audio-thread voluntary context switches per second ≥25 % lower;
     - in one traced perf run per arm, the RT-balancing and scheduler share of audio cycles is ≥⅓ lower.
+- **T0025 — REVERT (2026-10-19, 14:38–15:27; all six runs and both traced runs clean; live-7a94c377, `spin_ns=40000 spin_adaptive=1`):** the spin works, but Live's blocks do not get shorter and the audio CPU doubles.
+  - Rule D FAIL: B's DSP average was lower in 5 of 9 Set-pairs, median −0.4 % (Inbuilts 9.25 → 9.02, Max4Live 9.17 → 9.30, VSTs 8.66 → 8.24).
+  - G4 FAIL: audio-thread CPU +96 % (+22.9 points of one core, limit +15); Live CPU 35.9 → 57.6 %.
+  - G1, G2 pass: xruns 0 → 0, errors 11 → 9.
+  - Mechanism held:
+    - Per B run, about 6.9 M waits were gated and 5.45 M spun; 85 % of spins were satisfied while spinning, and the predictor skipped 1.46 M long waits.
+    - The audio threads' voluntary context switches fell 64 % (2.13 M → 0.75 M per window).
+    - Traced, the scheduler's cycles fell 0.96 G → 0.54 G.
+  - **Why no gain:**
+    - Traced, Live's own (user) cycles were the same in both arms (37.2 G → 36.3 G per 60 s), while the spin added about 43 G cycles inside ntsync (7.9 G → 51.3 G).
+    - Wake-up latency is not what limits Live's blocks. G3's bench gained because its work per round was tiny.
+    - Package power rose only about 0.5 W (PAUSE spinning).
+  - **Consequence for K5 and K8:** without spinning, ntsync calls are 16 % of the audio threads' cycles. That is the ceiling for a syscall-free path (LiveSync), and the gain would be CPU, not block time. K5 and K8 drop down the list.
 
 ## K5 LiveSync: shared-memory event state (module stage 2 + Wine 0113)
 - **Kernel storage:**
