@@ -637,6 +637,19 @@ Next candidates (user to choose; none pre-registered yet):
   - revert: a guard fails, or a mechanism check does not hold. The switch stays opt-in (default off).
 - Secondary readouts: wineserver CPU (% of one core) and voluntary switches per second, per Set; Live's UI-thread CPU; Live CPU; DSP peaks; xruns.
 - Driver `~/.local/state/profiler/trial-T0019.sh`. Scored by `plans/tools/trial-analyze.py T0019 --rule t0004` plus a mechanism summary, `t0019_mechanism.py`.
+- Before the trial (2026-10-18): the official build of 49c5030 took 4m45s on the workstation, the audit passed (192 checks, including 0111's fingerprint), and the runtime is installed on the laptop. The probe on the official runtime passes both ways: the hook adds 11.0 µs to every message after the swap chain (10.89 → 21.87 µs), and with the switch nothing is added (10.00 → 7.93 µs).
+- **T0019 — MECHANISM-CONFIRMED (2026-10-18/19, 23:35–00:28, normal kernel; all six runs and the four traced runs clean):** the switch does what it should, but it brings no audio gain under the rule.
+  - Rule FAIL: [D] no, [E] no; both guards pass.
+    - Dropouts: PipeWire errors 14 → 10 (Inbuilts 0/0/5 → 1/0/1, Max4Live 5/1/0 → 2/0/1, VSTs 1/1/1 → 0/4/1). B was fewer in 4 of 9 Set-pairs; one-sided p = 0.27. xruns 0 → 0.
+    - DSP average 9.52 / 9.65 / 9.20 → 9.57 / 9.90 / 9.19, at most 0.31 × the spread.
+  - Both mechanism checks held, as predicted:
+    - wineserver wakeups (voluntary switches per second, Set medians) fell by about 570, a quarter, against the predicted 580: Inbuilts 2,271 → 1,702, Max4Live 2,284 → 1,698, VSTs 2,272 → 1,706. Every run is within 6 of its arm's median.
+    - wined3d's winediag line appears in every B run and in no A run.
+    - Traced (dev runtime, `-d1`, 30 s): wineserver requests fell from 2,262 to 1,673 per second on Inbuilts and from 2,258 to 1,676 on Max4Live. Live's UI thread fell from 1,736 to 1,148 per second, and its WH_GETMESSAGE hook chains from 193 to 0. The 60 hook chains per second that remain are MaxPlug's WH_CALLWNDPROC.
+  - CPU (% of one core, Set medians): wineserver 1.23 / 1.22 / 1.24 → 1.11 / 1.11 / 1.07; Live's UI thread 9.8 / 10.1 / 7.7 → 9.3 / 9.3 / 7.5; Live 45.9 vs 46.3 overall.
+  - Reading: the hook made up a quarter of wineserver's requests, but wineserver's whole load is about one point of a core and off the audio path. Removing it does not move dropouts or DSP load, which fits D0001: the dropouts come from work spikes in Live's own audio callback.
+  - Context, not part of the rule: this A arm had 14 errors, against 1 in T0018's A arm (the old display setup) and 5 in T0015's normal-kernel arm. Dropout counts drift between sessions by more than most trial effects, and only the interleaved ABAB design absorbs that drift.
+  - Kept as is: patch 0111 stays in the series and the runtime as an opt-in switch, default off. The configuration does not change.
 
 **Wine hot-path research (2026-10-18 morning)**
 
