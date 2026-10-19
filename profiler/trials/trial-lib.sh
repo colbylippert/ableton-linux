@@ -157,15 +157,18 @@ cores_clear_off() {
   fi
   echo ffff | sudo -n tee /sys/devices/virtual/workqueue/cpumask >/dev/null
 }
-cores_restore_check() {  # how many saved IRQs are not on their original effective CPU
-  local i aff eff n=0 saved=$R/$TRIAL-irq-affinity.saved
+cores_restore_check() {  # "N/M": saved IRQs not on their original CPU, and of those the ones on or from an audio CPU
+  local i aff eff cur n=0 m=0 saved=$R/$TRIAL-irq-affinity.saved   # (rare IRQs move only when they next fire)
   if [ -s "$saved" ]; then
     while read -r i aff eff; do
       [ -n "$eff" ] && [ -r "/proc/irq/$i/effective_affinity_list" ] || continue
-      [ "$(cat "/proc/irq/$i/effective_affinity_list")" = "$eff" ] || n=$((n + 1))
+      cur=$(cat "/proc/irq/$i/effective_affinity_list")
+      [ "$cur" = "$eff" ] && continue
+      n=$((n + 1))
+      case ",0,2,4,6,8,10," in *",$eff,"*|*",$cur,"*) m=$((m + 1)) ;; esac
     done < "$saved"
   fi
-  echo "$n"
+  echo "$n/$m"
 }
 cores_masks() {  # one line: kwin's and journald's CPUs, system.slice's AllowedCPUs, the workqueue mask, xhci's CPU
   local x kw jd

@@ -10,7 +10,8 @@
 # Second attempt (2026-10-19). The first was aborted during A2: restoring only the IRQ masks left every IRQ on
 # CPUs 12-15 (the kernel keeps an IRQ where it is while that CPU is in its mask), so the A runs after B1 were not
 # as-is, and its record read the masks after the restore. cores_clear_off now puts each IRQ back on its own CPU;
-# the record has the masks in force before the restore and the number of IRQs not back afterwards (must be 0).
+# the record has the masks in force before the restore and the IRQs not back afterwards as N/M, M those on or from
+# an audio CPU (must be 0; rare IRQs on other CPUs may move back only when they next fire).
 set -u
 TRIAL=T0024
 source "$(dirname "${BASH_SOURCE[0]}")/trial-lib.sh"
