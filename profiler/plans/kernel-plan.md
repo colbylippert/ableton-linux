@@ -11,9 +11,9 @@ Living document, approved 2026-10-19: the status table is updated as each item l
 | K10 P-core frequency policy (new, from T0024) | idea: the audio threads average 3.2–3.5 of 4.7 GHz under `powersave` with EPP `balance_performance`; EPP `performance` (or HWP dynamic boost) on the P-cores, rule D with power reported | next free ID | — |
 | I0 infrastructure | in progress: campaign tooling in `profiler/trials/`, rule D, root-helper knobs (cpu-online, cpuidle, cpuidle-governor), ledger kinds `kernel`/`kernel-module` (validator fixed), GRUB variants (`profiler/kernel/grub/`, grub.d `45_`, not `09_`, so the normal entries never shift) and the `boot-kernel` variant table. To do on the laptop after T0023: install the helper and the GRUB variants, test rule D and the knobs | — | — |
 | K0 census | **done** (D0004): ~83 sync calls per block; K5 syscall-free share ~40 %; spin budget 20–40 µs; K4 gate fires but C2 wakes look cheap; CPU 4 spends 5 % in xhci IRQs | D0004 | see K0 |
-| K1 SMT offline | registered as T0026; driver `profiler/trials/trial-T0026.sh` (`KEPT_CLEAR` from T0024's verdict); runs after T0024 is scored | T0026 | — |
+| K1 SMT offline | running since 13:09 (`KEPT_CLEAR=0`) | T0026 | pending |
 | K2 mitigations=off | registered as T0027; driver `profiler/trials/trial-T0027.sh` with `reboot-lib.sh` and `reboot-waiter.sh`; GRUB entry installed | T0027 | — |
-| K3 ntsync-live spin | E0, E1, G2 **PASS**; G3 **FAIL** without the predictor (40 µs: block −23 %, CPU 1.72× > 1.5×); patch 0004 (adaptive) written, G3 again after T0024 | T0025 | — |
+| K3 ntsync-live spin | E0, E1, G2 **PASS**; G3 **PASS** with 0004 (live-7a94c377): 40 µs adaptive, block −26 % at 1.32× CPU (fixed spin failed at 1.71×). T0025 ready: `spin_ns=40000 spin_adaptive=1`; runs after T0026 | T0025 | — |
 | K4 C-state limit | gate fired (D0004: two thirds of audio wakes leave C2) but C2 wakes look cheap; registered as T0028, driver `profiler/trials/trial-T0028.sh`; p90/p99 per state checked before it runs | T0028 | — |
 | K5 LiveSync | not started; D0004 sizes it (about 40 % of sync calls syscall-free, every reset waiter-free, no alertable or multi-object audio waits) | next free IDs | — |
 | K6 isolation | registered as T0029 (driver ready); T0024 predicts no gain from moving IRQs off the audio cores, so it waits behind K10 | T0029 | — |
@@ -253,6 +253,22 @@ Trial IDs are assigned when each item is registered. The campaign's pending T002
     - 40 µs is the pick: −23 % median and a better p99. But at 1.72× the CPU it breaks the ≤ 1.5× limit.
     - Much of the extra CPU should be the futile spin on each thread's long wait between blocks.
   - **Next:** patch 0004 (the adaptive predictor), then G3 again with `spin_adaptive=1` at 20 and 40 µs as its own evaluation (T0025's B arm allows `spin_adaptive=P*`), with E1/G2 repeated on the 0001–0004 build.
+- **Gate results with 0004 (live-7a94c377 = 0001–0004, 2026-10-19 ~13:05):**
+  - **E1 and G2 PASS again:**
+    - The selftest fails only `wake_all`, as on stock.
+    - No lost or doubled wake-ups.
+    - Defaults are within ±3 % of stock (torture 4.40 vs 4.38 µs, ping-pong 3.05 vs 2.99 µs).
+    - Adaptive spinning for every thread passes and is the fastest: torture 2.64 µs, ping-pong 0.92 µs, misses 142.
+  - **G3 PASS with the predictor:**
+
+    | configuration | block p50 | p99 | CPU per round | notes |
+    |---|---|---|---|---|
+    | spin off | 194.0 µs | 221.1 µs | 146.5 µs | |
+    | 40 µs fixed | 147.8 | 168.9 | 250.7 (1.71×) | too costly |
+    | **40 µs adaptive** | **142.9 (−26 %)** | **164.1 (−26 %)** | **193.1 (1.32×)** | 100,134 long waits skipped; 99.9 % of spins satisfied |
+    | 20 µs adaptive | 193.7 | 220.1 | 148.3 | the predictor switched itself off: unspun waits include their wake-up and look longer than 20 µs |
+
+  - **T0025's parameters are settled by this procedure: S* = 40000 ns, P* = 1.** (The largest block was 4.3 ms once with adaptive 40 µs, against 1.6 ms with no spin; p99 is the registered criterion.)
 - **T0025:**
   - A: `spin_ns=0`. B: `spin_ns=S*`, `spin_comm=AudioCalc,pipeasio-rt`, `spin_rt=1`, `spin_adaptive=P*`. The same module binary runs in both arms; parameters change between runs.
   - **Rule D with G4:** M's median increase ≤ +15 points of one core. A bigger CPU cost turns a keep into mechanism-confirmed for the user to decide.

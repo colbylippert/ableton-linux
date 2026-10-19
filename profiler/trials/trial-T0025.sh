@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # Trial T0025: ntsync-live's in-kernel optimistic spin (kernel plan K3; pre-registered in profiler/plans/kernel-plan.md).
 # Usage: KEPT_LAYOUT=physcore KEPT_WORKERS=5 KEPT_DISPLAY=new KEPT_CLEAR=0|1 NTSL_S8=<series8> NTSL_SPIN_NS=<G3's S*> \
-#          profiler/trials/trial-T0025.sh
+#          NTSL_ADAPTIVE=<G3's P*: 0|1> profiler/trials/trial-T0025.sh
 # Both arms run the same module, live-$NTSL_S8, loaded once before the first run through the root helper (installed by
-# ntsync-live verify or g3) with spin_comm=AudioCalc,pipeasio-rt and spin_rt=1; the stock module comes back when the
-# driver exits. A: spin_ns=0. B: spin_ns=$NTSL_SPIN_NS. The parameter changes between runs, while Live is not running.
+# ntsync-live verify or g3) with spin_comm=AudioCalc,pipeasio-rt, spin_rt=1 and spin_adaptive=$NTSL_ADAPTIVE; the stock
+# module comes back when the driver exits. A: spin_ns=0 (no wait spins, whatever spin_adaptive says).
+# B: spin_ns=$NTSL_SPIN_NS. The parameter changes between runs, while Live is not running.
 # Rule D with G4 at +15 points of one core (campaign_tools.py rule-d T0025 15).
 # Mechanism, per run: the module's counters (gated waits, spins, hits, misses, aborts, spin time); the audio threads'
 # voluntary context switches (campaign_tools.py vcs); traced, one 60 s Inbuilts run per arm with d0003-capture (perf),
@@ -12,12 +13,13 @@
 set -u
 TRIAL=T0025
 source "$(dirname "${BASH_SOURCE[0]}")/trial-lib.sh"
-: "${KEPT_LAYOUT:?}" "${KEPT_WORKERS:?}" "${KEPT_DISPLAY:?}" "${KEPT_CLEAR:?}" "${NTSL_S8:?}" "${NTSL_SPIN_NS:?}"
+: "${KEPT_LAYOUT:?}" "${KEPT_WORKERS:?}" "${KEPT_DISPLAY:?}" "${KEPT_CLEAR:?}" "${NTSL_S8:?}" "${NTSL_SPIN_NS:?}" "${NTSL_ADAPTIVE:?}"
 export ABLETON_MAX_AUDIO_THREADS=$KEPT_WORKERS
 H=/usr/local/sbin/profiler-root-helper
 P=/sys/module/ntsync/parameters
 pgrep -f 'Live 12 Trial.exe' >/dev/null && { echo "Live is running"; exit 2; }
-sudo -n "$H" ntsync load "$NTSL_S8" spin_comm=AudioCalc,pipeasio-rt spin_rt=1 || { echo "ntsync load $NTSL_S8 failed"; exit 2; }
+sudo -n "$H" ntsync load "$NTSL_S8" spin_comm=AudioCalc,pipeasio-rt spin_rt=1 spin_adaptive="$NTSL_ADAPTIVE" \
+  || { echo "ntsync load $NTSL_S8 failed"; exit 2; }
 trap 'sudo -n "$H" ntsync restore-stock >/dev/null || echo "could not restore the stock ntsync (reboot restores it)"' EXIT
 spin_for() { if [ "$1" = B ]; then echo "$NTSL_SPIN_NS"; else echo 0; fi; }
 arm_env() {
@@ -32,7 +34,7 @@ arm_setup() {  # $tag: run_one's
 }
 arm_teardown() {
   sampler_stop
-  STATS=$(cat $P/stats 2>/dev/null); MODULE="$(cat /sys/module/ntsync/version 2>/dev/null) spin_ns=$(cat $P/spin_ns 2>/dev/null) spin_comm=$(cat $P/spin_comm 2>/dev/null) spin_rt=$(cat $P/spin_rt 2>/dev/null)"
+  STATS=$(cat $P/stats 2>/dev/null); MODULE="$(cat /sys/module/ntsync/version 2>/dev/null) spin_ns=$(cat $P/spin_ns 2>/dev/null) spin_comm=$(cat $P/spin_comm 2>/dev/null) spin_rt=$(cat $P/spin_rt 2>/dev/null) spin_adaptive=$(cat $P/spin_adaptive 2>/dev/null)"
   [ "$KEPT_CLEAR" = 1 ] && cores_clear_off
   return 0
 }
