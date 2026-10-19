@@ -741,6 +741,69 @@ Next candidates (user to choose; none pre-registered yet):
     - Patch 0112 stays opt-in in the series, as every fix does.
   - Upstream candidate (the user's call): the change is generic Wine, not Ableton-specific. Any Wine process that starts other processes pays this copy-on-write cost afterwards.
 
+**Headroom campaign T0021–T0025 (user decision 2026-10-19: "We want ableton specific improvement… What else can we try", then "Lets test all of this"; pre-registered before running)**
+- Why now:
+  - With `WINE_POSIX_SPAWN=1`, dropouts are rare (T0020's B arm: 1 error in 9 Set-runs), so the next gains are headroom: less CPU and a lower DSP load.
+  - D0003's perf data splits Live's audio-thread cycles into: Live's own code 60 %; the kernel side of the AudioCalc fan-out (ntsync waits and wakes, about 245 per block) 23 %; the kernel's RT balancing (`balance_rt`, `pull_rt_task`, `double_rq_lock` spinning while workers sleep and wake about 53,000 times a second) 11 %; other kernel work 6 %.
+- Facts used below:
+  - CPUs 0–11 are the P-cores, in sibling pairs (0,1) (2,3) (4,5) (6,7) (8,9) (10,11); CPUs 12–15 are the E-cores.
+  - The Focusrite's USB controller (xhci, IRQ 123, PCI 0000:00:14.0) currently fires on CPU 4. irqbalance is not installed.
+  - Live runs in the trial driver's session scope; PipeWire runs in the desktop session's `pipewire.service`.
+  - Audio-thread CPU per Set-run varies by about ±2 points around 30–37 % of one core (T0019, T0020).
+- Every trial in the campaign:
+  - The kept configuration at its start, including `WINE_POSIX_SPAWN=1` and every earlier verdict of the campaign.
+  - Normal kernel, the current boot (per-boot timers stopped).
+  - ABAB × 3 back to back; Inbuilts, Max4Live, VSTs; 120 s; untraced.
+- **Headroom rule (H)**, for T0021, T0022 and T0024:
+  - M is the audio-thread CPU of a Set-run: the summed CPU of Live's `AudioCalc*` and `pipeasio-rt` threads over the window, in % of one core, from the bench's `proc-delta.json`.
+  - PASS iff:
+    - [H1] B's M is below its paired A's in at least 8 of the 9 Set-pairs (one-sided sign test, p = 0.02);
+    - [H2] the median of the 9 paired changes in M is −3 % or larger in size;
+    - and the guards hold:
+      - [G1] B has no xruns;
+      - [G2] B's PipeWire errors are not significantly higher than A's (one-sided binomial test of B's share of all errors, p ≥ 0.05);
+      - [G3] no Set's median DSP average is worse in B by more than 2× its A/A spread (T0002).
+  - The guards replace T0004's "B errors ≤ A", which counts of 0 or 1 errors would decide by noise.
+  - Verdicts:
+    - keep: PASS and the mechanism holds;
+    - mechanism-confirmed: guards and mechanism hold, but [H1] or [H2] fails;
+    - revert: a guard fails, or the mechanism does not hold.
+  - Reported, not ruled on: DSP average and peak medians, Live CPU, worker run-queue waits.
+- **T0021, one CPU per audio thread (item 1).**
+  - A: the kept pinning: pipeasio-rt and every AudioCalc thread on CPUs 0–11 (shared mask).
+  - B: 1:1 pinning. pipeasio-rt on CPU 0 (its sibling, CPU 1, stays free). Each AudioCalc thread gets its own CPU from 2–10, in thread-id order, released when the thread exits; until a CPU is free, a new worker keeps the shared mask.
+  - Expected: a thread allowed on one CPU cannot be pushed or pulled, so most of the 11 % RT-balancing time should go.
+  - Rule H. Mechanism:
+    - (a) In every B Set-run, `proc-delta.json` shows each AudioCalc thread and pipeasio-rt on a single CPU, with no two sharing one; in A, all show 0–11.
+    - (b) Traced, after the ABAB: one 60 s Inbuilts run per arm with `d0003-capture` (perf). The RT-balancing share of audio-thread cycles in B is under a third of A's.
+  - Keep: B's pinning becomes the trial watcher's default.
+- **T0022, six workers, one per physical P-core (item 2; runs after T0021).**
+  - A: the kept configuration after T0021 (nine workers, pinned as T0021 decided).
+  - B: `ABLETON_MAX_AUDIO_THREADS=6`, the six AudioCalc threads on CPUs 0, 2, 4, 6, 8, 10 (one per physical core), and pipeasio-rt on CPU 1.
+  - Context: T0006 cut Live CPU 64 → 40 % with six workers but was judged amid the fork-storm noise.
+  - Rule H; [G3] guards against the per-block wall time growing with fewer workers.
+  - Mechanism: every B Set-run shows six AudioCalc threads on the six CPUs; A shows nine.
+  - Keep: six workers on that layout become the configuration.
+- **T0023, the display setup again (item 4; runs after T0022).**
+  - A: the current display: OpenGL, renderer off (golden), every frame shown.
+  - B: wined3d's Vulkan back end (`WINE_D3D_CONFIG=csmt=0x1,renderer=vulkan`), Live's GPU renderer on (`golden.20261019T011657Z`), and `WINED3D_PRESENT_SKIP=6`.
+  - Context: T0018 reverted it on dropouts (1 → 22) while it saved about 5 points of display CPU. The fork storms may have amplified those dropouts.
+  - Rule: T0018's non-inferiority rule. Keep iff B has no xruns, its PipeWire errors are not significantly higher (one-sided binomial, p ≥ 0.05), and no Set's median DSP average is worse by more than 2× its spread.
+  - Mechanism as in T0018: Live's GPU-renderer line per Set-run, and the Vulkan and skip lines in B only.
+  - Reported: display CPU (UI thread, `wined3d_cs`, kwin + Xwayland).
+  - Keep: golden becomes the GPU-renderer snapshot, and desktop launches get the two variables from environment.d.
+- **T0024, audio cores kept clear (item 5; runs after T0023).**
+  - A: as is.
+  - B, applied before and undone after each B run:
+    - every IRQ whose affinity can change moves to CPUs 12–15, except the xhci controller's, which goes to CPU 11 if T0021 kept 1:1 pinning (CPU 11 is then outside the audio layout) and to CPU 12 otherwise;
+    - `system.slice`, `init.scope`, and in the user manager `app.slice`, `background.slice` and every `session.slice` unit except `pipewire.service` (kwin, Xwayland, plasmashell, WirePlumber…) get `AllowedCPUs=12-15`;
+    - the unbound-workqueue cpumask goes to CPUs 12–15;
+    - Live (the driver's session scope) and PipeWire stay unrestricted.
+  - Rule H. Mechanism:
+    - (a) each B run records kwin's and a system service's CPU mask (12–15) and the xhci IRQ's effective CPU;
+    - (b) traced, one 60 s Inbuilts run per arm with `d0003-capture`: IRQ time and preemptions on the audio threads are lower in B by at least half.
+- **T0025, spinning before sleeping (item 3).** A Wine patch (0113) that lets threads named AudioCalc or pipeasio-rt spin briefly on their event before sleeping. It will be pre-registered with its probe once built; it is not run before then.
+
 **Wine hot-path research (2026-10-18 morning)**
 
 Diagnostic D0001: one traced run on the kept configuration (heavy Sets, 60 s each, 45,000 blocks per Set; history `diag-D0001-traced`).
