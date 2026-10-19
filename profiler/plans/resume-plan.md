@@ -611,6 +611,33 @@ Next candidates (user to choose; none pre-registered yet):
     - Not installing the hook would remove about 600–750 wineserver requests per second, about a third of its wakeups, and three round trips from every message Live's UI loop handles.
     - The MaxPlug hook and the posted messages are Live's and Max's own design.
 
+**T0019, wined3d's Alt+Enter hook (patch 0111; user decision 2026-10-18: "Lets try the wineserver wake reduction"; pre-registered before running)**
+- Change: patch 0111 (49c5030). With `WINED3D_NO_ALT_ENTER_HOOK=1`, wined3d installs no `WH_GETMESSAGE` hook on the threads that own swap-chain windows. Alt+Enter then no longer toggles DXGI's exclusive fullscreen, which Live does not use (its full-screen mode is a window mode). Unset, nothing changes.
+- Probe (`tools/msghookprobe.c`, dev runtime): PASS with and without the switch. The hook adds 8.6 µs to every message after the swap chain is created (11.09 → 19.67 µs); with the switch nothing is added (12.67 → 9.37 µs). The probe is repeated on the official runtime before the trial.
+- Expected size:
+  - It should remove about 580 wineserver requests per second (wined3d's ~194 hook calls per second × 3 round trips), about a quarter of wineserver's ~2,300 wakeups.
+  - The CPU saving is small: under half a point of one core across Live's UI thread and wineserver. An audio gain beyond the noise floor is not expected.
+  - The trial checks that the reduction is real and harmless, and whether it moves dropouts.
+- A: the kept configuration, with `WINED3D_NO_ALT_ENTER_HOOK` unset. B: the same with `WINED3D_NO_ALT_ENTER_HOOK=1`.
+- Both arms:
+  - the official runtime with 0111, built on the workstation from 49c5030;
+  - the normal kernel 7.2.11-1 with stock priorities;
+  - `PIPEASIO_REALTIME=1`, pinning, nine workers, the normal window, 64 frames;
+  - golden (OpenGL, renderer off, every frame shown), RT throttling off, the NVIDIA-only external display and wired Ethernet;
+  - one harness: the laptop's checkout fast-forwarded before A1, so the bench records the switch.
+- ABAB × 3, back to back on T0017's boot (its per-boot timers are stopped). Inbuilts, Max4Live, VSTs; 120 s; untraced.
+- Rule: the T0004 rule ([D] or [E], plus both guards), with the T0002 A/A spreads.
+- Mechanism check, untraced runs: wineserver's voluntary context switches per second over each Set-run's window, from the bench's `proc-delta.json`. It holds iff, on every Set, B's median is at least 400 per second below A's (about 70 % of the expected 580), and Wine logs `Not installing the Alt+Enter message hook` in B only.
+- Traced confirmation, after the ABAB runs (the patch kind needs one traced run per arm): D0002's part 2 on the dev runtime (the same 0108–0111 series, unstripped).
+  - wineserver's request log (`-d1`) covers 30 s inside a 60 s window, on Inbuilts and Max4Live, A then B.
+  - It confirms iff in B, Live's UI thread makes no `start_hook_chain( id=3` (WH_GETMESSAGE) requests (A: about 190 per second), and wineserver's total requests per second are at least 400 lower than in A on both Sets.
+- Verdict:
+  - keep: the rule passes, both mechanism checks hold, and the probe passes on the official runtime. The configuration then adds `WINED3D_NO_ALT_ENTER_HOOK=1`: trials from T0020 set it in both arms, and desktop launches get it from an environment.d file.
+  - mechanism-confirmed: both guards and both mechanism checks hold, but neither [D] nor [E] is met. The switch stays opt-in and the configuration does not change.
+  - revert: a guard fails, or a mechanism check does not hold. The switch stays opt-in (default off).
+- Secondary readouts: wineserver CPU (% of one core) and voluntary switches per second, per Set; Live's UI-thread CPU; Live CPU; DSP peaks; xruns.
+- Driver `~/.local/state/profiler/trial-T0019.sh`. Scored by `plans/tools/trial-analyze.py T0019 --rule t0004` plus a mechanism summary, `t0019_mechanism.py`.
+
 **Wine hot-path research (2026-10-18 morning)**
 
 Diagnostic D0001: one traced run on the kept configuration (heavy Sets, 60 s each, 45,000 blocks per Set; history `diag-D0001-traced`).
