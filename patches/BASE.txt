@@ -11,7 +11,7 @@ point-version gap with upstream's actively-maintained branch and with ENCORE
 The rebase involved five merge conflicts and uncovered three additional build
 breaks, plus a `build.sh`/`pipefail` tooling issue.
 
-The Wine series contains 99 patch files and ends at 0111. The absent numbers
+The Wine series contains 100 patch files and ends at 0112. The absent numbers
 are 0027, 0044, 0072, 0074, 0090 through 0095, 0097, and 0098; their reasons
 are declared in `SERIES_GAPS` in `scripts/build-audit.sh`. Patch 0073 keeps
 the wheel coordinate fix separate. Patch 0100 combines 10 pointer patches.
@@ -509,6 +509,20 @@ Patch 0111 lets wined3d skip its Alt+Enter message hook (`WINED3D_NO_ALT_ENTER_H
   installed. The fingerprint literal is `WINED3D_NO_ALT_ENTER_HOOK` in
   `wined3d.dll`. See `notes/ABLETON-WINE-NO-ALT-ENTER-HOOK.md` and
   `tools/msghookprobe.c`.
+Patch 0112 lets Wine start new processes with `posix_spawn()` (`WINE_POSIX_SPAWN`).
+  `spawn_process()` (`dlls/ntdll/unix/process.c`) starts every new process with
+  `fork()`, which write-protects all of the parent's private memory for
+  copy-on-write; afterwards the first write to each 4 KiB page takes a page fault.
+  Live starts its helper processes while a Set loads, so the first write to a
+  buffer, when a clip first plays, became a storm of about 1,500 faults inside one
+  audio block: the deterministic late blocks of diagnostic D0003. With
+  `WINE_POSIX_SPAWN=1`, `spawn_process_posix()` sets the child up through spawn
+  attributes and file actions, and `spawn_wineloader()` (`loader.c`, the twin of
+  `exec_wineloader()`) starts the loader with `posix_spawn()`, which shares the
+  address space until exec; children that have exited are reaped at the next
+  spawn. Unset, the fork path runs. The fingerprint literal is `WINE_POSIX_SPAWN`
+  in `ntdll.so`. See `notes/ABLETON-WINE-POSIX-SPAWN.md` and
+  `tools/spawncowprobe.c`.
 - `pipeasio/0017` adds six USDT probes (provider `pipeasio`) to the PipeASIO
   driver: `cycle_start` and `cycle_end` around the PipeWire cycle in
   `audio_on_process`, and `block_start`, `block_before_live`,

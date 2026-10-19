@@ -140,6 +140,11 @@ RUNTIME VARIABLES:
         thread for Alt+Enter (patch 0111); Alt+Enter then no longer
         toggles exclusive fullscreen; unset installs the hook
 
+    WINE_POSIX_SPAWN=1
+        start new processes with posix_spawn instead of fork (patch
+        0112), so starting Live's helpers does not leave Live's memory
+        write-protected; unset forks as upstream
+
     The pointer variables below override the saved pointer setting
     for one launch; the launcher exports none of them, and registry
     values hold the persistent settings. Values ignore letter case;

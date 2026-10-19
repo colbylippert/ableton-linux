@@ -1,0 +1,245 @@
+From e3fcf96ba97c04a3ee6f7df8af55d70ced71e413 Mon Sep 17 00:00:00 2001
+From: dist <build@localhost>
+Date: Mon, 19 Oct 2026 02:04:14 -0400
+Subject: [PATCH] ntdll: Optionally start new processes with posix_spawn
+ instead of fork (WINE_POSIX_SPAWN).
+
+---
+ dlls/ntdll/unix/loader.c       |  70 +++++++++++++++++++++++++++
+ dlls/ntdll/unix/process.c      | 105 +++++++++++++++++++++++++++++++++++++++++
+ dlls/ntdll/unix/unix_private.h |   4 ++
+ 3 files changed, 179 insertions(+)
+
+diff --git a/dlls/ntdll/unix/loader.c b/dlls/ntdll/unix/loader.c
+index c1321ce..719c251 100644
+--- a/dlls/ntdll/unix/loader.c
++++ b/dlls/ntdll/unix/loader.c
+@@ -497,6 +497,76 @@ NTSTATUS exec_wineloader( char **argv, int socketfd, const struct pe_image_info
+ }
+ 
+ 
++/***********************************************************************
++ *           spawn_wineloader
++ *
++ * Like exec_wineloader(), but starts the loader with posix_spawn() from the calling process instead of
++ * exec() in a forked child, and leaves our own environment alone. posix_spawn() runs the child in our
++ * address space until it execs (CLONE_VM | CLONE_VFORK), so no page table is copied and none of our
++ * pages is write-protected; after a fork() the first write to each 4 KiB page of ours takes a page fault.
++ * argv[0] and argv[1] must be reserved for the preloader and loader respectively.
++ */
++NTSTATUS spawn_wineloader( char **argv, int socketfd, const struct pe_image_info *pe_info, const char *winedebug,
++                           const posix_spawn_file_actions_t *actions, const posix_spawnattr_t *attr, pid_t *pid )
++{
++    WORD machine = pe_info->machine;
++    ULONGLONG res_start = pe_info->base;
++    ULONGLONG res_end = pe_info->base + pe_info->map_size;
++    char preloader_reserve[64], socket_env[64], noexec[] = "WINELOADERNOEXEC=1";
++    char *loaders[2], **envp;
++    NTSTATUS status = STATUS_INVALID_IMAGE_FORMAT;
++    size_t count = 0, i, j;
++
++    if (pe_info->wine_fakedll) res_start = res_end = 0;
++    if (pe_info->image_flags & IMAGE_FLAGS_ComPlusNativeReady) machine = native_machine;
++
++    snprintf( socket_env, sizeof(socket_env), "WINESERVERSOCKET=%u", socketfd );
++    snprintf( preloader_reserve, sizeof(preloader_reserve), "WINEPRELOADRESERVE=%x%08x-%x%08x",
++             (UINT)(res_start >> 32), (UINT)res_start, (UINT)(res_end >> 32), (UINT)res_end );
++
++    /* our environment with the variables that exec_wineloader() would putenv() replaced */
++    while (environ[count]) count++;
++    if (!(envp = malloc( (count + 5) * sizeof(*envp) ))) return STATUS_NO_MEMORY;
++    for (i = j = 0; i < count; i++)
++    {
++        if (winedebug && !strncmp( environ[i], "WINEDEBUG=", 10 )) continue;
++        if (!strncmp( environ[i], "WINESERVERSOCKET=", 17 )) continue;
++        if (!strncmp( environ[i], "WINEPRELOADRESERVE=", 19 )) continue;
++        if (!strncmp( environ[i], "WINELOADERNOEXEC=", 17 )) continue;
++        envp[j++] = environ[i];
++    }
++    if (winedebug) envp[j++] = (char *)winedebug;
++    envp[j++] = preloader_reserve;
++    envp[j++] = socket_env;
++    envp[j++] = noexec;
++    envp[j] = NULL;
++
++    /* the same candidates in the same order as loader_exec() and preloader_exec() */
++    loaders[0] = get_alternate_wineloader( machine );
++    loaders[1] = strdup( wineloader );
++    for (i = 0; i < 2 && status; i++)
++    {
++        if (!loaders[i]) continue;
++        argv[1] = loaders[i];
++#ifdef HAVE_WINE_PRELOADER
++        if (asprintf( &argv[0], "%s-preloader", loaders[i] ) != -1)
++        {
++            if (!posix_spawn( pid, argv[0], actions, attr, argv, envp )) status = STATUS_SUCCESS;
++            free( argv[0] );
++            argv[0] = NULL;
++            if (!status) break;
++        }
++#endif
++        if (!posix_spawn( pid, argv[1], actions, attr, argv + 1, envp )) status = STATUS_SUCCESS;
++    }
++    argv[1] = NULL;
++    free( loaders[0] );
++    free( loaders[1] );
++    free( envp );
++    return status;
++}
++
++
+ /***********************************************************************
+  *           exec_wineserver
+  *
+diff --git a/dlls/ntdll/unix/process.c b/dlls/ntdll/unix/process.c
+index 418f95b..5cdff2b 100644
+--- a/dlls/ntdll/unix/process.c
++++ b/dlls/ntdll/unix/process.c
+@@ -71,6 +71,7 @@
+ #include "wine/debug.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(process);
++WINE_DECLARE_DEBUG_CHANNEL(winediag);
+ 
+ 
+ static ULONG execute_flags = MEM_EXECUTE_OPTION_DISABLE;
+@@ -397,6 +398,102 @@ static BOOL is_unix_console_handle( HANDLE handle )
+ }
+ 
+ 
++/* WINE_POSIX_SPAWN=1 starts new processes with posix_spawn() instead of fork(). fork() write-protects
++ * every private writable page of this process for copy-on-write, and after the short-lived child is
++ * gone the first write to each 4 KiB page still takes a page fault: in Ableton Live that makes the
++ * first write to a buffer after Live has started its helper processes a storm of ~1,500 page faults
++ * inside one audio block. posix_spawn() runs the child in our address space until it execs, so nothing
++ * is copied or write-protected. Unset: fork(), as upstream. */
++static BOOL use_posix_spawn(void)
++{
++    static int enabled = -1;
++    const char *env;
++
++    if (enabled < 0)
++    {
++        enabled = (env = getenv( "WINE_POSIX_SPAWN" )) && !strcmp( env, "1" );
++        if (enabled) ERR_(winediag)( "Starting new processes with posix_spawn (WINE_POSIX_SPAWN).\n" );
++    }
++    return enabled;
++}
++
++/* Processes started with posix_spawn() are our children (the fork() path detaches them through an
++ * intermediate child that exits at once); reap the ones that have exited each time we start another,
++ * without waiting, so they do not stay zombies. */
++static void reap_spawned_children( pid_t new_pid )
++{
++    static pid_t pids[64];
++    static unsigned int count;
++    static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
++    unsigned int i, j;
++
++    pthread_mutex_lock( &mutex );
++    for (i = j = 0; i < count; i++)
++        if (!waitpid( pids[i], NULL, WNOHANG )) pids[j++] = pids[i];  /* still running */
++    count = j;
++    if (new_pid > 0 && count < ARRAY_SIZE(pids)) pids[count++] = new_pid;
++    pthread_mutex_unlock( &mutex );
++}
++
++/***********************************************************************
++ *           spawn_process_posix
++ *
++ * spawn_process() through posix_spawn(): the same child set-up (session, stdio, working directory,
++ * SIGPIPE, environment) expressed as spawn attributes and file actions, so the child only runs
++ * system calls before it execs the loader.
++ */
++static NTSTATUS spawn_process_posix( const RTL_USER_PROCESS_PARAMETERS *params, int socketfd, int unixdir,
++                                     char *winedebug, const struct pe_image_info *pe_info,
++                                     int stdin_fd, int stdout_fd )
++{
++    posix_spawn_file_actions_t actions;
++    posix_spawnattr_t attr;
++    sigset_t sigdefault;
++    short flags = POSIX_SPAWN_SETSIGDEF;
++    int in = stdin_fd, out = stdout_fd;
++    NTSTATUS status;
++    char **argv;
++    pid_t pid = -1;
++
++    if (!(argv = build_argv( &params->CommandLine, 2 ))) return STATUS_NO_MEMORY;
++    posix_spawn_file_actions_init( &actions );
++    posix_spawnattr_init( &attr );
++
++    if ((peb->ProcessParameters && params->ProcessGroupId != peb->ProcessParameters->ProcessGroupId) ||
++        params->ConsoleHandle == CONSOLE_HANDLE_ALLOC ||
++        params->ConsoleHandle == CONSOLE_HANDLE_ALLOC_NO_WINDOW ||
++        params->ConsoleHandle == NULL)
++    {
++        flags |= POSIX_SPAWN_SETSID;
++        in = out = -1;  /* stdin and stdout to /dev/null */
++    }
++    /* set_stdio_fd() */
++    if (in == -1) posix_spawn_file_actions_addopen( &actions, 0, "/dev/null", O_RDWR, 0 );
++    else if (in != 0) posix_spawn_file_actions_adddup2( &actions, in, 0 );
++    if (out == -1) posix_spawn_file_actions_addopen( &actions, 1, "/dev/null", O_RDWR, 0 );
++    else if (out != 1) posix_spawn_file_actions_adddup2( &actions, out, 1 );
++    if (stdin_fd != -1 && stdin_fd != 0) posix_spawn_file_actions_addclose( &actions, stdin_fd );
++    if (stdout_fd != -1 && stdout_fd != 1 && stdout_fd != stdin_fd) posix_spawn_file_actions_addclose( &actions, stdout_fd );
++    if (unixdir != -1)
++    {
++        posix_spawn_file_actions_addfchdir_np( &actions, unixdir );
++        posix_spawn_file_actions_addclose( &actions, unixdir );
++    }
++    sigemptyset( &sigdefault );
++    sigaddset( &sigdefault, SIGPIPE );
++    posix_spawnattr_setsigdefault( &attr, &sigdefault );
++    posix_spawnattr_setflags( &attr, flags );
++
++    status = spawn_wineloader( argv, socketfd, pe_info, winedebug, &actions, &attr, &pid );
++    reap_spawned_children( status ? -1 : pid );
++
++    posix_spawnattr_destroy( &attr );
++    posix_spawn_file_actions_destroy( &actions );
++    free( argv );
++    return status;
++}
++
++
+ /***********************************************************************
+  *           spawn_process
+  */
+@@ -416,6 +513,14 @@ static NTSTATUS spawn_process( const RTL_USER_PROCESS_PARAMETERS *params, int so
+         isatty(1) && is_unix_console_handle( params->hStdOutput ))
+         stdout_fd = 1;
+ 
++    if (use_posix_spawn())
++    {
++        status = spawn_process_posix( params, socketfd, unixdir, winedebug, pe_info, stdin_fd, stdout_fd );
++        if (stdin_fd != -1 && stdin_fd != 0) close( stdin_fd );
++        if (stdout_fd != -1 && stdout_fd != 1) close( stdout_fd );
++        return status;
++    }
++
+     if (!(pid = fork()))  /* child */
+     {
+         if (!(pid = fork()))  /* grandchild */
+diff --git a/dlls/ntdll/unix/unix_private.h b/dlls/ntdll/unix/unix_private.h
+index c8ca97d..c4c19f9 100644
+--- a/dlls/ntdll/unix/unix_private.h
++++ b/dlls/ntdll/unix/unix_private.h
+@@ -23,6 +23,7 @@
+ 
+ #include <pthread.h>
+ #include <signal.h>
++#include <spawn.h>
+ #include "unixlib.h"
+ #include "wine/unixlib.h"
+ #include "wine/server.h"
+@@ -230,6 +231,9 @@ extern void *create_startup_info( const UNICODE_STRING *nt_image, ULONG process_
+                                   const struct pe_image_info *pe_info, DWORD *info_size );
+ extern char *get_alternate_wineloader( WORD machine );
+ extern NTSTATUS exec_wineloader( char **argv, int socketfd, const struct pe_image_info *pe_info );
++extern NTSTATUS spawn_wineloader( char **argv, int socketfd, const struct pe_image_info *pe_info,
++                                  const char *winedebug, const posix_spawn_file_actions_t *actions,
++                                  const posix_spawnattr_t *attr, pid_t *pid );
+ extern NTSTATUS load_builtin( struct pe_mapping_info *pe_mapping, USHORT machine,
+                               SECTION_IMAGE_INFORMATION *info, void **module, SIZE_T *size,
+                               ULONG_PTR limit_low, ULONG_PTR limit_high, off_t offset );
