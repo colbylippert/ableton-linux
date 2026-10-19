@@ -1,0 +1,43 @@
+ntsync-live: NTSYNC_IOC_LIVE_GET_FEATURES
+
+On the device fd: version 1, the feature bits (F_SPIN), the word layout and the page size, so user space can
+tell this module from the stock one (which answers ENOTTY). include/ntsync_live.h holds the uapi additions.
+
+diff -ruN a/ntsync.c b/ntsync.c
+--- a/ntsync.c	2026-10-19 11:06:41.865139163 -0400
++++ b/ntsync.c	2026-10-19 11:06:41.865139163 -0400
+@@ -23,6 +23,7 @@
+ #include <linux/spinlock.h>
+ #include <linux/time_namespace.h>
+ #include <uapi/linux/ntsync.h>
++#include "ntsync_live.h"
+ 
+ #define NTSYNC_NAME	"ntsync"
+ 
+@@ -1320,6 +1321,17 @@
+ 	return 0;
+ }
+ 
++static int ntsl_get_features(void __user *argp)
++{
++	struct ntsync_live_features f = {
++		.version = NTSYNC_LIVE_VERSION,
++		.features = NTSYNC_LIVE_F_SPIN,
++		.page_size = PAGE_SIZE,
++	};
++
++	return copy_to_user(argp, &f, sizeof(f)) ? -EFAULT : 0;
++}
++
+ static long ntsync_char_ioctl(struct file *file, unsigned int cmd,
+ 			      unsigned long parm)
+ {
+@@ -1337,6 +1349,8 @@
+ 		return ntsync_wait_all(dev, argp);
+ 	case NTSYNC_IOC_WAIT_ANY:
+ 		return ntsync_wait_any(dev, argp);
++	case NTSYNC_IOC_LIVE_GET_FEATURES:
++		return ntsl_get_features(argp);
+ 	default:
+ 		return -ENOIOCTLCMD;
+ 	}
