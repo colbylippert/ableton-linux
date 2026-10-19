@@ -54,6 +54,7 @@ do_build() {
         done
     fi
     printf 'obj-m := ntsync.o\nccflags-y := -I$(src)/include\n' > "$work/src/Kbuild"
+    [ "$pristine" = 1 ] || printf "ccflags-y += -DNTSL_VERSION='\"live-%s\"'\n" "$s8" >> "$work/src/Kbuild"
     exec 9>~/.local/state/profiler/live-session.lock
     flock -n 9 || die "the Live session lock is held (a trial is running); build between trials"
     make -s LLVM=1 -C "$kbuild" M="$work/src" modules > "$work/build.log" 2>&1 || { tail -n 20 "$work/build.log" >&2; die "the build failed ($work/build.log)"; }
