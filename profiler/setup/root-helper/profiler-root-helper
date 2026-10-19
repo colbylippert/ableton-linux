@@ -35,6 +35,10 @@
 #       rt-prio.<pid>             fifo:N | rr:N | other, applied to that pid/tid only —
 #                                 accepted only for a process of the invoking user whose
 #                                 /proc/<pid>/exe is under <home>/.local/opt/wine-*/
+#       cpu-online.<N>            0 | 1, CPU hotplug; N is 1..11 only (P-core threads;
+#                                 never CPU 0 or the E-cores) — kernel-plan.md K1
+#       cpuidle.<N>.<S>           0 | 1, the "disable" flag of idle state S on CPU N — K4
+#       cpuidle-governor          a name from cpuidle/available_governors (menu, teo, …)
 #   trace start --tool NAME --run-dir DIR [--id ID] [--tool-dir DIR] [--pid N]…
 #               [--duration S] [-- ARGS…]
 #   trace stop  ID [--signal SIG] [--timeout S]
@@ -123,6 +127,7 @@ readonly RE_SECS='^[0-9]{1,6}$'
 readonly RE_USER='^[a-z_][a-z0-9_-]{0,31}$'
 readonly RE_KEY='^[a-z][a-z0-9_.-]{0,80}$'
 readonly RE_IFACE='^[a-z0-9][a-z0-9_.-]{0,14}$'                  # network interface names
+readonly RE_CPU_HOTPLUG='^([1-9]|1[01])$'                        # cpu-online: CPUs 1-11 only
 
 INVOKER="${SUDO_USER:-}"
 INVOKER_UID="${SUDO_UID:-}"
@@ -412,8 +417,36 @@ rt_prio_set() {
     esac
 }
 
+cpu_online_get() { cat "$CPU_ROOT/cpu$1/online" 2>/dev/null || printf 'unavailable\n'; }
+cpu_online_set() {
+    [[ "$2" =~ ^[01]$ ]] || refuse "cpu-online must be 0 or 1 (got '$2')"
+    [ -w "$CPU_ROOT/cpu$1/online" ] || unavailable "cpu$1 hotplug ($CPU_ROOT/cpu$1/online)"
+    printf '%s' "$2" > "$CPU_ROOT/cpu$1/online" 2>/dev/null || die "the kernel refused cpu$1 online=$2"
+}
+
+cpuidle_file() { printf '%s/cpu%s/cpuidle/state%s/disable\n' "$CPU_ROOT" "$1" "$2"; }
+cpuidle_get() { cat "$(cpuidle_file "$1" "$2")" 2>/dev/null || printf 'unavailable\n'; }
+cpuidle_set() {
+    local f
+    [[ "$3" =~ ^[01]$ ]] || refuse "cpuidle.<cpu>.<state> must be 0 or 1, the state's disable flag (got '$3')"
+    f="$(cpuidle_file "$1" "$2")"
+    [ -w "$f" ] || unavailable "idle state $2 of cpu$1 ($f)"
+    printf '%s' "$3" > "$f" 2>/dev/null || die "cannot write $f"
+}
+cpuidle_gov_get() {
+    cat "$CPU_ROOT/cpuidle/current_governor" 2>/dev/null || cat "$CPU_ROOT/cpuidle/current_governor_ro" 2>/dev/null || printf 'unavailable\n'
+}
+cpuidle_gov_set() {
+    local avail
+    [[ "$1" =~ $RE_WORD ]] || refuse "bad cpuidle governor name '$1'"
+    avail="$(cat "$CPU_ROOT/cpuidle/available_governors" 2>/dev/null || true)"
+    [ -n "$avail" ] && [ -w "$CPU_ROOT/cpuidle/current_governor" ] || unavailable "cpuidle governor switching ($CPU_ROOT/cpuidle/current_governor)"
+    case " $avail " in *" $1 "*) ;; *) refuse "cpuidle governor '$1' is not available (available: $avail)" ;; esac
+    printf '%s' "$1" > "$CPU_ROOT/cpuidle/current_governor" 2>/dev/null || die "cannot set the cpuidle governor to $1"
+}
+
 do_knob() {
-    local op="${1:-}" key="${2:-}" value="${3:-}" cur sub
+    local op="${1:-}" key="${2:-}" value="${3:-}" cur sub st
     case "$op" in
         get) [ $# -eq 2 ] || refuse "usage: knob get KEY" ;;
         set) [ $# -eq 3 ] || refuse "usage: knob set KEY VALUE" ;;
@@ -467,15 +500,31 @@ do_knob() {
             cur="$(rt_prio_get "$sub")"
             if [ "$op" = get ]; then msg "$cur"; return 0; fi
             rt_prio_set "$sub" "$value"; msg "rt-prio.$sub: $cur -> $(rt_prio_get "$sub")" ;;
+        cpu-online.*)
+            sub="${key#cpu-online.}"
+            [[ "$sub" =~ $RE_CPU_HOTPLUG ]] || refuse "cpu-online is limited to CPUs 1-11 (got '$sub')"
+            cur="$(cpu_online_get "$sub")"
+            if [ "$op" = get ]; then msg "$cur"; [ "$cur" != unavailable ] || return 3; return 0; fi
+            cpu_online_set "$sub" "$value"; msg "cpu-online.$sub: $cur -> $(cpu_online_get "$sub")" ;;
+        cpuidle-governor)
+            cur="$(cpuidle_gov_get)"
+            if [ "$op" = get ]; then msg "$cur"; [ "$cur" != unavailable ] || return 3; return 0; fi
+            cpuidle_gov_set "$value"; msg "cpuidle-governor: $cur -> $(cpuidle_gov_get)" ;;
+        cpuidle.*)
+            [[ "$key" =~ ^cpuidle\.([0-9]{1,4})\.([0-9]{1,2})$ ]] || refuse "the cpuidle knob is cpuidle.<cpu>.<state> (got '$key')"
+            sub="${BASH_REMATCH[1]}"; st="${BASH_REMATCH[2]}"
+            cur="$(cpuidle_get "$sub" "$st")"
+            if [ "$op" = get ]; then msg "$cur"; [ "$cur" != unavailable ] || return 3; return 0; fi
+            cpuidle_set "$sub" "$st" "$value"; msg "cpuidle.$sub.$st (disable): $cur -> $(cpuidle_get "$sub" "$st")" ;;
         *)
-            refuse "unknown knob '$key' (thp governor epp ananicy wifi-powersave.<iface> sysctl.<key> irq-affinity.<N> irq-prio.<N> rt-prio.<pid>)" ;;
+            refuse "unknown knob '$key' (thp governor epp ananicy wifi-powersave.<iface> sysctl.<key> irq-affinity.<N> irq-prio.<N> rt-prio.<pid> cpu-online.<N> cpuidle.<N>.<S> cpuidle-governor)" ;;
     esac
     _log "result=ok knob $op $key${value:+ $value}"
 }
 
 # --------------------------------------------------------------- snapshot ----
 do_snapshot() {
-    local force=0 tmp d n cpu v ts k
+    local force=0 tmp d n cpu v ts k f
     while [ $# -gt 0 ]; do
         case "$1" in --force) force=1 ;; *) refuse "snapshot takes only --force (got '$1')" ;; esac
         shift
@@ -525,6 +574,19 @@ do_snapshot() {
         done
         ps -eo pid=,rtprio=,comm= 2>/dev/null | awk '
             $3 ~ /^irq\/[0-9]+-/ { split($3, a, /[\/-]/); if (!(a[2] in seen)) { seen[a[2]] = 1; printf "irq_prio.%s=%s\n", a[2], $2 } }'
+        # CPUs first: reset brings them back online before it restores their idle states
+        for d in "$CPU_ROOT"/cpu[0-9]*; do
+            n="${d##*/cpu}"
+            [[ "$n" =~ $RE_CPU_HOTPLUG ]] || continue
+            v="$(cat "$d/online" 2>/dev/null)" || continue
+            printf 'cpu_online.%s=%s\n' "$n" "$v"
+        done
+        printf 'cpuidle_governor=%s\n' "$(cpuidle_gov_get)"
+        for f in "$CPU_ROOT"/cpu[0-9]*/cpuidle/state[0-9]*/disable; do
+            [ -f "$f" ] || continue
+            [[ "$f" =~ /cpu([0-9]+)/cpuidle/state([0-9]+)/disable$ ]] || continue
+            printf 'cpuidle_disable.%s.%s=%s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "$(cat "$f" 2>/dev/null)"
+        done
     } > "$tmp" || { rm -f -- "$tmp"; die "cannot write the baseline"; }
     chmod 0644 "$tmp"
     mv -f -- "$tmp" "$BASELINE" || { rm -f -- "$tmp"; die "cannot move the baseline into place"; }
@@ -605,6 +667,35 @@ do_reset() {
                         msg "irq-prio.$sub (tid $tid): $cur -> $val"; changed=$((changed + 1))
                     else err "irq-prio.$sub: chrt failed for tid $tid"; failed=$((failed + 1)); fi
                 done < <(irq_thread_tids "$sub") ;;
+            cpu_online.*)
+                sub="${key#cpu_online.}"
+                [[ "$sub" =~ $RE_CPU_HOTPLUG ]] && [[ "$val" =~ ^[01]$ ]] || continue
+                f="$CPU_ROOT/cpu$sub/online"
+                [ -w "$f" ] || continue
+                cur="$(cat "$f" 2>/dev/null || true)"
+                [ "$cur" = "$val" ] && continue
+                if printf '%s' "$val" > "$f" 2>/dev/null; then
+                    msg "cpu-online.$sub: $cur -> $val"; changed=$((changed + 1))
+                else err "cpu-online.$sub: cannot restore '$val'"; failed=$((failed + 1)); fi ;;
+            cpuidle_governor)
+                [[ "$val" =~ $RE_WORD ]] || continue
+                f="$CPU_ROOT/cpuidle/current_governor"
+                [ -w "$f" ] || continue
+                cur="$(cpuidle_gov_get)"
+                [ "$cur" = "$val" ] && continue
+                if printf '%s' "$val" > "$f" 2>/dev/null; then
+                    msg "cpuidle-governor: $cur -> $val"; changed=$((changed + 1))
+                else err "cpuidle-governor: cannot restore '$val'"; failed=$((failed + 1)); fi ;;
+            cpuidle_disable.*)
+                [[ "$key" =~ ^cpuidle_disable\.([0-9]{1,4})\.([0-9]{1,2})$ ]] || continue
+                sub="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}"; f="$(cpuidle_file "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}")"
+                [[ "$val" =~ ^[01]$ ]] || continue
+                [ -w "$f" ] || continue
+                cur="$(cat "$f" 2>/dev/null || true)"
+                [ "$cur" = "$val" ] && continue
+                if printf '%s' "$val" > "$f" 2>/dev/null; then
+                    msg "cpuidle.$sub: $cur -> $val"; changed=$((changed + 1))
+                else err "cpuidle.$sub: cannot restore '$val'"; failed=$((failed + 1)); fi ;;
             *) ;;   # snapshot_ts, kernel, helper_version, unknown keys
         esac
     done < "$BASELINE"
