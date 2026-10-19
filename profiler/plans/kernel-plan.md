@@ -6,7 +6,8 @@ Living document, approved 2026-10-19: the status table is updated as each item l
 | Item | State | Trial | Result |
 |---|---|---|---|
 | T0022 physcore, 5 workers | recorded 2026-10-19: rule H PASS (9/9, −26.0 %) | T0022 | **keep**: the kept layout |
-| T0023 display, T0024 core clearing | registered, drivers on the laptop | T0023, T0024 | pending (run on physcore) |
+| T0023 display | recorded 2026-10-19: non-inferiority PASS, display CPU −1 point in Live and −2.9 in the compositor | T0023 | **keep**: GPU renderer, Vulkan, present skip 6 |
+| T0024 core clearing | registered; runs next with `KEPT_LAYOUT=physcore KEPT_WORKERS=5 KEPT_DISPLAY=new` | T0024 | pending |
 | I0 infrastructure | in progress: campaign tooling in `profiler/trials/`, rule D, root-helper knobs (cpu-online, cpuidle, cpuidle-governor), ledger kinds `kernel`/`kernel-module` (validator fixed), GRUB variants (`profiler/kernel/grub/`, grub.d `45_`, not `09_`, so the normal entries never shift) and the `boot-kernel` variant table. To do on the laptop after T0023: install the helper and the GRUB variants, test rule D and the knobs | — | — |
 | K0 census | tool written (`profiler/kernel/census/`); runs after T0023 | D0004 | — |
 | K1 SMT offline | not started | next free ID | — |

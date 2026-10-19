@@ -817,6 +817,12 @@ Next candidates (user to choose; none pre-registered yet):
   - Mechanism as in T0018: Live's GPU-renderer line per Set-run, and the Vulkan and skip lines in B only.
   - Reported: display CPU (UI thread, `wined3d_cs`, kwin + Xwayland).
   - Keep: golden becomes the GPU-renderer snapshot, and desktop launches get the two variables from environment.d.
+  - **T0023 — KEEP (2026-10-19, 10:40–11:26; all six runs clean; on `physcore` with 5 workers):** with the fork storms gone, T0018's dropouts do not come back.
+    - Non-inferiority PASS: xruns 0 → 0, PipeWire errors 3 → 2 (p = 0.81), DSP average 9.05 / 9.16 / 8.61 → 9.01 / 9.32 / 8.43 (every Set within 0.2× its A/A spread).
+    - Mechanism held: Live's GPU renderer was `Off (Platform default)` in every A run and `OnAlways (User setting)` in every B run; B logged the Vulkan line (6 per run) and the present-skip line (2 per run), A neither.
+    - Display CPU in B (% of one core): kwin 2.8 → 1.0, Xwayland 1.6 → 0.4, Live's UI thread −0.2 and `wined3d_cs` −0.8 per Set. Live CPU 37.0 → 35.9 %. Audio-thread CPU unchanged (+0.3 %); worst DSP peak medians 65.7 / 64.0 / 67.0 → 65.2 / 62.5 / 61.1 %.
+    - **Kept:** the GPU-renderer snapshot becomes golden (the previous golden is kept under a timestamped name), and desktop launches get `WINE_D3D_CONFIG=csmt=0x1,renderer=vulkan` and `WINED3D_PRESENT_SKIP=6` from `~/.config/environment.d/92-profiler-display.conf`. T0024 runs with `KEPT_DISPLAY=new`.
+  - Also reported for T0022 (not its criterion): scored with rule D, `physcore` lowered the DSP average in 8 of 9 Set-pairs (median −5.3 %).
 - **T0024, audio cores kept clear (item 5; runs after T0023).**
   - A: as is.
   - B, applied before and undone after each B run:
