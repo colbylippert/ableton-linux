@@ -14,8 +14,9 @@ Living document, approved 2026-10-19: the status table is updated as each item l
 | K2 mitigations=off | registered as T0027; driver `profiler/trials/trial-T0027.sh` with `reboot-lib.sh` and `reboot-waiter.sh`; GRUB entry installed | T0027 | — |
 | K3 ntsync-live spin | **E0 PASS** (pristine srcversion 2C65A4C2795A6FEE73E9F96 = in-tree); stage 1 (0001–0003) builds clean as live-8b5e287b; root-helper ntsync verbs, the native suite (`ntsync-live verify`, `g3`) and the T0025 driver are written. Next on the laptop: verify (E1, G2), g3 | T0025 | — |
 | K4 C-state limit | gate fired (D0004: two thirds of audio wakes leave C2) but C2 wakes look cheap; registered as T0028, driver `profiler/trials/trial-T0028.sh`; p90/p99 per state checked before it runs | T0028 | — |
-| K5 LiveSync | not started | K5a, K5b | — |
-| K6 to K9 | not started | — | — |
+| K5 LiveSync | not started; D0004 sizes it (about 40 % of sync calls syscall-free, every reset waiter-free, no alertable or multi-object audio waits) | next free IDs | — |
+| K6 isolation | registered as T0029; driver `profiler/trials/trial-T0029.sh` (reboot per run; isolated entry installed) | T0029 | — |
+| K5 LiveSync, K7–K9 | not started (K5's trials take the next free IDs) | — | — |
 | Dev commit cd5ca47 (dropped Wine-side spin) | to revert | — | — |
 
 ## Context
@@ -327,7 +328,7 @@ Trial IDs are assigned when each item is registered. The campaign's pending T002
   - Wine 0113 with probes: 3. Wine matrix and official build: 1.
   - Trials: 1–2.
 
-## K6 Boot-time isolation
+## K6 Boot-time isolation — trial T0029
 - Variant `isolated`: `nohz_full=0,2,4,6,8,10 rcu_nocbs=0,2,4,6,8,10 irqaffinity=12-15 isolcpus=managed_irq,0,2,4,6,8,10`.
   - No `domain` flag: Live's non-audio threads still use the P-cores, unlike T0005.
   - At runtime the unbound-workqueue cpumask is set to 12–15, as in T0024.

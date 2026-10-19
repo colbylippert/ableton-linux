@@ -1,6 +1,7 @@
 # reboot-lib.sh: reboot-per-run trials (kernel plan K2, K6), ported from T0015's step driver. Sourced after
 # trial-lib.sh by a driver that sets TRIAL and ORDER and defines variant_of RUN (normal, rt, or a name from
-# profiler/kernel/grub/variants) plus trial-lib's arm hooks; it then calls reboot_main "$@".
+# profiler/kernel/grub/variants) plus trial-lib's arm hooks; it then calls reboot_main "$@". REBOOT_KEEP may name
+# more variables that start records and every step restores (the waiter starts steps without the environment).
 #   DRIVER start      record the kept configuration (KEPT_LAYOUT, KEPT_WORKERS, KEPT_DISPLAY) and reboot into the
 #                     first run's boot entry
 #   DRIVER step       one run per boot, started by profiler/trials/reboot-waiter.sh once the laptop is back:
@@ -111,6 +112,8 @@ reboot_step() {
   [ -f "$STATE" ] || { echo "$(date +%T) no $TRIAL state"; exit 0; }
   KEPT_LAYOUT=$(get layout) KEPT_WORKERS=$(get workers) KEPT_DISPLAY=$(get display)
   export KEPT_LAYOUT KEPT_WORKERS KEPT_DISPLAY ABLETON_MAX_AUDIO_THREADS=$(get workers)
+  local k val
+  while IFS='=' read -r k val; do case $k in env_*) export "${k#env_}=$val" ;; esac; done < "$STATE"
   run=$(next_run)
   [ -n "$run" ] || { reboot_finish; exit 0; }
   arm=${run%[0-9]}; want=$(variant_of "$run"); tag=trial-$TRIAL-$run
@@ -149,6 +152,7 @@ reboot_start() {
   flock -n "$S/live-session.lock" true || { echo "the session lock is held (a trial or an install runs)"; exit 2; }
   for r in $ORDER; do v=$(variant_of "$r"); [ -n "$(grub_title "$v")" ] || { echo "no GRUB entry for $v"; exit 2; }; done
   printf 'order=%s\ndone=\nfails=0\nlayout=%s\nworkers=%s\ndisplay=%s\n' "$ORDER" "$KEPT_LAYOUT" "$KEPT_WORKERS" "$KEPT_DISPLAY" > "$STATE"
+  for v in ${REBOOT_KEEP:-}; do put "env_$v" "${!v:-}"; done
   exec >>"$OUT" 2>&1
   r=$(next_run)
   mark START "$TRIAL order: $ORDER; layout=$KEPT_LAYOUT workers=$KEPT_WORKERS display=$KEPT_DISPLAY"
