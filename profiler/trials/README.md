@@ -8,6 +8,7 @@ These run on the laptop from the checkout (`~/Projects/ableton-linux`). They are
 | `trial-T00NN.sh` | One driver per trial: it defines the arm hooks (`arm_env`, `arm_setup`, `arm_teardown`, `pin_for`, `golden_for`, `arm_describe`, `arm_record`, optional `traced_runs`) and calls `campaign_main` |
 | `campaign_tools.py` | `affinity`, `audiocpu`, `rule-h TRIAL`, `rule-d TRIAL [G4_POINTS]`, `breakdown`; the scorers print a JSON verdict as their last line |
 | `ledger_campaign.py` | Prints a trial's ledger line from a spec JSON and the scorer's JSON (nothing is written) |
+| `reboot-lib.sh`, `reboot-waiter.sh` | Reboot-per-run trials (K2, K6), ported from T0015: the laptop runs one step per boot (`DRIVER start\|step\|status\|selftest`; one-shot `grub-reboot` into each run's boot variant, which is checked from `/proc/cmdline`; boot timers stopped and the load settled; RAPL power and temperature sampled); the waiter on the controlling host starts each step after a boot |
 | `d0003-capture` | Bench-tracer stand-in (`ABLETON_BENCH_TRACER`, with `ABLETON_BENCH_ROOT_HELPER=/nonexistent`): block markers, scheduler and fault events, perf; `D0003_LIGHT=1`, or a `d0003-capture-light` symlink, records blocks only |
 | `d0003_analyze.py`, `d0003_faults.py` | Analyse a `d0003-capture` output directory (late blocks; page-fault sources) |
 
