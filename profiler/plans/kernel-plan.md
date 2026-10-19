@@ -7,9 +7,9 @@ Living document, approved 2026-10-19: the status table is updated as each item l
 |---|---|---|---|
 | T0022 physcore, 5 workers | recorded 2026-10-19: rule H PASS (9/9, −26.0 %) | T0022 | **keep**: the kept layout |
 | T0023 display | recorded 2026-10-19: non-inferiority PASS, display CPU −1 point in Live and −2.9 in the compositor | T0023 | **keep**: GPU renderer, Vulkan, present skip 6 |
-| T0024 core clearing | registered; runs next with `KEPT_LAYOUT=physcore KEPT_WORKERS=5 KEPT_DISPLAY=new` | T0024 | pending |
+| T0024 core clearing | running since 11:37 (`physcore`, 5 workers, new display) | T0024 | pending |
 | I0 infrastructure | in progress: campaign tooling in `profiler/trials/`, rule D, root-helper knobs (cpu-online, cpuidle, cpuidle-governor), ledger kinds `kernel`/`kernel-module` (validator fixed), GRUB variants (`profiler/kernel/grub/`, grub.d `45_`, not `09_`, so the normal entries never shift) and the `boot-kernel` variant table. To do on the laptop after T0023: install the helper and the GRUB variants, test rule D and the knobs | — | — |
-| K0 census | tool written (`profiler/kernel/census/`); runs after T0023 | D0004 | — |
+| K0 census | **done** (D0004): ~83 sync calls per block; K5 syscall-free share ~40 %; spin budget 20–40 µs; K4 gate fires but C2 wakes look cheap; CPU 4 spends 5 % in xhci IRQs | D0004 | see K0 |
 | K1 SMT offline | not started | next free ID | — |
 | K2 mitigations=off | not started | next free ID | — |
 | K3 ntsync-live spin | **E0 PASS** (pristine build srcversion 2C65A4C2795A6FEE73E9F96 = in-tree); stage 1 (0001–0003) builds clean as live-8b5e287b. Next: root-helper ntsync verbs, native suite, E1–G3 | T0025 | — |
@@ -131,6 +131,22 @@ Trial IDs are assigned when each item is registered. The campaign's pending T002
   - K3's spin budget: the intra-block sleep CDF.
   - K5's expected syscall reduction: the share of sets with no sleeper, resets of already-reset events, and waits that found the event signaled.
   - K4/K7: the share of audio wakes from C2/C3 and the latency they add. K6 also uses the IRQ time on audio CPUs.
+- **Result (D0004, 2026-10-19 11:33–11:37; kept configuration: `physcore`, 5 workers, new display; Inbuilts and Max4Live, 66 s each, 750 blocks/s):**
+  - **Sync calls per block: about 83.** AudioCalc 18.7 sets, 19.4 resets, 19.1 waits; pipeasio-rt 16.7 sets, 3.1 resets, 2.7 waits; wineserver 0.5 sets, 2.0 resets; Live's other threads under 1. With 9 workers (D0001) it was about 245, so part of T0022's saving is the smaller fan-out.
+  - **K5:**
+    - Every reset found no waiter queued (100 %), and 71 % reset an event that was already reset.
+    - 24 % of sets found no waiter, and 21 % set an event that was already signaled.
+    - Only 3–4 % of waits were satisfied without sleeping.
+    - No audio wait is alertable or waits on more than one object, so K5 v1 (single-object, non-alertable) covers them all.
+    - Syscall-free share without any spin: about 40 % of the calls. Most waits sleep, so a user-space spin (K5b) is what would turn sets with a waiter into lock-free ones.
+  - **K3, spin budget:**
+    - AudioCalc sleeps: median 14 µs; 25 % ≤ 10 µs, 57 % ≤ 20 µs, 69 % ≤ 40 µs, 73 % ≤ 100 µs. The other 27 % are the sleep between blocks.
+    - pipeasio-rt sleeps: median 9 µs; 51 % ≤ 10 µs, 79 % ≤ 20 µs, 93 % ≤ 40 µs.
+    - So G3's 20 and 40 µs candidates are the relevant ones.
+  - **K4/K7:**
+    - About two-thirds of audio wakes come out of C2 (AudioCalc 66–68 %, pipeasio-rt 55–61 %), the rest out of C1. The gate (≥ 10 % from C2 or deeper) fires.
+    - But the median wake latency is about 1 µs from either state, so C2 exits look cheap: the BIOS's 127 µs is a worst-case figure. The analyser now also reports p90/p99 per state, and K4 waits for those tails.
+  - **K6:** CPU 4, an audio core, spends 50–54 ms per second (5 %) in interrupts, mostly `xhci_hcd`, the controller of the Focusrite's USB port (plus `vmd0`, i915 and one iwlwifi queue). The other audio CPUs spend 0.5–5 ms/s, and the non-audio CPUs about 0.34 ms/s. T0024's B arm moves all of it (xhci to CPU 12), so T0024 tests exactly this.
 
 ## K1 SMT siblings offline (new; follows directly from T0022)
 - **B:** before each B run, set CPUs 1, 3, 5, 7, 9, 11 offline (`cpu-online.<n> 0`); bring them back online afterwards.

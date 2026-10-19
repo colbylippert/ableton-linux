@@ -39,6 +39,16 @@
 #                                 never CPU 0 or the E-cores) — kernel-plan.md K1
 #       cpuidle.<N>.<S>           0 | 1, the "disable" flag of idle state S on CPU N — K4
 #       cpuidle-governor          a name from cpuidle/available_governors (menu, teo, …)
+#       ntsync.<param>            a loaded ntsync-live module's parameter (spin_ns spin_comm
+#                                 spin_rt spin_adaptive onstack_q; stats to read, stats_reset)
+#   ntsync status                 the loaded ntsync: stock or live-<series8>, refcount, parameters
+#   ntsync install S8             copy <home>/.local/opt/ntsync-live/S8/ntsync.ko (its recorded
+#                                 sha256, the name ntsync and the in-tree vermagic checked) to
+#                                 /usr/local/lib/profiler/ntsync-live/S8/ (root-owned)
+#   ntsync load S8 [P=V]…         replace the loaded ntsync with the installed S8, parameters from
+#                                 the allowlist; refused while Wine runs or the module is in use;
+#                                 a failed check brings the stock module back (kernel-plan.md K3)
+#   ntsync restore-stock          the stock module again (a reboot restores it too)
 #   trace start --tool NAME --run-dir DIR [--id ID] [--tool-dir DIR] [--pid N]…
 #               [--duration S] [-- ARGS…]
 #   trace stop  ID [--signal SIG] [--timeout S]
@@ -128,6 +138,11 @@ readonly RE_USER='^[a-z_][a-z0-9_-]{0,31}$'
 readonly RE_KEY='^[a-z][a-z0-9_.-]{0,80}$'
 readonly RE_IFACE='^[a-z0-9][a-z0-9_.-]{0,14}$'                  # network interface names
 readonly RE_CPU_HOTPLUG='^([1-9]|1[01])$'                        # cpu-online: CPUs 1-11 only
+readonly NTSL_LIB="$LIB_DIR/ntsync-live"
+readonly RE_S8='^[0-9a-f]{8}$'                                   # ntsync-live series8
+readonly RE_NTSL_VALUE='^[A-Za-z0-9,_-]{0,64}$'
+readonly -a NTSL_LOAD_PARAMS=(spin_ns spin_comm spin_rt spin_adaptive onstack_q livesync)
+readonly -a NTSL_KNOB_PARAMS=(spin_ns spin_comm spin_rt spin_adaptive onstack_q livesync stats stats_reset)
 
 INVOKER="${SUDO_USER:-}"
 INVOKER_UID="${SUDO_UID:-}"
@@ -445,8 +460,91 @@ cpuidle_gov_set() {
     printf '%s' "$1" > "$CPU_ROOT/cpuidle/current_governor" 2>/dev/null || die "cannot set the cpuidle governor to $1"
 }
 
+ntsl_version() { cat /sys/module/ntsync/version 2>/dev/null || true; }   # empty for the stock module
+ntsl_in() {          # ntsl_in NAME LIST… → 0 when NAME is one of LIST
+    local n="$1" p; shift
+    for p in "$@"; do [ "$n" = "$p" ] && return 0; done
+    return 1
+}
+ntsl_busy() {        # prints why the module cannot be swapped and returns 0; returns 1 when it can
+    if pgrep -x wineserver >/dev/null 2>&1; then echo "wineserver is running"; return 0; fi
+    local rc
+    rc="$(cat /sys/module/ntsync/refcnt 2>/dev/null || echo 0)"
+    if [ "$rc" != 0 ]; then echo "ntsync is in use (refcount $rc)"; return 0; fi
+    return 1
+}
+ntsl_restore_stock() {   # unload a live module, load the stock one; 0 when the stock module is loaded
+    if [ -n "$(ntsl_version)" ]; then rmmod ntsync 2>/dev/null || return 1; fi
+    [ -d /sys/module/ntsync ] || modprobe ntsync 2>/dev/null || return 1
+    [ -z "$(ntsl_version)" ] && [ -c /dev/ntsync ]
+}
+
+do_ntsync() {
+    local sub="${1:-}" s8 src dst v want p why
+    local -a kv=()
+    [ $# -gt 0 ] && shift
+    case "$sub" in
+        status)
+            [ $# -eq 0 ] || refuse "usage: ntsync status"
+            if [ ! -d /sys/module/ntsync ]; then msg "ntsync: not loaded"; return 0; fi
+            v="$(ntsl_version)"
+            msg "ntsync: ${v:-stock} refcount=$(cat /sys/module/ntsync/refcnt 2>/dev/null) taint=$(cat /sys/module/ntsync/taint 2>/dev/null)"
+            for p in /sys/module/ntsync/parameters/*; do [ -r "$p" ] && msg "  ${p##*/}=$(cat "$p" 2>/dev/null)"; done
+            return 0 ;;
+        install)
+            [ $# -eq 1 ] && [[ "$1" =~ $RE_S8 ]] || refuse "usage: ntsync install SERIES8 (8 hex digits)"
+            need_invoker
+            s8="$1"; src="$INVOKER_HOME/.local/opt/ntsync-live/$s8"
+            [ -f "$src/ntsync.ko" ] && [ -f "$src/ntsync.ko.sha256" ] || refuse "no build at $src (profiler/kernel/ntsync-live/bin/ntsync-live build)"
+            [ "$(stat -c %u -- "$src/ntsync.ko")" = "$INVOKER_UID" ] || refuse "$src/ntsync.ko is not owned by $INVOKER"
+            [ "$(sha256sum < "$src/ntsync.ko" | cut -d' ' -f1)" = "$(cat "$src/ntsync.ko.sha256")" ] || refuse "$src/ntsync.ko does not match its recorded sha256"
+            [ "$(modinfo -F name "$src/ntsync.ko" 2>/dev/null)" = ntsync ] || refuse "the module is not named ntsync"
+            [ "$(modinfo -F version "$src/ntsync.ko" 2>/dev/null)" = "live-$s8" ] || refuse "the module's version is not live-$s8"
+            [ "$(modinfo -F vermagic "$src/ntsync.ko" 2>/dev/null)" = "$(modinfo -F vermagic ntsync 2>/dev/null)" ] || refuse "its vermagic differs from the in-tree ntsync"
+            dst="$NTSL_LIB/$s8"
+            mkdir -p -m 0755 "$dst" || die "cannot create $dst"
+            install -m 0644 -o root -g root -- "$src/ntsync.ko" "$dst/ntsync.ko" || die "install failed"
+            sha256sum < "$dst/ntsync.ko" | cut -d' ' -f1 > "$dst/ntsync.ko.sha256"
+            [ -f "$src/BUILD-INFO" ] && install -m 0644 -o root -g root -- "$src/BUILD-INFO" "$dst/BUILD-INFO"
+            chmod 0644 "$dst/ntsync.ko.sha256"
+            msg "installed live-$s8 → $dst/ntsync.ko" ;;
+        load)
+            [ $# -ge 1 ] && [[ "$1" =~ $RE_S8 ]] || refuse "usage: ntsync load SERIES8 [PARAM=VALUE …]"
+            s8="$1"; shift
+            dst="$NTSL_LIB/$s8/ntsync.ko"
+            [ -f "$dst" ] || refuse "live-$s8 is not installed (ntsync install $s8)"
+            [ "$(sha256sum < "$dst" | cut -d' ' -f1)" = "$(cat "$NTSL_LIB/$s8/ntsync.ko.sha256" 2>/dev/null)" ] || refuse "$dst does not match its sha256"
+            for p in "$@"; do
+                [[ "$p" =~ ^([a-z_]{1,32})=(.*)$ ]] || refuse "bad parameter '$p' (PARAM=VALUE)"
+                ntsl_in "${BASH_REMATCH[1]}" "${NTSL_LOAD_PARAMS[@]}" || refuse "'${BASH_REMATCH[1]}' is not a load parameter (${NTSL_LOAD_PARAMS[*]})"
+                [[ "${BASH_REMATCH[2]}" =~ $RE_NTSL_VALUE ]] || refuse "bad value for ${BASH_REMATCH[1]}"
+                kv+=("$p")
+            done
+            why="$(ntsl_busy)" && refuse "not swapping ntsync: $why"
+            if [ -d /sys/module/ntsync ]; then rmmod ntsync 2>/dev/null || refuse "rmmod ntsync failed"; fi
+            if ! insmod "$dst" "${kv[@]}" 2>/dev/null; then
+                ntsl_restore_stock || die "insmod failed AND the stock ntsync did not come back: reboot to restore it"
+                die "insmod $dst ${kv[*]} failed; the stock ntsync is back"
+            fi
+            want="live-$s8"; v="$(ntsl_version)"
+            if [ "$v" != "$want" ] || [ ! -c /dev/ntsync ] || [ "$(stat -c %a /dev/ntsync 2>/dev/null)" != 666 ]; then
+                ntsl_restore_stock || die "the loaded module failed its checks AND the stock ntsync did not come back: reboot"
+                die "the loaded module failed its checks (version '$v', want '$want', /dev/ntsync mode $(stat -c %a /dev/ntsync 2>/dev/null)); the stock ntsync is back"
+            fi
+            msg "loaded $v from $dst${kv[*]:+ with ${kv[*]}}" ;;
+        restore-stock)
+            [ $# -eq 0 ] || refuse "usage: ntsync restore-stock"
+            if [ -d /sys/module/ntsync ] && [ -z "$(ntsl_version)" ]; then msg "ntsync: the stock module is loaded"; return 0; fi
+            why="$(ntsl_busy)" && refuse "not swapping ntsync: $why"
+            ntsl_restore_stock || die "cannot restore the stock ntsync (a reboot restores it)"
+            msg "ntsync: the stock module is loaded" ;;
+        *) refuse "usage: ntsync status | install SERIES8 | load SERIES8 [PARAM=VALUE …] | restore-stock" ;;
+    esac
+    _log "result=ok ntsync $sub${s8:+ $s8}${kv[*]:+ ${kv[*]}}"
+}
+
 do_knob() {
-    local op="${1:-}" key="${2:-}" value="${3:-}" cur sub st
+    local op="${1:-}" key="${2:-}" value="${3:-}" cur sub st f
     case "$op" in
         get) [ $# -eq 2 ] || refuse "usage: knob get KEY" ;;
         set) [ $# -eq 3 ] || refuse "usage: knob set KEY VALUE" ;;
@@ -516,8 +614,19 @@ do_knob() {
             cur="$(cpuidle_get "$sub" "$st")"
             if [ "$op" = get ]; then msg "$cur"; [ "$cur" != unavailable ] || return 3; return 0; fi
             cpuidle_set "$sub" "$st" "$value"; msg "cpuidle.$sub.$st (disable): $cur -> $(cpuidle_get "$sub" "$st")" ;;
+        ntsync.*)
+            sub="${key#ntsync.}"
+            ntsl_in "$sub" "${NTSL_KNOB_PARAMS[@]}" || refuse "unknown ntsync-live parameter '$sub' (${NTSL_KNOB_PARAMS[*]})"
+            f="/sys/module/ntsync/parameters/$sub"
+            cur="$(cat "$f" 2>/dev/null || echo unavailable)"
+            if [ "$op" = get ]; then msg "$cur"; [ "$cur" != unavailable ] || return 3; return 0; fi
+            [ -n "$(ntsl_version)" ] || unavailable "the loaded ntsync is the stock module (no parameters)"
+            [[ "$value" =~ $RE_NTSL_VALUE ]] || refuse "bad value for ntsync.$sub"
+            [ -e "$f" ] || unavailable "ntsync.$sub (not a parameter of $(ntsl_version))"
+            printf '%s' "$value" > "$f" 2>/dev/null || die "the module refused ntsync.$sub=$value (read-only, or a bad value)"
+            msg "ntsync.$sub: $cur -> $(cat "$f" 2>/dev/null || echo '(write-only)')" ;;
         *)
-            refuse "unknown knob '$key' (thp governor epp ananicy wifi-powersave.<iface> sysctl.<key> irq-affinity.<N> irq-prio.<N> rt-prio.<pid> cpu-online.<N> cpuidle.<N>.<S> cpuidle-governor)" ;;
+            refuse "unknown knob '$key' (thp governor epp ananicy wifi-powersave.<iface> sysctl.<key> irq-affinity.<N> irq-prio.<N> rt-prio.<pid> cpu-online.<N> cpuidle.<N>.<S> cpuidle-governor ntsync.<param>)" ;;
     esac
     _log "result=ok knob $op $key${value:+ $value}"
 }
@@ -711,6 +820,12 @@ do_reset() {
         elif [ "$base_act" != active ] && [ "$now_act" = active ]; then
             systemctl -q stop "$ANANICY_UNIT" 2>/dev/null && { msg "ananicy: stopped"; changed=$((changed + 1)); } || { err "ananicy: stop failed"; failed=$((failed + 1)); }
         fi
+    fi
+    # an ntsync-live module (kernel-plan.md K3) is never the baseline: the stock module is
+    if [ -n "$(ntsl_version)" ]; then
+        if ! ntsl_busy >/dev/null && ntsl_restore_stock; then
+            msg "ntsync: stock module restored"; changed=$((changed + 1))
+        else err "ntsync: $(ntsl_version) is loaded and in use; not restored (a reboot restores the stock module)"; failed=$((failed + 1)); fi
     fi
     # Persistent drop-ins (/etc/sysctl.d, written by the setup phases) describe the
     # host's configured state and win over the pre-profiler baseline values.
@@ -1070,7 +1185,8 @@ main() {
         knob)           do_knob "$@" ;;
         trace)          do_trace "$@" ;;
         install-tracer) do_install_tracer "$@" ;;
-        *)              refuse "unknown verb '$verb' (version snapshot reset knob trace install-tracer)" ;;
+        ntsync)         do_ntsync "$@" ;;
+        *)              refuse "unknown verb '$verb' (version snapshot reset knob trace install-tracer ntsync)" ;;
     esac
 }
 

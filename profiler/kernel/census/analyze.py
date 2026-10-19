@@ -149,6 +149,9 @@ def analyse(path):
     lat = maps.get("@wake_lat_us", {})
     k4["latency_median_us"] = {("busy" if k[1] == 99 else f"state{k[1]}"): buckets_quantile(b, 0.5)
                                for k, b in sorted(lat.items()) if k[0] == 1 and isinstance(b, list)}
+    # the tail is what costs a block: log2 buckets, so these are upper bounds of the bucket holding the quantile
+    k4["latency_p90_p99_us"] = {("busy" if k[1] == 99 else f"state{k[1]}"): [buckets_quantile(b, 0.9), buckets_quantile(b, 0.99)]
+                                for k, b in sorted(lat.items()) if k[0] == 1 and isinstance(b, list)}
     k4["share_from_c2_or_deeper"] = round(deep / all_audio, 3)
     k4["gate_fires"] = deep / all_audio >= 0.10
     res["K4_K7_wakes"] = k4
@@ -185,6 +188,7 @@ def main():
             print(f"  K4 {role} woken from: " + " ".join(f"{k}={x}" for k, x in r["K4_K7_wakes"].get(role, {}).items()))
         print(f"  K4 wake latency median (us, AudioCalc) by state: {r['K4_K7_wakes']['latency_median_us']}; "
               f"from C2 or deeper {r['K4_K7_wakes']['share_from_c2_or_deeper']} -> gate {'FIRES' if r['K4_K7_wakes']['gate_fires'] else 'does not fire'}")
+        print(f"  K4 wake latency p90, p99 (us, AudioCalc) by state: {r['K4_K7_wakes']['latency_p90_p99_us']}")
         print(f"  K6 IRQ time (us per s) on audio CPUs {r['K6_irq_us_per_s']['audio_cpus']}, other CPUs median {r['K6_irq_us_per_s']['other_cpus_median']}")
     print(json.dumps(out))
 
