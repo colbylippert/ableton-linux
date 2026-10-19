@@ -11,9 +11,9 @@ Living document, approved 2026-10-19: the status table is updated as each item l
 | K10 P-core frequency policy (new, from T0024) | **withdrawn unrun**: the bench's power hold already sets EPP performance for every run; the clocks look power/thermal-limited | T0030 | — |
 | I0 infrastructure | in progress: campaign tooling in `profiler/trials/`, rule D, root-helper knobs (cpu-online, cpuidle, cpuidle-governor), ledger kinds `kernel`/`kernel-module` (validator fixed), GRUB variants (`profiler/kernel/grub/`, grub.d `45_`, not `09_`, so the normal entries never shift) and the `boot-kernel` variant table. To do on the laptop after T0023: install the helper and the GRUB variants, test rule D and the knobs | — | — |
 | K0 census | **done** (D0004): ~83 sync calls per block; K5 syscall-free share ~40 %; spin budget 20–40 µs; K4 gate fires but C2 wakes look cheap; CPU 4 spends 5 % in xhci IRQs | D0004 | see K0 |
-| K1 SMT offline | first attempt invalid (13:09–13:33): the bench refused every B run, power-profiles-daemon cannot apply the bench's profile hold with CPUs offline; fixed (a hold taken before the CPUs go offline), rerun pending | T0026 | pending |
+| K1 SMT offline | recorded 2026-10-19 (second attempt): audio CPU +2.9 %, Live CPU 34.8 → 39.7 %; siblings offline in every B run | T0026 | **mechanism-confirmed** (not kept) |
 | K2 mitigations=off | registered as T0027; driver `profiler/trials/trial-T0027.sh` with `reboot-lib.sh` and `reboot-waiter.sh`; GRUB entry installed | T0027 | — |
-| K3 ntsync-live spin | E0, E1, G2 **PASS**; G3 **PASS** with 0004 (live-7a94c377): 40 µs adaptive, block −26 % at 1.32× CPU (fixed spin failed at 1.71×). T0025 ready: `spin_ns=40000 spin_adaptive=1`; runs after T0026 | T0025 | — |
+| K3 ntsync-live spin | E0, E1, G2, G3 **PASS** (G3 with 0004: 40 µs adaptive, block −26 % at 1.32× CPU); T0025 running since 14:38 (`spin_ns=40000 spin_adaptive=1`, live-7a94c377) | T0025 | pending |
 | K4 C-state limit | gate fired (D0004: two thirds of audio wakes leave C2) but C2 wakes look cheap; registered as T0028, driver `profiler/trials/trial-T0028.sh`; p90/p99 per state checked before it runs | T0028 | — |
 | K5 LiveSync | not started; D0004 sizes it (about 40 % of sync calls syscall-free, every reset waiter-free, no alertable or multi-object audio waits) | next free IDs | — |
 | K6 isolation | registered as T0029 (driver ready); T0024 predicts no gain from moving IRQs off the audio cores, so it waits behind K10 | T0029 | — |
@@ -156,6 +156,14 @@ Trial IDs are assigned when each item is registered. The campaign's pending T002
   - Everything else uses 6 P-core threads plus 4 E-cores.
 - **Mechanism:** `/sys/devices/system/cpu/online` is `0,2,4,6,8,10,12-15` during B runs, and the affinity records show `physcore`.
 - **Rule H.** Reported: DSP, peaks, power, kwin and Xwayland CPU.
+- **First attempt invalid (13:09–13:33):** the bench refused every B run. It holds the `performance` power profile for each run, and power-profiles-daemon cannot apply it while CPUs are offline. `smt_siblings_off` now takes that hold before offlining, and the runs are set aside (`t0026-aborted-1`).
+- **T0026 — MECHANISM-CONFIRMED (2026-10-19, 13:39–14:25, second attempt; all six runs clean):** the siblings cost the audio threads nothing measurable.
+  - Rule H FAIL: B's audio-thread CPU was lower in 2 of 9 Set-pairs, median +2.9 %.
+  - Live's CPU rose 34.8 → 39.7 %: its other threads had ten CPUs instead of sixteen.
+  - Guards pass: xruns 0 → 0, errors 11 → 15 (p = 0.28), DSP average 8.87 / 9.60 / 8.71 → 9.47 / 9.80 / 8.91, within the spread.
+  - Package power unchanged (about 20 W).
+  - Mechanism held: CPUs 0, 2, 4, 6, 8, 10 and 12–15 online in every B run, all 16 in every A run.
+  - All CPUs stay online (`KEPT_SMT=on`).
 
 ## K2 `mitigations=off` boot entry (user: all off) — trial T0027
 - **B:** the `mitigations-off` GRUB variant (`mitigations=off` added to the normal command line). **A:** the normal entry.

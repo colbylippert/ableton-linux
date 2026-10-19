@@ -274,10 +274,15 @@ def verdict_rules(value: dict[str, Any]) -> list[str]:
         needed = ("switch", "probe", "note") if patch else ("switch", "note")
         problems.extend(f"verdict keep needs change.{name}" for name in needed if value["change"][name] is None)
     if verdict == "mechanism-confirmed":
-        if runs["traced"] is None:
-            problems.append("verdict mechanism-confirmed needs runs.traced")
-        if value["traced_confirmation"] is None:
-            problems.append("verdict mechanism-confirmed needs traced_confirmation")
+        # as for keep: a code change shows its mechanism in traced runs; a configuration or kernel change whose
+        # mechanism every run records (CPU masks, CPUs online, boot arguments) may carry it in metrics.secondary
+        if value["change"]["kind"] in PATCH_KINDS or not (
+                isinstance(value.get("metrics"), dict) and isinstance(value["metrics"].get("secondary"), dict)
+                and value["metrics"]["secondary"].get("mechanism")):
+            if runs["traced"] is None:
+                problems.append("verdict mechanism-confirmed needs runs.traced")
+            if value["traced_confirmation"] is None:
+                problems.append("verdict mechanism-confirmed needs traced_confirmation")
     return problems
 
 

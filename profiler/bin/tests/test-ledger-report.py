@@ -209,6 +209,13 @@ class ValidationTests(unittest.TestCase):
         self.assertEqual(problems(change={**trial()["change"], "note": None}), ["verdict keep needs change.note"])
         self.assertEqual(problems(runs={**runs, "traced": None}, verdict="mechanism-confirmed"), ["verdict mechanism-confirmed needs runs.traced"])
         self.assertEqual(problems(traced_confirmation=None, verdict="mechanism-confirmed"), ["verdict mechanism-confirmed needs traced_confirmation"])
+        # a configuration or kernel change whose runs record its mechanism (T0026: the CPUs online) needs no traced runs
+        recorded = {**trial()["metrics"], "secondary": {"mechanism": {"online": "0,2,4,6,8,10,12-15 in every B run"}}}
+        self.assertEqual(problems(change={**config, "kind": "kernel"}, probe_result=None, runs={**runs, "traced": None},
+                                  traced_confirmation=None, metrics=recorded, verdict="mechanism-confirmed"), [])
+        self.assertEqual(problems(change=config, probe_result=None, runs={**runs, "traced": None}, traced_confirmation=None,
+                                  verdict="mechanism-confirmed"),
+                         ["verdict mechanism-confirmed needs runs.traced", "verdict mechanism-confirmed needs traced_confirmation"])
 
     def test_ledger_file_reports_line_numbers_duplicates_and_blank_lines(self):
         with tempfile.TemporaryDirectory() as temporary:
