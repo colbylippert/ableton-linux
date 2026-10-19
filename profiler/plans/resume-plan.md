@@ -551,6 +551,11 @@ Next candidates (user to choose; none pre-registered yet):
       - B's PipeWire errors are not significantly higher than A's (a one-sided binomial test of B's share of all errors, p ≥ 0.05);
       - the bench measured a 32-frame quantum in every B Set-run.
     - Otherwise 64 frames stays.
+  - **T0017 — REVERT (2026-10-18, 19:43–20:29, normal kernel, back to back on one boot):** the 64-frame buffer stays.
+    - Dropouts: PipeWire errors 19 → 677 (Inbuilts 5/2/2 → 87/48/63, Max4Live 6/0/2 → 107/104/68, VSTs 0/0/2 → 94/56/50); xruns 0 → 3. The rule needs p ≥ 0.05; it is about 0.
+    - The bench measured a 32-frame quantum in 9 of 9 B Set-runs and 64 frames in 9 of 9 A Set-runs.
+    - Reported, not ruled on: DSP average 9.84 / 9.67 / 9.24 → 13.79 / 14.45 / 14.41; worst DSP peak medians 104 / 96 / 99 → 195 / 196 / 110 %; Live CPU 46.2 → 68.4 % of one core.
+    - The 64-frame arm (new display setup, 95 % RT throttling) had 19 errors, close to T0016's normal-kernel arm (20) and against T0015's 5. T0018 tests that.
   - **T0018, the display setup** (user decision 2026-10-18: "That sounds good queue it up"; pre-registered before running; queued after T0017). It follows from T0016's normal-kernel arm, which had 20 errors against 5 in T0015's after the display setup changed.
     - A: the old display setup. wined3d on OpenGL (the launcher's default `WINE_D3D_CONFIG=csmt=0x1`), Live's GPU renderer off (the previous golden, `golden.20261018T223420Z`), every frame shown (`WINED3D_PRESENT_SKIP` unset).
     - B: the new display setup. wined3d's Vulkan back end, the GPU renderer on (golden), `WINED3D_PRESENT_SKIP=6`.
