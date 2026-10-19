@@ -110,16 +110,21 @@ else:
 PY
 }
 
-# Audio cores kept clear (T0024's B arm, for drivers whose kept configuration includes it; T0024's driver keeps its
-# own copy, as run): every movable IRQ on CPUs 12-15 except the Focusrite's xhci controller (CPU 11 for the 1to1
-# layout, else CPU 12); system.slice, init.scope and, in the user manager, app.slice, background.slice and every
-# session.slice unit except pipewire.service on AllowedCPUs=12-15; the unbound-workqueue cpumask on CPUs 12-15.
-# The IRQ affinities before the first clearing are saved once per trial, and cores_clear_off restores them.
+# Audio cores kept clear (T0024's B arm, and drivers whose kept configuration includes it): every movable IRQ on
+# CPUs 12-15 except the Focusrite's xhci controller (CPU 11 for the 1to1 layout, else CPU 12); system.slice,
+# init.scope and, in the user manager, app.slice, background.slice and every session.slice unit except
+# pipewire.service on AllowedCPUs=12-15; the unbound-workqueue cpumask on CPUs 12-15.
+# The first clearing of a trial saves every IRQ's mask and effective CPU. cores_clear_off puts each IRQ back on its
+# effective CPU before restoring its mask: the kernel leaves an IRQ where it is while that CPU is still in the mask,
+# so restoring the mask alone keeps it on 12-15 (T0024's first attempt). cores_restore_check counts the IRQs that
+# are not back; cores_masks says what is in force (for a driver's arm_teardown, before cores_clear_off).
 cores_clear_on() {
   local d i unit xhci xcpu=12 saved=$R/$TRIAL-irq-affinity.saved units=$R/$TRIAL-units.changed
   [ "${KEPT_LAYOUT:-}" = 1to1 ] && xcpu=11
   xhci=$(awk -F: '/xhci_hcd/ {gsub(/ /, "", $1); print $1; exit}' /proc/interrupts)
-  [ -s "$saved" ] || for d in /proc/irq/[0-9]*; do echo "${d##*/} $(cat "$d/smp_affinity_list" 2>/dev/null)"; done > "$saved"
+  [ -s "$saved" ] || for d in /proc/irq/[0-9]*; do
+    echo "${d##*/} $(cat "$d/smp_affinity_list" 2>/dev/null) $(cat "$d/effective_affinity_list" 2>/dev/null)"
+  done > "$saved"
   for d in /proc/irq/[0-9]*; do
     i=${d##*/}
     if [ "$i" = "$xhci" ]; then echo "$xcpu" | sudo -n tee "$d/smp_affinity_list" >/dev/null 2>&1
@@ -135,9 +140,13 @@ cores_clear_on() {
   echo f000 | sudo -n tee /sys/devices/virtual/workqueue/cpumask >/dev/null
 }
 cores_clear_off() {
-  local i aff kind unit saved=$R/$TRIAL-irq-affinity.saved units=$R/$TRIAL-units.changed
+  local i aff eff kind unit saved=$R/$TRIAL-irq-affinity.saved units=$R/$TRIAL-units.changed
   if [ -s "$saved" ]; then
-    while read -r i aff; do [ -n "$aff" ] && echo "$aff" | sudo -n tee "/proc/irq/$i/smp_affinity_list" >/dev/null 2>&1; done < "$saved"
+    while read -r i aff eff; do
+      [ -n "$aff" ] || continue
+      [ -n "$eff" ] && echo "$eff" | sudo -n tee "/proc/irq/$i/smp_affinity_list" >/dev/null 2>&1
+      echo "$aff" | sudo -n tee "/proc/irq/$i/smp_affinity_list" >/dev/null 2>&1
+    done < "$saved"
   fi
   if [ -f "$units" ]; then
     while read -r kind unit; do
@@ -147,6 +156,22 @@ cores_clear_off() {
     rm -f "$units"
   fi
   echo ffff | sudo -n tee /sys/devices/virtual/workqueue/cpumask >/dev/null
+}
+cores_restore_check() {  # how many saved IRQs are not on their original effective CPU
+  local i aff eff n=0 saved=$R/$TRIAL-irq-affinity.saved
+  if [ -s "$saved" ]; then
+    while read -r i aff eff; do
+      [ -n "$eff" ] && [ -r "/proc/irq/$i/effective_affinity_list" ] || continue
+      [ "$(cat "/proc/irq/$i/effective_affinity_list")" = "$eff" ] || n=$((n + 1))
+    done < "$saved"
+  fi
+  echo "$n"
+}
+cores_masks() {  # one line: kwin's and journald's CPUs, system.slice's AllowedCPUs, the workqueue mask, xhci's CPU
+  local x kw jd
+  x=$(awk -F: '/xhci_hcd/ {gsub(/ /, "", $1); print $1; exit}' /proc/interrupts)
+  kw=$(pgrep -xo kwin_wayland); jd=$(pgrep -xo systemd-journal)
+  echo "kwin_cpus=$(awk '/Cpus_allowed_list/ {print $2}' /proc/$kw/status 2>/dev/null) journald_cpus=$(awk '/Cpus_allowed_list/ {print $2}' /proc/$jd/status 2>/dev/null) system_slice=$(systemctl show -p AllowedCPUs --value system.slice 2>/dev/null) wq=$(cat /sys/devices/virtual/workqueue/cpumask) xhci_effective=$(cat /proc/irq/$x/effective_affinity_list 2>/dev/null)"
 }
 
 # The audio cores' SMT siblings (CPUs 1, 3, 5, 7, 9, 11) offline or online through the root helper (T0026, K1)
