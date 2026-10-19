@@ -777,13 +777,31 @@ Next candidates (user to choose; none pre-registered yet):
     - (a) In every B Set-run, `proc-delta.json` shows each AudioCalc thread and pipeasio-rt on a single CPU, with no two sharing one; in A, all show 0–11.
     - (b) Traced, after the ABAB: one 60 s Inbuilts run per arm with `d0003-capture` (perf). The RT-balancing share of audio-thread cycles in B is under a third of A's.
   - Keep: B's pinning becomes the trial watcher's default.
-- **T0022, six workers, one per physical P-core (item 2; runs after T0021).**
-  - A: the kept configuration after T0021 (nine workers, pinned as T0021 decided).
-  - B: `ABLETON_MAX_AUDIO_THREADS=6`, the six AudioCalc threads on CPUs 0, 2, 4, 6, 8, 10 (one per physical core), and pipeasio-rt on CPU 1.
-  - Context: T0006 cut Live CPU 64 → 40 % with six workers but was judged amid the fork-storm noise.
+  - **T0021 — MECHANISM-CONFIRMED (2026-10-19, 08:19–09:08; all six runs and both traced runs clean; restarted once at 08:19 after an analysis had run on the laptop during the first A1):** the balancing goes, the CPU does not.
+    - Rule H FAIL: B's audio-thread CPU was lower in 5 of 9 Set-pairs (median −0.4 %). Max4Live rose in all three pairs (+13 %, +2 %, +6 %); VSTs fell in all three (−6 %, −2 %, −4 %).
+    - Guards pass: xruns 0 → 0, PipeWire errors 0 → 1 (p = 0.5), DSP average 9.63 / 9.53 / 9.51 → 9.30 / 9.98 / 9.06.
+    - Mechanism held:
+      - The pinning applied in every Set-run.
+      - Traced, the RT-balancing share of audio-thread cycles fell from 8.6 % to 1.9 %, and the traced B run used 9 % fewer audio cycles.
+    - Reading: the shared mask had already removed most of the 11 % measured unpinned in D0003, and forcing workers onto sibling hyperthreads seems to cost what is left. Live CPU 44.8 vs 46.6 %, worst DSP peaks 62–71 % in both arms, 0 errors in 17 of 18 Set-runs.
+    - The shared pinning stays.
+- **T0022, one audio thread per physical P-core (item 2; re-registered 2026-10-19 before any B run).**
+  - Why re-registered: the user pointed out that Ableton deliberately puts one audio thread on each hyperthreaded core ("Ableton intentionally allocated threads to only one core on a hyperthreaded core. Can we do that?").
+    - The first registration put six workers on CPUs 0, 2, 4, 6, 8, 10 and pipeasio-rt on CPU 1, the sibling of a worker, so one core carried two audio threads.
+    - It was stopped during A1, before any B run; A1 is set aside.
+  - What Live does under Wine:
+    - Its log computes `High-Performance Cores Processor Mask(s): 0000111111111111` (CPUs 0–11).
+    - It imports `GetLogicalProcessorInformationEx`, `SetThreadAffinityMask` and `AvSetMmThreadCharacteristicsW`.
+    - In runs without our watcher, all its audio threads run on CPUs 0–15, so its placement does not take effect here.
+  - A: the kept configuration after T0021: nine workers, all audio threads on CPUs 0–11 (shared mask).
+  - B: `ABLETON_MAX_AUDIO_THREADS=5`, so six audio threads for the six physical P-cores:
+    - pipeasio-rt alone on core 0 (CPU 0);
+    - the five AudioCalc threads alone on cores 1–5 (CPUs 2, 4, 6, 8, 10);
+    - every sibling hyperthread (CPUs 1, 3, 5, 7, 9, 11) left free of audio threads.
+  - Context: T0006 cut Live CPU 64 → 40 % with six workers but was judged amid the fork-storm noise. T0021's 1:1 layout forced workers onto sibling hyperthreads and saved nothing.
   - Rule H; [G3] guards against the per-block wall time growing with fewer workers.
-  - Mechanism: every B Set-run shows six AudioCalc threads on the six CPUs; A shows nine.
-  - Keep: six workers on that layout become the configuration.
+  - Mechanism: every B Set-run shows five AudioCalc threads on CPUs 2, 4, 6, 8, 10 and pipeasio-rt on CPU 0; A shows nine on 0–11.
+  - Keep: that layout (`physcore`) becomes the configuration.
 - **T0023, the display setup again (item 4; runs after T0022).**
   - A: the current display: OpenGL, renderer off (golden), every frame shown.
   - B: wined3d's Vulkan back end (`WINE_D3D_CONFIG=csmt=0x1,renderer=vulkan`), Live's GPU renderer on (`golden.20261019T011657Z`), and `WINED3D_PRESENT_SKIP=6`.
