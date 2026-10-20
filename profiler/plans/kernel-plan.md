@@ -611,6 +611,29 @@ Living document, approved 2026-10-19: the status table is updated as each item l
   - **Late blocks:** 1, at start-up (Live's callback ran 4.6 ms, 7.7 s before play). The play instant left 1.4 ms of slack; none was late in the next 3 s.
   - **Errors on the Focusrite's input node:** 1 (64 frames, interrupt: 19; timer: 2).
   - **Live's reported latency:** input 3.00 ms, output 3.50 ms with buffering, overall 6.50 ms. That is 0.33 ms more input and 0.83 ms more output than 64 frames in interrupt mode, and 2.5 ms less output than timer mode.
+- **D0018 step 2 — RESULT (2026-10-20 16:13–16:44; three runs clean, each from a fresh boot; interrupt mode, a 72-frame buffer and 2 workers on CPUs 2 and 4 in every Set-run):** no PipeWire error, as with timer mode. Live's audio costs about a fifth more.
+
+  | Per Set, medians of three runs | 64 frames, interrupt (D0014) | 64 frames, timer (D0017) | **72 frames, interrupt (D0018)** |
+  |---|---|---|---|
+  | Cycles | 1.0 / 1.5 / 1.5 ms | even 1.333 ms | **even 1.5 ms** |
+  | Cushion (headroom while streaming) | 0 | 64 frames | **0** |
+  | PipeWire errors (9 Set-runs; per run) | 3 (0, 1, 2) | 0 (0, 0, 0) | **0 (0, 0, 0)** |
+  | Missed deadlines | 0 | 0 | **0** |
+  | DSP average % (Inbuilts / Max4Live / VSTs) | 6.43 / 6.78 / 5.81 | 6.58 / 6.86 / 5.90 | **7.74 / 7.97 / 6.98** |
+  | Audio-thread CPU % | 12.4 / 13.4 / 9.4 | 12.5 / 13.5 / 9.5 | **15.4 / 16.4 / 12.3** |
+  | Live CPU % | 25.8 / 25.3 / 20.1 | 24.0 / 26.0 / 19.5 | **27.3 / 29.6 / 22.8** |
+  | Live's reported latency, input / output | 2.67 / 2.67 ms | 2.67 / 6.00 ms | **3.00 / 3.50 ms** |
+
+  - **Even cycles without a cushion also remove the errors.** Over the three configurations, 3 errors all fell in the one with uneven cycles. At equal rates the chance of that is 1 in 27 (p ≈ 0.04): the 1.0 ms cycles, not the missing cushion, are the likely cause.
+  - **72 frames costs Live CPU.** The DSP average is 17–20 % higher, and the audio threads use 24–31 % more CPU for the same audio per second.
+    - The DSP average is a share of a period 12.5 % longer, so each block takes about a third more time.
+    - A buffer that is not a power of two plausibly costs Live and its devices an extra partial chunk per block (72 = 64 + 8).
+  - **Choices so far:**
+    - Timer mode at 64 frames: no errors, the same CPU, +3.33 ms of output latency.
+    - 72 frames in interrupt mode: no errors, about a fifth more audio CPU, +0.33 / +0.83 ms of latency.
+    - Both remove the 1.0 ms cycles. Neither is adopted yet; the user chooses.
+  - The timer rule stays removed. The 72-frame buffer was set per run only, so the laptop is back to 64 frames in interrupt mode.
+  - Files: `profiler/plans/findings/d0018-results.jsonl`.
 
 ## Context
 - `WINE_POSIX_SPAWN=1` (T0020) removed the fork-induced page-fault storms, and dropouts are now rare. **T0022 (one audio thread per physical P-core, 5 workers) is a keep**: audio-thread CPU −26 %, Live CPU 46.9 → 35.0 %, DSP average lower. The goal now is more headroom: shorter, steadier audio blocks and less CPU, through kernel-level changes.
