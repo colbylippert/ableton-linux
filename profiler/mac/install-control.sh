@@ -12,8 +12,8 @@ src=${1:-$HOME/AbletonBench/src}/profiler/control
 vendor=$src/vendor/AbletonOSC
 overlay=$src/overlay
 record=$src/VENDOR.txt
-library=${ABLETON_LIBRARY_PATH:-$HOME/Music/Ableton/User Library}
-target=$library/Remote Scripts/AbletonOSC
+library="${ABLETON_LIBRARY_PATH:-$HOME/Music/Ableton/User Library}"
+target="$library/Remote Scripts/AbletonOSC"
 
 fail() { echo "install-control: $*" >&2; exit 1; }
 
