@@ -563,7 +563,7 @@ Living document, approved 2026-10-19: the status table is updated as each item l
   - **Late blocks: 2, both at start-up, 7.1 s before play.** Live's callback ran 4.4 ms (the start-up work D0016 also showed), and the next block started 1.8 ms late behind it. None in the play window or the measured window.
   - **Play instant:** the first heavy block ran 17 ms after the command, 11.6 µs into its cycle, with 1.0 ms of slack. No late block in the next 3 s.
   - **Errors on the Focusrite's input node** (the graph's driver) over the bench's record: 2 (D0016: 19).
-  - **Latency:** Live reports 2.67 ms overall in both modes. The 32 frames of headroom (0.67 ms) are not in what PipeASIO reports to Live; a loopback measurement would give the real figure.
+  - **Latency** (corrected 2026-10-20 16:20: the first version of this line read the prefix's Log.txt, which golden's restore brings back from 2026-10-17; the bench's own per-run copy of Live's log has the session's lines): Live's session reported input 2.67 ms and output 6.00 ms (overall 8.67 ms) in timer mode, against input and output 2.67 ms (overall 2.67 ms) in interrupt mode (D0016). Timer scheduling raised the output latency Live sees by 3.33 ms.
 - **D0017 step 2 — RESULT (2026-10-20 15:32–16:03; three runs clean, each from a fresh boot; timer scheduling and 2 workers on CPUs 2 and 4 in every Set-run):** no PipeWire error in 18 minutes, against D0014's 3. The headroom in force was 64 frames, not 32.
 
   | Per Set, medians of three runs | 2 workers, interrupt-driven (D0014) | **2 workers, timer-driven (D0017)** |
@@ -578,7 +578,7 @@ Living document, approved 2026-10-19: the status table is updated as each item l
   - **DSP average 1–2 % higher on every Set** (+2.4, +1.3, +1.6 %). That is small and within the runs' spread, but the same sign on all three Sets.
   - **The headroom in force was 64 frames.** Each Set's audio snapshot shows the Focusrite's nodes with `disable-tsched` false and `api.alsa.headroom = 64` while streaming. D0014's show `disable-tsched` true and headroom 0. At idle the nodes show the configured 32.
     - PipeWire raised the headroom to a full period, probably because the USB interface reports its position only in chunks.
-    - Timer scheduling here costs 64 frames (1.33 ms) of playback latency, which Live's reported 2.67 ms does not include. In effect it is even cycles plus a 64-sample safety buffer.
+    - Timer scheduling here costs 3.33 ms of output latency as Live reports it: 6.00 ms against 2.67 ms (step 1's run; corrected 16:20). In effect it is even cycles plus a cushion of more than two periods.
   - The rule stays installed until the user decides (`profiler/kernel/pipewire/focusrite-tsched.sh off` removes it).
   - Files: `profiler/plans/findings/d0017-results.jsonl`; the timing diagram, `profiler/plans/findings/d0017/focusrite-cycle-timing.html`.
 
@@ -602,6 +602,15 @@ Living document, approved 2026-10-19: the status table is updated as each item l
   - No errors, or close to none, would mean even cycles alone remove them. D0014-like errors would mean the cushion did the work.
   - The DSP averages are a share of a longer period (1.5 ms against 1.333 ms), so they are not compared directly with the 64-frame runs.
 - The buffer setting applies per run and does not persist. The timer rule stays removed unless the user chooses it.
+- **D0018 step 1 — RESULT (2026-10-20 16:09–16:11; one first-buffer run, Inbuilts, 2 workers, 32,273 cycles): the mechanism holds.** Interrupt mode, headroom 0, a 72-frame buffer gives even 1.5 ms cycles.
+  - The Focusrite's nodes are in interrupt mode (`disable-tsched` true), with no headroom.
+  - The graph's quantum was 72 from the first cycle. Live's blocks were 72 frames, one per cycle from block 3 (32,270 blocks), with no muting and no missed frames.
+  - **Cycle spacing:** p1 1,471.7, p50 1,500.0, p99 1,528.3 µs. All but one cycle (start-up) fall in the 1,500 µs bin; there are no 1.0 ms cycles.
+  - PipeWire's next-cycle estimate is off by a median 87 µs and early in 5.8 % of cycles (64 frames, interrupt: 248 µs and 16 %; timer: 0).
+  - Live spends 91 µs a block in `bufferSwitch` (p99 216 µs), in proportion to the 72 frames.
+  - **Late blocks:** 1, at start-up (Live's callback ran 4.6 ms, 7.7 s before play). The play instant left 1.4 ms of slack; none was late in the next 3 s.
+  - **Errors on the Focusrite's input node:** 1 (64 frames, interrupt: 19; timer: 2).
+  - **Live's reported latency:** input 3.00 ms, output 3.50 ms with buffering, overall 6.50 ms. That is 0.33 ms more input and 0.83 ms more output than 64 frames in interrupt mode, and 2.5 ms less output than timer mode.
 
 ## Context
 - `WINE_POSIX_SPAWN=1` (T0020) removed the fork-induced page-fault storms, and dropouts are now rare. **T0022 (one audio thread per physical P-core, 5 workers) is a keep**: audio-thread CPU −26 %, Live CPU 46.9 → 35.0 %, DSP average lower. The goal now is more headroom: shorter, steadier audio blocks and less CPU, through kernel-level changes.
