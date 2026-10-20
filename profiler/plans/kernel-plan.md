@@ -40,6 +40,7 @@ Living document, approved 2026-10-19: the status table is updated as each item l
 | K3 ntsync-live spin | recorded 2026-10-19: in Live the DSP average did not move (5 of 9 pairs, −0.4 %) while audio CPU doubled (+22.9 points); the spin worked (context switches −64 %), wake-ups are not the bottleneck | T0025 | **revert** |
 | K4 C-state limit, C1E | D0007: a clock floor does not raise the workers' clock; D0008: C2/C3 off alone no consistent gain; D0009: with C1E off too, workers 2.9–3.3 → 4.5 GHz. **T0031: DSP −29.4 % (9/9 pairs), audio CPU −39.6 %, Live CPU 38.1 → 27.3 %, +5 W** | T0031 | **keep**: C1E off, C2/C3 off on the P-cores |
 | MMCSS (patch 0113, Wine) | T0032: only Live's audio threads realtime (AudioCalc FIFO 12, the rest normal) against all of Live at RR 10: DSP −0.3 % (8/9 pairs), guards held | T0032 | mechanism-confirmed (opt-in) |
+| Load ramp (headroom) | machinery done (every track duplicated per pass, buses trimmed); exploratory kept run: headroom 5× / 4× / 5×, steps fail on spikes at a DSP average of only 11–15 %. D0011 (MMCSS under load) registered | D0011 | — |
 | K5 LiveSync | not started; deprioritised by T0025: ntsync is 16 % of audio cycles, so at most a CPU gain, not block time (D0004: ~40 % of calls could be syscall-free) | — | — |
 | K6 isolation | registered as T0029 (driver ready); T0024 predicts no gain from moving IRQs off the audio cores, so it waits behind K10 | T0029 | — |
 | K7–K9 | not started (K7 pre-wake and K8 direct entry also deprioritised: C2 wakes are cheap, and T0025 showed the sync path is not the block-time limit) | — | — |
@@ -329,6 +330,58 @@ Living document, approved 2026-10-19: the status table is updated as each item l
     - B: AudioCalc SCHED_FIFO 12, `pipeasio-rt` FIFO 15, the UI and every other Live thread normal (0 of about 3,200 samples realtime);
     - A: AudioCalc and the UI SCHED_RR 10, about 92 % of the other samples realtime.
   - **Reading:** with the workers pinned to their own cores (physcore), Live's other threads rarely compete with them at this load, so who else is realtime hardly matters. The switch stays opt-in. Under contention, the load ramp is where an effect could show.
+
+## Load ramp: headroom (machinery 2026-10-20; exploratory run 07:52–08:21)
+- **Why:** every trial so far plays the Sets at their own load, where Live's DSP average is now 6–7 % of the buffer period (T0031). What a musician feels is headroom: how much more Live can play before it misses deadlines. Contention, T0032's open question, only shows near that limit.
+- **Method** (user, 2026-10-20: "lets duplicate all tracks for each pass"):
+  - **Load:** scenario `profiler/scenarios/ramp-duplicate-all.json` (diagnostic grade; it needs the control surface).
+    - The Set plays from the start. Every 51.4286 s (96 beats at 112 BPM), the bench handler's `/abl/bench/duplicate-all` duplicates every top-level track the Set had at the first pass (a group with its children).
+    - Load k is the Set playing k times over, in sync.
+  - **Bus trims** (user: "Send volume increases will distort returns. Should we add a gain to first device in returns to adjust down?"):
+    - With N copies playing, the return tracks and the master receive N times the amplitude.
+    - The first pass takes the Utility already first on each return track (when its gain is not automated) or puts a Utility first (on the master). Each pass then sets it to the Set's own gain − 20·log10 N dB.
+    - Sends, faders and automation stay as the Set has them: setting an automated parameter would override its automation.
+    - Live 12.4 calls Utility's gain "Output"; earlier versions call it "Gain".
+  - **Steps:** `profiler/control/ramp-report.py` splits each Set's window at the duplications.
+    - Step k runs from 10 s after the duplication that made it finished to the start of the next one. Live glitches while it builds the copies, and that belongs to neither step.
+    - Steps last 20–40 s, getting shorter as duplication gets slower.
+  - **Failure:** a step fails with 3 or more PipeWire errors from Live's nodes, or 3 or more peaks over 100 % (missed deadlines). **Headroom** is the load of the last step before the first failing one.
+  - **Driver:** `profiler/trials/ramp-run.sh TAG [kept|mmcss] [SETS] [PASSES]`.
+    - 10 passes give loads 1–10: about 9.5 min per Set, 28 min per run on the three Sets.
+    - Since D0011 it also samples Live's threads' scheduling every 30 s and the package power every 5 s.
+- **Exploratory run** (kept configuration, 2026-10-20 07:52–08:21). It ran before the trims existed, so the copies played at full level; level does not change the CPU cost.
+
+  | Set | Headroom | DSP average: 1× → headroom → 10× | First failing step |
+  |---|---|---|---|
+  | Inbuilts | 5× | 6.75 → 13.47 → 23.16 % | 6×: 1 peak over 100 %, 5 PipeWire errors |
+  | Max4Live | 4× | 6.68 → 11.97 → 24.25 % | 5×: 1 peak over 100 % (worst 143 %), 5 PipeWire errors |
+  | VSTs | 5× | 6.48 → 9.57 → 16.24 % | 6×: 1 peak over 100 %, 3 PipeWire errors |
+
+  - The DSP average rises by about 1.1–2.0 points per copy, yet steps fail at an average of only 11–15 % of the period. **The limit is single slow blocks (spikes), not throughput.**
+  - Peak medians: 14–15 % at 1×, 20–25 % at the first failure. Worst peaks at the first failure: 101–143 %.
+  - Duplicating took 2.3 s for the first copy. The ninth took 11 s (Inbuilts, VSTs) and 21 s (Max4Live).
+- **Trims verified** (2026-10-20 09:05, Inbuilts, 2 passes):
+  - 3 trims: the two returns' own Utilities, and a new Utility first on the master. Each display within 0.0 dB of its target.
+  - DSP 6.62 % at 1×, 7.77 % at 2×.
+
+### D0011: MMCSS under load (diagnostic, pre-registered 2026-10-20 ~09:15, before any of its runs)
+- **Question:** T0032 found that MMCSS (only Live's audio threads realtime) makes no difference at the Sets' own load (−0.3 %). Does it raise the headroom, where more of Live's other threads are busy (UI, the copies' devices, streaming)?
+- **Design:** A1 B1 A2 B2 load ramps, about 2 hours (`profiler/trials/d0011.sh`).
+  - A: kept (`ramp-run.sh d0011-A1 kept`): `chrt -r 10` for all of Live.
+  - B: `WINE_MMCSS=1 ABLETON_RT=off` (`ramp-run.sh d0011-B1 mmcss`).
+  - Each run: Inbuilts, Max4Live, VSTs, 10 passes, trims on.
+  - Both arms in the kept configuration: physcore with 5 workers, new display, posix_spawn, PipeASIO realtime, every-boot shallow idle, and the official runtime with 0113.
+- **Measured per Set-run:**
+  - the headroom;
+  - per load: the DSP average, peak median, worst peak, peaks over 100 %, PipeWire errors and duplication time;
+  - Live's threads' scheduling, and package power.
+- **Mechanism:** in every B run, AudioCalc runs SCHED_FIFO 12, `pipeasio-rt` FIFO 15, and the UI and every other Live thread normal. In every A run, AudioCalc and the UI thread run SCHED_RR 10.
+- **Reading** (pre-stated; `profiler/control/ramp-compare.py`), over six Set-pairs (3 Sets × 2 pairs):
+  - MMCSS **raises the headroom** if B's is higher in at least 3 of the 6 pairs, lower in none, and higher on average by more than the A/A spread (the mean |A1 − A2| over the Sets).
+  - It **lowers** the headroom by the mirror rule. Otherwise no difference in headroom is shown.
+  - Secondary, reported: glitches (PipeWire errors plus peaks over 100 %) over all loads per Set-pair, and the DSP average and peak median at each load, B against A.
+  - A run whose bench fails is rerun once in place, before the next run.
+- **Not a trial:** a headroom gain would not change T0032's verdict by itself. A trial with a pre-registered ramp rule would follow.
 
 ## Context
 - `WINE_POSIX_SPAWN=1` (T0020) removed the fork-induced page-fault storms, and dropouts are now rare. **T0022 (one audio thread per physical P-core, 5 workers) is a keep**: audio-thread CPU −26 %, Live CPU 46.9 → 35.0 %, DSP average lower. The goal now is more headroom: shorter, steadier audio blocks and less CPU, through kernel-level changes.

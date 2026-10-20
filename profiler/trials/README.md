@@ -11,6 +11,8 @@ These run on the laptop from the checkout (`~/Projects/ableton-linux`). They are
 | `reboot-lib.sh`, `reboot-waiter.sh` | Reboot-per-run trials (K2, K6), ported from T0015: the laptop runs one step per boot (`DRIVER start\|step\|status\|selftest`; one-shot `grub-reboot` into each run's boot variant, which is checked from `/proc/cmdline`; boot timers stopped and the load settled; RAPL power and temperature sampled); the waiter on the controlling host starts each step after a boot |
 | `d0003-capture` | Bench-tracer stand-in (`ABLETON_BENCH_TRACER`, with `ABLETON_BENCH_ROOT_HELPER=/nonexistent`): block markers, scheduler and fault events, perf; `D0003_LIGHT=1`, or a `d0003-capture-light` symlink, records blocks only |
 | `d0003_analyze.py`, `d0003_faults.py` | Analyse a `d0003-capture` output directory (late blocks; page-fault sources) |
+| `ramp-run.sh TAG [kept\|mmcss] [SETS] [PASSES]` | One load ramp (`profiler/scenarios/ramp-duplicate-all.json`): every top-level track duplicated once per 51.4 s period, the buses trimmed; prints `profiler/control/ramp-report.py`'s per-step table (headroom = the last load before the first failing step), Live's threads' scheduling and the package power; `RAMP_DONE` at the end |
+| `d0011.sh` | D0011, MMCSS under load: A1 B1 A2 B2 ramps (kept against mmcss), then `profiler/control/ramp-compare.py`'s pre-stated reading; `D0011_DONE` at the end |
 
 ## Running a trial
 
