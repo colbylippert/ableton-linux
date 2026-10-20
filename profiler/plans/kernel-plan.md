@@ -262,6 +262,26 @@ Living document, approved 2026-10-19: the status table is updated as each item l
   - **Kept:** shallow idle on the audio cores joins the kept configuration for later trials (both arms). A lasting form (applied only while Live runs, like the power hold, or at boot) is the user's call.
   - **Against Windows** (D0005, Windows 9.37 / 10.01 / 8.17): Linux is now 24–35 % lower on DSP. But Windows ran with C1E on too and would likely gain from the same change, so a fair comparison needs Windows' idle limited as well (`powercfg` processor idle disable).
 
+## T0031's change on Windows (D0010, diagnostic, pre-registered 2026-10-20 ~05:05, before any of its runs)
+- **Why:** Windows runs with the firmware's C1E on too, and has no setting for it. Two pieces make T0031's change there without a kernel driver:
+  - **The GRUB entry** `Windows Boot Manager, C1E off (profiler)` (`profiler/kernel/grub/46_profiler-c1e-off`, installed by `install-c1e-off.sh`) clears MSR_POWER_CTL bit 1 before chainloading Windows.
+    - The register is shared by the whole CPU: clearing it on CPU 0 clears it on all 16.
+    - A Linux boot through the same lines read C1E 0 on every CPU (0xf4005b → 0xf40059), with no kernel taint.
+  - **LiveIdleGuard** (`profiler/windows/live-idle-guard/`, C++; built with MSVC by `build-msvc.cmd`, or mingw-w64 by `build.sh`) is a Windows service. While Live runs, the active power scheme's processor idle state maximum is 1 (C1); it is restored when Live exits.
+    - Functional test: 0 → 1 within a second of Live starting, and back to 0 when Live exited.
+  - **The driver route was rejected:** this Windows runs VBS with memory integrity and Microsoft's vulnerable-driver blocklist. A self-signed driver would need test-signing mode, and the hypervisor may block its register write.
+- **Design:** Windows only; A1 B1 A2 B2, each run on a fresh boot through GRUB (`profiler/windows/d0010.sh`).
+  - A: the normal Windows entry (C1E on), LiveIdleGuard stopped, IDLESTATEMAX 0.
+  - B: the C1E-off entry, LiveIdleGuard running.
+  - `bench-win.py` with 5 workers, Inbuilts, Max4Live and VSTs at 120 s, as D0005's Windows runs.
+- **Measured per Set:**
+  - DSP average, peak median, peaks over 100 %;
+  - Live's CPU, the AudioCalc and ASIO callback threads' CPU;
+  - the P-cores' effective clock while active (Windows' "% Processor Performance" × the nominal clock; the mechanism).
+- **Reading:**
+  - The change helps Live on Windows too if B's DSP average is lower than its paired A's in both pairs on every Set.
+  - The mechanism holds if the P-cores' effective clock is higher in every B run, and the service log shows C1-only idle applied for each B Set and restored after.
+
 ## Context
 - `WINE_POSIX_SPAWN=1` (T0020) removed the fork-induced page-fault storms, and dropouts are now rare. **T0022 (one audio thread per physical P-core, 5 workers) is a keep**: audio-thread CPU −26 %, Live CPU 46.9 → 35.0 %, DSP average lower. The goal now is more headroom: shorter, steadier audio blocks and less CPU, through kernel-level changes.
 - User (2026-10-19): "We want ableton specific improvement… lets get clever and esoteric for this ableton only kernel patch concept"; then "complete implementation plan for kernel level items".

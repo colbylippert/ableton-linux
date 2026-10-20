@@ -23,7 +23,9 @@ def as_json(d):
                        "live_cpu": r.get("live_cpu_percent_of_one_core"), "audiocalc_cpu": audio,
                        "audiocalc_threads": r.get("audiocalc_threads"), "callback_cpu": other["cpu_percent_of_one_core"],
                        "audio_total": round(audio + other["cpu_percent_of_one_core"], 2),
-                       "sample_rate": r.get("log", {}).get("sample_rate"), "workers": r.get("workers_option")})
+                       "sample_rate": r.get("log", {}).get("sample_rate"), "workers": r.get("workers_option"),
+                       "pcore_mhz": (r.get("processor_performance") or {}).get("pcore_effective_mhz"),
+                       "ecore_perf_pct": (r.get("processor_performance") or {}).get("ecore_perf_pct")})
 
 
 def main():

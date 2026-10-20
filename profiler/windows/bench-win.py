@@ -21,6 +21,7 @@ import platform
 import re
 import socket
 import statistics
+import struct
 import subprocess
 import sys
 import time
@@ -245,6 +246,79 @@ def log_facts(path, start_offset):
     return facts
 
 
+def efficiency_classes():
+    """{(group, logical processor): efficiency class} from GetLogicalProcessorInformationEx (RelationProcessorCore); on
+    a hybrid CPU the P-cores have the higher class. {} when unavailable."""
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    n = wintypes.DWORD(0)
+    k32.GetLogicalProcessorInformationEx(0, None, ctypes.byref(n))
+    if not n.value:
+        return {}
+    buf = ctypes.create_string_buffer(n.value)
+    if not k32.GetLogicalProcessorInformationEx(0, buf, ctypes.byref(n)):
+        return {}
+    raw, off, out = buf.raw, 0, {}
+    while off + 42 <= n.value:
+        size = struct.unpack_from("<I", raw, off + 4)[0]
+        efficiency = raw[off + 9]                            # PROCESSOR_RELATIONSHIP.EfficiencyClass
+        mask, group = struct.unpack_from("<QH", raw, off + 32)   # GroupMask[0]: KAFFINITY Mask, WORD Group
+        for bit in range(64):
+            if mask >> bit & 1:
+                out[(group, bit)] = efficiency
+        if size <= 0:
+            break
+        off += size
+    return out
+
+
+def processor_performance(path):
+    """Per logical processor over the window, from typeperf's CSV: Windows' "% Processor Performance" (the clock while
+    the processor is not idle, against its nominal clock, from APERF/MPERF) and "Processor Frequency" (the nominal MHz),
+    so the effective MHz; the P-cores' mean effective MHz, and the E-cores' mean percentage (Windows reports the
+    P-cores' nominal clock for the E-cores too, so their MHz would be overstated)."""
+    import csv
+    try:
+        with open(path, newline="", encoding="utf-8", errors="replace") as f:
+            rows = list(csv.reader(f))
+    except OSError:
+        return None
+    if len(rows) < 2:
+        return None
+    sums = {}
+    for row in rows[1:]:
+        for name, value in zip(rows[0][1:], row[1:]):
+            try:
+                v = float(value)
+            except ValueError:
+                continue
+            m = re.search(r"Processor Information\((\d+),(\d+)\)\\(.+)$", name)
+            if not m:
+                continue                                    # _Total instances
+            key = (int(m.group(1)), int(m.group(2)))
+            s = sums.setdefault(key, {"perf": [], "mhz": []})
+            s["perf" if m.group(3).startswith("%") else "mhz"].append(v)
+    per_cpu = {}
+    for (group, cpu), s in sorted(sums.items()):
+        if s["perf"] and s["mhz"]:
+            perf, mhz = sum(s["perf"]) / len(s["perf"]), sum(s["mhz"]) / len(s["mhz"])
+            per_cpu[f"{group},{cpu}"] = {"perf_pct": round(perf, 1), "nominal_mhz": round(mhz),
+                                         "effective_mhz": round(perf / 100 * mhz)}
+    if not per_cpu:
+        return None
+    classes = efficiency_classes()
+    if len(set(classes.values())) > 1:                     # hybrid: the P-cores have the highest efficiency class
+        top = max(classes.values())
+        is_p = {k: classes.get(tuple(int(x) for x in k.split(","))) == top for k in per_cpu}
+    else:                                                   # else the highest nominal clock
+        top = max(v["nominal_mhz"] for v in per_cpu.values())
+        is_p = {k: v["nominal_mhz"] == top for k, v in per_cpu.items()}
+    p = [v["effective_mhz"] for k, v in per_cpu.items() if is_p[k]]
+    e = [v["perf_pct"] for k, v in per_cpu.items() if not is_p[k]]   # Windows gives every core the P-cores' nominal clock
+    return {"per_cpu": per_cpu, "pcores": sorted(k for k in per_cpu if is_p[k]),
+            "pcore_effective_mhz": round(sum(p) / len(p)) if p else None,
+            "ecore_perf_pct": round(sum(e) / len(e), 1) if e else None, "samples": len(rows) - 1}
+
+
 def dsp_summary(averages, peaks):
     """As scripts/bench-report.py: average of the averages, window maximum and median of the peaks, peaks > 100 %."""
     ordered = sorted(peaks)
@@ -307,6 +381,11 @@ def main():
     cpu_rows = []
     before = thread_times(proc)
     p_before = proc.cpu_times()
+    perf_csv = os.path.join(a.out, "perf.csv")
+    typeperf = subprocess.Popen(["typeperf", r"\Processor Information(*)\% Processor Performance",
+                                 r"\Processor Information(*)\Processor Frequency", "-si", "1", "-sc", str(a.duration),
+                                 "-f", "CSV", "-o", perf_csv, "-y"],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     queued = osc.drain()
     w0 = time.time()
     states = [int(p[0]) for addr, p in queued if addr == "/abl/bench/playing" and p]
@@ -330,6 +409,10 @@ def main():
     after = thread_times(proc)
     p_after = proc.cpu_times()
     osc.send("/abl/bench/stop")
+    try:
+        typeperf.wait(timeout=15)
+    except subprocess.TimeoutExpired:
+        typeperf.kill()
 
     threads = []
     for tid, (t1, name) in after.items():
@@ -348,6 +431,7 @@ def main():
         "thread_count": len(threads),
         "playing_events": playing,
         "log": log_facts(log_path, log_offset),
+        "processor_performance": processor_performance(perf_csv),
     })
     end_live()
     clean_crash_files()
