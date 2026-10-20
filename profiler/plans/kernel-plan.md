@@ -65,6 +65,7 @@ Living document, approved 2026-10-19: the status table is updated as each item l
   - Live's total CPU is about equal.
   - Five workers beat Live's own default on Windows too: 22 workers gave +1.0–1.3 DSP points, +5–7 CPU points, and the only missed deadline.
   - No missed deadlines with 5 workers.
+  - Correction (from D0005): these Windows figures came from the harness that counted reports queued before the window, so the DSP averages read low (by ~8 % in D0005), and the missed deadline may predate playback. D0005 supersedes the first look.
 - **D0005, the interleaved comparison (pre-registered 2026-10-19 ~19:25, before any of its runs):**
   - **Design:** order A1 B1 A2 B2 A3 B3, every run from a fresh boot into its system, the boots alternating; each run plays Inbuilts, Max4Live and VSTs for 120 s.
     - **A:** Linux in the kept configuration, through `profiler/windows/linux-run.sh`, settled as T0015/T0027 were.
@@ -86,18 +87,27 @@ Living document, approved 2026-10-19: the status table is updated as each item l
     - Windows Update is now paused for 7 days, with no restart pending.
     - The driver waits through a reboot in progress and stops on a run without results.
     - D0005 restarts from A1 (`d0005b`), so all six runs share one Windows build. The first attempt's A1 is kept for reference only.
-  - **D0005 — RESULT (d0005b, 2026-10-19 19:42–20:46; all six runs clean, 18 Set results, 48 kHz, 5 workers on both): no significant difference in Live's DSP average by the registered rule.**
-    - **Primary:** Windows was lower in 7 of 9 pairs (one-sided p = 0.09; 8 of 9 was the threshold), median −9.1 %.
-      - By Set: Inbuilts −4 / −11 / −9 %; Max4Live +3 / −2 / +4 % (a tie); VSTs −14 / −16 / −15 %.
-      - Linux medians 9.54 / 8.94 / 8.61; Windows 8.56 / 9.20 / 7.34.
+  - **D0005 — RESULT (d0005b, 2026-10-19 19:42–20:46; all six runs clean, 18 Set results, 48 kHz, 5 workers on both; corrected the same evening): no significant difference in Live's DSP average. Linux has the lower peak median in all 9 pairs and no missed deadlines.**
+    - **Correction:** the first scoring (e5b496a: Windows lower in 7 of 9 pairs, median −9.1 %, 5 missed deadlines) was wrong.
+      - `bench-win.py` counted the reports queued on its socket since the handler's pong as window readings: 30–41 per Set-run (17–23 s), mostly from before playback reached the heavy section (average ~3 %). That pulled Windows' DSP average down by ~8 % and its peak median down too.
+      - Three of the five readings over 100 % were among them, about 2 s after the handler came up, before playback started.
+      - Rescored from the per-reading logs (`profiler/plans/findings/d0005-dsp-readings.tsv`, `profiler/windows/rescore-d0005.py`) with the Windows window only. The script reproduces the first scoring's figures from the same data.
+      - The harness now discards queued reports before the window (tested on Windows), and `cross-os-trial.sh` copies the harness from the checkout before each Windows run.
+      - The thread CPU figures come from thread times at the window's ends and stand.
+    - **Primary (window only):** Windows lower in 5 of 9 pairs (one-sided p = 0.5), median −0.9 %.
+      - By Set: Inbuilts +4 / −3 / −1 % (a tie); Max4Live +14 / +6 / +13 % (Linux lower in all three); VSTs −4 / −8 / −7 % (Windows lower in all three).
+      - Medians: Linux 9.54 / 8.94 / 8.61, Windows 9.37 / 10.01 / 8.17.
+      - Song position: each Linux window began 3.5–4 s before the heavy section (7 intro readings at ~4–5 %), each Windows window as it began. Aligned on the heavy section (100 s from each window's first reading of at least 6 %): Windows lower in 5 of 9, median −1.7 %, the same pattern by Set.
     - **Secondary:**
+      - Peak median: Linux lower in 9 of 9 pairs (p = 0.002); Windows +6.4 % (aligned +6.1 %), Max4Live +12–18 %.
+      - Missed deadlines in the window: Linux 0 of 9 Set-runs; Windows 2, both Inbuilts and barely over (101.1 % at 10 s in B1, 102.0 % at 114 s in B3). Linux's PipeWire errors: 5 in total, in 3 Set-runs.
       - Live's total CPU is lower on Windows in 9 of 9 pairs (p = 0.002, median −17.8 %): Linux 38.3 / 38.9 / 32.6, Windows 33.0 / 33.2 / 23.8.
-      - The audio threads cost the same overall (Windows lower in 3 of 9, median +1.1 %), but differently split. The AudioCalc workers are cheaper on Windows (15.4 / 16.3 / 8.3 against 19.1 / 18.8 / 15.5), and the callback thread is cheaper on Linux (PipeASIO's `pipeasio-rt` 7.9 / 7.2 / 6.8 against the Focusrite ASIO thread's 12.8 / 12.9 / 11.3).
-      - Peak median is slightly lower on Linux (Windows lower in 2 of 9).
-      - Missed deadlines (Live's peaks over 100 %): Linux 0 of 9 Set-runs, Windows 5 of 9 (one each). Linux's PipeWire errors: 5 in total, in 3 Set-runs.
+      - The audio threads cost the same overall (Windows lower in 3 of 9, median +1.1 %), but split differently. The AudioCalc workers are cheaper on Windows (15.4 / 16.3 / 8.3 against 19.1 / 18.8 / 15.5); the callback thread is cheaper on Linux (PipeASIO's `pipeasio-rt` 7.9 / 7.2 / 6.8 against the Focusrite ASIO thread's 12.8 / 12.9 / 11.3).
+      - Caveat: Windows charges thread CPU time at clock ticks (sampled), Linux exactly. A Windows Performance Recorder trace (precise CPU from context switches) would confirm the Windows thread figures.
     - **Readings:**
-      - Linux plus Wine is within about 9 % of native Windows on Live's processing, level on Max4Live, and steadier on Live's own measure.
-      - The largest gap is the VSTs Set's workers: twice the CPU under Wine for the same plugin binaries (Dexed, K1v). Leads: floating-point denormal handling (FTZ/DAZ in MXCSR on the audio threads), and the plugins' Windows API calls through Wine. This is the next investigation, with a perf profile of the VSTs Set's AudioCalc threads against a Windows Performance Recorder trace.
+      - Live's processing under Linux plus Wine is level with native Windows overall: Max4Live 6–14 % cheaper on Linux, VSTs 4–8 % cheaper on Windows, Inbuilts a tie. Blocks are steadier on Linux (peak median in 9 of 9 pairs, no missed deadlines).
+      - VSTs: the workers take about twice the CPU under Wine (15.5 against 8.3 %), but the DSP average only 4–8 % more, so most of the extra worker CPU is off the critical path (or Windows' sampled accounting undercounts). Profiling the VSTs Set's AudioCalc threads (perf, against a WPR trace) is still the place to look for a Wine-side cost: denormal handling, the plugins' API calls.
+      - Max4Live costs more on Windows; not yet explained.
       - Live's non-audio work (UI, display, Wine's threads) costs more under Linux.
       - PipeASIO's callback is cheaper than the Focusrite ASIO driver's.
 

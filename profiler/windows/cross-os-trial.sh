@@ -6,9 +6,11 @@
 # boots alternating (from Linux: one-shot grub-reboot into Windows Boot Manager; from Windows: a restart, which GRUB's
 # default turns into Linux), and runs Inbuilts, Max4Live and VSTs for 120 s each.
 # Writes OUT/results.jsonl (one JSON line per Set-run, with "run"), OUT/<tag>.log per run, OUT/progress.log.
-# Needs the ssh aliases ableton-laptop (Linux) and ableton-win (Windows), Windows auto-logon, and the Windows harness in
-# C:\Users\colby\AbletonBench (bench-win.py, summarise.py, settle.ps1).
+# Needs the ssh aliases ableton-laptop (Linux) and ableton-win (Windows), Windows auto-logon, and C:\Users\colby\AbletonBench
+# (Sets, plugins); the harness (bench-win.py, summarise.py, settle.ps1) is copied there from this checkout before each
+# Windows run.
 set -u
+HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 TAG=${1:-d0005}
 OUT=${OUT:-$HOME/profiler-crossos/$TAG}
 ORDER=${ORDER:-"A1 B1 A2 B2 A3 B3"}
@@ -59,6 +61,12 @@ run_linux() {  # TAG-run
 
 run_windows() {  # TAG-run
   local s dirs=""
+  if ! scp -q -o BatchMode=yes -o ConnectTimeout=6 "$HERE/bench-win.py" "$HERE/summarise.py" "$HERE/settle.ps1" \
+      ableton-win:AbletonBench/ >> "$OUT/$1.log" 2>&1; then
+    echo "could not copy the harness to Windows" >> "$OUT/$1.log"
+    : > "$OUT/$1.jsonl"
+    return 1
+  fi
   win "powershell -NoProfile -ExecutionPolicy Bypass -File $WB\\settle.ps1" >> "$OUT/$1.log" 2>&1
   for s in $SETS; do
     win "$WINPY $WB\\bench-win.py --set Benchmark_$s --duration 120 --workers 5 --out $WB\\runs\\$1-$s" >> "$OUT/$1.log" 2>&1

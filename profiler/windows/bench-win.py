@@ -9,6 +9,7 @@ the bench handler inside AbletonOSC must answer /abl/bench/ping, Live's log must
 then /abl/bench/rewind and /abl/bench/play, SETTLE seconds and a quiet log again, then the measured window. During
 the window it keeps the handler's /abl/bench/cpu reports (Live's average and peak process usage, percent of the audio
 buffer period, every 500 ms) and, at both ends, every thread's CPU time (psutil) and name (GetThreadDescription).
+Reports queued before the window are discarded (counted in result.json's queued_before_window).
 Afterwards /abl/bench/stop, Live is ended, and Live's crash-recovery files are removed so the next start has no
 dialog. It writes result.json and cpu.tsv into --out.
 """
@@ -149,11 +150,33 @@ class Osc:
             data, _ = self.sock.recvfrom(65536)
         except (socket.timeout, ConnectionResetError):
             return None
+        return self.decode(data)
+
+    @staticmethod
+    def decode(data):
         try:
             m = OscMessage(data)
             return m.address, list(m.params)
         except Exception:
             return ("undecodable", [])
+
+    def drain(self):
+        """Read everything already queued and return it: the reports sent since the handler's pong, before the window,
+        which must not count as window readings (D0005's first scoring counted them)."""
+        msgs = []
+        self.sock.setblocking(False)
+        try:
+            for _ in range(100000):
+                try:
+                    data, _ = self.sock.recvfrom(65536)
+                except BlockingIOError:
+                    break
+                except ConnectionResetError:          # an earlier send's ICMP error, reported here; skip it
+                    continue
+                msgs.append(self.decode(data))
+        finally:
+            self.sock.settimeout(0.2)
+        return msgs
 
 
 # ---------------------------------------------------------------- threads
@@ -284,7 +307,11 @@ def main():
     cpu_rows = []
     before = thread_times(proc)
     p_before = proc.cpu_times()
+    queued = osc.drain()
     w0 = time.time()
+    states = [int(p[0]) for addr, p in queued if addr == "/abl/bench/playing" and p]
+    result["queued_before_window"] = {"messages": len(queued), "cpu_reports": sum(addr == "/abl/bench/cpu" for addr, _ in queued),
+                                      "playing": states[-1] if states else None}
     while time.time() - w0 < a.duration:
         m = osc.recv()
         if not m:
