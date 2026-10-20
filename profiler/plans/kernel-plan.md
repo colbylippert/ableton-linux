@@ -564,6 +564,23 @@ Living document, approved 2026-10-19: the status table is updated as each item l
   - **Play instant:** the first heavy block ran 17 ms after the command, 11.6 µs into its cycle, with 1.0 ms of slack. No late block in the next 3 s.
   - **Errors on the Focusrite's input node** (the graph's driver) over the bench's record: 2 (D0016: 19).
   - **Latency:** Live reports 2.67 ms overall in both modes. The 32 frames of headroom (0.67 ms) are not in what PipeASIO reports to Live; a loopback measurement would give the real figure.
+- **D0017 step 2 — RESULT (2026-10-20 15:32–16:03; three runs clean, each from a fresh boot; timer scheduling and 2 workers on CPUs 2 and 4 in every Set-run):** no PipeWire error in 18 minutes, against D0014's 3. The headroom in force was 64 frames, not 32.
+
+  | Per Set, medians of three runs | 2 workers, interrupt-driven (D0014) | **2 workers, timer-driven (D0017)** |
+  |---|---|---|
+  | DSP average % (Inbuilts / Max4Live / VSTs) | 6.43 / 6.78 / 5.81 | **6.58 / 6.86 / 5.90** |
+  | Missed deadlines (9 Set-runs) | 0 | **0** |
+  | PipeWire errors (9 Set-runs; per run) | 3 (0, 1, 2) | **0 (0, 0, 0)** |
+  | Live CPU % | 25.8 / 25.3 / 20.1 | **24.0 / 26.0 / 19.5** |
+  | Audio-thread CPU % | 12.4 / 13.4 / 9.4 | **12.5 / 13.5 / 9.5** |
+
+  - **PipeWire errors 3 → 0.** With only three errors in all, that alone is not significant: the chance that all 3 fall in one arm at equal rates is 1 in 8. The load ramp, where errors come by the dozen, is the test of effect.
+  - **DSP average 1–2 % higher on every Set** (+2.4, +1.3, +1.6 %). That is small and within the runs' spread, but the same sign on all three Sets.
+  - **The headroom in force was 64 frames.** Each Set's audio snapshot shows the Focusrite's nodes with `disable-tsched` false and `api.alsa.headroom = 64` while streaming. D0014's show `disable-tsched` true and headroom 0. At idle the nodes show the configured 32.
+    - PipeWire raised the headroom to a full period, probably because the USB interface reports its position only in chunks.
+    - Timer scheduling here costs 64 frames (1.33 ms) of playback latency, which Live's reported 2.67 ms does not include. In effect it is even cycles plus a 64-sample safety buffer.
+  - The rule stays installed until the user decides (`profiler/kernel/pipewire/focusrite-tsched.sh off` removes it).
+  - Files: `profiler/plans/findings/d0017-results.jsonl`.
 
 ## Context
 - `WINE_POSIX_SPAWN=1` (T0020) removed the fork-induced page-fault storms, and dropouts are now rare. **T0022 (one audio thread per physical P-core, 5 workers) is a keep**: audio-thread CPU −26 %, Live CPU 46.9 → 35.0 %, DSP average lower. The goal now is more headroom: shorter, steadier audio blocks and less CPU, through kernel-level changes.
