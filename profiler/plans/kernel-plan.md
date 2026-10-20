@@ -300,6 +300,27 @@ Living document, approved 2026-10-19: the status table is updated as each item l
   - IDLESTATEMAX 1 in Windows' power plan. Per D0010 it costs power there without a DSP gain; one command reverts it.
   - LiveIdleGuard stays installed (manual start) for a Live-only form.
 
+## T0032: MMCSS, only Live's audio threads realtime (patch 0113), pre-registered 2026-10-20 ~07:00, before any of its runs
+- **Why:**
+  - On Windows, MMCSS raises only the threads an application registers for "Pro Audio". Wine's avrt is a stub, so the launcher runs the whole of Live with `chrt -r 10`: all 76 threads (UI, file loading, plugin windows) share the audio workers' realtime priority.
+  - A diagnostic launch (`WINEDEBUG=+avrt,warn+threadname`) showed Live registering its AudioCalc workers (with `AVRT_PRIORITY_CRITICAL`) and two timer threads, nothing else.
+  - D0010 suggested native Windows keeps Live's audio work fast through its own scheduling.
+- **Patch 0113** (`WINE_MMCSS=1`; `notes/ABLETON-WINE-MMCSS.md`): a "Pro Audio" thread becomes SCHED_FIFO at `WINE_MMCSS_RTPRIO` (default 10) plus its MMCSS priority. AudioCalc runs at 12, below `pipeasio-rt`'s 15. The flag is reset on fork, and a revert restores the earlier scheduling.
+  - **Probe:** `tools/mmcssprobe.c` passes in every mode on the dev runtime.
+  - **Functional run** (dev runtime, `ABLETON_RT=off`): AudioCalc FIFO 12, `pipeasio-rt` FIFO 15, every other Live thread normal, DSP 7.0 %, no peaks over 100 %.
+  - The trial runs on the official runtime after its build, audit and probe.
+- **A:** as kept: `chrt -r 10` for all of Live, avrt the stub. **B:** `WINE_MMCSS=1 ABLETON_RT=off`.
+  - Both arms: kept configuration (physcore, 5 workers, new display, posix_spawn, PipeASIO realtime, every-boot shallow idle).
+  - ABAB × 3 on Inbuilts, Max4Live and VSTs at 120 s. Driver `profiler/trials/trial-T0032.sh`.
+- **Rule D:**
+  - D1: B lower in at least 8 of 9 Set-pairs (sign test, p = 0.02); D2: median paired change ≤ −3 %.
+  - Guards: G1 no xruns in B; G2 B's PipeWire errors not significantly higher; G4 audio-thread CPU's median increase ≤ +5 %.
+- **Mechanism** (a 10 s sampler of Live's threads in every run):
+  - in B, AudioCalc SCHED_FIFO 12 and the UI thread (tid = pid) normal, with no other Live thread realtime except the timers;
+  - in A, AudioCalc and the UI thread SCHED_RR 10.
+- **Reported:** the peak median and worst peak, missed deadlines, Live's CPU, package power and temperature.
+- **Verdicts:** keep = PASS with the mechanism; mechanism-confirmed = guards and mechanism hold but the primary fails; revert otherwise. If kept, `WINE_MMCSS=1 ABLETON_RT=off` joins the kept configuration.
+
 ## Context
 - `WINE_POSIX_SPAWN=1` (T0020) removed the fork-induced page-fault storms, and dropouts are now rare. **T0022 (one audio thread per physical P-core, 5 workers) is a keep**: audio-thread CPU −26 %, Live CPU 46.9 → 35.0 %, DSP average lower. The goal now is more headroom: shorter, steadier audio blocks and less CPU, through kernel-level changes.
 - User (2026-10-19): "We want ableton specific improvement… lets get clever and esoteric for this ableton only kernel patch concept"; then "complete implementation plan for kernel level items".
