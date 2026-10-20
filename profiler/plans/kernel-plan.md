@@ -39,6 +39,7 @@ Living document, approved 2026-10-19: the status table is updated as each item l
 | K2 mitigations=off | halted 16:08 after A1, B1, A2 (B2 interrupted) for the Windows install; the mechanism worked (B: 0 vulnerabilities mitigated, A: 5); reruns from A1 later | T0027 | halted |
 | K3 ntsync-live spin | recorded 2026-10-19: in Live the DSP average did not move (5 of 9 pairs, −0.4 %) while audio CPU doubled (+22.9 points); the spin worked (context switches −64 %), wake-ups are not the bottleneck | T0025 | **revert** |
 | K4 C-state limit, C1E | D0007: a clock floor does not raise the workers' clock; D0008: C2/C3 off alone no consistent gain; D0009: with C1E off too, workers 2.9–3.3 → 4.5 GHz. **T0031: DSP −29.4 % (9/9 pairs), audio CPU −39.6 %, Live CPU 38.1 → 27.3 %, +5 W** | T0031 | **keep**: C1E off, C2/C3 off on the P-cores |
+| MMCSS (patch 0113, Wine) | T0032: only Live's audio threads realtime (AudioCalc FIFO 12, the rest normal) against all of Live at RR 10: DSP −0.3 % (8/9 pairs), guards held | T0032 | mechanism-confirmed (opt-in) |
 | K5 LiveSync | not started; deprioritised by T0025: ntsync is 16 % of audio cycles, so at most a CPU gain, not block time (D0004: ~40 % of calls could be syscall-free) | — | — |
 | K6 isolation | registered as T0029 (driver ready); T0024 predicts no gain from moving IRQs off the audio cores, so it waits behind K10 | T0029 | — |
 | K7–K9 | not started (K7 pre-wake and K8 direct entry also deprioritised: C2 wakes are cheap, and T0025 showed the sync path is not the block-time limit) | — | — |
@@ -320,6 +321,14 @@ Living document, approved 2026-10-19: the status table is updated as each item l
   - in A, AudioCalc and the UI thread SCHED_RR 10.
 - **Reported:** the peak median and worst peak, missed deadlines, Live's CPU, package power and temperature.
 - **Verdicts:** keep = PASS with the mechanism; mechanism-confirmed = guards and mechanism hold but the primary fails; revert otherwise. If kept, `WINE_MMCSS=1 ABLETON_RT=off` joins the kept configuration.
+- **T0032 — RESULT (2026-10-20 07:04–07:50; six runs clean, on the official runtime with 0113; build audit 194/194, probe 4/4 modes): rule D FAIL, so mechanism-confirmed (not kept).**
+  - **DSP average:** B lower in 8 of 9 Set-pairs (p = 0.02) but by a median of only 0.3 % (Inbuilts 6.40 → 6.38, Max4Live 6.50 → 6.47, VSTs 6.18 → 6.19); D2 asks for 3 %.
+  - **Guards:** G1 no xruns; G2 PipeWire errors 2 → 1; G4 audio-thread CPU +0.4 %. Live's CPU 27.3 → 28.0 %.
+  - Worst-peak medians 59.8 / 77.5 / 60.8 → 76.8 / 66.4 / 60.4 %. Worker run-queue wait 1.8–2.1 → 2.2–2.8 ms per window.
+  - **Mechanism held in every run:**
+    - B: AudioCalc SCHED_FIFO 12, `pipeasio-rt` FIFO 15, the UI and every other Live thread normal (0 of about 3,200 samples realtime);
+    - A: AudioCalc and the UI SCHED_RR 10, about 92 % of the other samples realtime.
+  - **Reading:** with the workers pinned to their own cores (physcore), Live's other threads rarely compete with them at this load, so who else is realtime hardly matters. The switch stays opt-in. Under contention, the load ramp is where an effect could show.
 
 ## Context
 - `WINE_POSIX_SPAWN=1` (T0020) removed the fork-induced page-fault storms, and dropouts are now rare. **T0022 (one audio thread per physical P-core, 5 workers) is a keep**: audio-thread CPU −26 %, Live CPU 46.9 → 35.0 %, DSP average lower. The goal now is more headroom: shorter, steadier audio blocks and less CPU, through kernel-level changes.
