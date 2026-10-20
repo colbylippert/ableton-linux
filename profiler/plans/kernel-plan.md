@@ -86,6 +86,20 @@ Living document, approved 2026-10-19: the status table is updated as each item l
     - Windows Update is now paused for 7 days, with no restart pending.
     - The driver waits through a reboot in progress and stops on a run without results.
     - D0005 restarts from A1 (`d0005b`), so all six runs share one Windows build. The first attempt's A1 is kept for reference only.
+  - **D0005 — RESULT (d0005b, 2026-10-19 19:42–20:46; all six runs clean, 18 Set results, 48 kHz, 5 workers on both): no significant difference in Live's DSP average by the registered rule.**
+    - **Primary:** Windows was lower in 7 of 9 pairs (one-sided p = 0.09; 8 of 9 was the threshold), median −9.1 %.
+      - By Set: Inbuilts −4 / −11 / −9 %; Max4Live +3 / −2 / +4 % (a tie); VSTs −14 / −16 / −15 %.
+      - Linux medians 9.54 / 8.94 / 8.61; Windows 8.56 / 9.20 / 7.34.
+    - **Secondary:**
+      - Live's total CPU is lower on Windows in 9 of 9 pairs (p = 0.002, median −17.8 %): Linux 38.3 / 38.9 / 32.6, Windows 33.0 / 33.2 / 23.8.
+      - The audio threads cost the same overall (Windows lower in 3 of 9, median +1.1 %), but differently split. The AudioCalc workers are cheaper on Windows (15.4 / 16.3 / 8.3 against 19.1 / 18.8 / 15.5), and the callback thread is cheaper on Linux (PipeASIO's `pipeasio-rt` 7.9 / 7.2 / 6.8 against the Focusrite ASIO thread's 12.8 / 12.9 / 11.3).
+      - Peak median is slightly lower on Linux (Windows lower in 2 of 9).
+      - Missed deadlines (Live's peaks over 100 %): Linux 0 of 9 Set-runs, Windows 5 of 9 (one each). Linux's PipeWire errors: 5 in total, in 3 Set-runs.
+    - **Readings:**
+      - Linux plus Wine is within about 9 % of native Windows on Live's processing, level on Max4Live, and steadier on Live's own measure.
+      - The largest gap is the VSTs Set's workers: twice the CPU under Wine for the same plugin binaries (Dexed, K1v). Leads: floating-point denormal handling (FTZ/DAZ in MXCSR on the audio threads), and the plugins' Windows API calls through Wine. This is the next investigation, with a perf profile of the VSTs Set's AudioCalc threads against a Windows Performance Recorder trace.
+      - Live's non-audio work (UI, display, Wine's threads) costs more under Linux.
+      - PipeASIO's callback is cheaper than the Focusrite ASIO driver's.
 
 ## Context
 - `WINE_POSIX_SPAWN=1` (T0020) removed the fork-induced page-fault storms, and dropouts are now rare. **T0022 (one audio thread per physical P-core, 5 workers) is a keep**: audio-thread CPU −26 %, Live CPU 46.9 → 35.0 %, DSP average lower. The goal now is more headroom: shorter, steadier audio blocks and less CPU, through kernel-level changes.
