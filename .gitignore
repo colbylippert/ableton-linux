@@ -50,3 +50,6 @@ __pycache__/
 profiler/runs/
 profiler/dashboard/node_modules/
 profiler/dashboard/dist/
+
+# built by profiler/windows/live-idle-guard/build.sh
+profiler/windows/live-idle-guard/live-idle-guard.exe
