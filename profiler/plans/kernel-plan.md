@@ -38,7 +38,7 @@ Living document, approved 2026-10-19: the status table is updated as each item l
 | K1 SMT offline | recorded 2026-10-19 (second attempt): audio CPU +2.9 %, Live CPU 34.8 → 39.7 %; siblings offline in every B run | T0026 | **mechanism-confirmed** (not kept) |
 | K2 mitigations=off | halted 16:08 after A1, B1, A2 (B2 interrupted) for the Windows install; the mechanism worked (B: 0 vulnerabilities mitigated, A: 5); reruns from A1 later | T0027 | halted |
 | K3 ntsync-live spin | recorded 2026-10-19: in Live the DSP average did not move (5 of 9 pairs, −0.4 %) while audio CPU doubled (+22.9 points); the spin worked (context switches −64 %), wake-ups are not the bottleneck | T0025 | **revert** |
-| K4 C-state limit, C1E | D0007: a P-core clock floor does not raise the workers' clock; D0008: C2/C3 off alone no consistent gain; **D0009: C1E off with C2/C3 off: workers 2.9–3.3 → 4.5 GHz, DSP −22 to −28 %, Live CPU −23 to −31 %, +4–5 W** | T0031 | running (T0028 not run) |
+| K4 C-state limit, C1E | D0007: a clock floor does not raise the workers' clock; D0008: C2/C3 off alone no consistent gain; D0009: with C1E off too, workers 2.9–3.3 → 4.5 GHz. **T0031: DSP −29.4 % (9/9 pairs), audio CPU −39.6 %, Live CPU 38.1 → 27.3 %, +5 W** | T0031 | **keep**: C1E off, C2/C3 off on the P-cores |
 | K5 LiveSync | not started; deprioritised by T0025: ntsync is 16 % of audio cycles, so at most a CPU gain, not block time (D0004: ~40 % of calls could be syscall-free) | — | — |
 | K6 isolation | registered as T0029 (driver ready); T0024 predicts no gain from moving IRQs off the audio cores, so it waits behind K10 | T0029 | — |
 | K7–K9 | not started (K7 pre-wake and K8 direct entry also deprioritised: C2 wakes are cheap, and T0025 showed the sync path is not the block-time limit) | — | — |
@@ -247,6 +247,20 @@ Living document, approved 2026-10-19: the status table is updated as each item l
 - **Verdicts:**
   - Keep = PASS with the mechanism; mechanism-confirmed = guards and mechanism hold but the primary fails; revert otherwise.
   - If kept, B joins the kept configuration for later trials (both arms). A lasting form is the user's call: applied only while Live runs, like the power hold, or at boot.
+- **T0031 — RESULT (2026-10-20 01:08–01:55; six runs clean; the mechanism held in every run): rule D PASS, so keep. The largest single gain of the campaign.**
+  - **DSP average** lower in 9 of 9 Set-pairs (p = 0.002), median paired change −29.4 %:
+    - Inbuilts 9.07 → 6.49, Max4Live 9.34 → 6.52, VSTs 8.70 → 6.18;
+    - 2.2–3.4× the A/A spread.
+  - **G4:** audio-thread CPU −39.6 % (−9.75 points of one core): 26.0 / 26.5 / 22.3 → 15.7 / 16.7 / 12.7 %. Live's CPU 38.1 → 27.3 %.
+  - **G1:** no xruns.
+  - **G2:** PipeWire errors 6 → 12 (p = 0.12).
+    - 9 of B's 12 came from one stall of about 12 ms (a 908 % peak) 8 s into B2's Inbuilts window, with the package at 22 W and 53 °C, so not thermal.
+    - The other eight B Set-runs had 0–2 each.
+  - **Worst-peak medians** 59.4 / 69.5 / 61.0 → 64.2 / 60.4 / 56.2 %. Worker run-queue wait 3.1 / 9.5 / 13.5 → 2.1 / 1.2 / 2.0 ms per window.
+  - **Mechanism:** C1E 0 on every CPU and no C2/C3 entries on the audio CPUs in every B run (C1E 1 and 6.3–6.5 million entries in every A run).
+  - **Cost:** package 17.4–17.9 → 22.6–22.8 W (+5 W); median temperature 51–52 → 54–55 °C, max 69–80 → 84–88 °C.
+  - **Kept:** shallow idle on the audio cores joins the kept configuration for later trials (both arms). A lasting form (applied only while Live runs, like the power hold, or at boot) is the user's call.
+  - **Against Windows** (D0005, Windows 9.37 / 10.01 / 8.17): Linux is now 24–35 % lower on DSP. But Windows ran with C1E on too and would likely gain from the same change, so a fair comparison needs Windows' idle limited as well (`powercfg` processor idle disable).
 
 ## Context
 - `WINE_POSIX_SPAWN=1` (T0020) removed the fork-induced page-fault storms, and dropouts are now rare. **T0022 (one audio thread per physical P-core, 5 workers) is a keep**: audio-thread CPU −26 %, Live CPU 46.9 → 35.0 %, DSP average lower. The goal now is more headroom: shorter, steadier audio blocks and less CPU, through kernel-level changes.
