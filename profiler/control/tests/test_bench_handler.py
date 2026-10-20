@@ -268,8 +268,9 @@ class HandlerCase(unittest.TestCase):
         for name, expected in (("A", [0.5, 0.0]), ("B", [1.0, 0.25])):
             for track in (t for t in self.song.tracks if t.name == name):
                 self.assertEqual([s.value for s in track.mixer_device.sends], expected)
-        (pass_number, tracks, ms, trims, gain), _ = self.reports("/abl/bench/duplicate-all")[0]
+        (pass_number, tracks, ms, trims, gain, miss), _ = self.reports("/abl/bench/duplicate-all")[0]
         self.assertEqual((pass_number, tracks, trims, gain), (1, 10, 3, -6.02))
+        self.assertTrue(miss <= 0.05)   # the fake shows tenths of a dB
         self.assertIsInstance(ms, int)
         # a second pass duplicates the originals again, never the copies; no second trim, now at -20 log10 3 dB
         self.server.dispatch("/abl/bench/duplicate-all")
@@ -291,7 +292,7 @@ class HandlerCase(unittest.TestCase):
         # the Set's own Utility: no new device, -3 dB - 6.02 dB
         self.assertEqual([d.name for d in reverb.devices], ["Utility", "Reverb"])
         self.assertTrue(abs(reverb.devices[0].parameters[0].value + 9.02) < 0.06)
-        # an automated Gain is left alone and a new Utility goes first instead
+        # an automated gain is left alone and a new Utility goes first instead
         self.assertEqual([d.name for d in automated.devices], ["Utility", "Utility"])
         self.assertEqual(automated.devices[1].parameters[0].value, 0.0)
         self.assertTrue(abs(automated.devices[0].parameters[0].value + 6.02) < 0.06)

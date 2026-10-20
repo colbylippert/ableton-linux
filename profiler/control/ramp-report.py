@@ -24,7 +24,8 @@ NODE_RE = re.compile(r"Ableton|Live|[Pp]ipe[Aa][Ss][Ii][Oo]")   # scripts/bench-
 
 
 def osc_rows(path):
-    """(cpu rows [(t, average, peak)], duplicate-all replies [(t, pass, tracks, ms)], last t) from raw/osc.tsv"""
+    """(cpu rows [(t, average, peak)], duplicate-all replies [(t, pass, tracks, ms, trims, trim dB, trim miss dB)],
+    last t) from raw/osc.tsv"""
     cpu, dup, last = [], [], 0.0
     for line in open(path, errors="replace"):
         p = line.split()
@@ -39,7 +40,8 @@ def osc_rows(path):
             cpu.append((t, float(p[3]), float(p[4])))
         elif p[2] == "/abl/bench/duplicate-all" and len(p) >= 6:
             dup.append((t, int(float(p[3])), int(float(p[4])), int(float(p[5])),
-                        int(float(p[6])) if len(p) > 6 else None, float(p[7]) if len(p) > 7 else None))
+                        int(float(p[6])) if len(p) > 6 else None, float(p[7]) if len(p) > 7 else None,
+                        float(p[8]) if len(p) > 8 else None))
     return cpu, dup, last
 
 
@@ -100,7 +102,8 @@ def set_report(set_dir, settle, fail_errors, fail_peaks):
                 "peak_max": round(max(peaks), 1) if peaks else None, "peaks_over_100": over,
                 "pipewire_errors": pw, "duplicate_ms": dup[k - 1][3] if k >= 1 else None,
                 "tracks": dup[k - 1][2] if k >= 1 else None, "trims": dup[k - 1][4] if k >= 1 else None,
-                "trim_db": dup[k - 1][5] if k >= 1 else 0.0, "fails": fails}
+                "trim_db": dup[k - 1][5] if k >= 1 else 0.0, "trim_miss_db": dup[k - 1][6] if k >= 1 else None,
+                "fails": fails}
         steps.append(step)
         if fails and not failed:
             failed = True
@@ -108,7 +111,8 @@ def set_report(set_dir, settle, fail_errors, fail_peaks):
             headroom = k + 1
     return {"set": os.path.basename(set_dir).split("-", 1)[-1].replace("Benchmark_", ""), "steps": steps,
             "headroom": headroom, "first_failure": next((s["load"] for s in steps if s["fails"]), None),
-            "passes_seen": len(dup)}
+            "passes_seen": len(dup), "trims": dup[0][4] if dup else None,
+            "trim_miss_db": max((d[6] for d in dup if d[6] is not None), default=None)}
 
 
 def main():
@@ -129,7 +133,10 @@ def main():
     for r in reports:
         last = r["steps"][-1]["load"] if r["steps"] else 0
         hr = "none (step 1 failed)" if r["headroom"] is None else f"{r['headroom']}x" + ("+" if r["first_failure"] is None and r["headroom"] == last else "")
-        print(f"== {r['set']}: headroom {hr} (first failing load: {r['first_failure'] or '-'}x; {r['passes_seen']} passes)")
+        trims = "-" if r["trims"] is None else f"{r['trims']}" + (
+            "" if r["trim_miss_db"] is None else f", worst miss {r['trim_miss_db']} dB")
+        print(f"== {r['set']}: headroom {hr} (first failing load: {r['first_failure'] or '-'}x; {r['passes_seen']} passes;"
+              f" bus trims {trims})")
         print(f"   {'load':>4} {'tracks':>6} {'dup ms':>6} {'DSP avg':>7} {'pk med':>6} {'pk max':>6} {'>100':>4} {'PW err':>6}")
         for s in r["steps"]:
             print(f"   {s['load']:>3}x {s['tracks'] or '-':>6} {s['duplicate_ms'] or '-':>6} {s['dsp_average']:>7} "

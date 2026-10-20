@@ -40,12 +40,14 @@ DEFAULT_CPU_PERIOD_MS = 500
 # The load ramp (/abl/bench/duplicate-all) keeps every summing bus at the Set's own level. The copies play the same
 # audio in sync, so with N copies playing the return tracks and the master receive N times the amplitude
 # (+20 log10 N dB) and their effects would run hot. The first pass finds a trim for every return track and for the
-# master: the Utility already first in its chain when its Gain is not automated (the Set's returns start with one),
+# master: the Utility already first in its chain when its gain is not automated (the Set's returns start with one),
 # else a new Utility put first; each pass sets the trim to the Set's own gain minus 20 log10 N dB. Sends, faders and
 # automation stay as the Set has them: setting an automated parameter would override its automation for the rest of
 # the session. The trims cost the same in every configuration a ramp compares.
 RAMP_TRIM_DEVICE = "Utility"
-RAMP_TRIM_PARAMETER = "Gain"
+# Utility's gain parameter: "Output" in Live 12.4 (12.4.6: Device On, Left Inv, Right Inv, Channel Mode, Stereo Width,
+# Mono, Bass Mono, Bass Freq, Balance, Output, Mute, DC Filter), "Gain" in earlier versions.
+RAMP_TRIM_PARAMETERS = ("Output", "Gain")
 # Browser roots that /abl/bench/load-device searches by item name.
 BROWSER_ROOTS = ("instruments", "audio_effects", "midi_effects", "plugins", "max_for_live")
 SCRIPT_PATH = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
@@ -307,7 +309,7 @@ class BenchHandler(AbletonOSCHandler):
         children), so each pass adds the Set's own load once; the copies play the same clips and automation in sync.
         The first pass also puts a Utility first on every return track and on the master, and every pass sets their
         gain to -20 log10 N dB with N copies playing. Reports /abl/bench/duplicate-all (pass, tracks now, ms, trims,
-        trim gain in dB)."""
+        trim gain in dB, the largest distance in dB between a trim's display and its target)."""
         song = self.song
         start = time.monotonic()
         if self.ramp_originals is None:
@@ -326,13 +328,17 @@ class BenchHandler(AbletonOSCHandler):
             song.duplicate_track(index)
         self.ramp_pass += 1
         gain_db = -20.0 * math.log10(self.ramp_pass + 1)
+        miss_db = 0.0
         for trim, own_db in self.ramp_trims:
-            self._set_db(trim, own_db + gain_db)
+            target = own_db + gain_db
+            self._set_db(trim, target)
+            if target > float("-inf"):   # a bus the Set keeps silent stays silent
+                miss_db = max(miss_db, abs(self._db_of(trim, trim.value) - target))
         self._report("/abl/bench/duplicate-all", (self.ramp_pass, len(song.tracks), int((time.monotonic() - start) * 1000),
-                                                  len(self.ramp_trims), round(gain_db, 2)))
+                                                  len(self.ramp_trims), round(gain_db, 2), round(miss_db, 2)))
 
     def _bus_trim(self, track):
-        """The Gain that trims TRACK: the Utility already first in its chain when its Gain is not automated, else a new
+        """The gain that trims TRACK: the Utility already first in its chain when its gain is not automated, else a new
         Utility put first."""
         devices = list(track.devices)
         if devices and getattr(devices[0], "class_name", "") == "StereoGain":
@@ -343,19 +349,18 @@ class BenchHandler(AbletonOSCHandler):
 
     @staticmethod
     def _gain_parameter(device):
-        """Utility's gain: the parameter named RAMP_TRIM_PARAMETER, or the first whose name contains it (any case)."""
+        """Utility's gain: its parameter with the first name in RAMP_TRIM_PARAMETERS."""
         parameters = list(device.parameters)
-        for parameter in parameters:
-            if parameter.name == RAMP_TRIM_PARAMETER:
-                return parameter
-        for parameter in parameters:
-            if RAMP_TRIM_PARAMETER.lower() in parameter.name.lower():
-                return parameter
-        raise ValueError("no %s parameter on %s; it has %s" % (
-            RAMP_TRIM_PARAMETER, getattr(device, "class_name", "?"), ", ".join(repr(p.name) for p in parameters)))
+        for name in RAMP_TRIM_PARAMETERS:
+            for parameter in parameters:
+                if parameter.name == name:
+                    return parameter
+        raise ValueError("no gain parameter (%s) on %s; it has %s" % (
+            "/".join(RAMP_TRIM_PARAMETERS), getattr(device, "class_name", "?"),
+            ", ".join(repr(p.name) for p in parameters)))
 
     def _insert_trim(self, track):
-        """A Utility first in TRACK's chain; its Gain parameter. Live 12.1+ inserts a native device at an index; else
+        """A Utility first in TRACK's chain; its gain parameter. Live 12.1+ inserts a native device at an index; else
         the browser loads it on the selected track and Song.move_device puts it first."""
         if hasattr(track, "insert_device"):
             track.insert_device(RAMP_TRIM_DEVICE, 0)

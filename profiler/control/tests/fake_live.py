@@ -37,10 +37,11 @@ state = types.SimpleNamespace(application=None)
 # Live objects
 #--------------------------------------------------------------------------------
 class FakeGainParameter(object):
-    """Utility's Gain as Live shows it: the value runs -70..35 and reads "-6.0 dB", "-inf dB" at the bottom."""
+    """Utility's gain as Live 12.4 names and shows it: "Output", the value runs -70..35 and reads "-6.0 dB", "-inf dB"
+    at the bottom."""
 
     def __init__(self):
-        self.name = "Gain"
+        self.name = "Output"
         self.min = -70.0
         self.max = 35.0
         self.value = 0.0
