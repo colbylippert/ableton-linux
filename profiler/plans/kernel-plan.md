@@ -420,6 +420,23 @@ Living document, approved 2026-10-19: the status table is updated as each item l
   - Reported: peaks, PipeWire errors, xruns, the audio-thread and Live CPU, and the worker count seen.
   - Today's T0032 A runs (the kept 5 workers, same boot and configuration) are shown for context.
   - One run per count gives no verdict; a full run decides.
+- **D0012 — RESULT (2026-10-20 12:22–13:01; five runs clean; the workers were where the design put them in every run): fewer is better across the whole range.**
+
+  | Workers | DSP average % (Inbuilts / Max4Live / VSTs) | Score | Audio-thread CPU % | Live CPU % |
+  |---|---|---|---|---|
+  | 8 | 6.76 / 6.94 / 6.51 | 0.976 | 19.4 / 20.6 / 16.6 | 31.2 |
+  | 9 | 6.85 / 7.00 / 6.60 | 0.988 | 20.6 / 21.8 / 17.9 | 34.1 |
+  | 10 | 6.95 / 7.03 / 6.70 | 0.999 | 21.7 / 22.8 / 19.1 | 36.8 |
+  | 11 | 7.06 / 7.14 / 6.81 | 1.015 | 23.1 / 24.3 / 20.6 | 35.0 |
+  | 12 | 7.10 / 7.22 / 6.85 | 1.023 | 24.3 / 25.8 / 22.1 | 37.0 |
+  | 5, kept (T0032 A, medians of 3) | 6.40 / 6.50 / 6.18 | — | 15.6 / 16.7 / 12.7 | 27.3 |
+
+  - Each worker added costs about 1 % DSP and 1.2 points of audio-thread CPU. The order holds on every Set, although the runs went in the order 10, 8, 12, 9, 11.
+  - No PipeWire errors, peaks over 100 % or xruns in any run. Worst peaks 55–78 %.
+  - **Best of 8–12: 8.** The kept 5 (another session, same boot) is lower still: 5–6 % lower DSP and 3.8 points lower audio CPU than 8, so the optimum lies at 8 or below.
+  - The everyday launcher setting (auto, 15 workers, nothing pinned) sits further up this curve; the trials' pinning is not in the launcher.
+  - A full run should cover about 3 to 8 workers, with the kept 5 inside the same session.
+  - Files: `profiler/plans/findings/d0012/`.
 
 ## Context
 - `WINE_POSIX_SPAWN=1` (T0020) removed the fork-induced page-fault storms, and dropouts are now rare. **T0022 (one audio thread per physical P-core, 5 workers) is a keep**: audio-thread CPU −26 %, Live CPU 46.9 → 35.0 %, DSP average lower. The goal now is more headroom: shorter, steadier audio blocks and less CPU, through kernel-level changes.
