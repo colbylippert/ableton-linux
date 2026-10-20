@@ -463,21 +463,6 @@ Living document, approved 2026-10-19: the status table is updated as each item l
   - The kept 5 is not beaten on block time. A count of 3 would save CPU at equal block time. That is a rule H question (audio-thread CPU, with the DSP guard), and the load ramp is where fewer workers could cost headroom.
   - Files: `profiler/plans/findings/d0013/`.
 
-## T0033: two audio workers, pre-registered 2026-10-20 ~14:05, before any of its runs
-- **User:** "Lets do a full pass for two workers", after D0012 and D0013.
-- **Why:** in D0013, 2 workers gave the same block times as the kept 5 (DSP averages 6.47 / 6.67 / 5.81 against 6.41 / 6.50 / 6.18) for about 22 % less audio-thread CPU (11.7 against 15.0 %, the mean of the three Sets). With fewer workers, Live's fan-out of each block has fewer threads to wake, synchronise and wait for. One run per count was a smoke test; this is the full pass.
-- **A:** as kept: 5 workers, pipeasio-rt on CPU 0, the AudioCalc threads on CPUs 2, 4, 6, 8, 10. **B:** `ABLETON_MAX_AUDIO_THREADS=2`, pipeasio-rt on CPU 0, the two AudioCalc threads on CPUs 2 and 4.
-  - Both arms: the kept configuration otherwise (posix_spawn, PipeASIO realtime, the new display, every-boot shallow idle, `chrt -r 10` for all of Live).
-  - ABAB × 3 on Inbuilts, Max4Live and VSTs at 120 s. Driver `profiler/trials/trial-T0033.sh`.
-- **Rule H** (as for T0022, the last worker-count trial):
-  - H1: B's audio-thread CPU lower in at least 8 of 9 Set-pairs (sign test, p = 0.02); H2: median paired change ≤ −3 %.
-  - Guards: G1 no xruns in B; G2 B's PipeWire errors not significantly higher; G3 no Set's DSP average worse by more than 2× its A/A spread.
-- **Mechanism** (each run's affinity record): two AudioCalc threads on CPUs 2 and 4 in every B run, five on 2, 4, 6, 8, 10 in every A run.
-- **Reported:** each Set's DSP average (rule D's measure), the peak median and worst peak, missed deadlines, Live's CPU, package power and temperature.
-- **Verdicts:** keep = PASS with the mechanism; mechanism-confirmed = guards and mechanism hold but the primary fails; revert otherwise.
-  - If kept, 2 workers become the kept count for later trials.
-  - Under load (the ramp), fewer workers could cost headroom, so a ramp comparison of 2 against 5 workers follows before 2 is recommended for everyday use.
-
 ## Context
 - `WINE_POSIX_SPAWN=1` (T0020) removed the fork-induced page-fault storms, and dropouts are now rare. **T0022 (one audio thread per physical P-core, 5 workers) is a keep**: audio-thread CPU −26 %, Live CPU 46.9 → 35.0 %, DSP average lower. The goal now is more headroom: shorter, steadier audio blocks and less CPU, through kernel-level changes.
 - User (2026-10-19): "We want ableton specific improvement… lets get clever and esoteric for this ableton only kernel patch concept"; then "complete implementation plan for kernel level items".
