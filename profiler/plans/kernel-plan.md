@@ -158,6 +158,24 @@ Living document, approved 2026-10-19: the status table is updated as each item l
     - With our fixes, Linux is level with Windows on DSP and steadier.
   - Not interleaved: D0005's Linux runs were 19:43–20:35, these 21:41–22:11, with the same procedure and display. Per-Set results: `profiler/plans/findings/d0006-results.jsonl`.
 
+## The audio cores' clock (D0007, diagnostic, pre-registered 2026-10-19 ~22:55, before any of its runs)
+- **Why:**
+  - Live's own code is ~77 % of the audio threads' cycles, and its speed follows the clock.
+  - In T0024 the workers ran at 3.2–3.5 GHz on cores rated 4.7 GHz.
+  - T0027's kept runs drew ~21 W at ~60 °C on average, with the software power limits at 200 W, so K10's reading (power and thermal limited) looks wrong.
+  - Windows' High performance plan (D0005) holds the minimum processor state at 100 %.
+  - Bursty threads clock very low without a hold: in a test with three bursty threads on an idle system (EPP `balance_performance`), they ran at ~0.5 GHz.
+- **Design:** kept configuration; two bench runs in one session (Inbuilts, Max4Live and VSTs, 120 s each).
+  - A: as is (the bench's power hold sets EPP `performance`).
+  - B: a clock floor on the P-cores: `scaling_min_freq` = `cpuinfo_max_freq` on CPUs 0–11, i.e. the HWP minimum at the top. Restored after B and on any exit.
+  - Driver `profiler/kernel/clock/d0007.sh`, with `clock-capture` as the bench's tracer.
+- **Measured per Set:**
+  - the AudioCalc and `pipeasio-rt` threads' clock while running (cycles / task clock on the P-core PMU) and their IPC;
+  - Live's DSP average, peak median and peaks over 100 %; PipeWire errors; Live's CPU;
+  - package power, package and hottest-core temperature, thermal throttle events and time;
+  - the P-cores' `scaling_min_freq` and EPP during the capture (the mechanism).
+- **Decision:** register a trial (rule D, ABAB × 3, power and temperature reported) if B's AudioCalc clock is at least 5 % above A's on every Set; otherwise stop. One pair cannot decide the DSP effect, so it is reported only.
+
 ## Context
 - `WINE_POSIX_SPAWN=1` (T0020) removed the fork-induced page-fault storms, and dropouts are now rare. **T0022 (one audio thread per physical P-core, 5 workers) is a keep**: audio-thread CPU −26 %, Live CPU 46.9 → 35.0 %, DSP average lower. The goal now is more headroom: shorter, steadier audio blocks and less CPU, through kernel-level changes.
 - User (2026-10-19): "We want ableton specific improvement… lets get clever and esoteric for this ableton only kernel patch concept"; then "complete implementation plan for kernel level items".

@@ -1,0 +1,175 @@
+#!/usr/bin/env bash
+# clock-capture: a stand-in for wine-trace under bench-suite's tracer contract, as d0003-capture, run as root through
+# sudo (ABLETON_BENCH_TRACER=this, ABLETON_BENCH_ROOT_HELPER=/nonexistent/...), for D0007, the audio cores' clock
+# (profiler/plans/kernel-plan.md):
+#   clock-capture start --out DIR --pid P     returns once perf counts Live's audio threads
+#   clock-capture stop  --out DIR             stops the counting and writes DIR/summary.json
+# From play to the end of the window it records:
+#   perf-stat.csv   perf stat per thread on Live's AudioCalc and pipeasio-rt threads: task clock, and cycles, reference
+#                   cycles and instructions on the P-core PMU (the clock while running = cycles / task clock; IPC)
+#   samples.tsv     every second: wall time, RAPL package energy (uJ), package and hottest core temperature (m°C),
+#                   each P-core CPU's current frequency (kHz)
+#   start.txt, stop.txt   thermal throttle counts and total throttled time (per CPU and package), each P-core CPU's
+#                   scaling_min_freq, scaling_max_freq and EPP, the package energy, the wall time
+set -u
+verb=${1:-}
+[ $# -gt 0 ] && shift
+out= pids=()
+while [ $# -gt 0 ]; do
+  case $1 in
+    --out) out=$2; shift 2 ;;
+    --pid) pids+=("$2"); shift 2 ;;
+    *) shift ;;
+  esac
+done
+[ -n "$out" ] || { echo "clock-capture: --out is required" >&2; exit 2; }
+PCPUS=$(cat /sys/devices/cpu_core/cpus 2>/dev/null | awk -F- '{ for (i = $1; i <= $2; i++) printf "%d ", i }')
+[ -n "$PCPUS" ] || PCPUS=$(seq -s ' ' 0 11)
+RAPL=/sys/class/powercap/intel-rapl:0
+owner() { chown -R "${SUDO_UID:-0}:${SUDO_GID:-0}" "$out" 2>/dev/null || true; }
+
+state() {  # one "key values..." line per counter or setting
+  local d c
+  echo "time $EPOCHREALTIME"
+  echo "energy_uj $(cat $RAPL/energy_uj) $(cat $RAPL/max_energy_range_uj)"
+  for d in /sys/devices/system/cpu/cpu[0-9]*; do
+    [ -r "$d/thermal_throttle/core_throttle_count" ] || continue
+    echo "core_throttle ${d##*cpu} $(cat "$d/thermal_throttle/core_throttle_count") $(cat "$d/thermal_throttle/core_throttle_total_time_ms" 2>/dev/null || echo 0)"
+  done
+  d=/sys/devices/system/cpu/cpu0/thermal_throttle
+  echo "package_throttle $(cat $d/package_throttle_count) $(cat $d/package_throttle_total_time_ms 2>/dev/null || echo 0)"
+  for c in $PCPUS; do
+    d=/sys/devices/system/cpu/cpu$c/cpufreq
+    echo "cpufreq $c $(cat $d/scaling_min_freq) $(cat $d/scaling_max_freq) $(cat $d/energy_performance_preference 2>/dev/null || echo -)"
+  done
+}
+
+sample_loop() {  # every second until killed
+  local h hw= pkg= f v mx fr c e t
+  for h in /sys/class/hwmon/hwmon*; do [ "$(cat "$h/name")" = coretemp ] && { hw=$h; break; }; done
+  for f in "$hw"/temp*_label; do [ "$(cat "$f")" = "Package id 0" ] && pkg=${f%_label}_input; done
+  [ -n "$pkg" ] || pkg=$hw/temp1_input
+  while :; do
+    read -r e < $RAPL/energy_uj
+    read -r t < "$pkg"
+    mx=0
+    for f in "$hw"/temp*_input; do [ "$f" = "$pkg" ] && continue; read -r v < "$f"; [ "$v" -gt "$mx" ] && mx=$v; done
+    fr=
+    for c in $PCPUS; do read -r v < /sys/devices/system/cpu/cpu$c/cpufreq/scaling_cur_freq; fr="$fr $v"; done
+    echo "$EPOCHREALTIME $e $t $mx$fr"
+    sleep 1
+  done
+}
+
+case $verb in
+start)
+  mkdir -p "$out"
+  pid= tids=
+  for p in "${pids[@]}"; do
+    t=
+    for d in /proc/$p/task/[0-9]*; do
+      case $(cat "$d/comm" 2>/dev/null) in AudioCalc*|pipeasio-rt) t="$t,${d##*/}" ;; esac
+    done
+    if [ -n "$t" ]; then pid=$p; tids=${t#,}; break; fi
+  done
+  [ -n "$tids" ] || { echo "clock-capture: no AudioCalc or pipeasio-rt thread in pid(s) ${pids[*]:-none}" >&2; exit 1; }
+  echo "$pid" > "$out/live.pid"
+  for d in ${tids//,/ }; do echo "$d $(cat "/proc/$pid/task/$d/comm" 2>/dev/null)"; done > "$out/threads.txt"
+  state > "$out/start.txt"
+  setsid perf stat --per-thread -x, -o "$out/perf-stat.csv" \
+    -e task-clock,cpu_core/cycles/,cpu_core/ref-cycles/,cpu_core/instructions/ -t "$tids" \
+    < /dev/null > "$out/perf.log" 2>&1 &
+  echo $! > "$out/perf.pid"
+  setsid "$0" sample --out "$out" < /dev/null > /dev/null 2>&1 &
+  echo $! > "$out/sampler.pid"
+  sleep 1
+  kill -0 "$(cat "$out/perf.pid")" 2>/dev/null \
+    || { echo "clock-capture: perf stat did not start: $(cat "$out/perf.log")" >&2; owner; exit 1; }
+  owner
+  ;;
+sample)
+  sample_loop > "$out/samples.tsv"
+  ;;
+stop)
+  p=$(cat "$out/perf.pid" 2>/dev/null)
+  [ -n "$p" ] && kill -INT "$p" 2>/dev/null
+  s=$(cat "$out/sampler.pid" 2>/dev/null)
+  [ -n "$s" ] && kill "$s" 2>/dev/null
+  for i in $(seq 1 50); do { [ -n "$p" ] && kill -0 "$p" 2>/dev/null; } || break; sleep 0.2; done
+  state > "$out/stop.txt"
+  python3 - "$out" "$PCPUS" > "$out/summary.json" <<'PY'
+import json, os, statistics, sys
+out, pcpus = sys.argv[1], [int(c) for c in sys.argv[2].split()]
+
+def state(name):
+    d = {"core": {}, "cpufreq": {}}
+    for line in open(os.path.join(out, name)):
+        p = line.split()
+        if p[0] == "time": d["time"] = float(p[1])
+        elif p[0] == "energy_uj": d["energy"], d["energy_max"] = int(p[1]), int(p[2])
+        elif p[0] == "core_throttle": d["core"][int(p[1])] = (int(p[2]), int(p[3]))
+        elif p[0] == "package_throttle": d["package"] = (int(p[1]), int(p[2]))
+        elif p[0] == "cpufreq": d["cpufreq"][int(p[1])] = {"min": int(p[2]), "max": int(p[3]), "epp": p[4]}
+    return d
+
+a, b = state("start.txt"), state("stop.txt")
+dur = b["time"] - a["time"]
+threads = {}
+for line in open(os.path.join(out, "perf-stat.csv")):
+    p = line.rstrip("\n").split(",")
+    if len(p) < 4 or line.startswith("#") or "-" not in p[0]:
+        continue
+    comm, tid = p[0].rsplit("-", 1)
+    try:
+        val = float(p[1])
+    except ValueError:
+        continue
+    threads.setdefault(tid, {"comm": comm})[p[3]] = val
+
+def agg(ts):
+    tc = sum(t.get("task-clock", 0) for t in ts)            # ms
+    cy = sum(t.get("cpu_core/cycles/", 0) for t in ts)
+    rc = sum(t.get("cpu_core/ref-cycles/", 0) for t in ts)
+    ins = sum(t.get("cpu_core/instructions/", 0) for t in ts)
+    return {"threads": len(ts), "cpu_percent_of_one_core": round(tc / 10 / dur, 2) if dur else None,
+            "busy_ghz": round(cy / (tc * 1e6), 3) if tc else None, "ref_ghz": round(rc / (tc * 1e6), 3) if tc else None,
+            "ipc": round(ins / cy, 3) if cy else None}
+
+ac = [t for t in threads.values() if t["comm"].startswith("AudioCalc")]
+rt = [t for t in threads.values() if t["comm"] == "pipeasio-rt"]
+rows = []
+for line in open(os.path.join(out, "samples.tsv")):
+    p = line.split()
+    if len(p) >= 4:
+        rows.append([float(p[0]), int(p[1]), int(p[2]), int(p[3])] + [int(x) for x in p[4:]])
+watts = []
+for r0, r1 in zip(rows, rows[1:]):
+    de = r1[1] - r0[1]
+    if de < 0:
+        de += a.get("energy_max", 0)
+    if r1[0] > r0[0]:
+        watts.append(de / (r1[0] - r0[0]) / 1e6)
+de = b["energy"] - a["energy"]
+if de < 0:
+    de += a["energy_max"]
+summary = {
+    "duration_s": round(dur, 1),
+    "audiocalc": agg(ac), "pipeasio_rt": agg(rt),
+    "per_thread": {tid: dict(t, **agg([t])) for tid, t in threads.items()},
+    "package_w": round(de / dur / 1e6, 2) if dur else None,
+    "package_w_p95": round(sorted(watts)[int(0.95 * (len(watts) - 1))], 1) if watts else None,
+    "package_temp_c": {"mean": round(statistics.mean(r[2] for r in rows) / 1000, 1), "max": max(r[2] for r in rows) / 1000} if rows else None,
+    "hottest_core_temp_c": {"mean": round(statistics.mean(r[3] for r in rows) / 1000, 1), "max": max(r[3] for r in rows) / 1000} if rows else None,
+    "throttle": {
+        "package_events": b["package"][0] - a["package"][0], "package_ms": b["package"][1] - a["package"][1],
+        "core_events": {c: b["core"][c][0] - a["core"][c][0] for c in b["core"] if b["core"][c][0] != a["core"][c][0]},
+        "core_ms": {c: b["core"][c][1] - a["core"][c][1] for c in b["core"] if b["core"][c][1] != a["core"][c][1]},
+    },
+    "cpufreq_at_start": {c: a["cpufreq"][c] for c in pcpus if c in a["cpufreq"]},
+}
+print(json.dumps(summary, indent=1))
+PY
+  owner
+  ;;
+*) echo "usage: clock-capture start --out DIR --pid P | stop --out DIR" >&2; exit 2 ;;
+esac
