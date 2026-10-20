@@ -4,6 +4,9 @@ Reads the raw results in profiler/plans/findings: D0006 (Linux, upstream setup),
 (Linux with the current fixes). CPU values are the median of each setup's three runs per Set. Dropouts are totals over
 its nine Set-runs; Windows' missed deadlines count only readings inside the measured window (D0005's correction).
 Usage: python3 profiler/trials/fix_levels_svg.py profiler/plans/findings profiler/plans/findings/fix-levels.svg
+The PNG copy (fix-levels.png, for previews that do not draw the SVG) is the SVG rendered at 2x in headless Chromium:
+  msedge --headless=new --hide-scrollbars --force-device-scale-factor=2 --window-size=920,756 \
+         --screenshot=fix-levels.png file:///<checkout>/profiler/plans/findings/fix-levels.svg
 """
 import json
 import statistics
@@ -57,12 +60,12 @@ def one(x):
 
 W, PAD = 920, 28
 TEXT, MUTED, GRID, BORDER = "#1f2328", "#59636e", "#e6eaef", "#d0d7de"
-FONT = "-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif"
+FONT = "Helvetica, Arial, sans-serif"   # plain names, on every text element: GitHub's preview showed version 1 without text
 body = []
 
 
 def text(x, y, s, size=12, weight=None, fill=TEXT, anchor=None):
-    a = f'x="{x:.1f}" y="{y:.1f}" font-size="{size}" fill="{fill}"'
+    a = f'x="{x:.1f}" y="{y:.1f}" font-family="{FONT}" font-size="{size}" fill="{fill}"'
     if weight:
         a += f' font-weight="{weight}"'
     if anchor:
@@ -100,7 +103,7 @@ for px, metric, title, sub in (
         text(bx + v * k, 455, str(v), 10.5, fill=MUTED, anchor="middle")
     for gi, (set_name, what) in enumerate(SETS):
         yg = 200 + gi * 84
-        body.append(f'<text x="{px:.1f}" y="{yg:.1f}" font-size="12" fill="{TEXT}">'
+        body.append(f'<text x="{px:.1f}" y="{yg:.1f}" font-family="{FONT}" font-size="12" fill="{TEXT}">'
                     f'<tspan font-weight="600">{escape(set_name)}</tspan>'
                     f'<tspan fill="{MUTED}"> ({escape(what)})</tspan></text>')
         for i, s in enumerate(SETUPS):
@@ -153,10 +156,10 @@ summary = "; ".join(
     f'{"/".join(one(s["med"][(n, "audio_total")]) for n, _ in SETS)} % (Inbuilts/Max4Live/VSTs), {s["workers"]} workers, '
     f'{s["missed"]} missed deadlines' + ("" if s["pw"] is None else f', {s["pw"]} PipeWire errors')
     for s in SETUPS)
-svg = (f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" viewBox="0 0 {W} {H}" role="img" '
-       f'aria-labelledby="t d" font-family="{FONT}">\n'
-       f'<title id="t">Ableton Live 12: Live CPU, audio worker CPU and dropouts, Linux (Wine) against Windows 11</title>\n'
-       f'<desc id="d">{escape(summary)}.</desc>\n'
+svg = (f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" viewBox="0 0 {W} {H}" '
+       f'font-family="{FONT}">\n'
+       f'<title>Ableton Live 12: Live CPU, audio worker CPU and dropouts, Linux (Wine) against Windows 11</title>\n'
+       f'<desc>{escape(summary)}.</desc>\n'
        f'<rect x="0.5" y="0.5" width="{W - 1}" height="{H - 1}" rx="10" fill="#ffffff" stroke="{BORDER}"/>\n'
        + "\n".join(body) + "\n</svg>\n")
 with open(OUT, "w", encoding="utf-8", newline="\n") as fh:
