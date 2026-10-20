@@ -463,6 +463,18 @@ Living document, approved 2026-10-19: the status table is updated as each item l
   - The kept 5 is not beaten on block time. A count of 3 would save CPU at equal block time. That is a rule H question (audio-thread CPU, with the DSP guard), and the load ramp is where fewer workers could cost headroom.
   - Files: `profiler/plans/findings/d0013/`.
 
+## D0014: the best Linux configuration with 2 workers, against Windows and upstream (diagnostic, pre-registered 2026-10-20 ~14:15, before any of its runs)
+- **User:** "Lets take the current best fixes on linux and run a full pass with two workers to get a comparison against windows and upstream baseline". This came after D0013, where 2 to 5 workers tied on block time and 2 used the least CPU without 1 worker's penalty.
+- **Design:** as D0006, three Linux runs, each from a fresh boot with the boot settled first (`ORDER="A1 A2 A3" LINUX_CONFIG=kept-w2 TRIAL_ID=D0014 profiler/windows/cross-os-trial.sh d0014`).
+  - The kept configuration: posix_spawn, PipeASIO realtime, the new display, Live at RR 10, and the every-boot shallow idle (C1E off from GRUB, the P-cores no deeper than C1).
+  - `ABLETON_MAX_AUDIO_THREADS=2`: pipeasio-rt on CPU 0, the two AudioCalc threads on CPUs 2 and 4.
+  - Inbuilts, Max4Live and VSTs at 120 s.
+- **Compared with** (per Set, medians of three runs):
+  - Windows as shipped: D0005's corrected Windows runs, which D0010's A arm reproduced.
+  - The upstream Linux baseline: D0006.
+  - The best Linux configuration with 5 workers: T0031's B arm, the earlier table's column; D0013's 5-worker run for reference.
+- **Reported:** DSP average, peak median, missed deadlines (peaks over 100 %), PipeWire errors, Live's CPU and the audio-thread CPU. No verdict: it is the cross-OS table's new column.
+
 ## Context
 - `WINE_POSIX_SPAWN=1` (T0020) removed the fork-induced page-fault storms, and dropouts are now rare. **T0022 (one audio thread per physical P-core, 5 workers) is a keep**: audio-thread CPU −26 %, Live CPU 46.9 → 35.0 %, DSP average lower. The goal now is more headroom: shorter, steadier audio blocks and less CPU, through kernel-level changes.
 - User (2026-10-19): "We want ableton specific improvement… lets get clever and esoteric for this ableton only kernel patch concept"; then "complete implementation plan for kernel level items".
