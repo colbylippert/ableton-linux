@@ -40,7 +40,7 @@ Living document, approved 2026-10-19: the status table is updated as each item l
 | K3 ntsync-live spin | recorded 2026-10-19: in Live the DSP average did not move (5 of 9 pairs, −0.4 %) while audio CPU doubled (+22.9 points); the spin worked (context switches −64 %), wake-ups are not the bottleneck | T0025 | **revert** |
 | K4 C-state limit, C1E | D0007: a clock floor does not raise the workers' clock; D0008: C2/C3 off alone no consistent gain; D0009: with C1E off too, workers 2.9–3.3 → 4.5 GHz. **T0031: DSP −29.4 % (9/9 pairs), audio CPU −39.6 %, Live CPU 38.1 → 27.3 %, +5 W** | T0031 | **keep**: C1E off, C2/C3 off on the P-cores |
 | MMCSS (patch 0113, Wine) | T0032: only Live's audio threads realtime (AudioCalc FIFO 12, the rest normal) against all of Live at RR 10: DSP −0.3 % (8/9 pairs), guards held | T0032 | mechanism-confirmed (opt-in) |
-| Load ramp (headroom) | machinery done (every track duplicated per pass, buses trimmed); exploratory kept run: headroom 5× / 4× / 5×, steps fail on spikes at a DSP average of only 11–15 %. D0011 (MMCSS under load) registered | D0011 | — |
+| Load ramp (headroom) | machinery done (every track duplicated per pass, buses trimmed); headroom 4–5× on every Set, failing on spikes at a DSP average of only 11–15 %. D0011: MMCSS does not move it (2 higher, 2 lower of 6 pairs; DSP −1 to −2 %). 77–82 % of the misses fall on 4 of the loop's 24 bars (beats 60, 76, 92, 96: where "7-Vocal 05" plays) | D0011 | no difference |
 | K5 LiveSync | not started; deprioritised by T0025: ntsync is 16 % of audio cycles, so at most a CPU gain, not block time (D0004: ~40 % of calls could be syscall-free) | — | — |
 | K6 isolation | registered as T0029 (driver ready); T0024 predicts no gain from moving IRQs off the audio cores, so it waits behind K10 | T0029 | — |
 | K7–K9 | not started (K7 pre-wake and K8 direct entry also deprioritised: C2 wakes are cheap, and T0025 showed the sync path is not the block-time limit) | — | — |
@@ -382,6 +382,31 @@ Living document, approved 2026-10-19: the status table is updated as each item l
   - Secondary, reported: glitches (PipeWire errors plus peaks over 100 %) over all loads per Set-pair, and the DSP average and peak median at each load, B against A.
   - A run whose bench fails is rerun once in place, before the next run.
 - **Not a trial:** a headroom gain would not change T0032's verdict by itself. A trial with a pre-registered ramp rule would follow.
+- **D0011 — RESULT (2026-10-20 09:13–11:07; four runs clean, each with its 3 trims and the mechanism in place): no difference in headroom shown.**
+  - **Headroom** (A1, A2 | B1, B2): Inbuilts 5, 4 | 4, 5; Max4Live 5, 4 | 4, 5; VSTs 5, 5 | 5, 5.
+    - B higher in 2 of 6 Set-pairs and lower in 2; mean B − A 0.00 against an A/A spread of 0.67.
+    - At this resolution the ramp's headroom varies by one step from run to run.
+  - **Glitches** (PipeWire errors plus peaks over 100 %, all loads): A 96 / 103, 89 / 108, 72 / 81; B 109 / 95, 103 / 101, 69 / 71. Fewer in B in 4 of 6 Set-pairs.
+  - **DSP average:** B lower at 26 of 30 Set-loads.
+    - The median change over the loads is −0.9 % (Inbuilts), −2.1 % (Max4Live) and −1.9 % (VSTs).
+    - At 1× it is −0.9 to +0.5 %, as in T0032.
+  - **Mechanism held in every run:**
+    - B: AudioCalc SCHED_FIFO 12, `pipeasio-rt` FIFO 15, the UI and every other Live thread normal (0 of 4,455 and 4,432 samples realtime).
+    - A: AudioCalc and the UI SCHED_RR 10, 93 % of the other samples realtime.
+  - **Power and heat:**
+    - Package power per step is the same in both arms: 22–24 W at 1×, 28–33 W at 5×, 34–42 W at 10× (`ramp-report.py --power`).
+    - The steps never ran hot: the package reached at most 66–79 °C.
+    - The runs' highest temperatures (89–96 °C) and the CPU's thermal throttling fell during duplication and Set loading, outside the measured steps. The package throttled about 1 s in A2 and 6.5 s in B2, mostly worker core 6.
+  - **Where the misses fall** (`profiler/control/ramp-beats.py`; `findings/d0011/beats.txt`):
+    - 77–82 % of the misses at loads 4× and up fall in 4 of the loop's 24 bars: those starting at beats 60, 76, 92 and 96. PipeWire's report lags up to two beats.
+    - The pattern is the same in all three Sets and in the exploratory run (79–83 %).
+    - The bench Sets share one arrangement. Its track "7-Vocal 05" (Simpler: a one-second 44.1 kHz one-shot at the highest interpolation) plays at beats 60–64, 76–80 and 92–100 and nowhere else. Around beat 44, where four other tracks start clips, there are fewer misses.
+    - The copies play in sync, so every copy's notes start in the same block. The ramp's limit is that burst, N times over, not the steady load.
+  - **Reading:**
+    - MMCSS makes Live's blocks slightly cheaper under load (1–3 % DSP) but does not move the spikes that end the ramp.
+    - The headroom is limited by a burst at fixed points in the arrangement, not by scheduling.
+    - The next question is what costs the time there; each copy's note-ons on "Vocal 05" are the lead.
+  - Files: `profiler/plans/findings/d0011/` (per-run reports with per-step power, the comparison, the bar histograms).
 
 ## Context
 - `WINE_POSIX_SPAWN=1` (T0020) removed the fork-induced page-fault storms, and dropouts are now rare. **T0022 (one audio thread per physical P-core, 5 workers) is a keep**: audio-thread CPU −26 %, Live CPU 46.9 → 35.0 %, DSP average lower. The goal now is more headroom: shorter, steadier audio blocks and less CPU, through kernel-level changes.

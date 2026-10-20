@@ -1,0 +1,35 @@
+ramp-explore-kept Inbuilts: markers on the tempo line 74/103
+ramp-explore-kept Max4Live: markers on the tempo line 67/103
+ramp-explore-kept VSTs: markers on the tempo line 74/103
+== Inbuilts: misses by bar of the loop (bar 1 = beats 16-20), loads 4x and up
+   bar  8 (beat    44): PW err   1  >100 %   0  #
+   bar  9 (beat    48): PW err   5  >100 %   1  ###
+   bar 12 (beat    60): PW err  12  >100 %   4  ########
+   bar 13 (beat    64): PW err   6  >100 %   0  ###
+   bar 16 (beat    76): PW err  23  >100 %   4  ##############
+   bar 17 (beat    80): PW err   5  >100 %   0  ###
+   bar 19 (beat    88): PW err   1  >100 %   0  #
+   bar 20 (beat    92): PW err  10  >100 %   4  #######
+   bar 21 (beat    96): PW err  14  >100 %   7  ###########
+   the 4 worst of 24 bars hold 80 % of 97 misses
+== Max4Live: misses by bar of the loop (bar 1 = beats 16-20), loads 4x and up
+   bar  8 (beat    44): PW err   5  >100 %   1  ###
+   bar  9 (beat    48): PW err   4  >100 %   2  ###
+   bar 12 (beat    60): PW err  16  >100 %   5  ###########
+   bar 13 (beat    64): PW err   2  >100 %   0  #
+   bar 16 (beat    76): PW err  26  >100 %   7  #################
+   bar 17 (beat    80): PW err   4  >100 %   0  ##
+   bar 20 (beat    92): PW err   9  >100 %   6  ########
+   bar 21 (beat    96): PW err  16  >100 %   6  ###########
+   the 4 worst of 24 bars hold 83 % of 109 misses
+== VSTs: misses by bar of the loop (bar 1 = beats 16-20), loads 4x and up
+   bar  8 (beat    44): PW err   2  >100 %   3  ###
+   bar  9 (beat    48): PW err   2  >100 %   0  #
+   bar 12 (beat    60): PW err   8  >100 %   3  ######
+   bar 13 (beat    64): PW err   4  >100 %   0  ##
+   bar 16 (beat    76): PW err  18  >100 %   5  ############
+   bar 17 (beat    80): PW err   4  >100 %   0  ##
+   bar 19 (beat    88): PW err   1  >100 %   0  #
+   bar 20 (beat    92): PW err   8  >100 %   4  ######
+   bar 21 (beat    96): PW err  10  >100 %   6  ########
+   the 4 worst of 24 bars hold 79 % of 78 misses
