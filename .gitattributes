@@ -16,5 +16,7 @@ patches/pipeasio/0012-recover-selected-routes-after-hotplug.patch whitespace=-bl
 
 # profiler/ additions (local fork): keep scripts LF on every platform
 profiler/** text eol=lf
+# images stay binary (the profiler/** rule above once stripped a PNG's CR bytes)
+*.png binary
 *.sh text eol=lf
 CLAUDE.md text eol=lf
