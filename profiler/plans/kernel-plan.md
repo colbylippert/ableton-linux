@@ -539,6 +539,23 @@ Living document, approved 2026-10-19: the status table is updated as each item l
   - **Next:** make the cycles even, either with timer scheduling for the Focusrite (`api.alsa.disable-tsched = false`, with the headroom its 0.5 ms pointer needs) or with a period that is a multiple of 0.5 ms (72 frames: an even 1.5 ms). Then count PipeWire errors and the ramp's headroom.
   - Files: `profiler/plans/findings/d0016/analysis.txt`; the raw probes on the laptop (`~/.local/share/profiler/runs/first-d0016`).
 
+## D0017: timer scheduling for the Focusrite, even cycles (diagnostic, written before its runs)
+- **User:** "Lets schedule 1 for testing". Option 1 after D0016: timer scheduling with headroom.
+- **Switch:** `profiler/kernel/pipewire/focusrite-tsched.sh on` installs a WirePlumber rule for the Focusrite's pro-audio nodes (`api.alsa.disable-tsched = false`, `api.alsa.headroom = 32`, since the hardware pointer moves in 0.5 ms = 24-frame steps) and restarts PipeWire. `off` removes the rule.
+- **Steps:**
+  1. **Mechanism:** the two nodes report `disable-tsched` false and headroom 32. Then `first-buffer.sh d0017 2 Inbuilts 30`, as D0016, checking:
+     - the cycles' spacing within 1,333 ± 100 µs at p1 and p99 (D0016: 1,000 and 1,500);
+     - one block per cycle;
+     - no errors on the Focusrite's own nodes (pw-top ERR);
+     - PipeWire errors on Live's node over the run;
+     - Live's reported latency against D0016's.
+  2. **If the cycles are even:** a full pass as D0014 (three runs from fresh boots, `kept-w2`) with the rule in place, compared with D0014 (3 PipeWire errors in 9 Set-runs; DSP 6.4 / 6.8 / 5.8).
+  3. The rule is removed afterwards unless the user keeps it.
+- **Reading:**
+  - Even cycles confirm the mechanism.
+  - Over 18 minutes, fewer PipeWire errors than D0014's 3 would be suggestive only. The load ramp, where errors are frequent, is the test of effect; it follows if steps 1 and 2 hold.
+  - Errors on the Focusrite's nodes, or xruns, would mean the headroom is too small.
+
 ## Context
 - `WINE_POSIX_SPAWN=1` (T0020) removed the fork-induced page-fault storms, and dropouts are now rare. **T0022 (one audio thread per physical P-core, 5 workers) is a keep**: audio-thread CPU −26 %, Live CPU 46.9 → 35.0 %, DSP average lower. The goal now is more headroom: shorter, steadier audio blocks and less CPU, through kernel-level changes.
 - User (2026-10-19): "We want ableton specific improvement… lets get clever and esoteric for this ableton only kernel patch concept"; then "complete implementation plan for kernel level items".
