@@ -490,6 +490,11 @@ Living document, approved 2026-10-19: the status table is updated as each item l
   - The three runs agree within about 2 % per Set (DSP 6.33–6.44 / 6.63–6.85 / 5.77–5.83).
   - Files: `profiler/plans/findings/d0014-results.jsonl` (with D0006's `~/profiler-crossos/d0006`, T0031 B and D0005's corrected figures above).
 
+## D0015: the best Linux configuration with 3 workers, the same pass (diagnostic, written before any of its runs)
+- **User:** "Now lets do the same run with 3 workers".
+- **Design:** as D0014 with `ABLETON_MAX_AUDIO_THREADS=3`, the three AudioCalc threads on CPUs 2, 4 and 6 (`ORDER="A1 A2 A3" LINUX_CONFIG=kept-w3 TRIAL_ID=D0015 profiler/windows/cross-os-trial.sh d0015`).
+- **Compared with:** D0014 (2 workers), T0031 B (5 workers), D0005 (Windows) and D0006 (upstream), as in D0014's table. No verdict.
+
 ## Context
 - `WINE_POSIX_SPAWN=1` (T0020) removed the fork-induced page-fault storms, and dropouts are now rare. **T0022 (one audio thread per physical P-core, 5 workers) is a keep**: audio-thread CPU −26 %, Live CPU 46.9 → 35.0 %, DSP average lower. The goal now is more headroom: shorter, steadier audio blocks and less CPU, through kernel-level changes.
 - User (2026-10-19): "We want ableton specific improvement… lets get clever and esoteric for this ableton only kernel patch concept"; then "complete implementation plan for kernel level items".
