@@ -1,0 +1,129 @@
+#!/usr/bin/env bash
+# pwerr-capture: a stand-in for wine-trace under bench-suite's tracer contract, run as root through sudo
+# (ABLETON_BENCH_TRACER=this, ABLETON_BENCH_ROOT_HELPER=/nonexistent/...), for finding what makes Live's node miss a
+# PipeWire graph cycle (a PipeWire error, the ERR count pw-top shows):
+#   pwerr-capture start --out DIR --pid P [--run-id T] [--mode M]     returns once everything is attached
+#   pwerr-capture stop  --out DIR
+# From play to the end of the window it records (all times CLOCK_MONOTONIC ns):
+#   profiler.json    pw-profiler -J, run as the desktop user: per graph cycle the clock (start, duration, next start) and,
+#                    for the driver and every follower node (Live's PipeASIO node among them), when it was signalled,
+#                    woke and finished, and its xrun count (profiler.log: pw-profiler's own text output, if any)
+#   blocks.txt       bpftrace on PipeASIO's block_start/block_end USDT probes: every block (seq, start, elapsed, slack
+#                    against its deadline) and the callback tid
+#   perf-sched.data  perf on every CPU: switches and wakeups of Live's audio threads, PipeWire's threads and wineserver;
+#                    hard and soft IRQs; power:cpu_idle (each CPU's idle-state entries and exits)
+#   counters-start.txt, counters-stop.txt  MSR_SMI_COUNT (0x34: firmware interrupts, which no kernel trace shows) and
+#                    every CPU's thermal throttle counts
+#   tasks-start.txt, tasks-stop.txt, pipewire-tasks.txt  Live's threads (tid comm) and PipeWire's (pid tid comm)
+# Analysed by profiler/trials/pwerr_analyze.py.
+set -u
+verb=${1:-}
+[ $# -gt 0 ] && shift
+out= pids=()
+while [ $# -gt 0 ]; do
+  case $1 in
+    --out) out=$2; shift 2 ;;
+    --pid) pids+=("$2"); shift 2 ;;
+    *) shift ;;
+  esac
+done
+[ -n "$out" ] || { echo "pwerr-capture: --out is required" >&2; exit 2; }
+user_uid=${SUDO_UID:-$(id -u)}
+owner() { chown -R "${SUDO_UID:-0}:${SUDO_GID:-0}" "$out" 2>/dev/null || true; }
+mono() { python3 -c 'import time; print(time.monotonic_ns())'; }
+counters() {  # FILE
+  {
+    echo "mono $(mono)"
+    echo "smi_count $(dd if=/dev/cpu/0/msr bs=8 count=1 skip=$((0x34)) iflag=skip_bytes 2>/dev/null | od -An -tu8 | tr -d ' ')"
+    for c in /sys/devices/system/cpu/cpu[0-9]*; do
+      [ -r "$c/thermal_throttle/core_throttle_count" ] || continue
+      echo "throttle ${c##*/} $(cat "$c/thermal_throttle/core_throttle_count") $(cat "$c/thermal_throttle/package_throttle_count")"
+    done
+  } > "$1"
+}
+
+case $verb in
+start)
+  pid=${pids[0]:-}
+  [ -n "$pid" ] || { echo "pwerr-capture: --pid is required" >&2; exit 2; }
+  mkdir -p "$out"
+  modprobe msr 2>/dev/null
+  echo "$pid" > "$out/live.pid"
+  mono > "$out/start-mono.txt"
+  so=$(awk '/pipeasio64\.dll\.so$/ {print $6; exit}' "/proc/$pid/maps")
+  [ -n "$so" ] || { echo "pwerr-capture: pipeasio64.dll.so is not mapped in $pid" >&2; exit 1; }
+  for t in /proc/$pid/task/[0-9]*; do echo "${t##*/} $(cat "$t/comm" 2>/dev/null)"; done > "$out/tasks-start.txt"
+  for p in $(pgrep -x pipewire; pgrep -x pipewire-pulse; pgrep -x wireplumber); do
+    for t in /proc/$p/task/[0-9]*; do echo "$p ${t##*/} $(cat "$t/comm" 2>/dev/null)"; done
+  done > "$out/pipewire-tasks.txt"
+  counters "$out/counters-start.txt"
+  cat > "$out/blocks.bt" <<BT
+BEGIN { printf("READY %lu\n", nsecs(monotonic)); }
+usdt:$so:pipeasio:block_start /pid == $pid/ {
+  if (@tid == 0) { @tid = tid; printf("T %d\n", tid); }
+  @t0 = nsecs(monotonic); @dl = arg4; @seq = arg0;
+}
+usdt:$so:pipeasio:block_end /pid == $pid && @t0 > 0/ {
+  \$e = nsecs(monotonic) - @t0;
+  printf("B %lu %lu %lu %ld\n", @seq, @t0, \$e, (int64)@dl - (int64)(@t0 + \$e));
+}
+BT
+  setsid bpftrace -q --no-warnings "$out/blocks.bt" > "$out/blocks.txt" 2> "$out/blocks.err" < /dev/null &
+  echo $! > "$out/blocks.pid"
+  # switches in or out of the threads that carry a cycle (what ran before each, what took its CPU); their wakeups
+  # (the sample's task is the waker)
+  switch='prev_comm ~ "AudioCalc*" || next_comm ~ "AudioCalc*" || prev_comm == "pipeasio-rt" || next_comm == "pipeasio-rt"'
+  switch="$switch"' || prev_comm ~ "data-loop*" || next_comm ~ "data-loop*" || prev_comm == "pipewire" || next_comm == "pipewire"'
+  switch="$switch"' || prev_comm == "wineserver" || next_comm == "wineserver"'
+  setsid taskset -c 12-15 perf record -q -o "$out/perf-sched.data" -k CLOCK_MONOTONIC -m 2048 -a \
+    -e sched:sched_switch --filter "$switch" \
+    -e sched:sched_waking --filter 'comm ~ "AudioCalc*" || comm == "pipeasio-rt" || comm ~ "data-loop*" || comm == "pipewire" || comm == "wineserver"' \
+    -e irq:irq_handler_entry -e irq:irq_handler_exit -e irq:softirq_entry -e irq:softirq_exit \
+    -e power:cpu_idle > "$out/perf-sched.log" 2>&1 < /dev/null &
+  echo $! > "$out/perf-sched.pid"
+  setsid sudo -u "#$user_uid" env XDG_RUNTIME_DIR="/run/user/$user_uid" pw-profiler -J -o "$out/profiler.log" \
+    > "$out/profiler.json" 2> "$out/profiler.err" < /dev/null &
+  echo $! > "$out/profiler.pid"
+  # attached when bpftrace has run BEGIN, perf has written data and pw-profiler is alive
+  for _ in $(seq 1 120); do
+    ok=1
+    grep -q '^READY' "$out/blocks.txt" 2>/dev/null || ok=0
+    for p in blocks perf-sched profiler; do
+      kill -0 "$(cat "$out/$p.pid")" 2>/dev/null \
+        || { echo "pwerr-capture: $p exited: $(head -c 300 "$out/$p.err" "$out/$p.log" 2>/dev/null)" >&2; owner; exit 1; }
+    done
+    [ -s "$out/perf-sched.data" ] || ok=0
+    [ "$ok" = 1 ] && break
+    sleep 0.25
+  done
+  [ "$ok" = 1 ] || { echo "pwerr-capture: not attached after 30 s" >&2; owner; exit 1; }
+  echo "wine-trace: started: pwerr-capture pid $pid, out=$out"
+  owner
+  ;;
+stop)
+  for p in profiler perf-sched blocks; do
+    [ -f "$out/$p.pid" ] && kill -INT "$(cat "$out/$p.pid")" 2>/dev/null
+  done
+  pkill -INT -f "pw-profiler -J -o $out/profiler.log" 2>/dev/null   # sudo's child, if sudo did not pass the signal
+  for _ in $(seq 1 240); do
+    alive=0
+    for p in profiler perf-sched blocks; do
+      [ -f "$out/$p.pid" ] && kill -0 "$(cat "$out/$p.pid")" 2>/dev/null && alive=1
+    done
+    [ "$alive" = 0 ] && break
+    sleep 0.25
+  done
+  counters "$out/counters-stop.txt"
+  pid=$(cat "$out/live.pid" 2>/dev/null)
+  if [ -n "$pid" ] && [ -d "/proc/$pid" ]; then
+    for t in /proc/$pid/task/[0-9]*; do echo "${t##*/} $(cat "$t/comm" 2>/dev/null)"; done > "$out/tasks-stop.txt"
+  fi
+  mono > "$out/stop-mono.txt"
+  owner
+  echo "wine-trace: stopped: pwerr-capture out=$out"
+  ;;
+*)
+  echo "usage: pwerr-capture start --out DIR --pid P | stop --out DIR" >&2
+  exit 2
+  ;;
+esac
