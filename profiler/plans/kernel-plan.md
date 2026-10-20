@@ -364,7 +364,7 @@ Living document, approved 2026-10-19: the status table is updated as each item l
   - 3 trims: the two returns' own Utilities, and a new Utility first on the master. Each display within 0.0 dB of its target.
   - DSP 6.62 % at 1×, 7.77 % at 2×.
 
-### D0011: MMCSS under load (diagnostic, pre-registered 2026-10-20 ~09:15, before any of its runs)
+### D0011: MMCSS under load (diagnostic, pre-registered 2026-10-20 09:12, commit 8f6e7da, before any of its runs)
 - **Question:** T0032 found that MMCSS (only Live's audio threads realtime) makes no difference at the Sets' own load (−0.3 %). Does it raise the headroom, where more of Live's other threads are busy (UI, the copies' devices, streaming)?
 - **Design:** A1 B1 A2 B2 load ramps, about 2 hours (`profiler/trials/d0011.sh`).
   - A: kept (`ramp-run.sh d0011-A1 kept`): `chrt -r 10` for all of Live.
