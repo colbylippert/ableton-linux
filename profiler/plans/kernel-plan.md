@@ -478,13 +478,13 @@ Living document, approved 2026-10-19: the status table is updated as each item l
 
   | Per Set, medians of three runs | Linux upstream (D0006) | Linux best, 5 workers (T0031 B) | **Linux best, 2 workers (D0014)** | Windows as shipped (D0005, corrected) |
   |---|---|---|---|---|
-  | DSP average % (Inbuilts / Max4Live / VSTs) | 11.3 / 11.8 / 11.0 | 6.5 / 6.5 / 6.1 | **6.4 / 6.8 / 5.8** | 9.4 / 10.0 / 8.2 |
+  | DSP average % (Inbuilts / Max4Live / VSTs) | 11.3 / 11.8 / 11.0 | 6.5 / 6.5 / 6.2 | **6.4 / 6.8 / 5.8** | 9.4 / 10.0 / 8.2 |
   | Missed deadlines (9 Set-runs) | 55 | 1 | **0** | 2 |
   | PipeWire errors (9 Set-runs) | 176 | 12 | **3** | — |
   | Live CPU % | 63.8 / 68.2 / 60.2 | 27.3 / 29.4 / 22.7 | **25.8 / 25.3 / 20.1** | 33.0 / 33.2 / 23.8 |
   | Audio-thread CPU % (workers + callback thread) | 51.2 / 55.4 / 50.0 | 15.7 / 16.7 / 12.7 | **12.4 / 13.4 / 9.4** | 28.1 / 29.5 / 19.6 |
 
-  - **Against 5 workers:** block time is level (−1 %, +4 %, −5 % per Set). The audio threads use 21–26 % less CPU and Live 6–14 % less; no missed deadline (1 with 5 workers), 3 PipeWire errors against 12.
+  - **Against 5 workers:** block time is level (−1 %, +4 %, −6 % per Set). The audio threads use 20–26 % less CPU and Live 5–14 % less; no missed deadline (1 with 5 workers), 3 PipeWire errors against 12.
   - **Against Windows:** DSP 29–32 % lower, Live's CPU 16–24 % lower, the audio threads at less than half of Windows' CPU (AudioCalc + the ASIO callback thread there, + pipeasio-rt here), 0 missed deadlines against 2. Windows ran Live with 5 workers and its stock power and idle settings (D0005); D0010 showed limiting Windows' idle does not change its DSP, and Windows with 2 workers is untested.
   - **Against upstream Linux:** DSP 43–47 % lower, missed deadlines 55 → 0, PipeWire errors 176 → 3, Live's CPU 60–67 % lower.
   - The three runs agree within about 2 % per Set (DSP 6.33–6.44 / 6.63–6.85 / 5.77–5.83).
