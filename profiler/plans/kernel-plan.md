@@ -522,6 +522,22 @@ Living document, approved 2026-10-19: the status table is updated as each item l
   3. Whether, from then on, every cycle carries exactly one block at a steady phase, with no missed frames.
   4. At the play instant: when the transport's first heavy block runs, its phase and slack, and whether any block in the next 3 s is late, muted or off the one-per-cycle pattern.
 - No verdict: it tells whether the start and the play instant are aligned.
+- **D0016 — RESULT (2026-10-20 15:10–15:12; one run; 36,716 cycles and blocks from Live's first buffer, every probe hit recorded):** the start and the play instant are aligned. The graph's cycles are not evenly spaced: they alternate 1.0, 1.5, 1.5 ms.
+  - **First buffer:** the graph was already at 64 frames, so there was no size mismatch and no muted stretch. Blocks 1–3 were not admitted (Live not yet running its callback). From block 4, 10 ms after the first, there was exactly one block per cycle for all 36,712 blocks: no skipped or extra cycles, no missed frames, no muting.
+  - **Steady phase:** Live's `bufferSwitch` is entered 7 µs after the cycle's start (p99 22 µs). Live spends 74 µs in it (p99 163 µs).
+  - **Play instant:** the transport's first heavy block ran 10.6 ms after the play command, 8.5 µs into its cycle, with 1.5 ms of slack. In the 3 s after play: no late block, no muting, minimum slack 1.5 ms.
+  - **Late blocks: 3, all during Live's start-up, 8–9.5 s before play:**
+    - block 5 entered 6 ms after its cycle's start;
+    - block 951's callback ran 4.5 ms, 3.8 ms of it CPU (PipeASIO's telemetry), start-up work on the audio thread;
+    - block 705 "late" by 0.6 µs with 20 µs of work, an artefact of the deadline estimate (below).
+  - In the measured window (play + 5 s to + 35 s) no block exceeded 1 ms. The bench's stop, after the window, brought blocks of 1.0–1.2 ms.
+  - **The cycle pattern:** the cycles' starts (clock.nsec) are spaced 1,000 µs (12,205 cycles) or 1,500 µs (24,403), repeating 1.0, 1.5, 1.5 ms. The mean is 1,333.4 µs, which is 64 frames at 48 kHz; the position advances 64 frames every cycle.
+    - PipeWire drives the Focusrite from its period interrupt (`api.alsa.disable-tsched = true`, the pro-audio profile).
+    - snd-usb-audio completes the high-speed stream's 125 µs packets in 0.5 ms transfers, so a 1.333 ms period ends on a 0.5 ms boundary.
+    - **Every third cycle gives Live 1.0 ms instead of 1.333 ms.** A block of 1.0–1.33 ms, which Live's meter shows as 75–100 % and fine, misses the graph's deadline when it falls in a short cycle. That fits PipeWire errors without missed deadlines (D0014: 3 against 0).
+  - **The deadline estimate:** PipeWire's next-cycle estimate (`clock.next_nsec`, PipeASIO's deadline) lies a median 248 µs after the real next start, and before it in 16 % of cycles. PipeASIO's slack and late counts are therefore unreliable on this device; the real deadline is the next cycle's start.
+  - **Next:** make the cycles even, either with timer scheduling for the Focusrite (`api.alsa.disable-tsched = false`, with the headroom its 0.5 ms pointer needs) or with a period that is a multiple of 0.5 ms (72 frames: an even 1.5 ms). Then count PipeWire errors and the ramp's headroom.
+  - Files: `profiler/plans/findings/d0016/analysis.txt`; the raw probes on the laptop (`~/.local/share/profiler/runs/first-d0016`).
 
 ## Context
 - `WINE_POSIX_SPAWN=1` (T0020) removed the fork-induced page-fault storms, and dropouts are now rare. **T0022 (one audio thread per physical P-core, 5 workers) is a keep**: audio-thread CPU −26 %, Live CPU 46.9 → 35.0 %, DSP average lower. The goal now is more headroom: shorter, steadier audio blocks and less CPU, through kernel-level changes.

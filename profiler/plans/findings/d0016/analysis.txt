@@ -1,0 +1,39 @@
+cycles recorded 36716, blocks 36716; graph quantum over time (ms after the first cycle: frames): [(0.0, 64)]
+== driver instance 1: 36716 blocks recorded
+   first block: {'at_ms': 0.2, 'seq': 1, 'nframes': 64, 'graph_quantum': 64, 'flags': 0, 'after_cycle_start_us': 246.0, 'deadline_after_start_us': 1070.3}
+   muted blocks: 0; in sync (one block per cycle at the quantum) from: {'block': 4, 'at_ms': 10.3, 'after_first_block_ms': 10.1, 'quantum': 64}
+   steady blocks: 36712
+   steady cycles_per_block: {1: 36712}
+   steady other_size_blocks: 0
+   steady muted: 0
+   steady late: 3
+   steady phase_us_p50_p99_max: [6.3, 19.3, 5984.4]
+   steady bufferswitch_call_us_p50_p99_max: [7.1, 21.9, 5985.8]
+   steady live_us_p50_p99_max: [73.8, 162.8, 4530.9]
+   steady slack_us_min_p01_p50: [-4664.2, 1087.6, 1503.7]
+   steady missed_frames: 0
+== play at 9573.5 ms after the first cycle:
+   blocks_in_window: 2400
+   live_us_before_p50: 20.2
+   transport_start: {'after_play_ms': 10.59, 'seq': 7179, 'live_us': 269.0, 'phase_us': 8.5, 'slack_us': 1495.5, 'cycles_since_prev': 1, 'flags': 1}
+   late: 0
+   slack_us_min: 1495.5
+   live_us_max: 269.0
+   not_one_cycle_per_block: 0
+   muted: 0
+   missed_frames: 0
+   quanta: [64]
+after the full record, per second: {'seconds': 69, 'muted': 0, 'mismatched': 0, 'late': 3, 'missed_frames': 0, 'quanta': ['0', '64'], 'phase_max_us': 5984.39}
+PipeASIO lines in the launcher log: 336
+   [pipeasio telemetry] cycles=748 time_info=748 legacy=0 muted=0 dropped=0 block_range=742-1489 late=1
+   [pipeasio telemetry] monotonic_wall_ns phase=entry_to_live p50=979 p95=1924 p99=3239 max=6043
+   [pipeasio telemetry] monotonic_wall_ns phase=live_callback p50=21979 p95=34257 p99=128274 max=4535547
+   [pipeasio telemetry] monotonic_wall_ns phase=live_to_outputs p50=314 p95=574 p99=1012 max=3564
+   [pipeasio telemetry] thread_cpu_ns phase=entry_to_live p50=926 p95=1805 p99=3226 max=5808
+   [pipeasio telemetry] thread_cpu_ns phase=live_callback p50=15880 p95=24144 p99=46191 max=3758854
+   [pipeasio telemetry] thread_cpu_ns phase=live_to_outputs p50=281 p95=541 p99=892 max=3045
+   [pipeasio telemetry] cycles=750 time_info=750 legacy=0 muted=0 dropped=0 block_range=1490-2239 late=0
+   [pipeasio telemetry] monotonic_wall_ns phase=entry_to_live p50=913 p95=1915 p99=3400 max=4520
+   [pipeasio telemetry] monotonic_wall_ns phase=live_callback p50=22720 p95=34983 p99=46125 max=1058194
+   [pipeasio telemetry] monotonic_wall_ns phase=live_to_outputs p50=311 p95=562 p99=797 max=2397
+   [pipeasio telemetry] thread_cpu_ns phase=entry_to_live p50=890 p95=1778 p99=3126 max=4307
