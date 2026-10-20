@@ -509,6 +509,20 @@ Living document, approved 2026-10-19: the status table is updated as each item l
   - Against Windows, 3 workers are 27–35 % lower on DSP. The three runs agree within about 1 % per Set.
   - Files: `profiler/plans/findings/d0015-results.jsonl`.
 
+## D0016: Live's first buffer and play instant against PipeWire's cycle (diagnostic, written before its run)
+- **User:** "Lets focus on the first buffer that live gets as that determines if they are all insync"; "The start play instant in ableton if this isnt aligned internally with pipewire we have a window for unders".
+- **Background:** PipeASIO calls Live's `bufferSwitch` inside PipeWire's process callback, one block per graph cycle. It does so only while the graph's quantum equals Live's buffer size. Until then it mutes and runs Live on a wall-clock cadence (`patches/pipeasio/0005`).
+- **Design:** `profiler/trials/first-buffer.sh d0016 2 Inbuilts 30`.
+  - PipeASIO's USDT probes are armed by file before Live starts, so every cycle and block is recorded in full from the first one.
+  - pw-profiler runs from before Live starts. The bench's commands are marked by a sendto probe on the same clock.
+  - One bench window: Inbuilts, 30 s, kept configuration with 2 workers, `PIPEASIO_TELEMETRY=on`.
+- **Questions:**
+  1. The graph's quantum at Live's first buffer, and the first block's flags and phase.
+  2. The muted stretch, and when one block per cycle begins.
+  3. Whether, from then on, every cycle carries exactly one block at a steady phase, with no missed frames.
+  4. At the play instant: when the transport's first heavy block runs, its phase and slack, and whether any block in the next 3 s is late, muted or off the one-per-cycle pattern.
+- No verdict: it tells whether the start and the play instant are aligned.
+
 ## Context
 - `WINE_POSIX_SPAWN=1` (T0020) removed the fork-induced page-fault storms, and dropouts are now rare. **T0022 (one audio thread per physical P-core, 5 workers) is a keep**: audio-thread CPU −26 %, Live CPU 46.9 → 35.0 %, DSP average lower. The goal now is more headroom: shorter, steadier audio blocks and less CPU, through kernel-level changes.
 - User (2026-10-19): "We want ableton specific improvement… lets get clever and esoteric for this ableton only kernel patch concept"; then "complete implementation plan for kernel level items".
