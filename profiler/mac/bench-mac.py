@@ -10,7 +10,9 @@ Per Set, as profiler/windows/bench-win.py does on Windows: Live is opened with t
 must answer /abl/bench/ping, Live's log must be quiet for SETTLE seconds, then /abl/bench/rewind and /abl/bench/play,
 SETTLE seconds and a quiet log again, then the measured window. During the window it keeps the handler's
 /abl/bench/cpu reports (Live's average and peak, percent of the audio buffer period, every 500 ms) and, at both ends,
-every thread's CPU time and name and the process's (libproc's proc_pidinfo, no root needed for one's own processes).
+every thread's CPU time and name and the process's (libproc's proc_pidinfo, no root needed for one's own processes);
+with the bench's sudoers rule for /usr/bin/powermetrics, its cpu_power sampler every second over the window (the
+clusters' clock while active and the CPU's power on Apple silicon, the package power and average clock on Intel).
 Reports queued before the window are discarded. Afterwards /abl/bench/stop, Live is ended and its crash-recovery files
 are removed, so the next start has no recovery dialog.
 
@@ -254,6 +256,39 @@ def log_facts(path, start_offset):
     return facts
 
 
+POWERMETRICS = "/usr/bin/powermetrics"
+# per sample of powermetrics' cpu_power sampler: Apple silicon reports each cluster's clock while active and the CPU's
+# power, Intel the package power and the average clock against nominal
+POWER_PATTERNS = (("p_cluster_mhz", r"P\d*-Cluster HW active frequency:\s+([\d.]+) MHz"),
+                  ("e_cluster_mhz", r"E-Cluster HW active frequency:\s+([\d.]+) MHz"),
+                  ("cpu_power_mw", r"^CPU Power:\s+([\d.]+) mW"),
+                  ("package_w", r"Intel energy model derived package power \(CPUs\+GT\+SA\):\s+([\d.]+)W"),
+                  ("cpu_average_mhz", r"CPU Average frequency as fraction of nominal:\s+[\d.]+% \(([\d.]+) Mhz\)"))
+
+
+def powermetrics_allowed():
+    """True when sudo lets this user run powermetrics without a password (the bench's sudoers rule)."""
+    return subprocess.run(["sudo", "-n", "-l", POWERMETRICS], capture_output=True).returncode == 0
+
+
+def powermetrics_summary(path):
+    """Medians over the samples of what POWER_PATTERNS finds, and the sample count; None without a file."""
+    try:
+        text = open(path, errors="replace").read()
+    except OSError:
+        return None
+    samples = text.split("*** Sampled system activity")[1:]
+    values = {}
+    for sample in samples:
+        for key, pattern in POWER_PATTERNS:
+            found = re.findall(pattern, sample, re.M)
+            if found:
+                values.setdefault(key, []).append(statistics.mean(float(v) for v in found))
+    out = {key: round(statistics.median(v), 1) for key, v in values.items()}
+    out["samples"] = len(samples)
+    return out
+
+
 def dsp_summary(averages, peaks):
     """As scripts/bench-report.py: average of the averages, window maximum and median of the peaks, peaks > 100 %."""
     ordered = sorted(peaks)
@@ -323,6 +358,12 @@ def run_set(set_name, out, duration, workers, ramp, dialog_helper):
     window = ramp * RAMP_PERIOD_S + 1 if ramp else duration
     log("window %.0f s%s" % (window, " (load ramp, %d passes)" % ramp if ramp else ""))
     averages, peaks, playing, cpu_rows, raw = [], [], [], [], []
+    power_path = os.path.join(out, "raw", "powermetrics.txt")
+    power = None
+    if powermetrics_allowed():
+        power = subprocess.Popen(["sudo", "-n", POWERMETRICS, "--samplers", "cpu_power", "-i", "1000",
+                                  "-n", str(int(window)), "-o", power_path],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     before = thread_times(pid)
     p_before = task_cpu_seconds(pid)
     queued = osc.drain()
@@ -359,6 +400,11 @@ def run_set(set_name, out, duration, workers, ramp, dialog_helper):
     after = thread_times(pid)
     p_after = task_cpu_seconds(pid)
     osc.send("/abl/bench/stop")
+    if power is not None:
+        try:
+            power.wait(timeout=15)                  # it stops by itself after its sample count (it runs as root)
+        except subprocess.TimeoutExpired:
+            pass
 
     threads = []
     for tid, (t1, name, pri) in after.items():
@@ -380,6 +426,7 @@ def run_set(set_name, out, duration, workers, ramp, dialog_helper):
         "playing_events": playing,
         "duplications": dups,
         "log": log_facts(log_path, log_offset),
+        "power": powermetrics_summary(power_path) if power is not None else None,
     })
     end_live()
     clean_crash_files()
