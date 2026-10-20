@@ -408,6 +408,19 @@ Living document, approved 2026-10-19: the status table is updated as each item l
     - The next question is what costs the time there; each copy's note-ons on "Vocal 05" are the lead.
   - Files: `profiler/plans/findings/d0011/` (per-run reports with per-step power, the comparison, the bar histograms).
 
+## D0012: audio worker count 8–12, smoke test (2026-10-20, written before its runs)
+- **User:** "lets run a test to figure out exactly the best audio worker count for linux machine", then "Lets do only a run of 8 to 12", "This is a quick smoke test to see what is better. We can do a full run later", "We just want current best across 8 to 12 workers one pass".
+- **Counts in use today:** the trials keep 5 workers, one per physical P-core (T0022). The everyday launcher setting is auto, which gives 15 workers on this laptop (Options.txt `-MaxAudioThreads=15`), with nothing pinned.
+- **Design:** one bench run per count (8, 9, 10, 11, 12), in the order 10, 8, 12, 9, 11 (`profiler/trials/d0012.sh`).
+  - pipeasio-rt on CPU 0, and each AudioCalc thread on a CPU of its own: the P-cores' first threads (2, 4, 6, 8, 10), then their siblings (3, 5, 7, 9, 11), then the E-cores (12, 13).
+  - So 8 adds three siblings, 10 fills every P-core thread outside pipeasio-rt's core, and 11 and 12 add one and two E-cores.
+  - Everything else as kept: posix_spawn, PipeASIO realtime, the new display, every-boot shallow idle, `chrt -r 10` for all of Live.
+- **Reading** (`profiler/trials/d0012_summary.py`):
+  - The best count has the lowest DSP average over the three Sets (the mean of each Set's ratio to the five counts' mean).
+  - Reported: peaks, PipeWire errors, xruns, the audio-thread and Live CPU, and the worker count seen.
+  - Today's T0032 A runs (the kept 5 workers, same boot and configuration) are shown for context.
+  - One run per count gives no verdict; a full run decides.
+
 ## Context
 - `WINE_POSIX_SPAWN=1` (T0020) removed the fork-induced page-fault storms, and dropouts are now rare. **T0022 (one audio thread per physical P-core, 5 workers) is a keep**: audio-thread CPU −26 %, Live CPU 46.9 → 35.0 %, DSP average lower. The goal now is more headroom: shorter, steadier audio blocks and less CPU, through kernel-level changes.
 - User (2026-10-19): "We want ableton specific improvement… lets get clever and esoteric for this ableton only kernel patch concept"; then "complete implementation plan for kernel level items".
