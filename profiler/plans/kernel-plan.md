@@ -494,6 +494,20 @@ Living document, approved 2026-10-19: the status table is updated as each item l
 - **User:** "Now lets do the same run with 3 workers".
 - **Design:** as D0014 with `ABLETON_MAX_AUDIO_THREADS=3`, the three AudioCalc threads on CPUs 2, 4 and 6 (`ORDER="A1 A2 A3" LINUX_CONFIG=kept-w3 TRIAL_ID=D0015 profiler/windows/cross-os-trial.sh d0015`).
 - **Compared with:** D0014 (2 workers), T0031 B (5 workers), D0005 (Windows) and D0006 (upstream), as in D0014's table. No verdict.
+- **D0015 — RESULT (2026-10-20 14:38–15:09; three runs clean, each from a fresh boot; 3 workers on CPUs 2, 4, 6 in every Set-run; C1E off and the P-cores no deeper than C1 at every boot):**
+
+  | Per Set, medians of three runs | 2 workers (D0014) | **3 workers (D0015)** | 5 workers (T0031 B) | Windows as shipped (D0005, corrected) | Linux upstream (D0006) |
+  |---|---|---|---|---|---|
+  | DSP average % (Inbuilts / Max4Live / VSTs) | 6.4 / 6.8 / 5.8 | **6.4 / 6.6 / 6.0** | 6.5 / 6.5 / 6.2 | 9.4 / 10.0 / 8.2 | 11.3 / 11.8 / 11.0 |
+  | Missed deadlines (9 Set-runs) | 0 | **0** | 1 | 2 | 55 |
+  | PipeWire errors (9 Set-runs) | 3 | **2** | 12 | — | 176 |
+  | Live CPU % | 25.8 / 25.3 / 20.1 | **25.4 / 26.4 / 20.5** | 27.3 / 29.4 / 22.7 | 33.0 / 33.2 / 23.8 | 63.8 / 68.2 / 60.2 |
+  | Audio-thread CPU % | 12.4 / 13.4 / 9.4 | **13.7 / 14.6 / 10.5** | 15.7 / 16.7 / 12.7 | 28.1 / 29.5 / 19.6 | 51.2 / 55.4 / 50.0 |
+
+  - Block time with 2, 3 and 5 workers is level within the runs' spread. 3 against 2: −0.5 %, −3.4 %, +2.8 %. 3 against 5: −1.4 %, +0.5 %, −3.4 %.
+  - The audio threads cost about 1.2 points more with 3 workers than with 2, and 12–18 % less than with 5.
+  - Against Windows, 3 workers are 27–35 % lower on DSP. The three runs agree within about 1 % per Set.
+  - Files: `profiler/plans/findings/d0015-results.jsonl`.
 
 ## Context
 - `WINE_POSIX_SPAWN=1` (T0020) removed the fork-induced page-fault storms, and dropouts are now rare. **T0022 (one audio thread per physical P-core, 5 workers) is a keep**: audio-thread CPU −26 %, Live CPU 46.9 → 35.0 %, DSP average lower. The goal now is more headroom: shorter, steadier audio blocks and less CPU, through kernel-level changes.
