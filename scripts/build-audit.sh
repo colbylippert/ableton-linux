@@ -10,7 +10,7 @@ SERIES="$root/patches/SERIES.sha256"
 say()  { printf '%s\n' "$*"; }
 fail() { printf '!! %s\n' "$*" >&2; exit 1; }
 
-readonly REQUIRED_WINE_TAIL='0112-ntdll-posix-spawn.patch'
+readonly REQUIRED_WINE_TAIL='0113-avrt-mmcss-realtime.patch'
 readonly REQUIRED_PERFORMANCE_TAIL='performance/0001-ntdll-alertable-sleep-fast-path.patch'
 readonly REQUIRED_PIPEASIO_TAIL='pipeasio/0017-usdt-block-markers.patch'
 
@@ -490,6 +490,7 @@ FINGERPRINTS='
 0110|ascii|lib/wine/x86_64-windows/wined3d.dll|WINED3D_PRESENT_SKIP
 0111|ascii|lib/wine/x86_64-windows/wined3d.dll|WINED3D_NO_ALT_ENTER_HOOK
 0112|ascii|lib/wine/x86_64-unix/ntdll.so|WINE_POSIX_SPAWN
+0113|ascii|lib/wine/x86_64-unix/avrt.so|WINE_MMCSS
 performance/0001|ascii|lib/wine/x86_64-unix/ntdll.so|WINE_APC_FASTPATH
 pipeasio/0001|ascii|lib/wine/x86_64-unix/pipeasio.dll.so|pipeasio-clamp-sample-rate
 pipeasio/0002|ascii|lib/wine/x86_64-unix/pipeasio.dll.so|pipeasio-midi-timebase

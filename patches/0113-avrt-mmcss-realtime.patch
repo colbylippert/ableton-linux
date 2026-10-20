@@ -1,0 +1,410 @@
+From b5fa5c2f9e69d87a35e388518735f9050b6cb085 Mon Sep 17 00:00:00 2001
+From: colby <colby@Live.localdomain>
+Date: Tue, 20 Oct 2026 06:38:55 -0400
+Subject: [PATCH] avrt: Optionally run "Pro Audio" threads as Linux realtime
+ threads (WINE_MMCSS).
+
+On Windows, MMCSS raises a thread that registers for the "Pro Audio"
+task into the realtime priority range; Wine's avrt functions are stubs,
+so such threads keep normal scheduling. With WINE_MMCSS set, a thread
+registering for "Pro Audio" becomes SCHED_FIFO at WINE_MMCSS_RTPRIO
+(1-98, default 10), with SCHED_RESET_ON_FORK so threads it starts are
+not realtime; AvSetMmThreadPriority adds its -2..+2 and
+AvRevertMmThreadCharacteristics restores the earlier scheduling. The
+handle carries the unix tid and that earlier scheduling, so nothing is
+allocated and a stub handle is never dereferenced. Unset, or without the
+unix side (32-bit), every function is the stub it was. The process
+needs RLIMIT_RTPRIO (or CAP_SYS_NICE); without it the stub behaviour
+remains and winediag says so once.
+
+Ableton Live registers its audio worker threads (AudioCalc, with
+AVRT_PRIORITY_CRITICAL) and two timer threads for "Pro Audio".
+---
+ dlls/avrt/Makefile.in |   4 +-
+ dlls/avrt/main.c      | 137 ++++++++++++++++++++++++++++++++++++++++++++++++++
+ dlls/avrt/unixlib.c   | 122 ++++++++++++++++++++++++++++++++++++++++++++
+ dlls/avrt/unixlib.h   |  54 ++++++++++++++++++++
+ 4 files changed, 316 insertions(+), 1 deletion(-)
+
+diff --git a/dlls/avrt/Makefile.in b/dlls/avrt/Makefile.in
+index a76c61a..447b09b 100644
+--- a/dlls/avrt/Makefile.in
++++ b/dlls/avrt/Makefile.in
+@@ -1,6 +1,8 @@
+ MODULE    = avrt.dll
++UNIXLIB   = avrt.so
+ IMPORTLIB = avrt
+ IMPORTS   = user32
+ 
+ SOURCES = \
+-	main.c
++	main.c \
++	unixlib.c
+diff --git a/dlls/avrt/main.c b/dlls/avrt/main.c
+index 68af35c..8908ca1 100644
+--- a/dlls/avrt/main.c
++++ b/dlls/avrt/main.c
+@@ -19,14 +19,97 @@
+ 
+ #include <stdarg.h>
+ 
++#include "ntstatus.h"
++#define WIN32_NO_STATUS
+ #include "windef.h"
+ #include "winbase.h"
+ #include "winnls.h"
++#include "winternl.h"
+ #include "wine/debug.h"
+ #include "avrt.h"
++#include "unixlib.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(avrt);
+ 
++static BOOL unix_ready;
++
++#ifdef _WIN64
++
++WINE_DECLARE_DEBUG_CHANNEL(winediag);
++
++/* WINE_MMCSS=1 makes threads that register for the "Pro Audio" task realtime, as MMCSS boosts them on Windows:
++ * SCHED_FIFO at WINE_MMCSS_RTPRIO (default 10), AvSetMmThreadPriority adding its -2..+2, reverted by
++ * AvRevertMmThreadCharacteristics. Unset, every function stays the stub it was. The process needs RLIMIT_RTPRIO (or
++ * CAP_SYS_NICE) for the priority; without it the stub behaviour remains. */
++static BOOL mmcss_enabled;
++static int mmcss_base;
++static INIT_ONCE mmcss_once = INIT_ONCE_STATIC_INIT;
++
++static BOOL CALLBACK mmcss_init( INIT_ONCE *once, void *param, void **context )
++{
++    struct mmcss_config_params params = {0};
++
++    if (unix_ready && !WINE_UNIX_CALL( unix_mmcss_config, &params ) && params.enabled)
++    {
++        mmcss_enabled = TRUE;
++        mmcss_base = params.base;
++        ERR_(winediag)( "MMCSS: \"Pro Audio\" threads run SCHED_FIFO %d, AvSetMmThreadPriority adds -2..+2 (WINE_MMCSS)\n",
++                        mmcss_base );
++    }
++    return TRUE;
++}
++
++static BOOL mmcss_on(void)
++{
++    InitOnceExecuteOnce( &mmcss_once, mmcss_init, NULL, NULL );
++    return mmcss_enabled;
++}
++
++/* The handle of a realtime thread carries its unix tid and how it was scheduled before, so nothing is allocated and a
++ * stub handle is never dereferenced: 0xa7 in bits 56-63, the tid in 32-55, the old policy in 24-31 (bit 31 for
++ * SCHED_RESET_ON_FORK), the old priority in 16-23, the base priority in 8-15 and 0x5a in 0-7. */
++static HANDLE mmcss_handle( int tid, int old_policy, int old_prio, int base )
++{
++    ULONG_PTR policy = (old_policy & 0x7) | ((old_policy & 0x40000000) ? 0x80 : 0);
++
++    return (HANDLE)(((ULONG_PTR)0xa7 << 56) | ((ULONG_PTR)(tid & 0xffffff) << 32) | (policy << 24) |
++                    ((ULONG_PTR)(old_prio & 0xff) << 16) | ((ULONG_PTR)(base & 0xff) << 8) | 0x5a);
++}
++
++static BOOL mmcss_decode( HANDLE handle, int *tid, int *old_policy, int *old_prio, int *base )
++{
++    ULONG_PTR value = (ULONG_PTR)handle;
++
++    if ((value >> 56) != 0xa7 || (value & 0xff) != 0x5a) return FALSE;
++    *tid = (value >> 32) & 0xffffff;
++    *old_policy = ((value >> 24) & 0x7) | (((value >> 24) & 0x80) ? 0x40000000 : 0);
++    *old_prio = (value >> 16) & 0xff;
++    *base = (value >> 8) & 0xff;
++    return TRUE;
++}
++
++static HANDLE mmcss_register( const WCHAR *name, DWORD *index )
++{
++    struct mmcss_set_params params = {0};
++    static LONG warned;
++
++    if (!mmcss_on() || CompareStringOrdinal( name, -1, L"Pro Audio", -1, TRUE ) != CSTR_EQUAL) return NULL;
++    params.prio = mmcss_base;
++    if (WINE_UNIX_CALL( unix_mmcss_set, &params ) || params.error)
++    {
++        if (!InterlockedExchange( &warned, 1 ))
++            ERR_(winediag)( "MMCSS: could not make thread %04lx realtime (errno %d); is RLIMIT_RTPRIO high enough?\n",
++                            GetCurrentThreadId(), params.error );
++        return NULL;
++    }
++    TRACE( "(%s,%p): thread %04lx (unix %d) SCHED_FIFO %d\n", debugstr_w(name), index, GetCurrentThreadId(),
++           params.tid, params.prio );
++    *index = 1;
++    return mmcss_handle( params.tid, params.old_policy, params.old_prio, mmcss_base );
++}
++
++#endif  /* _WIN64 */
++
+ static inline WCHAR *strdupAW(const char *src)
+ {
+     int len;
+@@ -56,6 +139,12 @@ HANDLE WINAPI AvSetMmThreadCharacteristicsA(const char *name, DWORD *index)
+ 
+ HANDLE WINAPI AvSetMmThreadCharacteristicsW(const WCHAR *name, DWORD *index)
+ {
++#ifdef _WIN64
++    HANDLE handle;
++
++    if (name && index && (handle = mmcss_register( name, index ))) return handle;
++#endif
++
+     FIXME("(%s,%p): stub\n", debugstr_w(name), index);
+ 
+     if (!name)
+@@ -81,12 +170,48 @@ BOOL WINAPI AvQuerySystemResponsiveness(HANDLE AvrtHandle, ULONG *value)
+ 
+ BOOL WINAPI AvRevertMmThreadCharacteristics(HANDLE AvrtHandle)
+ {
++#ifdef _WIN64
++    int tid, old_policy, old_prio, base;
++
++    if (mmcss_decode( AvrtHandle, &tid, &old_policy, &old_prio, &base ))
++    {
++        struct mmcss_thread_params params = { .tid = tid, .policy = old_policy, .prio = old_prio };
++
++        WINE_UNIX_CALL( unix_mmcss_thread, &params );   /* a thread that has exited (ESRCH) needs nothing */
++        TRACE("(%p): unix %d back to policy %#x, priority %d (error %d)\n", AvrtHandle, tid, old_policy, old_prio,
++              params.error);
++        return TRUE;
++    }
++#endif
+     FIXME("(%p): stub\n", AvrtHandle);
+     return TRUE;
+ }
+ 
+ BOOL WINAPI AvSetMmThreadPriority(HANDLE AvrtHandle, AVRT_PRIORITY prio)
+ {
++#ifdef _WIN64
++    int tid, old_policy, old_prio, base;
++
++    if (mmcss_decode( AvrtHandle, &tid, &old_policy, &old_prio, &base ))
++    {
++        struct mmcss_thread_params params = { .tid = tid, .policy = -1, .prio = base + prio };
++
++        if (prio < AVRT_PRIORITY_VERYLOW || prio > AVRT_PRIORITY_CRITICAL)
++        {
++            SetLastError(ERROR_INVALID_PARAMETER);
++            return FALSE;
++        }
++        if (params.prio < 1) params.prio = 1;
++        if (params.prio > 98) params.prio = 98;
++        if (WINE_UNIX_CALL( unix_mmcss_thread, &params ) || params.error)
++        {
++            WARN("(%p)->(%d): unix %d SCHED_FIFO %d failed (errno %d)\n", AvrtHandle, prio, tid, params.prio, params.error);
++            return FALSE;
++        }
++        TRACE("(%p)->(%d): unix %d SCHED_FIFO %d\n", AvrtHandle, prio, tid, params.prio);
++        return TRUE;
++    }
++#endif
+     FIXME("(%p)->(%u) stub\n", AvrtHandle, prio);
+     return TRUE;
+ }
+@@ -133,3 +258,15 @@ HANDLE WINAPI AvSetMmMaxThreadCharacteristicsW(const WCHAR *task1, const WCHAR *
+ 
+     return (HANDLE)0x12345678;
+ }
++
++BOOL WINAPI DllMain( HINSTANCE hinst, DWORD reason, void *reserved )
++{
++    switch (reason)
++    {
++    case DLL_PROCESS_ATTACH:
++        DisableThreadLibraryCalls( hinst );
++        unix_ready = !__wine_init_unix_call();   /* without it (32-bit, no unix side) every function is the stub */
++        break;
++    }
++    return TRUE;
++}
+diff --git a/dlls/avrt/unixlib.c b/dlls/avrt/unixlib.c
+new file mode 100644
+index 0000000..d0fb994
+--- /dev/null
++++ b/dlls/avrt/unixlib.c
+@@ -0,0 +1,122 @@
++/*
++ * Unix side of avrt: MMCSS "Pro Audio" threads as Linux realtime threads
++ *
++ * Copyright 2026 ableton-linux contributors
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#if 0
++#pragma makedep unix
++#endif
++
++#include "config.h"
++
++#include <stdarg.h>
++#include <stdlib.h>
++#include <string.h>
++#include <strings.h>
++#include <errno.h>
++#include <unistd.h>
++#include <sched.h>
++#ifdef __linux__
++# include <sys/syscall.h>
++#endif
++
++#include "ntstatus.h"
++#define WIN32_NO_STATUS
++#include "windef.h"
++#include "winternl.h"
++
++#include "unixlib.h"
++
++#ifndef SCHED_RESET_ON_FORK
++#define SCHED_RESET_ON_FORK 0x40000000
++#endif
++
++/* WINE_MMCSS: the plain boolean switch; WINE_MMCSS_RTPRIO: the base SCHED_FIFO priority (1-98, default 10) */
++static NTSTATUS mmcss_config( void *args )
++{
++    struct mmcss_config_params *params = args;
++    const char *value = getenv( "WINE_MMCSS" ), *base = getenv( "WINE_MMCSS_RTPRIO" );
++
++    params->enabled = value && (!strcmp( value, "1" ) || !strcasecmp( value, "true" ) ||
++                                !strcasecmp( value, "yes" ) || !strcasecmp( value, "on" ));
++    params->base = 10;
++    if (base)
++    {
++        char *end;
++        long n = strtol( base, &end, 10 );
++        if (end != base && !*end && n >= 1 && n <= 98) params->base = n;
++    }
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS mmcss_set( void *args )
++{
++#ifdef __linux__
++    struct mmcss_set_params *params = args;
++    struct sched_param param;
++
++    params->tid = syscall( SYS_gettid );
++    params->old_policy = sched_getscheduler( 0 );
++    params->old_prio = sched_getparam( 0, &param ) ? 0 : param.sched_priority;
++    param.sched_priority = params->prio;
++    /* threads this one starts do not inherit realtime scheduling */
++    params->error = sched_setscheduler( 0, SCHED_FIFO | SCHED_RESET_ON_FORK, &param ) ? errno : 0;
++    return STATUS_SUCCESS;
++#else
++    return STATUS_NOT_SUPPORTED;
++#endif
++}
++
++static NTSTATUS mmcss_thread( void *args )
++{
++#ifdef __linux__
++    struct mmcss_thread_params *params = args;
++    struct sched_param param;
++    /* keep SCHED_RESET_ON_FORK: once set, an unprivileged thread may not clear it (EPERM), and it is harmless on
++     * the policy restored by AvRevertMmThreadCharacteristics */
++    int policy = (params->policy < 0 ? SCHED_FIFO : params->policy) | SCHED_RESET_ON_FORK;
++
++    param.sched_priority = params->prio;
++    params->error = sched_setscheduler( params->tid, policy, &param ) ? errno : 0;
++    return STATUS_SUCCESS;
++#else
++    return STATUS_NOT_SUPPORTED;
++#endif
++}
++
++const unixlib_entry_t __wine_unix_call_funcs[] =
++{
++    mmcss_config,
++    mmcss_set,
++    mmcss_thread,
++};
++
++C_ASSERT( ARRAYSIZE(__wine_unix_call_funcs) == unix_funcs_count );
++
++#ifdef _WIN64
++
++const unixlib_entry_t __wine_unix_call_wow64_funcs[] =
++{
++    mmcss_config,
++    mmcss_set,
++    mmcss_thread,
++};
++
++C_ASSERT( ARRAYSIZE(__wine_unix_call_wow64_funcs) == unix_funcs_count );
++
++#endif  /* _WIN64 */
+diff --git a/dlls/avrt/unixlib.h b/dlls/avrt/unixlib.h
+new file mode 100644
+index 0000000..6b4114e
+--- /dev/null
++++ b/dlls/avrt/unixlib.h
+@@ -0,0 +1,54 @@
++/*
++ * Unix side of avrt: MMCSS "Pro Audio" threads as Linux realtime threads
++ *
++ * Copyright 2026 ableton-linux contributors
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include "wine/unixlib.h"
++
++/* Every field is an int, so the layout is the same for 32-bit callers (the wow64 table reuses the functions). */
++
++struct mmcss_config_params
++{
++    int enabled;     /* out: WINE_MMCSS is a true value */
++    int base;        /* out: WINE_MMCSS_RTPRIO (1-98), 10 by default */
++};
++
++struct mmcss_set_params
++{
++    int prio;        /* in: the SCHED_FIFO priority for the calling thread */
++    int tid;         /* out: the calling thread's unix tid */
++    int old_policy;  /* out: its policy before (with SCHED_RESET_ON_FORK if it was set) */
++    int old_prio;    /* out: its priority before */
++    int error;       /* out: 0, or the errno of sched_setscheduler */
++};
++
++struct mmcss_thread_params
++{
++    int tid;         /* in: a unix tid of this process */
++    int policy;      /* in: the policy to apply, as sched_setscheduler takes it; -1: SCHED_FIFO, reset on fork */
++    int prio;        /* in */
++    int error;       /* out: 0, or errno */
++};
++
++enum avrt_funcs
++{
++    unix_mmcss_config,
++    unix_mmcss_set,
++    unix_mmcss_thread,
++    unix_funcs_count,
++};

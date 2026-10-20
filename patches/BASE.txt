@@ -11,7 +11,7 @@ point-version gap with upstream's actively-maintained branch and with ENCORE
 The rebase involved five merge conflicts and uncovered three additional build
 breaks, plus a `build.sh`/`pipefail` tooling issue.
 
-The Wine series contains 100 patch files and ends at 0112. The absent numbers
+The Wine series contains 101 patch files and ends at 0113. The absent numbers
 are 0027, 0044, 0072, 0074, 0090 through 0095, 0097, and 0098; their reasons
 are declared in `SERIES_GAPS` in `scripts/build-audit.sh`. Patch 0073 keeps
 the wheel coordinate fix separate. Patch 0100 combines 10 pointer patches.
@@ -523,6 +523,17 @@ Patch 0112 lets Wine start new processes with `posix_spawn()` (`WINE_POSIX_SPAWN
   spawn. Unset, the fork path runs. The fingerprint literal is `WINE_POSIX_SPAWN`
   in `ntdll.so`. See `notes/ABLETON-WINE-POSIX-SPAWN.md` and
   `tools/spawncowprobe.c`.
+Patch 0113 runs MMCSS "Pro Audio" threads as Linux realtime threads (`WINE_MMCSS`).
+  On Windows, MMCSS raises a thread that registers for the "Pro Audio" task into the
+  realtime priority range; Wine's avrt functions are stubs, so the launcher makes the
+  whole of Live realtime instead. With `WINE_MMCSS=1`, `AvSetMmThreadCharacteristicsW`
+  (`dlls/avrt/main.c`) makes a "Pro Audio" thread `SCHED_FIFO` at `WINE_MMCSS_RTPRIO`
+  (default 10) through avrt's new unix side (`dlls/avrt/unixlib.c`), with
+  `SCHED_RESET_ON_FORK`; `AvSetMmThreadPriority` adds its -2..+2 and
+  `AvRevertMmThreadCharacteristics` restores the earlier scheduling. Live registers its
+  AudioCalc workers (critical priority) and two timer threads. Unset, every function is
+  the stub it was. The fingerprint literal is `WINE_MMCSS` in `avrt.so`. See
+  `notes/ABLETON-WINE-MMCSS.md` and `tools/mmcssprobe.c`.
 - `pipeasio/0017` adds six USDT probes (provider `pipeasio`) to the PipeASIO
   driver: `cycle_start` and `cycle_end` around the PipeWire cycle in
   `audio_on_process`, and `block_start`, `block_before_live`,

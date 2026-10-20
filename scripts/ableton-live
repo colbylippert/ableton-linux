@@ -145,6 +145,13 @@ RUNTIME VARIABLES:
         0112), so starting Live's helpers does not leave Live's memory
         write-protected; unset forks as upstream
 
+    WINE_MMCSS=1
+        run threads that register with MMCSS for "Pro Audio" (Live's
+        audio workers) as SCHED_FIFO threads (patch 0113), at
+        WINE_MMCSS_RTPRIO (default 10) plus their MMCSS priority; with
+        ABLETON_RT=off the rest of Live then runs at normal priority;
+        unset keeps Wine's stubs
+
     The pointer variables below override the saved pointer setting
     for one launch; the launcher exports none of them, and registry
     values hold the persistent settings. Values ignore letter case;
