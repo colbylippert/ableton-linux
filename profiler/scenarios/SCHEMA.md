@@ -48,6 +48,7 @@ upstream AbletonOSC.
 | `add_notes` | `track`, `clip`, `notes` list of `[pitch 0–127, start ≥ 0, duration > 0, velocity 0–127, mute 0 or 1]` | `/live/clip/add/notes T C (P S D V M)…` | all; benchmark: setup only |
 | `show_view` | `view` text (`Session`, `Arranger`, `Detail/DeviceChain`, …) | `/abl/bench/show-view NAME` | all; never in benchmark |
 | `load_device` | `kind` one of `instruments`, `audio_effects`, `plugins`, `max_for_live`; `name` text; optional `track` index | `/abl/bench/load-device KIND NAME [T]` | all; never in benchmark |
+| `duplicate_all` | — | `/abl/bench/duplicate-all` (one load-ramp pass: every top-level track the Set had at the first pass is duplicated once, a group with its children; the reply carries the pass, the track count and the milliseconds) | all; never in benchmark |
 | `marker` | `name` marker name | `/abl/bench/scenario-marker NAME` (echoed with song time into `osc.tsv`) | all |
 | `sleep` | `seconds` > 0 | nothing; the driver waits | setup only |
 

@@ -328,6 +328,10 @@ def load_device(kind: str, name: str, track: int | None = None) -> Message:
     return send("/abl/bench/load-device", *values)
 
 
+def duplicate_all() -> Message:
+    return send("/abl/bench/duplicate-all")
+
+
 def show_view(name: str) -> Message:
     return send("/abl/bench/show-view", str(name))
 

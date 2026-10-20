@@ -155,6 +155,7 @@ OPS: dict[str, tuple[dict[str, Callable[[object], bool]], dict[str, Callable[[ob
     "add_notes": ({"track": index, "clip": index, "notes": notes}, {}),
     "show_view": ({"view": text}, {}),
     "load_device": ({"kind": device_kind, "name": text}, {"track": index}),
+    "duplicate_all": ({}, {}),
     "marker": ({"name": marker_name}, {}),
     "sleep": ({"seconds": positive}, {}),
 }
@@ -166,7 +167,8 @@ PHASE_OPS = {
 }
 # A benchmark scenario keeps the set topology and the browser out of the
 # window; it may still prepare clips before the window starts.
-BENCHMARK_FORBIDDEN = {"load_device", "create_midi_track", "create_audio_track", "delete_track", "show_view"}
+BENCHMARK_FORBIDDEN = {"load_device", "create_midi_track", "create_audio_track", "delete_track", "show_view",
+                       "duplicate_all"}
 BENCHMARK_SETUP_ONLY = {"create_clip", "add_notes", "set_quantization"}
 TOP_KEYS = {"schema", "name", "kind", "base_set", "description", "requires", "setup", "timeline", "teardown"}
 REQUIRED_TOP = TOP_KEYS - {"description"}
@@ -189,6 +191,7 @@ SENDERS: dict[str, Callable[[dict], liveosc.Message]] = {
     "add_notes": lambda step: liveosc.add_notes(step["track"], step["clip"], step["notes"]),
     "show_view": lambda step: liveosc.show_view(step["view"]),
     "load_device": lambda step: liveosc.load_device(step["kind"], step["name"], step.get("track")),
+    "duplicate_all": lambda step: liveosc.duplicate_all(),
     "marker": lambda step: liveosc.marker(step["name"]),
 }
 

@@ -14,6 +14,7 @@ Live API call is logged as "bench: ..." which the manager relays to
 import collections
 import os
 import sys
+import time
 import traceback
 
 import Live
@@ -34,6 +35,12 @@ TICK_MS = 100
 # The Max device reported CPU every 500 ms without being asked; the suite's
 # osc collector relies on that.
 DEFAULT_CPU_PERIOD_MS = 500
+# The master volume the first load-ramp pass sets (/abl/bench/duplicate-all), about -16 dB below unity (0.85), so
+# the sum of the copies does not clip at the output; the devices process the same at any volume. Everything reaches
+# the output through the master (the return tracks too) and Live mixes in floating point, so nothing clips before it.
+# Sends and other mixer settings are left alone: setting an automated parameter overrides its automation for the
+# rest of the session, which would change how the Set plays. For the same reason an automated master is left as is.
+RAMP_MASTER_VOLUME = 0.5
 # Browser roots that /abl/bench/load-device searches by item name.
 BROWSER_ROOTS = ("instruments", "audio_effects", "midi_effects", "plugins", "max_for_live")
 SCRIPT_PATH = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
@@ -54,6 +61,9 @@ class BenchHandler(AbletonOSCHandler):
         self.browser_index = {}
         self.browser_pending = {}
         self.cpu_attribute_ok = False
+        self.ramp_originals = None
+        self.ramp_pass = 0
+        self.ramp_master_down = 0
 
         self._add("ping", self._ping)
         self._add("play", self._play)
@@ -69,6 +79,7 @@ class BenchHandler(AbletonOSCHandler):
         self._add("load-device", self._load_device)
         self._add("subscribe", self._subscribe)
         self._add("unsubscribe", self._unsubscribe)
+        self._add("duplicate-all", self._duplicate_all)
         self._startup()
 
     def clear_api(self):
@@ -285,6 +296,36 @@ class BenchHandler(AbletonOSCHandler):
 
     def _subscribe(self, params):
         self.subscribers.add(("127.0.0.1", int(params[0])))
+
+    def _duplicate_all(self, params):
+        """One load-ramp pass: duplicate every top-level track the Set had at the first pass (a group with its
+        children), so each pass adds the Set's own load once; the copies play the same clips and automation in sync.
+        The first pass also turns the master down to RAMP_MASTER_VOLUME unless it is automated. Reports
+        /abl/bench/duplicate-all (pass, tracks now, ms, 1 if the master was turned down else 0)."""
+        song = self.song
+        start = time.monotonic()
+        if self.ramp_originals is None:
+            self.ramp_originals = [track for track in song.tracks if not track.is_grouped]
+            volume = song.master_track.mixer_device.volume
+            if getattr(volume, "automation_state", 0) == 0:
+                volume.value = max(volume.min, min(volume.max, RAMP_MASTER_VOLUME))
+                self.ramp_master_down = 1
+            else:
+                self.logger.info("bench: the master volume is automated; the load ramp leaves it as is")
+        tracks = list(song.tracks)
+        # from the last original to the first, so the indices still to come stay valid
+        for index in sorted((self._index_of(tracks, track) for track in self.ramp_originals), reverse=True):
+            song.duplicate_track(index)
+        self.ramp_pass += 1
+        self._report("/abl/bench/duplicate-all",
+                     (self.ramp_pass, len(song.tracks), int((time.monotonic() - start) * 1000), self.ramp_master_down))
+
+    @staticmethod
+    def _index_of(tracks, track):
+        for index, other in enumerate(tracks):
+            if other == track:
+                return index
+        raise ValueError("an original track of the load ramp is gone: %s" % getattr(track, "name", "?"))
 
     def _unsubscribe(self, params):
         self.subscribers.discard(("127.0.0.1", int(params[0])))

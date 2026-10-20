@@ -35,7 +35,7 @@ Manager = package.manager.Manager
 ADDRESSES = {
     "/abl/bench/" + name for name in (
         "ping", "play", "stop", "rewind", "poll", "cpu-period", "scenario-marker", "info",
-        "views", "show-view", "focus-view", "load-device", "subscribe", "unsubscribe",
+        "views", "show-view", "focus-view", "load-device", "subscribe", "unsubscribe", "duplicate-all",
     )
 }
 
@@ -246,6 +246,41 @@ class HandlerCase(unittest.TestCase):
         self.assertTrue(any("bench: load-device failed: stale browser item" in line for line in logged.output))
         self.assertNotIn("instruments", handler.browser_index)
         self.assertNotIn("instruments", handler.browser_pending)
+
+    def test_duplicate_all_adds_the_set_once_per_pass(self):
+        group = fake_live.FakeTrack("Group", foldable=True)
+        self.song.tracks = [fake_live.FakeTrack("A", sends=(0.5, 0.0)), group, fake_live.FakeTrack("G1", group),
+                            fake_live.FakeTrack("G2", group), fake_live.FakeTrack("B", sends=(1.0, 0.25))]
+        self.make_handler()
+        self.server.dispatch("/abl/bench/duplicate-all")
+        self.assertEqual([t.name for t in self.song.tracks],
+                         ["A", "A", "Group", "G1", "G2", "Group", "G1", "G2", "B", "B"])
+        copy = self.song.tracks[5]
+        self.assertTrue(copy.is_foldable and copy is not group)
+        self.assertTrue(all(t.group_track is copy for t in self.song.tracks[6:8]))
+        self.assertEqual(self.song.master_track.mixer_device.volume.value, bench.RAMP_MASTER_VOLUME)
+        # the sends (automated or not) are left alone, and every copy carries its original's
+        for name, expected in (("A", [0.5, 0.0]), ("B", [1.0, 0.25])):
+            for track in (t for t in self.song.tracks if t.name == name):
+                self.assertEqual([s.value for s in track.mixer_device.sends], expected)
+        (pass_number, tracks, ms, master_down), _ = self.reports("/abl/bench/duplicate-all")[0]
+        self.assertEqual((pass_number, tracks, master_down), (1, 10, 1))
+        self.assertIsInstance(ms, int)
+        # a second pass duplicates the originals again, never the copies, and leaves the master alone
+        self.song.master_track.mixer_device.volume.value = 0.7
+        self.server.dispatch("/abl/bench/duplicate-all")
+        self.assertEqual(len(self.song.tracks), 15)
+        self.assertEqual([t.name for t in self.song.tracks].count("Group"), 3)
+        self.assertEqual(self.reports("/abl/bench/duplicate-all")[-1][0][:2], (2, 15))
+        self.assertEqual(self.song.master_track.mixer_device.volume.value, 0.7)
+
+    def test_duplicate_all_leaves_an_automated_master_alone(self):
+        volume = self.song.master_track.mixer_device.volume
+        volume.automation_state = 1
+        self.make_handler()
+        self.server.dispatch("/abl/bench/duplicate-all")
+        self.assertEqual(volume.value, 0.85)
+        self.assertEqual(self.reports("/abl/bench/duplicate-all")[0][0][3], 0)
 
     def test_subscribe_fans_out_every_report(self):
         handler = self.make_handler()

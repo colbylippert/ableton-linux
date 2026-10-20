@@ -37,10 +37,33 @@ state = types.SimpleNamespace(application=None)
 # Live objects
 #--------------------------------------------------------------------------------
 class FakeTrack(object):
-    def __init__(self, name):
+    def __init__(self, name, group=None, foldable=False, sends=()):
         self.name = name
         self.devices = []
         self.clip_slots = []
+        self.group_track = group
+        self.is_grouped = group is not None
+        self.is_foldable = foldable
+        self.mixer_device = FakeMixer(sends)
+
+
+class FakeParameter(object):
+    def __init__(self, value, minimum=0.0, maximum=1.0):
+        self.value = value
+        self.min = minimum
+        self.max = maximum
+        self.automation_state = 0   # Live.DeviceParameter.AutomationState: 0 none, 1 playing, 2 overridden
+
+
+class FakeMixer(object):
+    def __init__(self, sends=()):
+        self.volume = FakeParameter(0.85)
+        self.sends = [FakeParameter(value) for value in sends]
+
+
+class FakeMasterTrack(object):
+    def __init__(self):
+        self.mixer_device = FakeMixer()
 
 
 class FakeSongView(object):
@@ -59,6 +82,7 @@ class FakeSong(object):
         self.current_song_time = 0.0
         self.tempo = 120.0
         self.tracks = [FakeTrack("1-MIDI"), FakeTrack("2-Audio")]
+        self.master_track = FakeMasterTrack()
         self.scenes = []
         self.cue_points = []
         self.view = FakeSongView(self)
@@ -81,6 +105,22 @@ class FakeSong(object):
     def stop_playing(self):
         self.calls.append("stop_playing")
         self.set_playing(False)
+
+    def duplicate_track(self, index):
+        """As Live: the copy goes right after the track, and a group is copied with its children, after the last."""
+        track = self.tracks[index]
+        block = [track]
+        if track.is_foldable:
+            for other in self.tracks[index + 1:]:
+                if other.group_track is not track:
+                    break
+                block.append(other)
+        def sends(t):
+            return [send.value for send in t.mixer_device.sends]
+        group = FakeTrack(track.name, track.group_track, track.is_foldable, sends(track))
+        copies = [group] + [FakeTrack(child.name, group, child.is_foldable, sends(child)) for child in block[1:]]
+        self.tracks[index + len(block):index + len(block)] = copies
+        self.calls.append("duplicate_track %d" % index)
 
     def set_playing(self, value):
         if self.is_playing == value:
