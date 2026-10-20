@@ -38,7 +38,7 @@ Living document, approved 2026-10-19: the status table is updated as each item l
 | K1 SMT offline | recorded 2026-10-19 (second attempt): audio CPU +2.9 %, Live CPU 34.8 → 39.7 %; siblings offline in every B run | T0026 | **mechanism-confirmed** (not kept) |
 | K2 mitigations=off | halted 16:08 after A1, B1, A2 (B2 interrupted) for the Windows install; the mechanism worked (B: 0 vulnerabilities mitigated, A: 5); reruns from A1 later | T0027 | halted |
 | K3 ntsync-live spin | recorded 2026-10-19: in Live the DSP average did not move (5 of 9 pairs, −0.4 %) while audio CPU doubled (+22.9 points); the spin worked (context switches −64 %), wake-ups are not the bottleneck | T0025 | **revert** |
-| K4 C-state limit | gate fired (D0004: two thirds of audio wakes leave C2) but C2 wakes look cheap; registered as T0028, driver `profiler/trials/trial-T0028.sh`; p90/p99 per state checked before it runs | T0028 | — |
+| K4 C-state limit, C1E | D0007: a P-core clock floor does not raise the workers' clock; D0008: C2/C3 off alone no consistent gain; **D0009: C1E off with C2/C3 off: workers 2.9–3.3 → 4.5 GHz, DSP −22 to −28 %, Live CPU −23 to −31 %, +4–5 W** | T0031 | running (T0028 not run) |
 | K5 LiveSync | not started; deprioritised by T0025: ntsync is 16 % of audio cycles, so at most a CPU gain, not block time (D0004: ~40 % of calls could be syscall-free) | — | — |
 | K6 isolation | registered as T0029 (driver ready); T0024 predicts no gain from moving IRQs off the audio cores, so it waits behind K10 | T0029 | — |
 | K7–K9 | not started (K7 pre-wake and K8 direct entry also deprioritised: C2 wakes are cheap, and T0025 showed the sync path is not the block-time limit) | — | — |
@@ -225,6 +225,28 @@ Living document, approved 2026-10-19: the status table is updated as each item l
   - Driver `profiler/kernel/clock/d0009.sh`.
 - **Measured per Set:** as in D0008, plus the C1E bit during each capture (the mechanism).
 - **Decision:** register a trial (rule D, ABAB × 3, power and temperature reported) if B's AudioCalc clock while executing is at least 10 % above its paired A run's, in both pairs and on every Set; otherwise stop. The bar is 10 % because same-configuration single runs differed by up to 17 %.
+- **D0009 — RESULT (2026-10-20 00:34–01:05; four runs clean, pinning held; C1E 0 on every CPU in both B runs, 1 in both A runs): C1E is what holds the workers' clock down. Every comparison passed the bar, so T0031 follows.**
+  - B against its paired A, pair 1 / pair 2 (Inbuilts; Max4Live; VSTs):
+    - **AudioCalc clock while executing:** 2.99 → 4.54 / 2.96 → 4.52 GHz; 3.33 → 4.55 / 3.05 → 4.53; 3.13 → 4.50 / 2.88 → 4.49 (+37 to +56 %). `pipeasio-rt` 4.6 GHz in every B run.
+    - **DSP average:** 8.97 → 6.73 / 9.33 → 6.73; 8.84 → 6.86 / 9.12 → 6.78; 8.54 → 6.46 / 8.47 → 6.45 (−22 to −28 %).
+    - **Peak median:** 17.1–17.8 → 14.5–15.1 (−12 to −18 %). No peaks over 100 % in any run; PipeWire errors 1 / 1 / 0 (B) against 0 / 1 / 0 (A).
+    - **Live's CPU:** 34–41 % → 23–31 % (−23 to −31 %). AudioCalc CPU 15–20 % → 9–13 %.
+  - **The workers execute more of their on-CPU time** (87–92 % against 80–86 %). Their idle is C1 only, about 4,800–5,100 entries a second per audio CPU.
+  - **Cost:** package 17.6–18.4 W → 22.1–23.5 W (+4–5 W); mean temperature 52–53 → 55–56 °C, max ≤ 73 °C; 1–9 ms of throttling per Set.
+  - **Reading:** with C1E on, every C1 halt drops the core's voltage and clock, and each of the workers' thousands of wakes a second starts from there. Off, an idle audio core only stops its clock and wakes at full speed. Neither change alone did it: C2/C3 off alone (D0008) left the cores in C1E, and the floor (D0007) cannot act inside a halt.
+  - Summary: `profiler/plans/findings/d0009-summary.txt`.
+
+## T0031: shallow idle on the audio cores (C1E off, C2/C3 off), pre-registered 2026-10-20 ~01:20, before any of its runs
+- **From D0009:** with C1E off on every CPU and C2/C3 off on the P-cores, the workers execute at ~4.5 GHz instead of 2.9–3.3 GHz. DSP average −22 to −28 % in both pairs on every Set, Live's CPU −23 to −31 %, package +4–5 W.
+- **A:** as is. **B:** D0009's B, applied before and undone after each B run (`profiler/trials/trial-T0031.sh`). ABAB × 3 on Inbuilts, Max4Live and VSTs at 120 s, kept configuration (physcore, 5 workers, new display, posix_spawn, PipeASIO realtime).
+- **Rule D:**
+  - D1: B lower in at least 8 of 9 Set-pairs (sign test, p = 0.02); D2: median paired change ≤ −3 %.
+  - Guards: G1 no xruns in B; G2 B's PipeWire errors not significantly higher; G4 audio-thread CPU's median increase ≤ +5 %.
+- **Mechanism** (from each run's record): every CPU's C1E bit is 0 and the audio CPUs make no C2/C3 entries during each B run (C1E 1 and C2/C3 entries during each A run).
+- **Reported:** package power and temperature, Live's CPU, the peak median and the worst peak.
+- **Verdicts:**
+  - Keep = PASS with the mechanism; mechanism-confirmed = guards and mechanism hold but the primary fails; revert otherwise.
+  - If kept, B joins the kept configuration for later trials (both arms). A lasting form is the user's call: applied only while Live runs, like the power hold, or at boot.
 
 ## Context
 - `WINE_POSIX_SPAWN=1` (T0020) removed the fork-induced page-fault storms, and dropouts are now rare. **T0022 (one audio thread per physical P-core, 5 workers) is a keep**: audio-thread CPU −26 %, Live CPU 46.9 → 35.0 %, DSP average lower. The goal now is more headroom: shorter, steadier audio blocks and less CPU, through kernel-level changes.
