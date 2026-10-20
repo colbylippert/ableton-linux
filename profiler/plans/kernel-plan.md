@@ -463,7 +463,7 @@ Living document, approved 2026-10-19: the status table is updated as each item l
   - The kept 5 is not beaten on block time. A count of 3 would save CPU at equal block time. That is a rule H question (audio-thread CPU, with the DSP guard), and the load ramp is where fewer workers could cost headroom.
   - Files: `profiler/plans/findings/d0013/`.
 
-## D0014: the best Linux configuration with 2 workers, against Windows and upstream (diagnostic, pre-registered 2026-10-20 ~14:15, before any of its runs)
+## D0014: the best Linux configuration with 2 workers, against Windows and upstream (diagnostic, pre-registered 2026-10-20 14:04, commit 4ff77c7, before any of its runs)
 - **User:** "Lets take the current best fixes on linux and run a full pass with two workers to get a comparison against windows and upstream baseline". This came after D0013, where 2 to 5 workers tied on block time and 2 used the least CPU without 1 worker's penalty.
 - **Design:** as D0006, three Linux runs, each from a fresh boot with the boot settled first (`ORDER="A1 A2 A3" LINUX_CONFIG=kept-w2 TRIAL_ID=D0014 profiler/windows/cross-os-trial.sh d0014`).
   - The kept configuration: posix_spawn, PipeASIO realtime, the new display, Live at RR 10, and the every-boot shallow idle (C1E off from GRUB, the P-cores no deeper than C1).
@@ -474,6 +474,21 @@ Living document, approved 2026-10-19: the status table is updated as each item l
   - The upstream Linux baseline: D0006.
   - The best Linux configuration with 5 workers: T0031's B arm, the earlier table's column; D0013's 5-worker run for reference.
 - **Reported:** DSP average, peak median, missed deadlines (peaks over 100 %), PipeWire errors, Live's CPU and the audio-thread CPU. No verdict: it is the cross-OS table's new column.
+- **D0014 — RESULT (2026-10-20 14:04–14:35; three runs clean, each from a fresh boot; 2 workers on CPUs 2 and 4 in every Set-run; C1E off and the P-cores no deeper than C1 at every boot):**
+
+  | Per Set, medians of three runs | Linux upstream (D0006) | Linux best, 5 workers (T0031 B) | **Linux best, 2 workers (D0014)** | Windows as shipped (D0005, corrected) |
+  |---|---|---|---|---|
+  | DSP average % (Inbuilts / Max4Live / VSTs) | 11.3 / 11.8 / 11.0 | 6.5 / 6.5 / 6.1 | **6.4 / 6.8 / 5.8** | 9.4 / 10.0 / 8.2 |
+  | Missed deadlines (9 Set-runs) | 55 | 1 | **0** | 2 |
+  | PipeWire errors (9 Set-runs) | 176 | 12 | **3** | — |
+  | Live CPU % | 63.8 / 68.2 / 60.2 | 27.3 / 29.4 / 22.7 | **25.8 / 25.3 / 20.1** | 33.0 / 33.2 / 23.8 |
+  | Audio-thread CPU % (workers + callback thread) | 51.2 / 55.4 / 50.0 | 15.7 / 16.7 / 12.7 | **12.4 / 13.4 / 9.4** | 28.1 / 29.5 / 19.6 |
+
+  - **Against 5 workers:** block time is level (−1 %, +4 %, −5 % per Set). The audio threads use 21–26 % less CPU and Live 6–14 % less; no missed deadline (1 with 5 workers), 3 PipeWire errors against 12.
+  - **Against Windows:** DSP 29–32 % lower, Live's CPU 16–24 % lower, the audio threads at less than half of Windows' CPU (AudioCalc + the ASIO callback thread there, + pipeasio-rt here), 0 missed deadlines against 2. Windows ran Live with 5 workers and its stock power and idle settings (D0005); D0010 showed limiting Windows' idle does not change its DSP, and Windows with 2 workers is untested.
+  - **Against upstream Linux:** DSP 43–47 % lower, missed deadlines 55 → 0, PipeWire errors 176 → 3, Live's CPU 60–67 % lower.
+  - The three runs agree within about 2 % per Set (DSP 6.33–6.44 / 6.63–6.85 / 5.77–5.83).
+  - Files: `profiler/plans/findings/d0014-results.jsonl` (with D0006's `~/profiler-crossos/d0006`, T0031 B and D0005's corrected figures above).
 
 ## Context
 - `WINE_POSIX_SPAWN=1` (T0020) removed the fork-induced page-fault storms, and dropouts are now rare. **T0022 (one audio thread per physical P-core, 5 workers) is a keep**: audio-thread CPU −26 %, Live CPU 46.9 → 35.0 %, DSP average lower. The goal now is more headroom: shorter, steadier audio blocks and less CPU, through kernel-level changes.
