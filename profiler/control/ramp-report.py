@@ -37,7 +37,8 @@ def osc_rows(path):
         if p[2] == "/abl/bench/cpu" and len(p) >= 5:
             cpu.append((t, float(p[3]), float(p[4])))
         elif p[2] == "/abl/bench/duplicate-all" and len(p) >= 6:
-            dup.append((t, int(float(p[3])), int(float(p[4])), int(float(p[5]))))
+            dup.append((t, int(float(p[3])), int(float(p[4])), int(float(p[5])),
+                        int(float(p[6])) if len(p) > 6 else None, float(p[7]) if len(p) > 7 else None))
     return cpu, dup, last
 
 
@@ -93,7 +94,8 @@ def set_report(set_dir, settle, fail_errors, fail_peaks):
                 "peak_median": round(statistics.median(peaks), 2) if peaks else None,
                 "peak_max": round(max(peaks), 1) if peaks else None, "peaks_over_100": over,
                 "pipewire_errors": pw, "duplicate_ms": dup[k - 1][3] if k >= 1 else None,
-                "tracks": dup[k - 1][2] if k >= 1 else None, "fails": fails}
+                "tracks": dup[k - 1][2] if k >= 1 else None, "trims": dup[k - 1][4] if k >= 1 else None,
+                "trim_db": dup[k - 1][5] if k >= 1 else 0.0, "fails": fails}
         steps.append(step)
         if fails and not failed:
             failed = True

@@ -258,28 +258,34 @@ class HandlerCase(unittest.TestCase):
         copy = self.song.tracks[5]
         self.assertTrue(copy.is_foldable and copy is not group)
         self.assertTrue(all(t.group_track is copy for t in self.song.tracks[6:8]))
-        self.assertEqual(self.song.master_track.mixer_device.volume.value, bench.RAMP_MASTER_VOLUME)
+        # a Utility first on every return and on the master, at -20 log10 2 dB; the faders are left alone
+        buses = self.song.return_tracks + [self.song.master_track]
+        self.assertTrue(all(bus.devices[0].name == "Utility" for bus in buses))
+        self.assertEqual(self.song.master_track.devices[1].name, "Limiter")
+        self.assertTrue(all(abs(bus.devices[0].parameters[0].value + 6.02) < 0.06 for bus in buses))
+        self.assertEqual(self.song.master_track.mixer_device.volume.value, 0.85)
         # the sends (automated or not) are left alone, and every copy carries its original's
         for name, expected in (("A", [0.5, 0.0]), ("B", [1.0, 0.25])):
             for track in (t for t in self.song.tracks if t.name == name):
                 self.assertEqual([s.value for s in track.mixer_device.sends], expected)
-        (pass_number, tracks, ms, master_down), _ = self.reports("/abl/bench/duplicate-all")[0]
-        self.assertEqual((pass_number, tracks, master_down), (1, 10, 1))
+        (pass_number, tracks, ms, trims, gain), _ = self.reports("/abl/bench/duplicate-all")[0]
+        self.assertEqual((pass_number, tracks, trims, gain), (1, 10, 3, -6.02))
         self.assertIsInstance(ms, int)
-        # a second pass duplicates the originals again, never the copies, and leaves the master alone
-        self.song.master_track.mixer_device.volume.value = 0.7
+        # a second pass duplicates the originals again, never the copies; no second trim, now at -20 log10 3 dB
         self.server.dispatch("/abl/bench/duplicate-all")
         self.assertEqual(len(self.song.tracks), 15)
         self.assertEqual([t.name for t in self.song.tracks].count("Group"), 3)
         self.assertEqual(self.reports("/abl/bench/duplicate-all")[-1][0][:2], (2, 15))
-        self.assertEqual(self.song.master_track.mixer_device.volume.value, 0.7)
+        self.assertEqual([d.name for d in self.song.master_track.devices], ["Utility", "Limiter"])
+        self.assertTrue(abs(self.song.master_track.devices[0].parameters[0].value + 9.54) < 0.06)
 
-    def test_duplicate_all_leaves_an_automated_master_alone(self):
-        volume = self.song.master_track.mixer_device.volume
-        volume.automation_state = 1
+    def test_duplicate_all_runs_without_trims_when_utility_cannot_be_placed(self):
+        for bus in self.song.return_tracks + [self.song.master_track]:
+            bus.insert_device = None   # not callable: the insert raises, the ramp goes on without that trim
         self.make_handler()
-        self.server.dispatch("/abl/bench/duplicate-all")
-        self.assertEqual(volume.value, 0.85)
+        with self.assertLogs("abletonosc", "ERROR"):
+            self.server.dispatch("/abl/bench/duplicate-all")
+        self.assertEqual(len(self.song.tracks), 4)
         self.assertEqual(self.reports("/abl/bench/duplicate-all")[0][0][3], 0)
 
     def test_subscribe_fans_out_every_report(self):

@@ -12,7 +12,9 @@ Live API call is logged as "bench: ..." which the manager relays to
 /live/error; it never stops the tick loop or the periodic CPU report.
 """
 import collections
+import math
 import os
+import re
 import sys
 import time
 import traceback
@@ -35,12 +37,14 @@ TICK_MS = 100
 # The Max device reported CPU every 500 ms without being asked; the suite's
 # osc collector relies on that.
 DEFAULT_CPU_PERIOD_MS = 500
-# The master volume the first load-ramp pass sets (/abl/bench/duplicate-all), about -16 dB below unity (0.85), so
-# the sum of the copies does not clip at the output; the devices process the same at any volume. Everything reaches
-# the output through the master (the return tracks too) and Live mixes in floating point, so nothing clips before it.
-# Sends and other mixer settings are left alone: setting an automated parameter overrides its automation for the
-# rest of the session, which would change how the Set plays. For the same reason an automated master is left as is.
-RAMP_MASTER_VOLUME = 0.5
+# The load ramp (/abl/bench/duplicate-all) keeps every summing bus at the Set's own level. The copies play the same
+# audio in sync, so with N copies playing the return tracks and the master receive N times the amplitude
+# (+20 log10 N dB) and their effects would run hot. The first pass puts a Utility first in the chain of every return
+# track and of the master; each pass sets its Gain to -20 log10 N dB. Sends, faders and automation stay as the Set has
+# them: setting an automated parameter would override its automation for the rest of the session, and a new device
+# has none. The trims cost the same in every configuration a ramp compares.
+RAMP_TRIM_DEVICE = "Utility"
+RAMP_TRIM_PARAMETER = "Gain"
 # Browser roots that /abl/bench/load-device searches by item name.
 BROWSER_ROOTS = ("instruments", "audio_effects", "midi_effects", "plugins", "max_for_live")
 SCRIPT_PATH = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
@@ -63,7 +67,7 @@ class BenchHandler(AbletonOSCHandler):
         self.cpu_attribute_ok = False
         self.ramp_originals = None
         self.ramp_pass = 0
-        self.ramp_master_down = 0
+        self.ramp_trims = []
 
         self._add("ping", self._ping)
         self._add("play", self._play)
@@ -300,25 +304,66 @@ class BenchHandler(AbletonOSCHandler):
     def _duplicate_all(self, params):
         """One load-ramp pass: duplicate every top-level track the Set had at the first pass (a group with its
         children), so each pass adds the Set's own load once; the copies play the same clips and automation in sync.
-        The first pass also turns the master down to RAMP_MASTER_VOLUME unless it is automated. Reports
-        /abl/bench/duplicate-all (pass, tracks now, ms, 1 if the master was turned down else 0)."""
+        The first pass also puts a Utility first on every return track and on the master, and every pass sets their
+        gain to -20 log10 N dB with N copies playing. Reports /abl/bench/duplicate-all (pass, tracks now, ms, trims,
+        trim gain in dB)."""
         song = self.song
         start = time.monotonic()
         if self.ramp_originals is None:
             self.ramp_originals = [track for track in song.tracks if not track.is_grouped]
-            volume = song.master_track.mixer_device.volume
-            if getattr(volume, "automation_state", 0) == 0:
-                volume.value = max(volume.min, min(volume.max, RAMP_MASTER_VOLUME))
-                self.ramp_master_down = 1
-            else:
-                self.logger.info("bench: the master volume is automated; the load ramp leaves it as is")
+            for bus in list(song.return_tracks) + [song.master_track]:
+                try:
+                    trim = self._insert_trim(bus)
+                except Exception as e:
+                    trim = None
+                    self.logger.error("bench: no load-ramp trim on %s: %s" % (getattr(bus, "name", "?"), e))
+                if trim is not None:
+                    self.ramp_trims.append(trim)
         tracks = list(song.tracks)
         # from the last original to the first, so the indices still to come stay valid
         for index in sorted((self._index_of(tracks, track) for track in self.ramp_originals), reverse=True):
             song.duplicate_track(index)
         self.ramp_pass += 1
-        self._report("/abl/bench/duplicate-all",
-                     (self.ramp_pass, len(song.tracks), int((time.monotonic() - start) * 1000), self.ramp_master_down))
+        gain_db = -20.0 * math.log10(self.ramp_pass + 1)
+        for trim in self.ramp_trims:
+            self._set_db(trim, gain_db)
+        self._report("/abl/bench/duplicate-all", (self.ramp_pass, len(song.tracks), int((time.monotonic() - start) * 1000),
+                                                  len(self.ramp_trims), round(gain_db, 2)))
+
+    def _insert_trim(self, track):
+        """A Utility first in TRACK's chain; its Gain parameter. Live 12.1+ inserts a native device at an index; else
+        the browser loads it on the selected track and Song.move_device puts it first."""
+        if hasattr(track, "insert_device"):
+            track.insert_device(RAMP_TRIM_DEVICE, 0)
+            device = track.devices[0]
+        else:
+            item = self._browser_item("audio_effects", RAMP_TRIM_DEVICE)
+            if item is None:
+                raise ValueError("%s is not in the browser" % RAMP_TRIM_DEVICE)
+            before = list(track.devices)
+            self.song.view.selected_track = track
+            Live.Application.get_application().browser.load_item(item)
+            device = next(d for d in track.devices if not any(d == b for b in before))
+            self.song.move_device(device, track, 0)
+        return next(p for p in device.parameters if p.name == RAMP_TRIM_PARAMETER)
+
+    @staticmethod
+    def _set_db(parameter, db):
+        """Set PARAMETER to DB as its own display reads it ("-6.0 dB"; "-inf dB" at the bottom): a bisection over
+        str_for_value, which rises with the value."""
+        def shown(value):
+            match = re.search(r"(-?inf|[-+]?\d+(?:\.\d+)?)", parameter.str_for_value(value))
+            if not match:
+                raise ValueError("unreadable %s display: %r" % (parameter.name, parameter.str_for_value(value)))
+            return float("-inf") if "inf" in match.group(1) else float(match.group(1))
+        low, high = parameter.min, parameter.max
+        for _ in range(40):
+            middle = (low + high) / 2.0
+            if shown(middle) < db:
+                low = middle
+            else:
+                high = middle
+        parameter.value = high
 
     @staticmethod
     def _index_of(tracks, track):

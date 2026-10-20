@@ -36,6 +36,26 @@ state = types.SimpleNamespace(application=None)
 #--------------------------------------------------------------------------------
 # Live objects
 #--------------------------------------------------------------------------------
+class FakeGainParameter(object):
+    """Utility's Gain as Live shows it: the value runs -70..35 and reads "-6.0 dB", "-inf dB" at the bottom."""
+
+    def __init__(self):
+        self.name = "Gain"
+        self.min = -70.0
+        self.max = 35.0
+        self.value = 0.0
+        self.automation_state = 0
+
+    def str_for_value(self, value):
+        return "-inf dB" if value <= self.min else "%.1f dB" % value
+
+
+class FakeDevice(object):
+    def __init__(self, name):
+        self.name = name
+        self.parameters = [FakeGainParameter()] if name == "Utility" else []
+
+
 class FakeTrack(object):
     def __init__(self, name, group=None, foldable=False, sends=()):
         self.name = name
@@ -45,6 +65,9 @@ class FakeTrack(object):
         self.is_grouped = group is not None
         self.is_foldable = foldable
         self.mixer_device = FakeMixer(sends)
+
+    def insert_device(self, name, index):
+        self.devices.insert(index, FakeDevice(name))
 
 
 class FakeParameter(object):
@@ -63,7 +86,12 @@ class FakeMixer(object):
 
 class FakeMasterTrack(object):
     def __init__(self):
+        self.name = "Master"
         self.mixer_device = FakeMixer()
+        self.devices = [FakeDevice("Limiter")]
+
+    def insert_device(self, name, index):
+        self.devices.insert(index, FakeDevice(name))
 
 
 class FakeSongView(object):
@@ -83,6 +111,7 @@ class FakeSong(object):
         self.tempo = 120.0
         self.tracks = [FakeTrack("1-MIDI"), FakeTrack("2-Audio")]
         self.master_track = FakeMasterTrack()
+        self.return_tracks = [FakeTrack("A-Reverb"), FakeTrack("B-Delay")]
         self.scenes = []
         self.cue_points = []
         self.view = FakeSongView(self)
