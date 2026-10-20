@@ -336,10 +336,23 @@ class BenchHandler(AbletonOSCHandler):
         Utility put first."""
         devices = list(track.devices)
         if devices and getattr(devices[0], "class_name", "") == "StereoGain":
-            gain = next((p for p in devices[0].parameters if p.name == RAMP_TRIM_PARAMETER), None)
-            if gain is not None and getattr(gain, "automation_state", 0) == 0:
+            gain = self._gain_parameter(devices[0])
+            if getattr(gain, "automation_state", 0) == 0:
                 return gain
         return self._insert_trim(track)
+
+    @staticmethod
+    def _gain_parameter(device):
+        """Utility's gain: the parameter named RAMP_TRIM_PARAMETER, or the first whose name contains it (any case)."""
+        parameters = list(device.parameters)
+        for parameter in parameters:
+            if parameter.name == RAMP_TRIM_PARAMETER:
+                return parameter
+        for parameter in parameters:
+            if RAMP_TRIM_PARAMETER.lower() in parameter.name.lower():
+                return parameter
+        raise ValueError("no %s parameter on %s; it has %s" % (
+            RAMP_TRIM_PARAMETER, getattr(device, "class_name", "?"), ", ".join(repr(p.name) for p in parameters)))
 
     def _insert_trim(self, track):
         """A Utility first in TRACK's chain; its Gain parameter. Live 12.1+ inserts a native device at an index; else
@@ -356,7 +369,7 @@ class BenchHandler(AbletonOSCHandler):
             Live.Application.get_application().browser.load_item(item)
             device = next(d for d in track.devices if not any(d == b for b in before))
             self.song.move_device(device, track, 0)
-        return next(p for p in device.parameters if p.name == RAMP_TRIM_PARAMETER)
+        return self._gain_parameter(device)
 
     @staticmethod
     def _db_of(parameter, value):
