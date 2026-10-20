@@ -438,6 +438,13 @@ Living document, approved 2026-10-19: the status table is updated as each item l
   - A full run should cover about 3 to 8 workers, with the kept 5 inside the same session.
   - Files: `profiler/plans/findings/d0012/`.
 
+## D0013: audio worker count 1–5, smoke test (2026-10-20, written before its runs)
+- **User:** "Lets try 5 all the down to 1 workers", after D0012.
+- **Design:** as D0012, one bench run per count, in the order 3, 5, 1, 4, 2 (`profiler/trials/worker-smoke.sh D0013 3 5 1 4 2`).
+  - pipeasio-rt on CPU 0; the workers on the P-cores' first threads, one each: 1 worker on CPU 2; 2 on CPUs 2 and 4; and so on up to 5 on 2, 4, 6, 8, 10.
+  - 5 is the kept layout (physcore), so the reference is in the same session this time.
+- **Reading** (`profiler/trials/d0012_summary.py --id d0013`): as D0012. One run per count gives no verdict.
+
 ## Context
 - `WINE_POSIX_SPAWN=1` (T0020) removed the fork-induced page-fault storms, and dropouts are now rare. **T0022 (one audio thread per physical P-core, 5 workers) is a keep**: audio-thread CPU −26 %, Live CPU 46.9 → 35.0 %, DSP average lower. The goal now is more headroom: shorter, steadier audio blocks and less CPU, through kernel-level changes.
 - User (2026-10-19): "We want ableton specific improvement… lets get clever and esoteric for this ableton only kernel patch concept"; then "complete implementation plan for kernel level items".

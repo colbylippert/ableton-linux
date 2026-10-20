@@ -1,25 +1,26 @@
 #!/usr/bin/env python3
-"""d0012_summary.py [--runs DIR] [--json]: the D0012 smoke test of 8 to 12 audio workers
-(profiler/plans/kernel-plan.md, D0012).
+"""d0012_summary.py [--runs DIR] [--id ID] [--json]: a smoke test of Live's audio worker count
+(profiler/plans/kernel-plan.md: D0012, 8 to 12 workers, and the worker-smoke.sh runs after it, such as D0013).
 
-Reads the smoke runs ($R/d0012-r1-wN/bench): per Set Live's DSP average, peak median, worst peak and peaks over 100 %
-(measurement.json's osc_dsp), Live's PipeWire errors (pipewire.pw_top.err_delta), xrun log lines, the audio-thread CPU M
-and Live's CPU, and the AudioCalc threads' count (campaign_tools.per_set). Each count's score is the mean over the three
-Sets of its DSP average divided by the five counts' mean for that Set (below 1 is better). For reference, today's T0032
-A runs (the kept 5 workers, physcore, on the same boot and configuration; three runs, medians) are shown alongside: not
-the same session, so context, not part of the ranking. One run per count: a smoke test, not a verdict.
+Reads the smoke runs ($R/ID-r1-wN/bench, every N present; ID d0012 by default): per Set Live's DSP average, peak
+median, worst peak and peaks over 100 % (measurement.json's osc_dsp), Live's PipeWire errors (pipewire.pw_top.err_delta),
+xrun log lines, the audio-thread CPU M and Live's CPU, and the AudioCalc threads' count (campaign_tools.per_set). Each
+count's score is the mean over the three Sets of its DSP average divided by the counts' mean for that Set (below 1 is
+better). For reference, 2026-10-20's T0032 A runs (the kept 5 workers, physcore, on the same boot and configuration;
+three runs, medians) are shown alongside: not the same session, so context, not part of the ranking. One run per
+count: a smoke test, not a verdict.
 """
 import argparse
 import glob
 import json
 import os
+import re
 import statistics
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import campaign_tools  # noqa: E402
 
-CONFIGS = [f"w{n}" for n in range(8, 13)]
 SETS = campaign_tools.SETS
 REFERENCE = ["trial-T0032-A1", "trial-T0032-A2", "trial-T0032-A3"]
 
@@ -43,9 +44,15 @@ def measurements(bench):
     return out
 
 
-def reading(runs):
-    data = {c: measurements(os.path.join(runs, f"d0012-r1-{c}", "bench")) for c in CONFIGS
-            if os.path.isdir(os.path.join(runs, f"d0012-r1-{c}", "bench"))}
+def counts(runs, run_id):
+    """The worker counts the smoke runs of RUN_ID cover, ascending: ["w1", "w2", ...]"""
+    found = [re.search(r"-r1-w(\d+)$", d) for d in glob.glob(os.path.join(runs, f"{run_id}-r1-w*"))]
+    return [f"w{n}" for n in sorted(int(m.group(1)) for m in found if m)]
+
+
+def reading(runs, run_id="d0012"):
+    data = {c: measurements(os.path.join(runs, f"{run_id}-r1-{c}", "bench")) for c in counts(runs, run_id)
+            if os.path.isdir(os.path.join(runs, f"{run_id}-r1-{c}", "bench"))}
     ref_runs = [measurements(os.path.join(runs, r, "bench")) for r in REFERENCE if os.path.isdir(os.path.join(runs, r, "bench"))]
     mean = {s: statistics.mean(data[c][s]["dsp"] for c in data if s in data[c]) for s in SETS
             if any(s in data[c] for c in data)}
@@ -68,9 +75,10 @@ def reading(runs):
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--runs", default=campaign_tools.RUNS)
+    ap.add_argument("--id", default="d0012", help="the runs' name prefix, as worker-smoke.sh names them")
     ap.add_argument("--json", action="store_true")
     a = ap.parse_args()
-    result = reading(a.runs)
+    result = reading(a.runs, a.id)
     if a.json:
         print(json.dumps(result))
         return
@@ -90,7 +98,9 @@ def main():
               f"{' / '.join(str(ref[s]['peak_median']) for s in SETS)} | {' / '.join(str(ref[s]['worst']) for s in SETS)} | "
               f"{' / '.join(str(ref[s]['m']) for s in SETS)} | {statistics.median(ref[s]['live'] for s in SETS)} | "
               f"PW err {result['reference_pw_err']} over {result['reference_runs']} runs")
-    print(f"Smoke reading: lowest DSP among 8-12: {result['best']} (one run per count; a full run decides)")
+    covered = [r["config"][1:] for r in sorted(result["rows"], key=lambda r: int(r["config"][1:]))]
+    print(f"Smoke reading: lowest DSP among {', '.join(covered)} workers: {result['best']} "
+          "(one run per count; a full run decides)")
 
 
 if __name__ == "__main__":
