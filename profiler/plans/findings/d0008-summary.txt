@@ -1,0 +1,27 @@
+== Inbuilts
+  A: AudioCalc 3.38 GHz executing 85.3 % IPC 1.801 CPU 17.61 % | pipeasio-rt 3.66 GHz | DSP 8.874 pk_med 16.80 pk_max 68.9 >100 0 PW err 1 | Live CPU 39.33 %
+     package 18.02 W, temp {'mean': 51.8, 'max': 64.0}, throttle 0 ms pkg | audio CPUs' idle (entries/s, residency %): {'POLL': (5, 0.0), 'C1_ACPI': (1649, 30.2), 'C2_ACPI': (2715, 62.5), 'C3_ACPI': (0, 0.0)} | min_freq [400000] disabled []
+  B: AudioCalc 3.59 GHz executing 85.8 % IPC 1.751 CPU 16.97 % | pipeasio-rt 3.74 GHz | DSP 8.646 pk_med 16.50 pk_max 65.5 >100 0 PW err 9 | Live CPU 38.28 %
+     package 18.32 W, temp {'mean': 53.1, 'max': 81.0}, throttle 0 ms pkg | audio CPUs' idle (entries/s, residency %): {'POLL': (2, 0.0), 'C1_ACPI': (4273, 92.8), 'C2_ACPI': (0, 0.0), 'C3_ACPI': (0, 0.0)} | min_freq [400000] disabled ['C2_ACPI', 'C3_ACPI']
+  C: AudioCalc 2.99 GHz executing 83.9 % IPC 1.816 CPU 19.59 % | pipeasio-rt 3.65 GHz | DSP 9.611 pk_med 17.70 pk_max 117.8 >100 1 PW err 2 | Live CPU 42.62 %
+     package 18.20 W, temp {'mean': 53.0, 'max': 63.0}, throttle 0 ms pkg | audio CPUs' idle (entries/s, residency %): {'POLL': (4, 0.0), 'C1_ACPI': (4378, 92.3), 'C2_ACPI': (0, 0.0), 'C3_ACPI': (0, 0.0)} | min_freq [4700000, 4900000] disabled ['C2_ACPI', 'C3_ACPI']
+  B vs A: AudioCalc clock +6.1 %, DSP -2.6 %
+  C vs A: AudioCalc clock -11.5 %, DSP +8.3 %
+== Max4Live
+  A: AudioCalc 3.44 GHz executing 85.7 % IPC 1.780 CPU 18.37 % | pipeasio-rt 3.59 GHz | DSP 9.099 pk_med 17.25 pk_max 60.4 >100 0 PW err 0 | Live CPU 40.36 %
+     package 18.53 W, temp {'mean': 53.1, 'max': 66.0}, throttle 0 ms pkg | audio CPUs' idle (entries/s, residency %): {'POLL': (3, 0.0), 'C1_ACPI': (1932, 32.8), 'C2_ACPI': (2585, 59.7), 'C3_ACPI': (0, 0.0)} | min_freq [400000] disabled []
+  B: AudioCalc 3.28 GHz executing 85.9 % IPC 1.790 CPU 19.12 % | pipeasio-rt 3.47 GHz | DSP 9.330 pk_med 17.62 pk_max 80.5 >100 0 PW err 0 | Live CPU 41.91 %
+     package 18.63 W, temp {'mean': 53.9, 'max': 64.0}, throttle 0 ms pkg | audio CPUs' idle (entries/s, residency %): {'POLL': (4, 0.0), 'C1_ACPI': (4310, 92.4), 'C2_ACPI': (0, 0.0), 'C3_ACPI': (0, 0.0)} | min_freq [400000] disabled ['C2_ACPI', 'C3_ACPI']
+  C: AudioCalc 3.16 GHz executing 86.2 % IPC 1.727 CPU 20.30 % | pipeasio-rt 3.79 GHz | DSP 9.414 pk_med 17.70 pk_max 57.5 >100 0 PW err 0 | Live CPU 42.80 %
+     package 18.25 W, temp {'mean': 53.2, 'max': 71.0}, throttle 23 ms pkg | audio CPUs' idle (entries/s, residency %): {'POLL': (3, 0.0), 'C1_ACPI': (4228, 92.2), 'C2_ACPI': (0, 0.0), 'C3_ACPI': (0, 0.0)} | min_freq [4700000, 4900000] disabled ['C2_ACPI', 'C3_ACPI']
+  B vs A: AudioCalc clock -4.8 %, DSP +2.5 %
+  C vs A: AudioCalc clock -8.1 %, DSP +3.5 %
+== VSTs
+  A: AudioCalc 2.67 GHz executing 79.8 % IPC 1.522 CPU 17.20 % | pipeasio-rt 3.47 GHz | DSP 9.153 pk_med 17.62 pk_max 66.1 >100 0 PW err 0 | Live CPU 37.18 %
+     package 17.35 W, temp {'mean': 52.3, 'max': 62.0}, throttle 0 ms pkg | audio CPUs' idle (entries/s, residency %): {'POLL': (6, 0.0), 'C1_ACPI': (1843, 30.9), 'C2_ACPI': (2423, 61.8), 'C3_ACPI': (0, 0.0)} | min_freq [400000] disabled []
+  B: AudioCalc 2.94 GHz executing 81.3 % IPC 1.421 CPU 16.51 % | pipeasio-rt 3.59 GHz | DSP 8.789 pk_med 17.25 pk_max 62.9 >100 0 PW err 0 | Live CPU 34.61 %
+     package 16.88 W, temp {'mean': 52.1, 'max': 66.0}, throttle 1 ms pkg | audio CPUs' idle (entries/s, residency %): {'POLL': (4, 0.0), 'C1_ACPI': (4157, 92.9), 'C2_ACPI': (0, 0.0), 'C3_ACPI': (0, 0.0)} | min_freq [400000] disabled ['C2_ACPI', 'C3_ACPI']
+  C: AudioCalc 3.26 GHz executing 81.8 % IPC 1.435 CPU 15.13 % | pipeasio-rt 3.51 GHz | DSP 8.453 pk_med 16.65 pk_max 62.1 >100 0 PW err 0 | Live CPU 34.21 %
+     package 17.59 W, temp {'mean': 51.8, 'max': 66.0}, throttle 0 ms pkg | audio CPUs' idle (entries/s, residency %): {'POLL': (6, 0.0), 'C1_ACPI': (4443, 93.3), 'C2_ACPI': (0, 0.0), 'C3_ACPI': (0, 0.0)} | min_freq [4700000, 4900000] disabled ['C2_ACPI', 'C3_ACPI']
+  B vs A: AudioCalc clock +10.2 %, DSP -4.0 %
+  C vs A: AudioCalc clock +22.1 %, DSP -7.6 %

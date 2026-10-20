@@ -203,6 +203,28 @@ Living document, approved 2026-10-19: the status table is updated as each item l
   - Run T0028 (rule D, ABAB × 3) if B's or C's AudioCalc clock while executing is at least 5 % above A's on every Set.
   - If only C qualifies, T0028's B gets the floor too.
   - Otherwise stop. DSP is reported either way.
+- **D0008 — RESULT (2026-10-20 00:06–00:30; three runs clean, pinning held): deep C-states off does not raise the workers' clock consistently, so no T0028 (stop, as registered).**
+  - **Mechanism held:**
+    - In A the audio CPUs spent 60–62 % of their time in C2 (2,400–2,700 entries a second each) and 30–33 % in C1; C3 was never used.
+    - In B and C: no C2 or C3 entries, C1 92–93 %.
+  - **AudioCalc clock while executing, against A** (Inbuilts / Max4Live / VSTs):
+    - B +6.1 / −4.8 / +10.2 %; C −11.5 / −8.1 / +22.1 %.
+  - **DSP average:** B −2.6 / +2.5 / −4.0 %; C +8.3 / +3.5 / −7.6 % (C's Inbuilts had one peak over 100 %).
+  - **Package** 17–18.6 W in every run, temperatures alike.
+  - Same-configuration runs differ by up to 17 % in the workers' clock (VSTs: D0007's A 3.23 GHz, D0008's A 2.67 GHz), so single runs cannot resolve effects of this size.
+  - **Not the turbo limit:** MSR_TURBO_RATIO_LIMIT allows 4.7 GHz with up to 8 active P-cores (4.9 GHz with one or two), and HWP's highest performance is 60. The workers execute at 2.7–3.6 GHz, so the limit is neither turbo, power nor heat.
+  - **C1E is on** (MSR_POWER_CTL bit 1, every core): a C1 halt also drops voltage and clock. With C2/C3 off, the cores still drop into C1E between rounds, about 4,000 times a second.
+  - Next: D0009, C1E off together with C2/C3 off. Summary: `profiler/plans/findings/d0008-summary.txt`.
+
+## C1E and the clock (D0009, diagnostic, pre-registered 2026-10-20 ~00:55, before any of its runs)
+- **Why:** see D0008. If C1E's voltage and clock drop on each of the ~4,000 halts a second is what keeps the workers at 2.7–3.6 GHz, then idle cores that only clock-gate should run their bursts near 4.7 GHz.
+- **Design:** kept configuration; four bench runs in one session, A B A B (Inbuilts, Max4Live and VSTs, 120 s each).
+  - A: as is.
+  - B: C1E off on every CPU (MSR 0x1FC bit 1 cleared through `/dev/cpu/N/msr`) and C2/C3 off on the P-cores.
+  - The saved values are restored after each run and on any exit, and the MSR resets at reboot. The msr driver taints the kernel CPU_OUT_OF_SPEC until the next reboot.
+  - Driver `profiler/kernel/clock/d0009.sh`.
+- **Measured per Set:** as in D0008, plus the C1E bit during each capture (the mechanism).
+- **Decision:** register a trial (rule D, ABAB × 3, power and temperature reported) if B's AudioCalc clock while executing is at least 10 % above its paired A run's, in both pairs and on every Set; otherwise stop. The bar is 10 % because same-configuration single runs differed by up to 17 %.
 
 ## Context
 - `WINE_POSIX_SPAWN=1` (T0020) removed the fork-induced page-fault storms, and dropouts are now rare. **T0022 (one audio thread per physical P-core, 5 workers) is a keep**: audio-thread CPU −26 %, Live CPU 46.9 → 35.0 %, DSP average lower. The goal now is more headroom: shorter, steadier audio blocks and less CPU, through kernel-level changes.

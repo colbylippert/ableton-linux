@@ -81,7 +81,8 @@ def main():
                   f" | DSP {f(x['dsp'], 3)} pk_med {f(x['pk_med'])} pk_max {f(x['pk_max'], 1)} >100 {x['over100']}"
                   f" PW err {x['pw_err']} | Live CPU {f(x['live_cpu'])} %")
             print(f"     package {f(c.get('package_w'))} W, temp {c.get('package_temp_c')}, throttle {th.get('package_ms')} ms pkg"
-                  f" | audio CPUs' idle (entries/s, residency %): {idle(c)} | min_freq {mins} disabled {disabled}")
+                  f" | audio CPUs' idle (entries/s, residency %): {idle(c)} | min_freq {mins} disabled {disabled}"
+                  f" C1E {c.get('c1e_at_start', '-')}")
         b = base.get(s)
         for label, r in runs[1:]:
             x = r.get(s)
