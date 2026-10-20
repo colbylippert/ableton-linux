@@ -111,6 +111,37 @@ Living document, approved 2026-10-19: the status table is updated as each item l
       - Live's non-audio work (UI, display, Wine's threads) costs more under Linux.
       - PipeASIO's callback is cheaper than the Focusrite ASIO driver's.
 
+## Linux upstream-only baseline (D0006, pre-registered 2026-10-19 ~21:45, before any of its runs)
+- **Why:** a new Linux baseline with only upstream's fixes (user: "turn those off and get a new baseline with just upstream fixes"; Linux only, not interleaved). Against D0005's Linux runs (the kept configuration, same procedure, same evening) it shows what our fixes add together. Descriptive only: no verdict.
+- **Configuration** (`profiler/windows/linux-run.sh TAG upstream`):
+  - Off (ours):
+    - posix_spawn (`WINE_POSIX_SPAWN`, 0112, T0020);
+    - PipeASIO realtime (`PIPEASIO_REALTIME`, T0003; upstream ships it off);
+    - the physcore pinning with 5 workers (T0022);
+    - the new display (T0023: Vulkan, Live's GPU renderer, present skip 6);
+    - realtime throttling off.
+  - Upstream's defaults instead:
+    - the launcher's automatic worker count: 15 on this laptop (10 physical cores, raised to half of Live's own 30);
+    - no pinning;
+    - wined3d on OpenGL with every frame shown, and Live's GPU renderer off (the golden before T0023, `golden.20261019T153253Z`);
+    - realtime throttling as booted.
+  - Unchanged:
+    - the project's Wine 11.13 build (patches 0108–0112 are inert without their switches; 0108's trace points are idle no-ops);
+    - Live at SCHED_RR 10 and the performance power hold (upstream's launcher defaults);
+    - the Focusrite on PipeWire's Pro Audio profile at 48 kHz and 64 frames;
+    - the stock 7.2.11 kernel and ntsync module, Link off, the built-in screen on the Intel GPU.
+- **Design:** 3 runs (A1 A2 A3), each from a fresh boot, settled as D0005's Linux runs were; Inbuilts, Max4Live and VSTs at 120 s each. Driver: `ORDER="A1 A2 A3" LINUX_CONFIG=upstream TRIAL_ID=D0006 profiler/windows/cross-os-trial.sh d0006` on the workstation.
+- **Checks per run** (from the run records):
+  - none of `WINE_POSIX_SPAWN`, `PIPEASIO_REALTIME`, `WINE_D3D_CONFIG`, `WINED3D_PRESENT_SKIP` or `ABLETON_MAX_AUDIO_THREADS` among the recorded switches;
+  - no pins, 15 workers;
+  - Live's log says "GPU Renderer: Off";
+  - realtime throttling at its boot value.
+- **Reported:** per Set, against D0005's Linux runs:
+  - the DSP average and peak median;
+  - peaks over 100 %;
+  - PipeWire errors;
+  - Live's CPU and the audio threads' CPU.
+
 ## Context
 - `WINE_POSIX_SPAWN=1` (T0020) removed the fork-induced page-fault storms, and dropouts are now rare. **T0022 (one audio thread per physical P-core, 5 workers) is a keep**: audio-thread CPU −26 %, Live CPU 46.9 → 35.0 %, DSP average lower. The goal now is more headroom: shorter, steadier audio blocks and less CPU, through kernel-level changes.
 - User (2026-10-19): "We want ableton specific improvement… lets get clever and esoteric for this ableton only kernel patch concept"; then "complete implementation plan for kernel level items".

@@ -6,12 +6,16 @@
 # boots alternating (from Linux: one-shot grub-reboot into Windows Boot Manager; from Windows: a restart, which GRUB's
 # default turns into Linux), and runs Inbuilts, Max4Live and VSTs for 120 s each.
 # Writes OUT/results.jsonl (one JSON line per Set-run, with "run"), OUT/<tag>.log per run, OUT/progress.log.
+# Environment: ORDER (the runs, e.g. "A1 A2 A3" for Linux only), LINUX_CONFIG (kept or upstream, for
+# profiler/windows/linux-run.sh), TRIAL_ID (D0005 by default; D0006 is the upstream-only Linux baseline).
 # Needs the ssh aliases ableton-laptop (Linux) and ableton-win (Windows), Windows auto-logon, and C:\Users\colby\AbletonBench
 # (Sets, plugins); the harness (bench-win.py, summarise.py, settle.ps1) is copied there from this checkout before each
 # Windows run.
 set -u
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 TAG=${1:-d0005}
+TRIAL_ID=${TRIAL_ID:-D0005}
+LINUX_CONFIG=${LINUX_CONFIG:-kept}
 OUT=${OUT:-$HOME/profiler-crossos/$TAG}
 ORDER=${ORDER:-"A1 B1 A2 B2 A3 B3"}
 SETS="Inbuilts Max4Live VSTs"
@@ -55,7 +59,7 @@ boot_into() {  # linux|windows: a fresh boot into it
 }
 
 run_linux() {  # TAG-run
-  lin "cd ~/Projects/ableton-linux && git fetch -q fork profiler && git merge -q --ff-only fork/profiler; profiler/windows/linux-run.sh $1" \
+  lin "cd ~/Projects/ableton-linux && git fetch -q fork profiler && git merge -q --ff-only fork/profiler; profiler/windows/linux-run.sh $1 $LINUX_CONFIG $TRIAL_ID" \
     > "$OUT/$1.jsonl" 2> "$OUT/$1.log"
 }
 
@@ -75,7 +79,7 @@ run_windows() {  # TAG-run
   win "$WINPY $WB\\summarise.py --json$dirs" > "$OUT/$1.jsonl" 2>> "$OUT/$1.log"
 }
 
-say "D0005 $TAG: order $ORDER; results in $OUT"
+say "$TRIAL_ID $TAG: order $ORDER; Linux configuration $LINUX_CONFIG; results in $OUT"
 for r in $ORDER; do
   os=linux
   case $r in B*) os=windows ;; esac
@@ -89,4 +93,4 @@ for r in $ORDER; do
   [ "$n" -gt 0 ] || { say "run $tag produced no results (see $OUT/$tag.log); stopping"; exit 1; }
 done
 [ "$(current_os)" = linux ] || boot_into linux
-say "D0005 $TAG done"
+say "$TRIAL_ID $TAG done"
