@@ -555,6 +555,15 @@ Living document, approved 2026-10-19: the status table is updated as each item l
   - Even cycles confirm the mechanism.
   - Over 18 minutes, fewer PipeWire errors than D0014's 3 would be suggestive only. The load ramp, where errors are frequent, is the test of effect; it follows if steps 1 and 2 hold.
   - Errors on the Focusrite's nodes, or xruns, would mean the headroom is too small.
+- **D0017 step 1 — RESULT (2026-10-20 15:30–15:31; one first-buffer run, Inbuilts, 2 workers, 35,829 cycles): the mechanism holds.**
+  - The Focusrite's nodes report `disable-tsched` false and headroom 32 (before: true, none).
+  - **Cycle spacing:** p1 1,333.2, p50 1,333.3, p99 1,335.1 µs (D0016: 988.8, 1,499.9, 1,511.2). The cycles are even; no 1.0 ms ones remain.
+  - **PipeWire's next-cycle estimate is exact:** 0.0 µs from the real next start at p1, p50 and p99, early in 2 of 35,728 cycles (D0016: median +248 µs, early in 16 %). PipeASIO's slack and late counts are accurate now.
+  - One block per cycle from block 3; no muting, no missed frames. Live's `bufferSwitch` is entered 12 µs into the cycle (p99 25 µs; D0016: 7 and 22).
+  - **Late blocks: 2, both at start-up, 7.1 s before play.** Live's callback ran 4.4 ms (the start-up work D0016 also showed), and the next block started 1.8 ms late behind it. None in the play window or the measured window.
+  - **Play instant:** the first heavy block ran 17 ms after the command, 11.6 µs into its cycle, with 1.0 ms of slack. No late block in the next 3 s.
+  - **Errors on the Focusrite's input node** (the graph's driver) over the bench's record: 2 (D0016: 19).
+  - **Latency:** Live reports 2.67 ms overall in both modes. The 32 frames of headroom (0.67 ms) are not in what PipeASIO reports to Live; a loopback measurement would give the real figure.
 
 ## Context
 - `WINE_POSIX_SPAWN=1` (T0020) removed the fork-induced page-fault storms, and dropouts are now rare. **T0022 (one audio thread per physical P-core, 5 workers) is a keep**: audio-thread CPU −26 %, Live CPU 46.9 → 35.0 %, DSP average lower. The goal now is more headroom: shorter, steadier audio blocks and less CPU, through kernel-level changes.
