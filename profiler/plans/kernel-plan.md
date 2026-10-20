@@ -175,6 +175,18 @@ Living document, approved 2026-10-19: the status table is updated as each item l
   - package power, package and hottest-core temperature, thermal throttle events and time;
   - the P-cores' `scaling_min_freq` and EPP during the capture (the mechanism).
 - **Decision:** register a trial (rule D, ABAB × 3, power and temperature reported) if B's AudioCalc clock is at least 5 % above A's on every Set; otherwise stop. One pair cannot decide the DSP effect, so it is reported only.
+- **D0007 — RESULT (2026-10-19 23:44–23:59; both runs clean, physcore pinning held): the floor does not raise the workers' clock, so no trial (stop, as registered).**
+  - **Clock while executing** (cycles / reference cycles × the 2.9 GHz TSC), A → B per Set (Inbuilts / Max4Live / VSTs):
+    - AudioCalc 3.41 / 3.11 / 3.23 → 3.18 / 3.00 / 3.03 GHz (−4 to −7 %);
+    - `pipeasio-rt` 3.53 / 3.69 / 3.39 → 4.08 / 3.95 / 3.94 GHz (+8 to +16 %).
+  - The workers execute only 81–85 % of their on-CPU time (reference cycles / task clock); the rest is halted waiting inside their time slice.
+  - **DSP average** 8.96 / 9.50 / 8.40 → 8.87 / 9.44 / 8.39 (−1.0 / −0.7 / −0.2 %); no peaks over 100 %, no PipeWire errors in either run.
+  - **No power or thermal limit:** package 17–19 W in both runs, mean 54–58 °C, max 64–74 °C. In A, 9–20 ms of throttling per Set; none in B.
+  - **Reading:**
+    - The workers run at 3.0–3.4 GHz on cores rated 4.7–4.9 GHz, with power and heat far from any limit, and a floor does not move them up.
+    - The likely limit is how the cores come back from sleep: they sleep between rounds, and two thirds of audio wakes leave C2 (D0004).
+    - The follow-up check is D0008 (deep C-states off on the P-cores, with and without the floor).
+  - Summary: `profiler/plans/findings/d0007-summary.txt`.
 
 ## Context
 - `WINE_POSIX_SPAWN=1` (T0020) removed the fork-induced page-fault storms, and dropouts are now rare. **T0022 (one audio thread per physical P-core, 5 workers) is a keep**: audio-thread CPU −26 %, Live CPU 46.9 → 35.0 %, DSP average lower. The goal now is more headroom: shorter, steadier audio blocks and less CPU, through kernel-level changes.

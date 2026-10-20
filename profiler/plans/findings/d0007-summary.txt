@@ -1,0 +1,18 @@
+== Inbuilts
+  A: AudioCalc 2.896 GHz IPC 1.778 CPU 17.63 % | pipeasio-rt 3.259 GHz CPU 7.34 % | DSP 8.960 pk_med 17.02 pk_max 64.9 >100 0 PW err 0 | Live CPU 39.44 %
+     package 19.10 W (p95 20.7), temp {'mean': 57.0, 'max': 74.0}, hottest core {'mean': 56.9, 'max': 74.0}, throttle pkg 2 ev / 9 ms, cores ms {'6': 9, '7': 9} | min_freq [400000] EPP ['performance']
+  B: AudioCalc 2.691 GHz IPC 1.770 CPU 18.67 % | pipeasio-rt 3.678 GHz CPU 6.92 % | DSP 8.872 pk_med 17.02 pk_max 61.3 >100 0 PW err 0 | Live CPU 39.93 %
+     package 18.75 W (p95 20.0), temp {'mean': 54.5, 'max': 64.0}, hottest core {'mean': 54.5, 'max': 64.0}, throttle pkg 0 ev / 0 ms, cores ms {} | min_freq [4700000, 4900000] EPP ['performance']
+  B vs A: clock -7.1 %, DSP -1.0 %
+== Max4Live
+  A: AudioCalc 2.644 GHz IPC 1.790 CPU 20.07 % | pipeasio-rt 3.418 GHz CPU 7.82 % | DSP 9.499 pk_med 17.55 pk_max 62.5 >100 0 PW err 0 | Live CPU 42.64 %
+     package 18.74 W (p95 19.6), temp {'mean': 57.7, 'max': 71.0}, hottest core {'mean': 57.7, 'max': 71.0}, throttle pkg 7 ev / 20 ms, cores ms {'0': 12, '1': 12, '6': 8, '7': 8} | min_freq [400000] EPP ['performance']
+  B: AudioCalc 2.542 GHz IPC 1.796 CPU 20.56 % | pipeasio-rt 3.553 GHz CPU 7.70 % | DSP 9.436 pk_med 17.59 pk_max 63.7 >100 0 PW err 0 | Live CPU 43.37 %
+     package 18.55 W (p95 19.7), temp {'mean': 54.1, 'max': 64.0}, hottest core {'mean': 54.2, 'max': 64.0}, throttle pkg 0 ev / 0 ms, cores ms {} | min_freq [4700000, 4900000] EPP ['performance']
+  B vs A: clock -3.9 %, DSP -0.7 %
+== VSTs
+  A: AudioCalc 2.618 GHz IPC 1.479 CPU 15.09 % | pipeasio-rt 3.083 GHz CPU 6.72 % | DSP 8.402 pk_med 16.65 pk_max 67.5 >100 0 PW err 0 | Live CPU 34.19 %
+     package 17.38 W (p95 18.2), temp {'mean': 55.0, 'max': 70.0}, hottest core {'mean': 55.0, 'max': 70.0}, throttle pkg 0 ev / 0 ms, cores ms {} | min_freq [400000] EPP ['performance']
+  B: AudioCalc 2.453 GHz IPC 1.426 CPU 15.54 % | pipeasio-rt 3.511 GHz CPU 6.77 % | DSP 8.387 pk_med 17.06 pk_max 60.8 >100 0 PW err 0 | Live CPU 35.03 %
+     package 17.59 W (p95 18.3), temp {'mean': 53.2, 'max': 64.0}, hottest core {'mean': 53.2, 'max': 64.0}, throttle pkg 0 ev / 0 ms, cores ms {} | min_freq [4700000, 4900000] EPP ['performance']
+  B vs A: clock -6.3 %, DSP -0.2 %
