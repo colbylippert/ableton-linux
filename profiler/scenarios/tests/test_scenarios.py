@@ -38,7 +38,7 @@ validate = scenario_run.validate
 EXPECTED = {
     "idle-playing": "benchmark", "clip-launch-storm": "benchmark", "param-sweep": "benchmark",
     "tempo-ramp": "benchmark", "track-churn": "diagnostic", "view-flip": "diagnostic",
-    "load-devices": "diagnostic",
+    "load-devices": "diagnostic", "ramp-duplicate-all": "diagnostic",
 }
 
 
@@ -98,7 +98,7 @@ class ShippedScenarioTests(unittest.TestCase):
                     self.assertTrue(set(ops(document, phase)) <= scenario_run.PHASE_OPS[phase])
 
     def test_benchmark_scenarios_keep_their_grade(self):
-        forbidden = {"load_device", "create_midi_track", "create_audio_track", "delete_track", "show_view"}
+        forbidden = {"load_device", "create_midi_track", "create_audio_track", "delete_track", "show_view", "duplicate_all"}
         for name, (_, document) in shipped().items():
             with self.subTest(name):
                 used = {phase: set(ops(document, phase)) for phase in ("setup", "timeline", "teardown")}

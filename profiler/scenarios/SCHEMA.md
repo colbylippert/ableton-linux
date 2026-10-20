@@ -124,8 +124,8 @@ timeout, 2 usage.
 ## Benchmark grade
 
 `kind: benchmark` scenarios keep a fixed schedule on a fixed set:
-`load_device`, `create_midi_track`, `create_audio_track`, `delete_track` and
-`show_view` are not allowed anywhere, and `create_clip`, `add_notes` and
+`load_device`, `create_midi_track`, `create_audio_track`, `delete_track`,
+`show_view` and `duplicate_all` are not allowed anywhere, and `create_clip`, `add_notes` and
 `set_quantization` only in `setup`. They are comparable only through
 `bench-report.py compare --structure diagnostic` with identical scenario,
 sets, duration and trace mode. `kind: diagnostic` scenarios may use every
@@ -142,6 +142,7 @@ op; their reports are for mechanism evidence, not for A/B claims.
 | `track-churn` | diagnostic | Benchmark_Empty | a MIDI track inserted at index 1 and deleted again every 2 s |
 | `view-flip` | diagnostic | Benchmark_Inbuilts | Session, Arranger and Detail/DeviceChain shown in turn each second |
 | `load-devices` | diagnostic | Benchmark_Empty | ten stock instruments and effects loaded from the browser, one every 3 s |
+| `ramp-duplicate-all` | diagnostic | any | a load ramp: every top-level track duplicated once per 96-beat loop (51.4286 s at 112 BPM), so period *k* plays the Set *k* times; split per step by `profiler/control/ramp-report.py` |
 
 The canonical sets are arrangement sets with eight empty scenes, so clip
 scenarios create their own session clips in `setup`; firing an empty scene

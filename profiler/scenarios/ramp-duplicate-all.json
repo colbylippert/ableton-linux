@@ -1,0 +1,43 @@
+{
+  "schema": "ableton-linux-scenario/v1",
+  "name": "ramp-duplicate-all",
+  "kind": "diagnostic",
+  "base_set": "any",
+  "description": "Load ramp: stop, rewind, play before the window; inside it, once per 96-beat loop of the heavy Sets (51.4286 s at 112 BPM), every top-level track the Set had is duplicated once (/abl/bench/duplicate-all), so the k-th period plays the Set k times; stop afterwards. profiler/control/ramp-report.py splits the window at the duplicate-all replies and finds the highest load that holds.",
+  "requires": {
+    "control_surface": true,
+    "max_for_live": false,
+    "plugins": []
+  },
+  "setup": [
+    {
+      "op": "stop"
+    },
+    {
+      "op": "rewind"
+    },
+    {
+      "op": "play"
+    },
+    {
+      "op": "marker",
+      "name": "setup-done"
+    }
+  ],
+  "timeline": {
+    "period_s": 51.4286,
+    "repeat": true,
+    "marker_every_s": 5.0,
+    "steps": [
+      {
+        "at_s": 51.3,
+        "op": "duplicate_all"
+      }
+    ]
+  },
+  "teardown": [
+    {
+      "op": "stop"
+    }
+  ]
+}
