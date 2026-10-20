@@ -13,7 +13,7 @@
 # instant in ableton if this isnt aligned internally with pipewire we have a window for unders").
 # Output in $R/first-TAG: probes.txt (every probe hit in full for the first EVENTS, default 2000000, the whole run at
 # about 4,000 a second, then one line per second), profiler.json, live.log, bench/. Then
-# profiler/trials/first_buffer_analyze.py.
+# profiler/trials/first_buffer_analyze.py. BUFFER=F sets PipeASIO's preferred buffer (PIPEASIO_PREFERRED_BUFFERSIZE).
 set -u
 TAG=${1:?usage: first-buffer.sh TAG [WORKERS] [SET] [DURATION]}
 WORKERS=${2:-2}
@@ -28,6 +28,7 @@ export KEPT_LAYOUT=physcore KEPT_WORKERS=$WORKERS ABLETON_MAX_AUDIO_THREADS=$WOR
 campaign_setup
 export WINE_D3D_CONFIG=csmt=0x1,renderer=vulkan WINED3D_PRESENT_SKIP=6
 unset WINE_MMCSS ABLETON_RT
+if [ -n "${BUFFER:-}" ]; then export PIPEASIO_PREFERRED_BUFFERSIZE=$BUFFER; fi   # campaign_setup clears it
 out=$R/first-$TAG
 rm -rf "${out:?}"; mkdir -p "$out"
 cat > "$out/probes.bt" <<BT
@@ -77,7 +78,7 @@ profiler_pid=$!
 profiler/bin/state restore --name golden > /dev/null 2>&1
 PIN_LOG=$out/pin.log; : > "$PIN_LOG"
 pin_kept & pinner=$!
-echo "FIRSTBUF $TAG $(date +%T) workers=$WORKERS set=$SET duration=${DURATION}s"
+echo "FIRSTBUF $TAG $(date +%T) workers=$WORKERS set=$SET duration=${DURATION}s buffer=${PIPEASIO_PREFERRED_BUFFERSIZE:-default}"
 profiler/bin/bench --tag "first-$TAG" --sets "$SET" --duration "$DURATION" --output "$out/bench" > "$out/bench.log" 2>&1
 rc=$?
 kill "$pinner" 2> /dev/null; wait "$pinner" 2> /dev/null

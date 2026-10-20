@@ -580,7 +580,28 @@ Living document, approved 2026-10-19: the status table is updated as each item l
     - PipeWire raised the headroom to a full period, probably because the USB interface reports its position only in chunks.
     - Timer scheduling here costs 64 frames (1.33 ms) of playback latency, which Live's reported 2.67 ms does not include. In effect it is even cycles plus a 64-sample safety buffer.
   - The rule stays installed until the user decides (`profiler/kernel/pipewire/focusrite-tsched.sh off` removes it).
-  - Files: `profiler/plans/findings/d0017-results.jsonl`.
+  - Files: `profiler/plans/findings/d0017-results.jsonl`; the timing diagram, `profiler/plans/findings/d0017/focusrite-cycle-timing.html`.
+
+## D0018: a 72-frame buffer in interrupt mode, even cycles without a cushion (diagnostic, written before its runs)
+- **User:** "Lets try number 2 so we have good data". Option 2 after D0017: separate the even cycles from D0017's extra 64 frames of headroom.
+- **Why:** 72 frames at 48 kHz is 1.5 ms, exactly three of the USB stream's 0.5 ms transfers. So in interrupt mode, with no headroom, every cycle should start on a transfer boundary 1.5 ms after the last: even cycles with no buffering beyond the period itself (+0.17 ms a buffer against 64 frames).
+- **Switch:**
+  - The timer rule is removed (`focusrite-tsched.sh off`: interrupt mode, headroom 0).
+  - `PIPEASIO_PREFERRED_BUFFERSIZE=72`, as T0017 set 32: configuration `kept-w2-b72` in `linux-run.sh`, `BUFFER=72` for `first-buffer.sh`.
+- **Steps:**
+  1. **Mechanism:** `BUFFER=72 first-buffer.sh d0018 2 Inbuilts 30`, checking:
+     - the graph's quantum at 72;
+     - the cycle spacing within 1,500 ± 100 µs at p1 and p99;
+     - one block per cycle;
+     - the Focusrite's nodes in interrupt mode with headroom 0;
+     - Live's reported latency (expected 3.0 ms).
+  2. **If the cycles are even:** a full pass as D0014 and D0017 (three fresh boots, `kept-w2-b72`), compared with:
+     - D0014: 3 errors, with uneven 1.333 ms cycles and no cushion;
+     - D0017: 0 errors, with even 1.333 ms cycles plus 64 frames of headroom.
+- **Reading:**
+  - No errors, or close to none, would mean even cycles alone remove them. D0014-like errors would mean the cushion did the work.
+  - The DSP averages are a share of a longer period (1.5 ms against 1.333 ms), so they are not compared directly with the 64-frame runs.
+- The buffer setting applies per run and does not persist. The timer rule stays removed unless the user chooses it.
 
 ## Context
 - `WINE_POSIX_SPAWN=1` (T0020) removed the fork-induced page-fault storms, and dropouts are now rare. **T0022 (one audio thread per physical P-core, 5 workers) is a keep**: audio-thread CPU −26 %, Live CPU 46.9 → 35.0 %, DSP average lower. The goal now is more headroom: shorter, steadier audio blocks and less CPU, through kernel-level changes.

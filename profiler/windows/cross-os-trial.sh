@@ -6,7 +6,7 @@
 # boots alternating (from Linux: one-shot grub-reboot into Windows Boot Manager; from Windows: a restart, which GRUB's
 # default turns into Linux), and runs Inbuilts, Max4Live and VSTs for 120 s each.
 # Writes OUT/results.jsonl (one JSON line per Set-run, with "run"), OUT/<tag>.log per run, OUT/progress.log.
-# Environment: ORDER (the runs, e.g. "A1 A2 A3" for Linux only), LINUX_CONFIG (kept, kept-wN or upstream, for
+# Environment: ORDER (the runs, e.g. "A1 A2 A3" for Linux only), LINUX_CONFIG (kept, kept-wN[-bF] or upstream, for
 # profiler/windows/linux-run.sh), TRIAL_ID (D0005 by default; D0006 is the upstream-only Linux baseline, D0014 the
 # kept configuration with 2 workers).
 # Needs the ssh aliases ableton-laptop (Linux) and ableton-win (Windows), Windows auto-logon, and C:\Users\colby\AbletonBench

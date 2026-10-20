@@ -1,0 +1,312 @@
+<title>Focusrite Cycle Timing</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;600&family=Martian+Mono:wght@400;500&display=swap">
+<style>
+  /* Layout: one reading column; two to-scale timing traces on a shared 0-8 ms axis, then the measured table. */
+  :root {
+    --bg: #f3f5f8; --surface: #ffffff; --ink: #1c2331; --muted: #5a6475; --grid: #cfd5df;
+    --trace: #2d4c8a; --due: #8c95a8; --bar: #e6ebf3; --bar-edge: #b9c3d4;
+    --ok: #2b7a6a; --warn: #b2661c; --warn-soft: #f6e7d6; --bad: #b5393a;
+    --sans: "Instrument Sans", "Segoe UI", system-ui, sans-serif;
+    --mono: "Martian Mono", ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #11151d; --surface: #182030; --ink: #e5e9f0; --muted: #9ba5b5; --grid: #2c3546;
+      --trace: #8eaef0; --due: #6e788c; --bar: #222c3e; --bar-edge: #3b4860;
+      --ok: #5cc0aa; --warn: #e4a556; --warn-soft: #3a2c1c; --bad: #f07272; color-scheme: dark;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #11151d; --surface: #182030; --ink: #e5e9f0; --muted: #9ba5b5; --grid: #2c3546;
+    --trace: #8eaef0; --due: #6e788c; --bar: #222c3e; --bar-edge: #3b4860;
+    --ok: #5cc0aa; --warn: #e4a556; --warn-soft: #3a2c1c; --bad: #f07272; color-scheme: dark;
+  }
+  body { background: var(--bg); color: var(--ink); font-family: var(--sans); font-size: 16px; line-height: 1.55; }
+  main { max-width: 1040px; margin: 0 auto; padding-inline: 20px; padding-block: 36px 56px; display: grid; gap: 28px; }
+  header { display: grid; gap: 10px; max-width: 68ch; }
+  .eyebrow { font-family: var(--mono); font-size: 12px; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); }
+  h1 { font-size: clamp(28px, 4vw, 38px); line-height: 1.15; margin: 0; text-wrap: balance; font-weight: 600; }
+  h2 { font-size: 20px; margin: 0; text-wrap: balance; font-weight: 600; }
+  p { margin: 0; }
+  .legend { display: flex; flex-wrap: wrap; gap: 10px 22px; font-size: 14px; color: var(--muted); }
+  .legend span { display: inline-flex; align-items: center; gap: 8px; }
+  .sw { display: inline-block; flex: none; }
+  .sw-usb { width: 2px; height: 14px; background: var(--trace); }
+  .sw-due { width: 0; height: 14px; border-left: 2px dashed var(--due); }
+  .sw-start { width: 10px; height: 10px; border-radius: 50%; background: var(--trace); }
+  .sw-bar { width: 22px; height: 12px; border-radius: 2px; background: var(--bar); border: 1px solid var(--bar-edge); }
+  .sw-short { width: 22px; height: 12px; border-radius: 2px; background: var(--warn-soft); border: 1px solid var(--warn); }
+  .sw-ok { width: 22px; height: 9px; border-radius: 2px; background: var(--ok); }
+  .sw-bad { width: 22px; height: 9px; border-radius: 2px; background: var(--bad); }
+  figure { margin: 0; background: var(--surface); border: 1px solid var(--grid); border-radius: 10px; padding: 18px 18px 16px; display: grid; gap: 10px; }
+  .scroll { overflow-x: auto; }
+  .scroll svg { display: block; width: 100%; min-width: 760px; height: auto; color: var(--muted); }
+  figcaption { color: var(--muted); font-size: 15px; max-width: 75ch; }
+  svg text { font-family: var(--mono); font-size: 11px; fill: var(--muted); }
+  svg .lane-label { font-family: var(--sans); font-size: 12.5px; font-weight: 600; fill: var(--ink); text-anchor: end; }
+  svg .usb { stroke: var(--trace); stroke-width: 1.6; }
+  svg .lane { stroke: var(--grid); stroke-width: 1; }
+  svg .due { stroke: var(--due); stroke-width: 1; stroke-dasharray: 3 4; }
+  svg .due-mark { fill: var(--surface); stroke: var(--due); stroke-width: 1.5; }
+  svg .start-line { stroke: var(--trace); stroke-width: 1; opacity: .5; }
+  svg .start-mark { fill: var(--trace); }
+  svg .arrow { stroke: var(--muted); stroke-width: 1.2; fill: none; }
+  svg .arrowhead { fill: var(--muted); }
+  svg .bar { fill: var(--bar); stroke: var(--bar-edge); stroke-width: 1; }
+  svg .bar.short { fill: var(--warn-soft); stroke: var(--warn); }
+  svg .bar-label { fill: var(--ink); text-anchor: middle; }
+  svg .bar-label.short { fill: var(--warn); font-weight: 500; }
+  svg .blk-ok { fill: var(--ok); }
+  svg .blk-bad { fill: var(--bad); }
+  svg .miss { stroke: var(--bad); stroke-width: 2; }
+  svg .miss-label { fill: var(--bad); }
+  svg .axis { stroke: var(--grid); stroke-width: 1; }
+  svg .axis-label { text-anchor: middle; }
+  svg .note { stroke: var(--warn); stroke-width: 1.3; fill: none; }
+  svg .note-label { fill: var(--warn); }
+  section { display: grid; gap: 12px; }
+  .table-wrap { overflow-x: auto; background: var(--surface); border: 1px solid var(--grid); border-radius: 10px; }
+  table { border-collapse: collapse; width: 100%; min-width: 560px; font-size: 15px; }
+  th, td { text-align: left; padding: 10px 14px; border-bottom: 1px solid var(--grid); vertical-align: top; }
+  tr:last-child td { border-bottom: 0; }
+  th { font-weight: 600; font-size: 13px; color: var(--muted); }
+  td.num { font-family: var(--mono); font-size: 13px; font-variant-numeric: tabular-nums; }
+  td.better { color: var(--ok); }
+  td.worse { color: var(--warn); }
+  .foot { font-size: 14px; color: var(--muted); max-width: 75ch; }
+  code { font-family: var(--mono); font-size: .86em; }
+</style>
+
+<main>
+  <header>
+    <div class="eyebrow">PipeWire · Focusrite Scarlett 2i4 · 64 frames at 48 kHz</div>
+    <h1>Focusrite cycle timing</h1>
+    <p>Each PipeWire cycle hands Live one 64-frame buffer, 1.333 ms of audio, and Live must finish before the next cycle starts. The Focusrite's USB driver reports its progress only every 0.5 ms. The two traces below show the same 8 ms before and after switching the card from interrupt-driven to timer-driven scheduling, drawn to the same scale.</p>
+    <div class="legend" aria-hidden="true">
+      <span><i class="sw sw-usb"></i>USB transfer done</span>
+      <span><i class="sw sw-due"></i>64-frame period due</span>
+      <span><i class="sw sw-start"></i>PipeWire cycle starts</span>
+      <span><i class="sw sw-bar"></i>Time Live gets</span>
+      <span><i class="sw sw-short"></i>Short cycle</span>
+      <span><i class="sw sw-ok"></i>1.1 ms block fits</span>
+      <span><i class="sw sw-bad"></i>Misses: PipeWire error</span>
+    </div>
+  </header>
+
+  <figure>
+    <h2>Before: interrupt-driven</h2>
+    <div class="scroll">
+      <svg viewBox="0 0 980 300" role="img" aria-label="Interrupt-driven timing: USB transfers finish every 0.5 ms; 64-frame periods fall due every 1.333 ms, but PipeWire starts each cycle only at the next transfer, so the cycles last 1.5, 1.5 and 1.0 ms, repeating. A 1.1 ms block fits the 1.5 ms cycles and misses the 1.0 ms ones.">
+        <defs>
+          <marker id="ah1" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path class="arrowhead" d="M0,0 L8,4 L0,8 Z"/>
+          </marker>
+        </defs>
+        <text class="lane-label" x="128" y="46">USB transfers</text>
+        <text class="lane-label" x="128" y="84">Period due</text>
+        <text class="lane-label" x="128" y="124">Cycle starts</text>
+        <text class="lane-label" x="128" y="172">Time Live gets</text>
+        <text class="lane-label" x="128" y="217">1.1 ms block</text>
+
+        <line class="lane" x1="140" y1="50" x2="940" y2="50"/>
+        <g>
+          <line class="usb" x1="140" y1="34" x2="140" y2="50"/><line class="usb" x1="190" y1="34" x2="190" y2="50"/>
+          <line class="usb" x1="240" y1="34" x2="240" y2="50"/><line class="usb" x1="290" y1="34" x2="290" y2="50"/>
+          <line class="usb" x1="340" y1="34" x2="340" y2="50"/><line class="usb" x1="390" y1="34" x2="390" y2="50"/>
+          <line class="usb" x1="440" y1="34" x2="440" y2="50"/><line class="usb" x1="490" y1="34" x2="490" y2="50"/>
+          <line class="usb" x1="540" y1="34" x2="540" y2="50"/><line class="usb" x1="590" y1="34" x2="590" y2="50"/>
+          <line class="usb" x1="640" y1="34" x2="640" y2="50"/><line class="usb" x1="690" y1="34" x2="690" y2="50"/>
+          <line class="usb" x1="740" y1="34" x2="740" y2="50"/><line class="usb" x1="790" y1="34" x2="790" y2="50"/>
+          <line class="usb" x1="840" y1="34" x2="840" y2="50"/><line class="usb" x1="890" y1="34" x2="890" y2="50"/>
+          <line class="usb" x1="940" y1="34" x2="940" y2="50"/>
+        </g>
+
+        <g>
+          <line class="due" x1="140" y1="62" x2="140" y2="236"/><line class="due" x1="273.3" y1="62" x2="273.3" y2="236"/>
+          <line class="due" x1="406.7" y1="62" x2="406.7" y2="236"/><line class="due" x1="540" y1="62" x2="540" y2="236"/>
+          <line class="due" x1="673.3" y1="62" x2="673.3" y2="236"/><line class="due" x1="806.7" y1="62" x2="806.7" y2="236"/>
+          <line class="due" x1="940" y1="62" x2="940" y2="236"/>
+          <polygon class="due-mark" points="140,74 146,80 140,86 134,80"/><polygon class="due-mark" points="273.3,74 279.3,80 273.3,86 267.3,80"/>
+          <polygon class="due-mark" points="406.7,74 412.7,80 406.7,86 400.7,80"/><polygon class="due-mark" points="540,74 546,80 540,86 534,80"/>
+          <polygon class="due-mark" points="673.3,74 679.3,80 673.3,86 667.3,80"/><polygon class="due-mark" points="806.7,74 812.7,80 806.7,86 800.7,80"/>
+          <polygon class="due-mark" points="940,74 946,80 940,86 934,80"/>
+        </g>
+
+        <g>
+          <path class="arrow" d="M276,88 L288,111" marker-end="url(#ah1)"/>
+          <path class="arrow" d="M410,88 L437,111" marker-end="url(#ah1)"/>
+          <path class="arrow" d="M676,88 L688,111" marker-end="url(#ah1)"/>
+          <path class="arrow" d="M810,88 L837,111" marker-end="url(#ah1)"/>
+          <text x="447" y="102">waits for the next transfer</text>
+        </g>
+
+        <g>
+          <line class="start-line" x1="140" y1="114" x2="140" y2="236"/><line class="start-line" x1="290" y1="114" x2="290" y2="236"/>
+          <line class="start-line" x1="440" y1="114" x2="440" y2="236"/><line class="start-line" x1="540" y1="114" x2="540" y2="236"/>
+          <line class="start-line" x1="690" y1="114" x2="690" y2="236"/><line class="start-line" x1="840" y1="114" x2="840" y2="236"/>
+          <line class="start-line" x1="940" y1="114" x2="940" y2="236"/>
+          <circle class="start-mark" cx="140" cy="120" r="5"/><circle class="start-mark" cx="290" cy="120" r="5"/>
+          <circle class="start-mark" cx="440" cy="120" r="5"/><circle class="start-mark" cx="540" cy="120" r="5"/>
+          <circle class="start-mark" cx="690" cy="120" r="5"/><circle class="start-mark" cx="840" cy="120" r="5"/>
+          <circle class="start-mark" cx="940" cy="120" r="5"/>
+        </g>
+
+        <g>
+          <rect class="bar" x="142" y="158" width="146" height="22" rx="3"/><text class="bar-label" x="215" y="173">1.5 ms</text>
+          <rect class="bar" x="292" y="158" width="146" height="22" rx="3"/><text class="bar-label" x="365" y="173">1.5 ms</text>
+          <rect class="bar short" x="442" y="158" width="96" height="22" rx="3"/><text class="bar-label short" x="490" y="173">1.0 ms</text>
+          <rect class="bar" x="542" y="158" width="146" height="22" rx="3"/><text class="bar-label" x="615" y="173">1.5 ms</text>
+          <rect class="bar" x="692" y="158" width="146" height="22" rx="3"/><text class="bar-label" x="765" y="173">1.5 ms</text>
+          <rect class="bar short" x="842" y="158" width="96" height="22" rx="3"/><text class="bar-label short" x="890" y="173">1.0 ms</text>
+        </g>
+
+        <g>
+          <rect class="blk-ok" x="142" y="207" width="110" height="14" rx="2"/>
+          <rect class="blk-ok" x="292" y="207" width="110" height="14" rx="2"/>
+          <rect class="blk-bad" x="442" y="207" width="110" height="14" rx="2"/>
+          <line class="miss" x1="534" y1="201" x2="546" y2="227"/><line class="miss" x1="546" y1="201" x2="534" y2="227"/>
+          <rect class="blk-ok" x="542" y="207" width="110" height="14" rx="2"/>
+          <rect class="blk-ok" x="692" y="207" width="110" height="14" rx="2"/>
+          <rect class="blk-bad" x="842" y="207" width="110" height="14" rx="2"/>
+          <line class="miss" x1="934" y1="201" x2="946" y2="227"/><line class="miss" x1="946" y1="201" x2="934" y2="227"/>
+          <text class="miss-label" x="560" y="244">misses the 1.0 ms cycle</text>
+        </g>
+
+        <line class="axis" x1="140" y1="262" x2="940" y2="262"/>
+        <g>
+          <line class="axis" x1="140" y1="262" x2="140" y2="268"/><line class="axis" x1="190" y1="262" x2="190" y2="265"/>
+          <line class="axis" x1="240" y1="262" x2="240" y2="268"/><line class="axis" x1="290" y1="262" x2="290" y2="265"/>
+          <line class="axis" x1="340" y1="262" x2="340" y2="268"/><line class="axis" x1="390" y1="262" x2="390" y2="265"/>
+          <line class="axis" x1="440" y1="262" x2="440" y2="268"/><line class="axis" x1="490" y1="262" x2="490" y2="265"/>
+          <line class="axis" x1="540" y1="262" x2="540" y2="268"/><line class="axis" x1="590" y1="262" x2="590" y2="265"/>
+          <line class="axis" x1="640" y1="262" x2="640" y2="268"/><line class="axis" x1="690" y1="262" x2="690" y2="265"/>
+          <line class="axis" x1="740" y1="262" x2="740" y2="268"/><line class="axis" x1="790" y1="262" x2="790" y2="265"/>
+          <line class="axis" x1="840" y1="262" x2="840" y2="268"/><line class="axis" x1="890" y1="262" x2="890" y2="265"/>
+          <line class="axis" x1="940" y1="262" x2="940" y2="268"/>
+          <text class="axis-label" x="140" y="284">0</text><text class="axis-label" x="240" y="284">1</text>
+          <text class="axis-label" x="340" y="284">2</text><text class="axis-label" x="440" y="284">3</text>
+          <text class="axis-label" x="540" y="284">4</text><text class="axis-label" x="640" y="284">5</text>
+          <text class="axis-label" x="740" y="284">6</text><text class="axis-label" x="840" y="284">7</text>
+          <text class="axis-label" x="940" y="284">8 ms</text>
+        </g>
+      </svg>
+    </div>
+    <figcaption>PipeWire starts a cycle only when the USB driver reports a finished period, and the driver reports only at the end of a 0.5 ms transfer. A period due at 1.333 ms therefore starts at 1.5 ms, the next at 3.0 ms, the next exactly at 4.0 ms. The cycles last 1.5, 1.5 and 1.0 ms, forever. Live's meter shows a 1.1 ms block as 83 % load, yet it misses every third cycle.</figcaption>
+  </figure>
+
+  <figure>
+    <h2>After: timer-driven</h2>
+    <div class="scroll">
+      <svg viewBox="0 0 980 300" role="img" aria-label="Timer-driven timing: PipeWire's own timer starts a cycle every 1.333 ms, exactly when each 64-frame period falls due, so every cycle gives Live 1.333 ms and a 1.1 ms block fits every time. The card's position PipeWire reads can be up to 0.5 ms old, so PipeWire keeps 64 frames of headroom queued.">
+        <text class="lane-label" x="128" y="46">USB transfers</text>
+        <text class="lane-label" x="128" y="84">Period due</text>
+        <text class="lane-label" x="128" y="124">Cycle starts</text>
+        <text class="lane-label" x="128" y="172">Time Live gets</text>
+        <text class="lane-label" x="128" y="217">1.1 ms block</text>
+
+        <path class="note" d="M240,29 L240,25 L273.3,25 L273.3,29"/>
+        <text class="note-label" x="282" y="24">position read here can be up to 0.5 ms old: PipeWire keeps 64 frames of headroom queued</text>
+
+        <line class="lane" x1="140" y1="50" x2="940" y2="50"/>
+        <g>
+          <line class="usb" x1="140" y1="34" x2="140" y2="50"/><line class="usb" x1="190" y1="34" x2="190" y2="50"/>
+          <line class="usb" x1="240" y1="34" x2="240" y2="50"/><line class="usb" x1="290" y1="34" x2="290" y2="50"/>
+          <line class="usb" x1="340" y1="34" x2="340" y2="50"/><line class="usb" x1="390" y1="34" x2="390" y2="50"/>
+          <line class="usb" x1="440" y1="34" x2="440" y2="50"/><line class="usb" x1="490" y1="34" x2="490" y2="50"/>
+          <line class="usb" x1="540" y1="34" x2="540" y2="50"/><line class="usb" x1="590" y1="34" x2="590" y2="50"/>
+          <line class="usb" x1="640" y1="34" x2="640" y2="50"/><line class="usb" x1="690" y1="34" x2="690" y2="50"/>
+          <line class="usb" x1="740" y1="34" x2="740" y2="50"/><line class="usb" x1="790" y1="34" x2="790" y2="50"/>
+          <line class="usb" x1="840" y1="34" x2="840" y2="50"/><line class="usb" x1="890" y1="34" x2="890" y2="50"/>
+          <line class="usb" x1="940" y1="34" x2="940" y2="50"/>
+        </g>
+
+        <g>
+          <line class="due" x1="140" y1="62" x2="140" y2="236"/><line class="due" x1="273.3" y1="62" x2="273.3" y2="236"/>
+          <line class="due" x1="406.7" y1="62" x2="406.7" y2="236"/><line class="due" x1="540" y1="62" x2="540" y2="236"/>
+          <line class="due" x1="673.3" y1="62" x2="673.3" y2="236"/><line class="due" x1="806.7" y1="62" x2="806.7" y2="236"/>
+          <line class="due" x1="940" y1="62" x2="940" y2="236"/>
+          <polygon class="due-mark" points="140,74 146,80 140,86 134,80"/><polygon class="due-mark" points="273.3,74 279.3,80 273.3,86 267.3,80"/>
+          <polygon class="due-mark" points="406.7,74 412.7,80 406.7,86 400.7,80"/><polygon class="due-mark" points="540,74 546,80 540,86 534,80"/>
+          <polygon class="due-mark" points="673.3,74 679.3,80 673.3,86 667.3,80"/><polygon class="due-mark" points="806.7,74 812.7,80 806.7,86 800.7,80"/>
+          <polygon class="due-mark" points="940,74 946,80 940,86 934,80"/>
+        </g>
+        <text x="152" y="104">timer fires on time, locked to the card's clock</text>
+
+        <g>
+          <line class="start-line" x1="140" y1="114" x2="140" y2="236"/><line class="start-line" x1="273.3" y1="114" x2="273.3" y2="236"/>
+          <line class="start-line" x1="406.7" y1="114" x2="406.7" y2="236"/><line class="start-line" x1="540" y1="114" x2="540" y2="236"/>
+          <line class="start-line" x1="673.3" y1="114" x2="673.3" y2="236"/><line class="start-line" x1="806.7" y1="114" x2="806.7" y2="236"/>
+          <line class="start-line" x1="940" y1="114" x2="940" y2="236"/>
+          <circle class="start-mark" cx="140" cy="120" r="5"/><circle class="start-mark" cx="273.3" cy="120" r="5"/>
+          <circle class="start-mark" cx="406.7" cy="120" r="5"/><circle class="start-mark" cx="540" cy="120" r="5"/>
+          <circle class="start-mark" cx="673.3" cy="120" r="5"/><circle class="start-mark" cx="806.7" cy="120" r="5"/>
+          <circle class="start-mark" cx="940" cy="120" r="5"/>
+        </g>
+
+        <g>
+          <rect class="bar" x="142" y="158" width="129.3" height="22" rx="3"/><text class="bar-label" x="206.7" y="173">1.33 ms</text>
+          <rect class="bar" x="275.3" y="158" width="129.4" height="22" rx="3"/><text class="bar-label" x="340" y="173">1.33 ms</text>
+          <rect class="bar" x="408.7" y="158" width="129.3" height="22" rx="3"/><text class="bar-label" x="473.3" y="173">1.33 ms</text>
+          <rect class="bar" x="542" y="158" width="129.3" height="22" rx="3"/><text class="bar-label" x="606.7" y="173">1.33 ms</text>
+          <rect class="bar" x="675.3" y="158" width="129.4" height="22" rx="3"/><text class="bar-label" x="740" y="173">1.33 ms</text>
+          <rect class="bar" x="808.7" y="158" width="129.3" height="22" rx="3"/><text class="bar-label" x="873.3" y="173">1.33 ms</text>
+        </g>
+
+        <g>
+          <rect class="blk-ok" x="142" y="207" width="110" height="14" rx="2"/>
+          <rect class="blk-ok" x="275.3" y="207" width="110" height="14" rx="2"/>
+          <rect class="blk-ok" x="408.7" y="207" width="110" height="14" rx="2"/>
+          <rect class="blk-ok" x="542" y="207" width="110" height="14" rx="2"/>
+          <rect class="blk-ok" x="675.3" y="207" width="110" height="14" rx="2"/>
+          <rect class="blk-ok" x="808.7" y="207" width="110" height="14" rx="2"/>
+          <text x="560" y="244">fits every cycle, with 0.23 ms to spare</text>
+        </g>
+
+        <line class="axis" x1="140" y1="262" x2="940" y2="262"/>
+        <g>
+          <line class="axis" x1="140" y1="262" x2="140" y2="268"/><line class="axis" x1="190" y1="262" x2="190" y2="265"/>
+          <line class="axis" x1="240" y1="262" x2="240" y2="268"/><line class="axis" x1="290" y1="262" x2="290" y2="265"/>
+          <line class="axis" x1="340" y1="262" x2="340" y2="268"/><line class="axis" x1="390" y1="262" x2="390" y2="265"/>
+          <line class="axis" x1="440" y1="262" x2="440" y2="268"/><line class="axis" x1="490" y1="262" x2="490" y2="265"/>
+          <line class="axis" x1="540" y1="262" x2="540" y2="268"/><line class="axis" x1="590" y1="262" x2="590" y2="265"/>
+          <line class="axis" x1="640" y1="262" x2="640" y2="268"/><line class="axis" x1="690" y1="262" x2="690" y2="265"/>
+          <line class="axis" x1="740" y1="262" x2="740" y2="268"/><line class="axis" x1="790" y1="262" x2="790" y2="265"/>
+          <line class="axis" x1="840" y1="262" x2="840" y2="268"/><line class="axis" x1="890" y1="262" x2="890" y2="265"/>
+          <line class="axis" x1="940" y1="262" x2="940" y2="268"/>
+          <text class="axis-label" x="140" y="284">0</text><text class="axis-label" x="240" y="284">1</text>
+          <text class="axis-label" x="340" y="284">2</text><text class="axis-label" x="440" y="284">3</text>
+          <text class="axis-label" x="540" y="284">4</text><text class="axis-label" x="640" y="284">5</text>
+          <text class="axis-label" x="740" y="284">6</text><text class="axis-label" x="840" y="284">7</text>
+          <text class="axis-label" x="940" y="284">8 ms</text>
+        </g>
+      </svg>
+    </div>
+    <figcaption>PipeWire wakes on its own timer every 1.333 ms and keeps that timer locked to the Focusrite's crystal by measuring how far the card has played. The USB transfers still finish every 0.5 ms, but they no longer decide when a cycle starts, so every cycle gives Live the full 1.333 ms. The card's position can be up to 0.5 ms old when PipeWire reads it, so while streaming PipeWire keeps a full period, 64 frames, queued as headroom (it raised the 32 the rule asks for): 1.33 ms more playback latency.</figcaption>
+  </figure>
+
+  <section>
+    <h2>Measured on the laptop</h2>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th></th><th>Interrupt-driven (D0016)</th><th>Timer-driven (D0017)</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Cycle length, 1st / median / 99th percentile</td><td class="num">989 / 1,500 / 1,511 µs</td><td class="num better">1,333 / 1,333 / 1,335 µs</td></tr>
+          <tr><td>Shortest time Live gets</td><td class="num">1.0 ms, every third cycle</td><td class="num better">1.333 ms, every cycle</td></tr>
+          <tr><td>PipeWire's estimate of the next cycle start, median error</td><td class="num">+248 µs, early in 16 % of cycles</td><td class="num better">0 µs, early in 2 of 35,728</td></tr>
+          <tr><td>Errors on the Focusrite's driver node, one run</td><td class="num">19</td><td class="num better">2</td></tr>
+          <tr><td>Late blocks while playing</td><td class="num">0</td><td class="num">0</td></tr>
+          <tr><td>Live's buffers</td><td class="num">one per cycle, entered 7 µs in</td><td class="num">one per cycle, entered 12 µs in</td></tr>
+          <tr><td>Extra playback latency</td><td class="num">none</td><td class="num worse">+64 frames (1.33 ms) while streaming, not reported to Live</td></tr>
+          <tr><td>PipeWire errors on Live's node, full pass (3 fresh boots, 18 min)</td><td class="num">3 (0, 1, 2 per run)</td><td class="num better">0 (0, 0, 0)</td></tr>
+          <tr><td>DSP average, full pass (Inbuilts / Max4Live / VSTs)</td><td class="num">6.43 / 6.78 / 5.81 %</td><td class="num">6.58 / 6.86 / 5.90 %</td></tr>
+          <tr><td>Missed deadlines, full pass</td><td class="num">0</td><td class="num">0</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="foot">The first six rows come from one 30 s bench run per mode on the Inbuilts Set with 2 audio workers, recorded with PipeASIO's probes from Live's first buffer (D0016, D0017). The full-pass rows come from three runs per mode, each from a fresh boot, playing Inbuilts, Max4Live and VSTs for 120 s each (D0014, D0017), all on 2026-10-20. Three errors against none is not yet significant on its own; a load ramp, where errors are frequent, is the stronger test. The switch is a WirePlumber rule on the Focusrite's pro-audio nodes, <code>api.alsa.disable-tsched = false</code> with <code>api.alsa.headroom = 32</code>, which PipeWire raised to 64 while streaming.</p>
+  </section>
+</main>

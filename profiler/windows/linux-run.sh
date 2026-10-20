@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# linux-run.sh TAG [kept|kept-wN|upstream] [TRIAL]: one Linux run on the laptop's Linux side, driven by
+# linux-run.sh TAG [kept|kept-wN[-bF]|upstream] [TRIAL]: one Linux run on the laptop's Linux side, driven by
 # profiler/windows/cross-os-trial.sh on the workstation right after a fresh boot (D0005, D0006 in
 # profiler/plans/kernel-plan.md).
 # Settles the boot as T0015/T0027 did (the timers that fire after every boot stopped, the desktop session up, 120 s,
@@ -9,23 +9,28 @@
 #   kept      the kept configuration (posix_spawn, PipeASIO realtime, physcore with 5 workers, the new display
 #             settings with golden, realtime throttling off)
 #   kept-wN   the same with N workers (1 to 5), one per physical P-core from CPU 2 (kept-w2: CPUs 2 and 4; D0014)
+#   kept-wN-bF  and PipeASIO's preferred buffer F frames (PIPEASIO_PREFERRED_BUFFERSIZE; kept-w2-b72: D0018)
 #   upstream  upstream's defaults: none of our switches (no posix_spawn, PipeASIO realtime off as shipped), no
 #             pinning, the launcher's automatic worker count (15 here), the old display (OpenGL, Live's GPU renderer
 #             off: the golden before T0023), realtime throttling as booted. The runtime's own patches (0108-0112)
 #             stay inert without their switches. Live at SCHED_RR 10 and the performance power hold are upstream's
 #             launcher defaults and stay.
 set -u
-TAG=${1:?usage: linux-run.sh TAG [kept|kept-wN|upstream] [TRIAL]}
+TAG=${1:?usage: linux-run.sh TAG [kept|kept-wN[-bF]|upstream] [TRIAL]}
 CONFIG=${2:-kept}
 TRIAL=${3:-D0005}
 source "$(dirname "${BASH_SOURCE[0]}")/../trials/trial-lib.sh"
 RT_BOOT=$(cat /proc/sys/kernel/sched_rt_runtime_us)
 case $CONFIG in
-  kept|kept-w[1-5])
-    workers=5
-    case $CONFIG in kept-w*) workers=${CONFIG#kept-w} ;; esac
+  kept|kept-w[1-5]|kept-w[1-5]-b[1-9]*)
+    workers=5 buffer=
+    case $CONFIG in kept-w*) workers=${CONFIG#kept-w}; workers=${workers%%-*} ;; esac
+    case $CONFIG in *-b*) buffer=${CONFIG##*-b} ;; esac
     export KEPT_LAYOUT=physcore KEPT_WORKERS=$workers KEPT_DISPLAY=new ABLETON_MAX_AUDIO_THREADS=$workers
-    arm_env() { export WINE_D3D_CONFIG=csmt=0x1,renderer=vulkan WINED3D_PRESENT_SKIP=6; }
+    arm_env() {   # campaign_setup clears PIPEASIO_PREFERRED_BUFFERSIZE; a -bF configuration sets it per run
+      export WINE_D3D_CONFIG=csmt=0x1,renderer=vulkan WINED3D_PRESENT_SKIP=6
+      if [ -n "$buffer" ]; then export PIPEASIO_PREFERRED_BUFFERSIZE=$buffer; fi
+    }
     arm_setup() { :; }
     golden_for() { echo golden; }
     pin_for() { pin_kept; } ;;
@@ -35,7 +40,7 @@ case $CONFIG in
     arm_setup() { sudo -n sysctl -q kernel.sched_rt_runtime_us="$RT_BOOT"; }   # campaign_setup turns throttling off
     golden_for() { echo golden.20261019T153253Z; }
     pin_for() { :; } ;;
-  *) echo "usage: linux-run.sh TAG [kept|kept-wN|upstream] [TRIAL] (N: 1 to 5)" >&2; exit 2 ;;
+  *) echo "usage: linux-run.sh TAG [kept|kept-wN[-bF]|upstream] [TRIAL] (N: 1 to 5; F: frames)" >&2; exit 2 ;;
 esac
 arm_teardown() { :; }
 arm_describe() { echo "linux $CONFIG configuration"; }
