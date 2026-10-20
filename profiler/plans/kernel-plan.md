@@ -142,6 +142,22 @@ Living document, approved 2026-10-19: the status table is updated as each item l
   - PipeWire errors;
   - Live's CPU and the audio threads' CPU.
 
+- **D0006 — RESULT (2026-10-19 21:41–22:11; three runs, each from a fresh boot, 9 Set results): with only upstream's fixes, Live under Linux needs 18–32 % more DSP time and about twice the CPU, and misses deadlines in every Set-run.**
+  - **Checks:** all held in every run: upstream configuration, no pins, 15 workers (15 AudioCalc threads), none of our switches recorded (only Link off and the performance power hold), Live's log "GPU Renderer: Off (Platform default)".
+  - Realtime throttling: this kernel boots with `sched_rt_runtime_us` = 1000000 (nothing sets it), so throttling was off in both configurations and is not a difference.
+  - **Medians per Set** (Inbuilts / Max4Live / VSTs), upstream against D0005's kept runs. Every upstream run was worse than every kept run in every Set.
+    - DSP average 11.31 / 11.79 / 10.95 against 9.54 / 8.94 / 8.61 (+18.5 / +31.9 / +27.2 %).
+    - Peak median 21.45 / 22.73 / 21.11 against 17.70 / 17.55 / 16.84 (+21 / +30 / +25 %).
+    - Missed deadlines (peaks over 100 %): 55 in 9 Set-runs (3–13 each) against 0.
+    - PipeWire errors: 176 against 5.
+    - Live's CPU 63.8 / 68.2 / 60.3 against 38.3 / 38.9 / 32.6 (+67 / +75 / +85 %).
+    - Audio threads 51.3 / 55.4 / 50.0 against 27.0 / 25.5 / 22.2. The 15 AudioCalc workers take 44.9 / 48.4 / 43.7 against 19.1 / 18.8 / 15.5 for five. PipeASIO's thread, not realtime here, is slightly cheaper (6.4 / 6.9 / 6.5 against 7.9 / 7.2 / 6.8).
+  - The missed deadlines are spread over the whole window, not only at the first pass's song positions where fork's page-fault storms land (D0003). That fits scheduling (PipeASIO's thread not realtime, 15 unpinned workers), as in T0003, where PipeASIO realtime cut PipeWire errors 204 → 30.
+  - **Against native Windows** (D0005 corrected, a different session):
+    - Upstream Linux's DSP average is 18–34 % higher (Windows 9.37 / 10.01 / 8.17), Live's CPU about twice Windows' (33.0 / 33.2 / 23.8), and it has 55 missed deadlines against Windows' 2.
+    - With our fixes, Linux is level with Windows on DSP and steadier.
+  - Not interleaved: D0005's Linux runs were 19:43–20:35, these 21:41–22:11, with the same procedure and display. Per-Set results: `profiler/plans/findings/d0006-results.jsonl`.
+
 ## Context
 - `WINE_POSIX_SPAWN=1` (T0020) removed the fork-induced page-fault storms, and dropouts are now rare. **T0022 (one audio thread per physical P-core, 5 workers) is a keep**: audio-thread CPU −26 %, Live CPU 46.9 → 35.0 %, DSP average lower. The goal now is more headroom: shorter, steadier audio blocks and less CPU, through kernel-level changes.
 - User (2026-10-19): "We want ableton specific improvement… lets get clever and esoteric for this ableton only kernel patch concept"; then "complete implementation plan for kernel level items".
