@@ -444,6 +444,24 @@ Living document, approved 2026-10-19: the status table is updated as each item l
   - pipeasio-rt on CPU 0; the workers on the P-cores' first threads, one each: 1 worker on CPU 2; 2 on CPUs 2 and 4; and so on up to 5 on 2, 4, 6, 8, 10.
   - 5 is the kept layout (physcore), so the reference is in the same session this time.
 - **Reading** (`profiler/trials/d0012_summary.py --id d0013`): as D0012. One run per count gives no verdict.
+- **D0013 — RESULT (2026-10-20 13:17–13:56; five runs clean; the workers were where the design put them in every run): block time is flat from 2 to 5 workers, and the CPU cost rises with each one.**
+
+  | Workers | DSP average % (Inbuilts / Max4Live / VSTs) | Score | Audio-thread CPU % | Live CPU % |
+  |---|---|---|---|---|
+  | 1 | 7.16 / 7.54 / 5.62 | 1.048 | 11.6 / 12.4 / 8.1 | 23.2 |
+  | 2 | 6.47 / 6.67 / 5.81 | 0.981 | 12.4 / 13.3 / 9.4 | 24.2 |
+  | 3 | 6.46 / 6.57 / 5.98 | 0.985 | 13.7 / 14.7 / 10.6 | 24.1 |
+  | 4 | 6.46 / 6.56 / 6.18 | 0.996 | 14.8 / 15.8 / 11.7 | 27.9 |
+  | 5, kept | 6.41 / 6.50 / 6.18 | 0.990 | 15.6 / 16.7 / 12.7 | 27.1 |
+
+  - The 5-worker run reproduced T0032's A arm (6.40 / 6.50 / 6.18), so D0012's 8–12 runs, an hour earlier, compare.
+  - **2 to 5 workers lie within about 1.5 % of each other** (the score's spread; one run per count is noise at that size). 2 and 3 lead on VSTs (5.81, 5.98 against 6.18); 5 leads on Max4Live.
+  - **The audio-thread CPU falls about 1.1 points per worker removed:** 3 workers use 1.9 points less than 5 on Inbuilts (−12 %), and Live's CPU is 3 points lower.
+  - **1 worker** is 12–16 % slower on Inbuilts and Max4Live, but the fastest on VSTs, which has little to share out.
+  - No missed deadlines or xruns; PipeWire errors 0–2 per run.
+  - **With D0012:** block time is flat from 2 to 5 and rises from 8 to 12 by about 1 % per worker. At the Sets' own load a few workers suffice; the extra ones add synchronisation and CPU.
+  - The kept 5 is not beaten on block time. A count of 3 would save CPU at equal block time. That is a rule H question (audio-thread CPU, with the DSP guard), and the load ramp is where fewer workers could cost headroom.
+  - Files: `profiler/plans/findings/d0013/`.
 
 ## Context
 - `WINE_POSIX_SPAWN=1` (T0020) removed the fork-induced page-fault storms, and dropouts are now rare. **T0022 (one audio thread per physical P-core, 5 workers) is a keep**: audio-thread CPU −26 %, Live CPU 46.9 → 35.0 %, DSP average lower. The goal now is more headroom: shorter, steadier audio blocks and less CPU, through kernel-level changes.
