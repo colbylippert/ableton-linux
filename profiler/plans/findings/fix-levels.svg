@@ -1,0 +1,127 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="920" height="756" viewBox="0 0 920 756" role="img" aria-labelledby="t d" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif">
+<title id="t">Ableton Live 12: Live CPU, audio worker CPU and dropouts, Linux (Wine) against Windows 11</title>
+<desc id="d">Linux, upstream setup: Live CPU 63.8/68.2/60.3 %, audio worker CPU 51.3/55.4/50.0 % (Inbuilts/Max4Live/VSTs), 15 workers, 55 missed deadlines, 176 PipeWire errors; Windows 11, Focusrite ASIO: Live CPU 33.0/33.2/23.8 %, audio worker CPU 28.2/29.5/19.6 % (Inbuilts/Max4Live/VSTs), 5 workers, 2 missed deadlines; Linux with the current fixes: Live CPU 27.3/29.6/22.8 %, audio worker CPU 15.4/16.4/12.3 % (Inbuilts/Max4Live/VSTs), 2 workers, 0 missed deadlines, 0 PipeWire errors.</desc>
+<rect x="0.5" y="0.5" width="919" height="755" rx="10" fill="#ffffff" stroke="#d0d7de"/>
+<text x="28.0" y="42.0" font-size="20" fill="#1f2328" font-weight="600">Ableton Live 12: Linux (Wine) against Windows 11 on the same laptop</text>
+<text x="28.0" y="66.0" font-size="12.5" fill="#59636e">i7-13620H laptop, Focusrite Scarlett 2i4 at 48 kHz. Each bar is the median of 3 runs, 2 minutes of playback per Set.</text>
+<rect x="28.0" y="87.0" width="11.0" height="11.0" rx="2" fill="#8c959f"/>
+<text x="45.0" y="97.0" font-size="12" fill="#1f2328">Linux, upstream setup</text>
+<rect x="200.0" y="87.0" width="11.0" height="11.0" rx="2" fill="#0969da"/>
+<text x="217.0" y="97.0" font-size="12" fill="#1f2328">Windows 11, Focusrite ASIO</text>
+<rect x="392.0" y="87.0" width="11.0" height="11.0" rx="2" fill="#1a7f37"/>
+<text x="409.0" y="97.0" font-size="12" fill="#1f2328">Linux with the current fixes</text>
+<text x="28.0" y="146.0" font-size="15" fill="#1f2328" font-weight="600">Live CPU</text>
+<text x="28.0" y="164.0" font-size="11.5" fill="#59636e">whole Live process, % of one core</text>
+<line x1="124.0" y1="186.0" x2="124.0" y2="440.0" stroke="#e6eaef" stroke-width="1"/>
+<text x="124.0" y="455.0" font-size="10.5" fill="#59636e" text-anchor="middle">0</text>
+<line x1="204.0" y1="186.0" x2="204.0" y2="440.0" stroke="#e6eaef" stroke-width="1"/>
+<text x="204.0" y="455.0" font-size="10.5" fill="#59636e" text-anchor="middle">20</text>
+<line x1="284.0" y1="186.0" x2="284.0" y2="440.0" stroke="#e6eaef" stroke-width="1"/>
+<text x="284.0" y="455.0" font-size="10.5" fill="#59636e" text-anchor="middle">40</text>
+<line x1="364.0" y1="186.0" x2="364.0" y2="440.0" stroke="#e6eaef" stroke-width="1"/>
+<text x="364.0" y="455.0" font-size="10.5" fill="#59636e" text-anchor="middle">60</text>
+<text x="28.0" y="200.0" font-size="12" fill="#1f2328"><tspan font-weight="600">Inbuilts</tspan><tspan fill="#59636e"> (Live's own devices)</tspan></text>
+<text x="116.0" y="219.5" font-size="11" fill="#59636e" text-anchor="end">Linux upstream</text>
+<rect x="124.0" y="208.0" width="255.0" height="15.0" rx="2" fill="#8c959f"/>
+<text x="385.0" y="219.5" font-size="11" fill="#1f2328">63.8</text>
+<text x="116.0" y="239.5" font-size="11" fill="#59636e" text-anchor="end">Windows 11</text>
+<rect x="124.0" y="228.0" width="132.0" height="15.0" rx="2" fill="#0969da"/>
+<text x="262.0" y="239.5" font-size="11" fill="#1f2328">33.0</text>
+<text x="116.0" y="259.5" font-size="11" fill="#59636e" text-anchor="end">Linux + fixes</text>
+<rect x="124.0" y="248.0" width="109.0" height="15.0" rx="2" fill="#1a7f37"/>
+<text x="239.0" y="259.5" font-size="11" fill="#1f2328" font-weight="600">27.3</text>
+<text x="28.0" y="284.0" font-size="12" fill="#1f2328"><tspan font-weight="600">Max4Live</tspan><tspan fill="#59636e"> (Max for Live devices)</tspan></text>
+<text x="116.0" y="303.5" font-size="11" fill="#59636e" text-anchor="end">Linux upstream</text>
+<rect x="124.0" y="292.0" width="272.6" height="15.0" rx="2" fill="#8c959f"/>
+<text x="402.6" y="303.5" font-size="11" fill="#1f2328">68.2</text>
+<text x="116.0" y="323.5" font-size="11" fill="#59636e" text-anchor="end">Windows 11</text>
+<rect x="124.0" y="312.0" width="132.8" height="15.0" rx="2" fill="#0969da"/>
+<text x="262.8" y="323.5" font-size="11" fill="#1f2328">33.2</text>
+<text x="116.0" y="343.5" font-size="11" fill="#59636e" text-anchor="end">Linux + fixes</text>
+<rect x="124.0" y="332.0" width="118.4" height="15.0" rx="2" fill="#1a7f37"/>
+<text x="248.4" y="343.5" font-size="11" fill="#1f2328" font-weight="600">29.6</text>
+<text x="28.0" y="368.0" font-size="12" fill="#1f2328"><tspan font-weight="600">VSTs</tspan><tspan fill="#59636e"> (third-party plugins)</tspan></text>
+<text x="116.0" y="387.5" font-size="11" fill="#59636e" text-anchor="end">Linux upstream</text>
+<rect x="124.0" y="376.0" width="241.0" height="15.0" rx="2" fill="#8c959f"/>
+<text x="371.0" y="387.5" font-size="11" fill="#1f2328">60.3</text>
+<text x="116.0" y="407.5" font-size="11" fill="#59636e" text-anchor="end">Windows 11</text>
+<rect x="124.0" y="396.0" width="95.0" height="15.0" rx="2" fill="#0969da"/>
+<text x="225.0" y="407.5" font-size="11" fill="#1f2328">23.8</text>
+<text x="116.0" y="427.5" font-size="11" fill="#59636e" text-anchor="end">Linux + fixes</text>
+<rect x="124.0" y="416.0" width="91.0" height="15.0" rx="2" fill="#1a7f37"/>
+<text x="221.0" y="427.5" font-size="11" fill="#1f2328" font-weight="600">22.8</text>
+<text x="468.0" y="146.0" font-size="15" fill="#1f2328" font-weight="600">Audio worker CPU</text>
+<text x="468.0" y="164.0" font-size="11.5" fill="#59636e">Live's audio workers + the driver's callback thread, % of one core</text>
+<line x1="564.0" y1="186.0" x2="564.0" y2="440.0" stroke="#e6eaef" stroke-width="1"/>
+<text x="564.0" y="455.0" font-size="10.5" fill="#59636e" text-anchor="middle">0</text>
+<line x1="644.0" y1="186.0" x2="644.0" y2="440.0" stroke="#e6eaef" stroke-width="1"/>
+<text x="644.0" y="455.0" font-size="10.5" fill="#59636e" text-anchor="middle">20</text>
+<line x1="724.0" y1="186.0" x2="724.0" y2="440.0" stroke="#e6eaef" stroke-width="1"/>
+<text x="724.0" y="455.0" font-size="10.5" fill="#59636e" text-anchor="middle">40</text>
+<line x1="804.0" y1="186.0" x2="804.0" y2="440.0" stroke="#e6eaef" stroke-width="1"/>
+<text x="804.0" y="455.0" font-size="10.5" fill="#59636e" text-anchor="middle">60</text>
+<text x="468.0" y="200.0" font-size="12" fill="#1f2328"><tspan font-weight="600">Inbuilts</tspan><tspan fill="#59636e"> (Live's own devices)</tspan></text>
+<text x="556.0" y="219.5" font-size="11" fill="#59636e" text-anchor="end">Linux upstream</text>
+<rect x="564.0" y="208.0" width="205.0" height="15.0" rx="2" fill="#8c959f"/>
+<text x="775.0" y="219.5" font-size="11" fill="#1f2328">51.3</text>
+<text x="556.0" y="239.5" font-size="11" fill="#59636e" text-anchor="end">Windows 11</text>
+<rect x="564.0" y="228.0" width="112.6" height="15.0" rx="2" fill="#0969da"/>
+<text x="682.6" y="239.5" font-size="11" fill="#1f2328">28.2</text>
+<text x="556.0" y="259.5" font-size="11" fill="#59636e" text-anchor="end">Linux + fixes</text>
+<rect x="564.0" y="248.0" width="61.4" height="15.0" rx="2" fill="#1a7f37"/>
+<text x="631.4" y="259.5" font-size="11" fill="#1f2328" font-weight="600">15.4</text>
+<text x="468.0" y="284.0" font-size="12" fill="#1f2328"><tspan font-weight="600">Max4Live</tspan><tspan fill="#59636e"> (Max for Live devices)</tspan></text>
+<text x="556.0" y="303.5" font-size="11" fill="#59636e" text-anchor="end">Linux upstream</text>
+<rect x="564.0" y="292.0" width="221.4" height="15.0" rx="2" fill="#8c959f"/>
+<text x="791.4" y="303.5" font-size="11" fill="#1f2328">55.4</text>
+<text x="556.0" y="323.5" font-size="11" fill="#59636e" text-anchor="end">Windows 11</text>
+<rect x="564.0" y="312.0" width="118.0" height="15.0" rx="2" fill="#0969da"/>
+<text x="688.0" y="323.5" font-size="11" fill="#1f2328">29.5</text>
+<text x="556.0" y="343.5" font-size="11" fill="#59636e" text-anchor="end">Linux + fixes</text>
+<rect x="564.0" y="332.0" width="65.4" height="15.0" rx="2" fill="#1a7f37"/>
+<text x="635.4" y="343.5" font-size="11" fill="#1f2328" font-weight="600">16.4</text>
+<text x="468.0" y="368.0" font-size="12" fill="#1f2328"><tspan font-weight="600">VSTs</tspan><tspan fill="#59636e"> (third-party plugins)</tspan></text>
+<text x="556.0" y="387.5" font-size="11" fill="#59636e" text-anchor="end">Linux upstream</text>
+<rect x="564.0" y="376.0" width="200.0" height="15.0" rx="2" fill="#8c959f"/>
+<text x="770.0" y="387.5" font-size="11" fill="#1f2328">50.0</text>
+<text x="556.0" y="407.5" font-size="11" fill="#59636e" text-anchor="end">Windows 11</text>
+<rect x="564.0" y="396.0" width="78.4" height="15.0" rx="2" fill="#0969da"/>
+<text x="648.4" y="407.5" font-size="11" fill="#1f2328">19.6</text>
+<text x="556.0" y="427.5" font-size="11" fill="#59636e" text-anchor="end">Linux + fixes</text>
+<rect x="564.0" y="416.0" width="49.3" height="15.0" rx="2" fill="#1a7f37"/>
+<text x="619.3" y="427.5" font-size="11" fill="#1f2328" font-weight="600">12.3</text>
+<text x="28.0" y="500.0" font-size="15" fill="#1f2328" font-weight="600">Dropouts</text>
+<text x="104.0" y="500.0" font-size="12" fill="#59636e">totals over each setup's 9 Set-runs (18 minutes of playback)</text>
+<text x="45.0" y="528.0" font-size="11.5" fill="#59636e" font-weight="600">Setup</text>
+<text x="470.0" y="528.0" font-size="11.5" fill="#59636e" font-weight="600" text-anchor="end">Audio workers</text>
+<text x="590.0" y="528.0" font-size="11.5" fill="#59636e" font-weight="600" text-anchor="end">Buffer</text>
+<text x="740.0" y="528.0" font-size="11.5" fill="#59636e" font-weight="600" text-anchor="end">Missed deadlines</text>
+<text x="892.0" y="528.0" font-size="11.5" fill="#59636e" font-weight="600" text-anchor="end">PipeWire errors</text>
+<line x1="28.0" y1="536.0" x2="892.0" y2="536.0" stroke="#d0d7de" stroke-width="1"/>
+<rect x="28.0" y="548.0" width="11.0" height="11.0" rx="2" fill="#8c959f"/>
+<text x="45.0" y="558.0" font-size="12.5" fill="#1f2328">Linux, upstream setup</text>
+<text x="470.0" y="558.0" font-size="12.5" fill="#1f2328" text-anchor="end">15</text>
+<text x="590.0" y="558.0" font-size="12.5" fill="#1f2328" text-anchor="end">64 samples</text>
+<text x="740.0" y="558.0" font-size="12.5" fill="#1f2328" text-anchor="end">55</text>
+<text x="892.0" y="558.0" font-size="12.5" fill="#1f2328" text-anchor="end">176</text>
+<line x1="28.0" y1="566.0" x2="892.0" y2="566.0" stroke="#e6eaef" stroke-width="1"/>
+<rect x="28.0" y="574.0" width="11.0" height="11.0" rx="2" fill="#0969da"/>
+<text x="45.0" y="584.0" font-size="12.5" fill="#1f2328">Windows 11, Focusrite ASIO</text>
+<text x="470.0" y="584.0" font-size="12.5" fill="#1f2328" text-anchor="end">5</text>
+<text x="590.0" y="584.0" font-size="12.5" fill="#1f2328" text-anchor="end">64 samples</text>
+<text x="740.0" y="584.0" font-size="12.5" fill="#1f2328" text-anchor="end">2</text>
+<text x="892.0" y="584.0" font-size="12.5" fill="#1f2328" text-anchor="end">n/a</text>
+<line x1="28.0" y1="592.0" x2="892.0" y2="592.0" stroke="#e6eaef" stroke-width="1"/>
+<rect x="28.0" y="600.0" width="11.0" height="11.0" rx="2" fill="#1a7f37"/>
+<text x="45.0" y="610.0" font-size="12.5" fill="#1f2328" font-weight="600">Linux with the current fixes</text>
+<text x="470.0" y="610.0" font-size="12.5" fill="#1f2328" font-weight="600" text-anchor="end">2</text>
+<text x="590.0" y="610.0" font-size="12.5" fill="#1f2328" font-weight="600" text-anchor="end">72 samples</text>
+<text x="740.0" y="610.0" font-size="12.5" fill="#1f2328" font-weight="600" text-anchor="end">0</text>
+<text x="892.0" y="610.0" font-size="12.5" fill="#1f2328" font-weight="600" text-anchor="end">0</text>
+<text x="28.0" y="654.0" font-size="11" fill="#59636e">Missed deadline: an audio block that took Live longer than its buffer period to compute (its DSP meter over 100 % during playback).</text>
+<text x="28.0" y="670.0" font-size="11" fill="#59636e">PipeWire error: a cycle in which Live's audio reached the interface late. Windows has no PipeWire, so there are none to count there.</text>
+<text x="28.0" y="686.0" font-size="11" fill="#59636e">Current fixes: posix_spawn for new processes, a realtime driver callback thread, one audio thread per physical P-core, a new display path,</text>
+<text x="28.0" y="702.0" font-size="11" fill="#59636e">shallow CPU idle (C1E off; C2/C3 off on the P-cores) and a buffer aligned to the interface's 0.5 ms USB transfers.</text>
+<text x="28.0" y="718.0" font-size="11" fill="#59636e">Each setup ran with the worker count in the table. Measured 2026-10-19 (upstream, Windows) and 2026-10-20 (current fixes).</text>
+<text x="28.0" y="734.0" font-size="11" fill="#59636e">Data: profiler/plans/findings in github.com/colbylippert/ableton-linux, runs D0006 (upstream), D0005 (Windows) and D0018 (current fixes).</text>
+</svg>
