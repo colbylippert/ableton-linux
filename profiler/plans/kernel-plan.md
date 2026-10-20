@@ -40,6 +40,7 @@ Living document, approved 2026-10-19: the status table is updated as each item l
 | K3 ntsync-live spin | recorded 2026-10-19: in Live the DSP average did not move (5 of 9 pairs, −0.4 %) while audio CPU doubled (+22.9 points); the spin worked (context switches −64 %), wake-ups are not the bottleneck | T0025 | **revert** |
 | K4 C-state limit, C1E | D0007: a clock floor does not raise the workers' clock; D0008: C2/C3 off alone no consistent gain; D0009: with C1E off too, workers 2.9–3.3 → 4.5 GHz. **T0031: DSP −29.4 % (9/9 pairs), audio CPU −39.6 %, Live CPU 38.1 → 27.3 %, +5 W** | T0031 | **keep**: C1E off, C2/C3 off on the P-cores |
 | MMCSS (patch 0113, Wine) | T0032: only Live's audio threads realtime (AudioCalc FIFO 12, the rest normal) against all of Live at RR 10: DSP −0.3 % (8/9 pairs), guards held | T0032 | mechanism-confirmed (opt-in) |
+| Buffer size, the Focusrite's cycles (D0016–D0018) | 64 frames gave uneven 1.0 / 1.5 / 1.5 ms cycles (USB 0.5 ms transfers, interrupt scheduling); 72 frames gives even 1.5 ms: PipeWire errors 3 → 0 in 18 min, audio CPU +24–31 %, latency +0.33 / +0.83 ms | D0018 | **kept** (user decision): golden re-baselined at 72 frames |
 | Load ramp (headroom) | machinery done (every track duplicated per pass, buses trimmed); headroom 4–5× on every Set, failing on spikes at a DSP average of only 11–15 %. D0011: MMCSS does not move it (2 higher, 2 lower of 6 pairs; DSP −1 to −2 %). 77–82 % of the misses fall on 4 of the loop's 24 bars (beats 60, 76, 92, 96: where "7-Vocal 05" plays) | D0011 | no difference |
 | K5 LiveSync | not started; deprioritised by T0025: ntsync is 16 % of audio cycles, so at most a CPU gain, not block time (D0004: ~40 % of calls could be syscall-free) | — | — |
 | K6 isolation | registered as T0029 (driver ready); T0024 predicts no gain from moving IRQs off the audio cores, so it waits behind K10 | T0029 | — |
@@ -634,6 +635,14 @@ Living document, approved 2026-10-19: the status table is updated as each item l
     - Both remove the 1.0 ms cycles. Neither is adopted yet; the user chooses.
   - The timer rule stays removed. The 72-frame buffer was set per run only, so the laptop is back to 64 frames in interrupt mode.
   - Files: `profiler/plans/findings/d0018-results.jsonl`.
+- **Kept: the 72-frame buffer (user decision 2026-10-20, after the result: "We will keep the 72 frame fix").**
+  - Applied at 16:52 as `buffer_size = 72` in `~/.config/pipeasio/config.ini` (`fixed_buffer_size = true`), the file everyday Live reads.
+  - `golden` was re-baselined with it (`state snapshot --name golden --rebaseline`). `state diff` beforehand showed that file as the only change.
+    - The previous golden, 64 frames with the GPU renderer, is `golden.20261020T205208Z`.
+    - The upstream baseline's snapshot (`golden.20261019T153253Z`) is unchanged at 64 frames.
+  - Every trial, ramp and cross-OS run from here restores golden, so it runs at 72 frames.
+  - No ABAB trial was run, so the ledger has no line for it. The evidence is D0016 (the cause), D0017 and D0018 (the effect, three-run passes), recorded here.
+  - Note `notes/ABLETON-PIPEWIRE-BUFFER-72.md`. DSP averages from earlier runs are at 64 frames.
 
 ## Context
 - `WINE_POSIX_SPAWN=1` (T0020) removed the fork-induced page-fault storms, and dropouts are now rare. **T0022 (one audio thread per physical P-core, 5 workers) is a keep**: audio-thread CPU −26 %, Live CPU 46.9 → 35.0 %, DSP average lower. The goal now is more headroom: shorter, steadier audio blocks and less CPU, through kernel-level changes.

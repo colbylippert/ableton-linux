@@ -7,7 +7,8 @@
 # trial-lib's run_one, adds the history record, and prints one JSON line per Set in profiler/windows/summarise.py's
 # format. The configuration:
 #   kept      the kept configuration (posix_spawn, PipeASIO realtime, physcore with 5 workers, the new display
-#             settings with golden, realtime throttling off)
+#             settings with golden, realtime throttling off; golden holds PipeASIO's 72-frame buffer since
+#             2026-10-20, D0018)
 #   kept-wN   the same with N workers (1 to 5), one per physical P-core from CPU 2 (kept-w2: CPUs 2 and 4; D0014)
 #   kept-wN-bF  and PipeASIO's preferred buffer F frames (PIPEASIO_PREFERRED_BUFFERSIZE; kept-w2-b72: D0018)
 #   upstream  upstream's defaults: none of our switches (no posix_spawn, PipeASIO realtime off as shipped), no
