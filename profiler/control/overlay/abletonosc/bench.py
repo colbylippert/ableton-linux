@@ -39,10 +39,11 @@ TICK_MS = 100
 DEFAULT_CPU_PERIOD_MS = 500
 # The load ramp (/abl/bench/duplicate-all) keeps every summing bus at the Set's own level. The copies play the same
 # audio in sync, so with N copies playing the return tracks and the master receive N times the amplitude
-# (+20 log10 N dB) and their effects would run hot. The first pass puts a Utility first in the chain of every return
-# track and of the master; each pass sets its Gain to -20 log10 N dB. Sends, faders and automation stay as the Set has
-# them: setting an automated parameter would override its automation for the rest of the session, and a new device
-# has none. The trims cost the same in every configuration a ramp compares.
+# (+20 log10 N dB) and their effects would run hot. The first pass finds a trim for every return track and for the
+# master: the Utility already first in its chain when its Gain is not automated (the Set's returns start with one),
+# else a new Utility put first; each pass sets the trim to the Set's own gain minus 20 log10 N dB. Sends, faders and
+# automation stay as the Set has them: setting an automated parameter would override its automation for the rest of
+# the session. The trims cost the same in every configuration a ramp compares.
 RAMP_TRIM_DEVICE = "Utility"
 RAMP_TRIM_PARAMETER = "Gain"
 # Browser roots that /abl/bench/load-device searches by item name.
@@ -313,22 +314,32 @@ class BenchHandler(AbletonOSCHandler):
             self.ramp_originals = [track for track in song.tracks if not track.is_grouped]
             for bus in list(song.return_tracks) + [song.master_track]:
                 try:
-                    trim = self._insert_trim(bus)
+                    trim = self._bus_trim(bus)
+                    self.ramp_trims.append((trim, self._db_of(trim, trim.value)))
                 except Exception as e:
-                    trim = None
-                    self.logger.error("bench: no load-ramp trim on %s: %s" % (getattr(bus, "name", "?"), e))
-                if trim is not None:
-                    self.ramp_trims.append(trim)
+                    self.logger.error("bench: no load-ramp trim on %s: %s %r (insert_device %s; first device %s)" % (
+                        getattr(bus, "name", "?"), type(e).__name__, e, hasattr(bus, "insert_device"),
+                        getattr(bus.devices[0], "class_name", "?") if list(bus.devices) else "none"))
         tracks = list(song.tracks)
         # from the last original to the first, so the indices still to come stay valid
         for index in sorted((self._index_of(tracks, track) for track in self.ramp_originals), reverse=True):
             song.duplicate_track(index)
         self.ramp_pass += 1
         gain_db = -20.0 * math.log10(self.ramp_pass + 1)
-        for trim in self.ramp_trims:
-            self._set_db(trim, gain_db)
+        for trim, own_db in self.ramp_trims:
+            self._set_db(trim, own_db + gain_db)
         self._report("/abl/bench/duplicate-all", (self.ramp_pass, len(song.tracks), int((time.monotonic() - start) * 1000),
                                                   len(self.ramp_trims), round(gain_db, 2)))
+
+    def _bus_trim(self, track):
+        """The Gain that trims TRACK: the Utility already first in its chain when its Gain is not automated, else a new
+        Utility put first."""
+        devices = list(track.devices)
+        if devices and getattr(devices[0], "class_name", "") == "StereoGain":
+            gain = next((p for p in devices[0].parameters if p.name == RAMP_TRIM_PARAMETER), None)
+            if gain is not None and getattr(gain, "automation_state", 0) == 0:
+                return gain
+        return self._insert_trim(track)
 
     def _insert_trim(self, track):
         """A Utility first in TRACK's chain; its Gain parameter. Live 12.1+ inserts a native device at an index; else
@@ -348,18 +359,21 @@ class BenchHandler(AbletonOSCHandler):
         return next(p for p in device.parameters if p.name == RAMP_TRIM_PARAMETER)
 
     @staticmethod
-    def _set_db(parameter, db):
-        """Set PARAMETER to DB as its own display reads it ("-6.0 dB"; "-inf dB" at the bottom): a bisection over
-        str_for_value, which rises with the value."""
-        def shown(value):
-            match = re.search(r"(-?inf|[-+]?\d+(?:\.\d+)?)", parameter.str_for_value(value))
-            if not match:
-                raise ValueError("unreadable %s display: %r" % (parameter.name, parameter.str_for_value(value)))
-            return float("-inf") if "inf" in match.group(1) else float(match.group(1))
+    def _db_of(parameter, value):
+        """VALUE of PARAMETER in dB as its own display reads it ("-6.0 dB"; "-inf dB" at the bottom)."""
+        text = parameter.str_for_value(value)
+        match = re.search(r"(-?inf|[-+]?\d+(?:\.\d+)?)", text)
+        if not match:
+            raise ValueError("unreadable %s display: %r" % (parameter.name, text))
+        return float("-inf") if "inf" in match.group(1) else float(match.group(1))
+
+    @classmethod
+    def _set_db(cls, parameter, db):
+        """Set PARAMETER to DB as its display reads it: a bisection over str_for_value, which rises with the value."""
         low, high = parameter.min, parameter.max
         for _ in range(40):
             middle = (low + high) / 2.0
-            if shown(middle) < db:
+            if cls._db_of(parameter, middle) < db:
                 low = middle
             else:
                 high = middle

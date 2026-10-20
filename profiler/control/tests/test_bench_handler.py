@@ -279,6 +279,24 @@ class HandlerCase(unittest.TestCase):
         self.assertEqual([d.name for d in self.song.master_track.devices], ["Utility", "Limiter"])
         self.assertTrue(abs(self.song.master_track.devices[0].parameters[0].value + 9.54) < 0.06)
 
+    def test_duplicate_all_trims_with_a_utility_already_first_relative_to_its_own_gain(self):
+        reverb = self.song.return_tracks[0]
+        reverb.devices = [fake_live.FakeDevice("Utility"), fake_live.FakeDevice("Reverb")]
+        reverb.devices[0].parameters[0].value = -3.0
+        automated = self.song.return_tracks[1]
+        automated.devices = [fake_live.FakeDevice("Utility")]
+        automated.devices[0].parameters[0].automation_state = 1
+        self.make_handler()
+        self.server.dispatch("/abl/bench/duplicate-all")
+        # the Set's own Utility: no new device, -3 dB - 6.02 dB
+        self.assertEqual([d.name for d in reverb.devices], ["Utility", "Reverb"])
+        self.assertTrue(abs(reverb.devices[0].parameters[0].value + 9.02) < 0.06)
+        # an automated Gain is left alone and a new Utility goes first instead
+        self.assertEqual([d.name for d in automated.devices], ["Utility", "Utility"])
+        self.assertEqual(automated.devices[1].parameters[0].value, 0.0)
+        self.assertTrue(abs(automated.devices[0].parameters[0].value + 6.02) < 0.06)
+        self.assertEqual(self.reports("/abl/bench/duplicate-all")[0][0][3], 3)
+
     def test_duplicate_all_runs_without_trims_when_utility_cannot_be_placed(self):
         for bus in self.song.return_tracks + [self.song.master_track]:
             bus.insert_device = None   # not callable: the insert raises, the ramp goes on without that trim

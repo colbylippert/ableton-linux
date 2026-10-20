@@ -53,6 +53,7 @@ class FakeGainParameter(object):
 class FakeDevice(object):
     def __init__(self, name):
         self.name = name
+        self.class_name = {"Utility": "StereoGain", "Limiter": "Limiter", "Reverb": "Reverb"}.get(name, name)
         self.parameters = [FakeGainParameter()] if name == "Utility" else []
 
 

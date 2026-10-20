@@ -4,7 +4,8 @@
 For a bench run with the ramp-duplicate-all scenario. Per Set it splits the measured window at the
 /abl/bench/duplicate-all replies the bench recorded in raw/osc.tsv: step k (the Set playing k+1 times) runs from the
 k-th reply (the window start for step 0) plus SETTLE seconds (default 10: the new devices and the copies' first plays)
-to the next reply, or the window end. Per step: Live's DSP average and peak median (percent of the buffer period),
+to the start of the next duplication (its reply minus the milliseconds it reports), or the window end: Live glitches
+while it builds the copies, and that belongs to neither step. Per step: Live's DSP average and peak median (percent of the buffer period),
 the worst peak, the peaks over 100 % (missed deadlines), Live's PipeWire errors in that time (raw/pw-top.tsv, Live's
 nodes as scripts/bench-report.py matches them), and how long the duplication took.
 
@@ -75,10 +76,14 @@ def pw_error_events(path):
 def set_report(set_dir, settle, fail_errors, fail_peaks):
     cpu, dup, end = osc_rows(os.path.join(set_dir, "raw", "osc.tsv"))
     errors = pw_error_events(os.path.join(set_dir, "raw", "pw-top.tsv"))
-    bounds = [0.0] + [d[0] for d in dup] + [end]
+    # a step starts SETTLE seconds after the duplication that made it finished (its reply) and ends when the next one
+    # starts (that reply minus the milliseconds it reports): Live glitches while it builds the copies, and that belongs
+    # to neither step
+    starts = [0.0] + [d[0] for d in dup]
+    stops = [d[0] - d[3] / 1000.0 for d in dup] + [end]
     steps, headroom, failed = [], None, False
-    for k in range(len(bounds) - 1):
-        start, stop = bounds[k] + settle, bounds[k + 1]
+    for k in range(len(starts)):
+        start, stop = starts[k] + settle, stops[k]
         if stop - start < 5:                     # nothing left to measure after the settle time
             continue
         rows = [(a, p) for t, a, p in cpu if start <= t < stop]
