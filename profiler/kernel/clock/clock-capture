@@ -10,7 +10,8 @@
 #   samples.tsv     every second: wall time, RAPL package energy (uJ), package and hottest core temperature (m°C),
 #                   each P-core CPU's current frequency (kHz)
 #   start.txt, stop.txt   thermal throttle counts and total throttled time (per CPU and package), each P-core CPU's
-#                   scaling_min_freq, scaling_max_freq and EPP, the package energy, the wall time
+#                   scaling_min_freq, scaling_max_freq and EPP, each P-core CPU's idle-state entries, residency and
+#                   disable flag, the package energy, the wall time; start.txt also the TSC rate from the boot log
 set -u
 verb=${1:-}
 [ $# -gt 0 ] && shift
@@ -41,6 +42,9 @@ state() {  # one "key values..." line per counter or setting
   for c in $PCPUS; do
     d=/sys/devices/system/cpu/cpu$c/cpufreq
     echo "cpufreq $c $(cat $d/scaling_min_freq) $(cat $d/scaling_max_freq) $(cat $d/energy_performance_preference 2>/dev/null || echo -)"
+    for s in /sys/devices/system/cpu/cpu$c/cpuidle/state[0-9]*; do
+      echo "cpuidle $c ${s##*state} $(cat "$s/usage") $(cat "$s/time") $(cat "$s/disable") $(cat "$s/name")"
+    done
   done
 }
 
@@ -76,6 +80,7 @@ start)
   echo "$pid" > "$out/live.pid"
   for d in ${tids//,/ }; do echo "$d $(cat "/proc/$pid/task/$d/comm" 2>/dev/null)"; done > "$out/threads.txt"
   state > "$out/start.txt"
+  echo "tsc_mhz $(journalctl -k -b -o cat 2>/dev/null | grep -m1 -o 'tsc: Detected [0-9.]* MHz' | awk '{print $3}')" >> "$out/start.txt"
   setsid perf stat --per-thread -x, -o "$out/perf-stat.csv" \
     -e task-clock,cpu_core/cycles/,cpu_core/ref-cycles/,cpu_core/instructions/ -t "$tids" \
     < /dev/null > "$out/perf.log" 2>&1 &
@@ -110,10 +115,13 @@ def state(name):
         elif p[0] == "core_throttle": d["core"][int(p[1])] = (int(p[2]), int(p[3]))
         elif p[0] == "package_throttle": d["package"] = (int(p[1]), int(p[2]))
         elif p[0] == "cpufreq": d["cpufreq"][int(p[1])] = {"min": int(p[2]), "max": int(p[3]), "epp": p[4]}
+        elif p[0] == "cpuidle": d.setdefault("cpuidle", {})[(int(p[1]), int(p[2]))] = (int(p[3]), int(p[4]), int(p[5]), p[6] if len(p) > 6 else "")
+        elif p[0] == "tsc_mhz" and len(p) > 1: d["tsc_mhz"] = float(p[1])
     return d
 
 a, b = state("start.txt"), state("stop.txt")
 dur = b["time"] - a["time"]
+TSC = a.get("tsc_mhz")
 threads = {}
 for line in open(os.path.join(out, "perf-stat.csv")):
     p = line.rstrip("\n").split(",")
@@ -133,7 +141,9 @@ def agg(ts):
     ins = sum(t.get("cpu_core/instructions/", 0) for t in ts)
     return {"threads": len(ts), "cpu_percent_of_one_core": round(tc / 10 / dur, 2) if dur else None,
             "busy_ghz": round(cy / (tc * 1e6), 3) if tc else None, "ref_ghz": round(rc / (tc * 1e6), 3) if tc else None,
-            "ipc": round(ins / cy, 3) if cy else None}
+            "ipc": round(ins / cy, 3) if cy else None,
+            "clock_unhalted_ghz": round(cy / rc * TSC / 1000, 3) if rc and TSC else None,
+            "unhalted_pct": round(100 * rc / (tc * TSC * 1e3), 1) if tc and TSC else None}
 
 ac = [t for t in threads.values() if t["comm"].startswith("AudioCalc")]
 rt = [t for t in threads.values() if t["comm"] == "pipeasio-rt"]
@@ -166,6 +176,11 @@ summary = {
         "core_ms": {c: b["core"][c][1] - a["core"][c][1] for c in b["core"] if b["core"][c][1] != a["core"][c][1]},
     },
     "cpufreq_at_start": {c: a["cpufreq"][c] for c in pcpus if c in a["cpufreq"]},
+    "tsc_mhz": TSC,
+    "cpuidle": {f"{c}.{s}": {"name": b["cpuidle"][(c, s)][3], "entries": b["cpuidle"][(c, s)][0] - a["cpuidle"][(c, s)][0],
+                               "residency_pct": round(100 * (b["cpuidle"][(c, s)][1] - a["cpuidle"][(c, s)][1]) / 1e6 / dur, 2) if dur else None,
+                               "disabled": b["cpuidle"][(c, s)][2]}
+                for (c, s) in sorted(b.get("cpuidle", {})) if (c, s) in a.get("cpuidle", {})},
 }
 print(json.dumps(summary, indent=1))
 PY

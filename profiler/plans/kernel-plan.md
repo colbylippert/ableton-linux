@@ -188,6 +188,22 @@ Living document, approved 2026-10-19: the status table is updated as each item l
     - The follow-up check is D0008 (deep C-states off on the P-cores, with and without the floor).
   - Summary: `profiler/plans/findings/d0007-summary.txt`.
 
+## Sleep depth and the clock (D0008, diagnostic, pre-registered 2026-10-20 ~00:20, before any of its runs)
+- **Why:**
+  - D0007: the workers execute at 3.0–3.4 GHz on cores rated 4.7–4.9 GHz, with no power or thermal limit, and a clock floor does not raise the clock.
+  - Two thirds of audio wakes leave C2 (D0004). A core that powered down between rounds may run slower until it ramps back up.
+  - T0028 (registered) judges the C-state limit on DSP; this check first measures whether it raises the clock.
+- **Design:** kept configuration; three bench runs in one session (Inbuilts, Max4Live and VSTs, 120 s each).
+  - A: as is.
+  - B: C2 and C3 off on the P-cores (T0028's B, through the root helper).
+  - C: B plus D0007's clock floor.
+  - Everything is restored after each run and on any exit. Driver `profiler/kernel/clock/d0008.sh`; summary `clock_summary.py`.
+- **Measured per Set:** as in D0007, plus each audio CPU's idle-state entries and residency (the mechanism: no C2 or C3 entries in B and C).
+- **Decision:**
+  - Run T0028 (rule D, ABAB × 3) if B's or C's AudioCalc clock while executing is at least 5 % above A's on every Set.
+  - If only C qualifies, T0028's B gets the floor too.
+  - Otherwise stop. DSP is reported either way.
+
 ## Context
 - `WINE_POSIX_SPAWN=1` (T0020) removed the fork-induced page-fault storms, and dropouts are now rare. **T0022 (one audio thread per physical P-core, 5 workers) is a keep**: audio-thread CPU −26 %, Live CPU 46.9 → 35.0 %, DSP average lower. The goal now is more headroom: shorter, steadier audio blocks and less CPU, through kernel-level changes.
 - User (2026-10-19): "We want ableton specific improvement… lets get clever and esoteric for this ableton only kernel patch concept"; then "complete implementation plan for kernel level items".
