@@ -1,0 +1,13 @@
+[Unit]
+Description=Profiler: the P-cores idle no deeper than C1 (T0031; C1E is off from GRUB)
+Documentation=file:///home/colby/Projects/ableton-linux/profiler/plans/kernel-plan.md
+After=systemd-modules-load.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/profiler-shallow-idle on
+ExecStop=/usr/local/sbin/profiler-shallow-idle off
+
+[Install]
+WantedBy=multi-user.target

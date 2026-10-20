@@ -281,6 +281,24 @@ Living document, approved 2026-10-19: the status table is updated as each item l
 - **Reading:**
   - The change helps Live on Windows too if B's DSP average is lower than its paired A's in both pairs on every Set.
   - The mechanism holds if the P-cores' effective clock is higher in every B run, and the service log shows C1-only idle applied for each B Set and restored after.
+- **D0010 — RESULT (2026-10-20 05:04–05:50; four runs clean): the mechanism carries over to Windows but Live's DSP time does not move, so the gain is Linux-specific.**
+  - **Mechanism held:**
+    - P-cores' effective clock while active: A 2.29–2.78 GHz → B 4.69–4.71 GHz (+69 to +105 %); E-cores 57–97 % → 194–198 % of nominal.
+    - So the GRUB write survives Windows' boot, VBS included.
+    - The service applied C1-only idle for each B Set and restored it after; the A runs had IDLESTATEMAX 0 and the service stopped.
+  - **DSP average:** B lower in 3 of 6 Set-pairs, −3.2 to +3.2 % (Inbuilts −1.3 / +3.2; Max4Live +1.2 / −3.2; VSTs +0.7 / −0.1 %). Peak median −3.6 to +2.6 %. No peaks over 100 %.
+  - **CPU:** Live's CPU −11.6 to +4.5 %, AudioCalc −25 to +17 %, the ASIO callback unchanged; all mixed.
+  - The A runs reproduce D0005's corrected Windows figures: DSP 8.93–9.32 / 10.08–10.10 / 8.15 against 9.37 / 10.01 / 8.17.
+  - **Reading:**
+    - On native Windows the cores' clock is not what limits Live's blocks; something keeps its audio work fast without this change. Most likely that is Live's own thread placement and MMCSS "Pro Audio" scheduling, which work natively but not under Wine (Live's placement does not take effect there; MMCSS is stubbed).
+    - Under Wine, with the workers pinned and halting thousands of times a second, C1E was what cost the time (T0031).
+    - Linux with T0031 (DSP 6.49 / 6.52 / 6.18) is now 24–35 % below Windows in either configuration. That is across sessions, but far outside run-to-run spread.
+  - Per-Set results: `profiler/plans/findings/d0010-results.jsonl`.
+- **Lasting form (user decision 2026-10-20, before D0010's result: "We will leave it every boot for this test machine"):**
+  - C1E off from GRUB on every boot, Linux and Windows (`01_profiler-c1e-off`, replacing the per-entry `46_profiler-c1e-off`).
+  - The P-cores no deeper than C1 on Linux (`profiler-shallow-idle.service`, `profiler/kernel/idle/`).
+  - IDLESTATEMAX 1 in Windows' power plan. Per D0010 it costs power there without a DSP gain; one command reverts it.
+  - LiveIdleGuard stays installed (manual start) for a Live-only form.
 
 ## Context
 - `WINE_POSIX_SPAWN=1` (T0020) removed the fork-induced page-fault storms, and dropouts are now rare. **T0022 (one audio thread per physical P-core, 5 workers) is a keep**: audio-thread CPU −26 %, Live CPU 46.9 → 35.0 %, DSP average lower. The goal now is more headroom: shorter, steadier audio blocks and less CPU, through kernel-level changes.

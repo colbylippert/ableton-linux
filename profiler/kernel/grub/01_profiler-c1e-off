@@ -1,0 +1,37 @@
+#!/bin/sh
+# /etc/grub.d/01_profiler-c1e-off (from profiler/kernel/grub/, kernel-plan.md T0031, D0010): C1E off for every boot
+# of this test laptop, Linux and Windows alike (user decision 2026-10-20: "We will leave it every boot for this test
+# machine"). Its lines run at the top of grub.cfg, after 00_header has loaded grubenv and before the menu.
+# MSR_POWER_CTL (0x1FC) bit 1 enables C1E. It is one register for the whole CPU here (clearing it on the boot CPU
+# clears it on all 16), so GRUB's wrmsr, which runs on the boot CPU, covers every core; GRUB reads the register,
+# clears bit 1 in the last hex digit and writes it back, keeping the other bits. Windows has no setting for C1E and
+# would need a kernel driver for the register; Linux would taint itself writing it.
+# One boot with C1E on, as the firmware sets it (a comparison run): grub-editenv - set profiler_c1e=on before the
+# reboot, grub-editenv - unset profiler_c1e after. The register comes back on at every power-on and after sleep or
+# hibernation (the next boot through GRUB clears it again).
+set -e
+cat <<'GRUB'
+# profiler (01_profiler-c1e-off): C1E off for every boot unless grubenv has profiler_c1e=on
+if [ "${profiler_c1e}" != "on" ]; then
+	insmod rdmsr
+	insmod wrmsr
+	insmod regexp
+	rdmsr 0x1fc -v profiler_pc
+	regexp --set=profiler_pc_head '^(.*).$' "$profiler_pc"
+	regexp --set=profiler_pc_last '(.)$' "$profiler_pc"
+	if [ "$profiler_pc_last" = 2 ]; then profiler_pc_last=0
+	elif [ "$profiler_pc_last" = 3 ]; then profiler_pc_last=1
+	elif [ "$profiler_pc_last" = 6 ]; then profiler_pc_last=4
+	elif [ "$profiler_pc_last" = 7 ]; then profiler_pc_last=5
+	elif [ "$profiler_pc_last" = a ]; then profiler_pc_last=8
+	elif [ "$profiler_pc_last" = b ]; then profiler_pc_last=9
+	elif [ "$profiler_pc_last" = e ]; then profiler_pc_last=c
+	elif [ "$profiler_pc_last" = f ]; then profiler_pc_last=d
+	elif [ "$profiler_pc_last" = A ]; then profiler_pc_last=8
+	elif [ "$profiler_pc_last" = B ]; then profiler_pc_last=9
+	elif [ "$profiler_pc_last" = E ]; then profiler_pc_last=C
+	elif [ "$profiler_pc_last" = F ]; then profiler_pc_last=D
+	fi
+	wrmsr 0x1fc "0x${profiler_pc_head}${profiler_pc_last}"
+fi
+GRUB

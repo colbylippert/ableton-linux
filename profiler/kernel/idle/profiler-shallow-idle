@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# profiler-shallow-idle on|off|status: the P-cores' idle no deeper than C1 (kernel-plan.md T0031), the Linux half of
+# the every-boot shallow idle on this test laptop (user decision 2026-10-20); C1E itself is turned off by GRUB
+# (profiler/kernel/grub/01_profiler-c1e-off). Installed as /usr/local/sbin/profiler-shallow-idle and run at boot by
+# profiler-shallow-idle.service (install.sh beside it).
+#   on      disable every idle state deeper than C1 (state index 2 and up: C2_ACPI, C3_ACPI here) on the P-cores
+#   off     enable them again
+#   status  C1E (MSR_POWER_CTL bit 1, read through the msr module; reading does not taint the kernel) and the
+#           disabled idle states per CPU
+# The E-cores are untouched, as in T0031. profiler-root-helper's reset restores its baseline (every state enabled)
+# until the next boot.
+set -u
+pcores() { awk -F- '{ for (i = $1; i <= $2; i++) printf "%d ", i }' /sys/devices/cpu_core/cpus; }
+flags() {  # 0|1 on every state deeper than C1 of every P-core
+  local c s
+  for c in $(pcores); do
+    for s in /sys/devices/system/cpu/cpu$c/cpuidle/state[2-9]; do
+      [ -w "$s/disable" ] && echo "$1" > "$s/disable"
+    done
+  done
+}
+case ${1:-} in
+  on) flags 1 ;;
+  off) flags 0 ;;
+  status)
+    modprobe msr 2>/dev/null
+    v=$(dd if=/dev/cpu/0/msr bs=8 count=1 skip=$((0x1FC)) iflag=skip_bytes 2>/dev/null | od -An -tx8 | tr -d ' ')
+    if [ -n "$v" ]; then echo "C1E: $(( (0x$v >> 1) & 1 )) (MSR_POWER_CTL $v)"; else echo "C1E: unknown (no msr access)"; fi
+    for c in $(ls -d /sys/devices/system/cpu/cpu[0-9]* | sed 's/.*cpu//' | sort -n); do
+      d=
+      for s in /sys/devices/system/cpu/cpu$c/cpuidle/state[0-9]*; do
+        [ "$(cat "$s/disable" 2>/dev/null)" = 1 ] && d="$d $(cat "$s/name")"
+      done
+      echo "cpu$c disabled:${d:- none}"
+    done | awk '{ k = $0; sub(/^cpu[0-9]+ /, "", k); if (k == last) { n++ } else { if (last != "") print first "-" prev ": " last; first = $1; last = k } prev = $1 }
+                END { print first "-" prev ": " last }' | sed 's/disabled: //'
+    ;;
+  *) echo "usage: profiler-shallow-idle on|off|status" >&2; exit 2 ;;
+esac

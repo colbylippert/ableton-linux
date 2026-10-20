@@ -243,6 +243,9 @@ campaign_setup() {  # the session lock, kernel and runtime checks, the common en
     ABLETON_BENCH_TRACER ABLETON_BENCH_ROOT_HELPER
   sudo -n sysctl -q kernel.sched_rt_runtime_us="$(cat /proc/sys/kernel/sched_rt_period_us)"
   echo "$TRIAL: kernel $(uname -r); sched_rt_runtime_us=$(cat /proc/sys/kernel/sched_rt_runtime_us); checkout $(git log --oneline -1 | cut -c1-72)"
+  # the every-boot shallow idle (T0031: C1E off from GRUB, the P-cores no deeper than C1) is part of every run since
+  # 2026-10-20; record what is in force
+  echo "$TRIAL: idle: $(sudo -n /usr/local/sbin/profiler-shallow-idle status 2>/dev/null | tr '\n' ';' || echo unknown)"
 }
 
 campaign_main() {
