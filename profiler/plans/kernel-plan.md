@@ -19,6 +19,12 @@ Living document, approved 2026-10-19: the status table is updated as each item l
   - KWin now composites on the Intel GPU. eDP-1 runs at 1920×1080 @ 60.32 Hz (like the old external monitor's 59.94 Hz, not the panel's 144 Hz). The external HDMI output on the NVIDIA GPU is disabled.
   - **This shifts the display baseline:** trials before it ran with the NVIDIA-only external display. Interleaved A/B trials stay valid, but absolute display-CPU figures (T0023) do not carry over.
   - To check at the next Live run: which GPU wined3d's Vulkan renderer picks (Intel or NVIDIA). The iGPU shares the package power budget with the P-cores.
+- **Display moved back to the NVIDIA-only external HDMI output (2026-10-21 ~03:40, user: "We are movimg osx machine back to nvidia only external hdmi port … I will configure bios for PEG"; the Macs have no NVIDIA GPU, so this is the laptop):**
+  - `video=eDP-1:d` is back in `/etc/default/grub` (backup `grub.profiler-20261021T074012Z`) and on every profiler variant (`profiler/kernel/grub/install.sh` re-run: 6 of 6 linux lines).
+  - `90-profiler-kwin-gpu.conf` is back in `~/.config/environment.d/`, so KWin opens only `/dev/dri/nvidia-dgpu` (the udev names from `61-profiler-gpu-names.rules` survive the firmware's boot-VGA change).
+  - The user sets the BIOS's primary display to PEG. To verify at the first boot: KWin on the NVIDIA GPU, HDMI-A-1 the only output, eDP-1 off.
+  - Unchanged and unrelated to measurement (2026-10-20, user): the boot splash stays off (`splash` removed from the kernel command line), and Plasma's session restore is off (`loginMode=emptySession`), so Live no longer reopens at login.
+  - **The display baseline shifts again:** every run since 2026-10-19 18:08 (D0005 onward, T0031 and the fix-level figure included) used the built-in panel on the Intel GPU. Interleaved A/B comparisons stay valid; absolute figures across the switch do not carry over one to one.
 - **Next:**
   1. ~~Shrink the laptop's btrfs root to half~~ — **done 16:2x (2026-10-19):** btrfs and partition 2 are 476.5 GiB (same start, UUIDs and name); 477 GiB is unallocated at the end of the disk. A reboot was verified clean. The partition table from before is saved as `~/partition-table-before-windows.sfdisk` on the laptop, with a copy on the workstation.
   2. The user installs Windows 11.
